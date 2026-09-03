@@ -1,0 +1,53 @@
+# Machine Owners configuration for Deploy Approval Agent (final schema)
+#
+# version: 1
+# machines:
+#   <alias>:          # unique, non-empty, used in /approve_deploy machine=<alias>
+#     node_id: <id>   # unique, non-empty machine-policy identifier
+#     node_host: <ipv4>  # literal IPv4 used to reach the existing Agent Core API (port 15678)
+#     owners:         # non-empty list of GitHub logins (case-insensitive, deduped)
+#       - <github-login>
+#     targets:        # list of targets this machine can host
+#       - perception
+#       - actucore
+#       - driver
+#     platforms:      # optional: restrict to specific platforms
+#       - linux/arm64
+#     variants:       # optional: restrict to specific canonical variants
+#       - 5.11
+#       - 6.1
+#     driver_paths:   # required for driver targets
+#       - unitree/g1
+#
+# Missing/invalid file -> startup fail closed.
+
+version: 1
+
+machines:
+  sh-g1-01:
+    node_id: node-g1-01
+    node_host: 10.0.1.101
+    owners:
+      - alice
+      - bob
+    targets:
+      - perception
+      - actucore
+    platforms:
+      - linux/arm64
+    variants:
+      - 5.11
+      - 6.1
+
+  sh-go2:
+    node_id: node-go2
+    node_host: 10.0.1.102
+    owners:
+      - bob
+      - charlie
+    targets:
+      - driver
+    driver_paths:
+      - unitree/go2
+    platforms:
+      - linux/arm64
