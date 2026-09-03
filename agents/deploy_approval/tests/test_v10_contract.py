@@ -108,6 +108,7 @@ def _component(**overrides):
         "target": "perception",
         "driver_path": "",
         "variant": "5.11",
+        "review_image_tag": "registry/repo:v1",
         "image_ref": "registry/repo@sha256:" + "a" * 64,
         "resolved_platform": "linux/arm64",
         "runtime_id": "perception",
@@ -201,7 +202,6 @@ class TestAgentCoreClientSecurity:
         client = AgentCoreClient(
             config,
             base_url="http://10.0.0.1:15678",
-            token_env="AGENT_CORE_TOKEN",
             node_host="10.0.0.1",
         )
         assert client.base_url == "http://10.0.0.1:15678"
@@ -214,7 +214,6 @@ class TestAgentCoreClientSecurity:
             AgentCoreClient(
                 config,
                 base_url="http://10.0.0.99:15678",
-                token_env="AGENT_CORE_TOKEN",
                 node_host="10.0.0.1",
             )
 
@@ -224,7 +223,6 @@ class TestAgentCoreClientSecurity:
             AgentCoreClient(
                 config,
                 base_url="http://10.0.0.1:15679",
-                token_env="AGENT_CORE_TOKEN",
                 node_host="10.0.0.1",
             )
 
@@ -235,7 +233,6 @@ class TestAgentCoreClientSecurity:
             AgentCoreClient(
                 config,
                 base_url="http://10.0.0.1:15678",
-                token_env="AGENT_CORE_TOKEN",
                 node_host="evil.com",
             )
         # path injection in base_url
@@ -243,38 +240,33 @@ class TestAgentCoreClientSecurity:
             AgentCoreClient(
                 config,
                 base_url="http://10.0.0.1:15678/api/evil",
-                token_env="AGENT_CORE_TOKEN",
                 node_host="10.0.0.1",
             )
         with pytest.raises(AgentCoreError, match="must not contain a path"):
             AgentCoreClient(
                 config,
                 base_url="http://10.0.0.1:15678/evil",
-                token_env="AGENT_CORE_TOKEN",
                 node_host="10.0.0.1",
             )
         with pytest.raises(AgentCoreError, match="must not contain query"):
             AgentCoreClient(
                 config,
                 base_url="http://10.0.0.1:15678?evil=1",
-                token_env="AGENT_CORE_TOKEN",
                 node_host="10.0.0.1",
             )
         with pytest.raises(AgentCoreError, match="must not contain fragment"):
             AgentCoreClient(
                 config,
                 base_url="http://10.0.0.1:15678#evil",
-                token_env="AGENT_CORE_TOKEN",
                 node_host="10.0.0.1",
             )
 
     def test_agent_core_bearer_token_is_sent(self, config):
-        """When AGENT_CORE_TOKEN is set, the Authorization header is sent."""
-        with patch.dict("os.environ", {"AGENT_CORE_TOKEN": "secret-token-123"}):
+        """When ACCESS_TOKEN is set, the Authorization header is sent."""
+        with patch.dict("os.environ", {"ACCESS_TOKEN": "secret-token-123"}):
             client = AgentCoreClient(
                 config,
                 base_url="http://10.0.0.1:15678",
-                token_env="AGENT_CORE_TOKEN",
                 node_host="10.0.0.1",
             )
             headers = client._headers()
@@ -282,11 +274,10 @@ class TestAgentCoreClientSecurity:
 
     def test_agent_core_token_never_persisted_or_rendered(self, config):
         """The token is read from env at call time and never stored on the instance."""
-        with patch.dict("os.environ", {"AGENT_CORE_TOKEN": "my-secret-token"}):
+        with patch.dict("os.environ", {"ACCESS_TOKEN": "my-secret-token"}):
             client = AgentCoreClient(
                 config,
                 base_url="http://10.0.0.1:15678",
-                token_env="AGENT_CORE_TOKEN",
                 node_host="10.0.0.1",
             )
             # The token is not stored directly on the instance
@@ -304,7 +295,6 @@ class TestAgentCoreClientSecurity:
         client = AgentCoreClient(
             config,
             base_url="http://10.0.0.1:15678",
-            token_env="AGENT_CORE_TOKEN",
             node_host="10.0.0.1",
         )
         # Replace verify with a mock that raises a SecurityError
@@ -550,7 +540,6 @@ class TestDeployHealth:
         core = AsyncMock()
         core.deploy_driver = AsyncMock(return_value={"code": 0})
         core.driver_status = AsyncMock(return_value={
-            "status": "running",
             "running_image": "registry/repo@sha256:" + "a" * 64,
         })
         controller._resolve_core_client = AsyncMock(return_value=core)
@@ -562,7 +551,6 @@ class TestDeployHealth:
         )
         assert result["passed"] is True
         assert result["running_image"] == "registry/repo@sha256:" + "a" * 64
-        assert result["status"] == "running"
 
     @pytest.mark.asyncio
     async def test_health_wait_uses_same_runtime_id_as_preflight_and_deploy(self, controller):
@@ -570,7 +558,6 @@ class TestDeployHealth:
         core = AsyncMock()
         core.deploy_driver = AsyncMock(return_value={"code": 0})
         core.driver_status = AsyncMock(return_value={
-            "status": "running",
             "running_image": "registry/repo@sha256:" + "a" * 64,
         })
         controller._resolve_core_client = AsyncMock(return_value=core)
@@ -597,7 +584,6 @@ class TestDeployHealth:
         core = AsyncMock()
         core.deploy_driver = AsyncMock(return_value={"code": 0})
         core.driver_status = AsyncMock(return_value={
-            "status": "running",
             "running_image": "registry/wrong@sha256:" + "b" * 64,
         })
         controller._resolve_core_client = AsyncMock(return_value=core)
@@ -623,7 +609,6 @@ class TestDeployHealth:
         core = AsyncMock()
         core.deploy_driver = AsyncMock(return_value={"code": 0})
         core.driver_status = AsyncMock(return_value={
-            "status": "starting",
             "running_image": "",
         })
         ctrl._resolve_core_client = AsyncMock(return_value=core)
@@ -643,7 +628,6 @@ class TestDeployHealth:
         core = AsyncMock()
         core.deploy_driver = AsyncMock(return_value={"code": 0})
         core.driver_status = AsyncMock(return_value={
-            "status": "running",
             "running_image": "registry/repo@sha256:" + "a" * 64,
         })
         controller._resolve_core_client = AsyncMock(return_value=core)

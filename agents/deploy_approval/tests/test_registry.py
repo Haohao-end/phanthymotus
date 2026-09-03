@@ -165,14 +165,9 @@ _DMAN = "sha256:" + hashlib.sha256(_manifest_body(_DCFG)).hexdigest()
 
 def _reg_cfg(**kw) -> Config:
     defaults = dict(
-        api_token="t",
-
         poll_enabled=False,
         allow_private_http=True,
         http_allowed_cidrs=[],
-        agent_core_token="test-core-tok",
-        registry_user_env="ARGUSER",
-        registry_password_env="ARGPASS",
     )
     defaults.update(kw)
     return Config(**defaults)

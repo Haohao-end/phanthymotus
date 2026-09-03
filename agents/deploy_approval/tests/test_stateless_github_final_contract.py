@@ -92,6 +92,7 @@ def _component(**overrides):
         "target": "perception",
         "driver_path": "",
         "variant": "5.11",
+        "review_image_tag": "registry/repo:v1",
         "image_ref": "registry/repo@sha256:" + "a" * 64,
         "resolved_platform": "linux/arm64",
         "runtime_id": "perception",
@@ -727,7 +728,7 @@ async def test_review_lookup_does_not_pass_pr_number(controller, proxy, mock_git
     proxy.read_hidden_state = AsyncMock(return_value=_state(status="deploy-ready", review_job_id="", components=[]))
     controller.review.list_jobs = AsyncMock(return_value=[
         _review_job("job-1", "a" * 40, [
-            {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "tag"},
+        {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag"},
         ], completed_at="2026-09-01T10:00:00Z"),
     ])
     controller.registry.resolve.return_value = SimpleNamespace(image_ref="registry/repo@sha256:" + "b" * 64, platform="linux/arm64")
@@ -752,15 +753,15 @@ async def test_review_lookup_exact_repo_pr_full_head_latest(controller, proxy, m
     }
     proxy.read_hidden_state = AsyncMock(return_value=_state(status="deploy-ready", review_job_id="job-new", head_sha=head_sha, components=[]))
     job_new = _review_job("job-new", head_sha, [
-        {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "tag-new"},
+        {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag-new"},
     ], completed_at="2026-09-01T11:00:00Z")
     controller.review.list_jobs = AsyncMock(return_value=[
         _review_job("job-old", head_sha, [
-            {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "tag-old"},
+            {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag-old"},
         ], completed_at="2026-09-01T10:00:00Z"),
         job_new,
         _review_job("job-other", "b" * 40, [
-            {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "tag-other"},
+            {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag-other"},
         ], completed_at="2026-09-01T12:00:00Z"),
     ])
     controller.review.get_job = AsyncMock(return_value=job_new)
@@ -976,7 +977,7 @@ async def test_uncertain_same_head_relooks_up_review_job(controller, proxy, mock
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
     controller.review.list_jobs = AsyncMock(return_value=[
         _review_job("job-2", "a" * 40, [
-            {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "tag"},
+            {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag"},
         ], completed_at="2026-09-01T11:00:00Z"),
     ])
     core = AsyncMock()

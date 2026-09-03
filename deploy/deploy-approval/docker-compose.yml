@@ -5,26 +5,30 @@ services:
       dockerfile: agents/deploy_approval/Dockerfile
     image: phanthy-motus/deploy-approval:local
     container_name: deploy-approval
-    # ── Single-replica / single-serial-worker topology ───────────────
-    # Exactly one replica of the Deploy Controller is expected. The controller
-    # uses exactly one serial command worker. No distributed lock, no CAS, no
-    # asyncio.gather for mutating deploy commands. Scaling replicas >1 would
-    # violate the at-most-once execution model.
+    # ── Single-replica / single-writer topology ───────────────────────
+    # Deploy Approval is restart-safe stateless, but intentionally
+    # single-replica / single-writer. Exactly one GitHubCommandWatcher serially
+    # processes mutating commands. Multiple concurrent Deploy Controller
+    # replicas are unsupported because the current hidden-state protocol has no
+    # CAS/distributed lock. Running replicas >1 would violate the at-most-once
+    # unsafe-side-effect model.
     restart: unless-stopped
-    env_file:
-      - ${DA_ENV_FILE:-/dev/null}
     environment:
-      APP_HOST: "0.0.0.0"
-      APP_PORT: "25001"
-      GITHUB_COMMAND_POLL_INTERVAL_SECONDS: "60"
-      REVIEW_AGENT_BASE_URL: "${REVIEW_AGENT_BASE_URL:-http://host.docker.internal:25000}"
-      MACHINE_OWNERS_FILE: "/run/deploy-approval/machines.yaml"
-      ALLOW_PRIVATE_HTTP: "false"
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+      GITHUB_REPOS: "${GITHUB_REPOS:-4paradigm/phanthymotus,4paradigm/phanthymotus-driver}"
+      POLL_ENABLED: "${POLL_ENABLED:-true}"
+      POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-30}"
+      WEBHOOK_ENABLED: "${WEBHOOK_ENABLED:-false}"
+      GITHUB_WEBHOOK_SECRET: "${GITHUB_WEBHOOK_SECRET:-}"
+      REGISTRY: "${REGISTRY:-}"
+      REGISTRY_USER: "${REGISTRY_USER:-}"
+      REGISTRY_PASSWORD: "${REGISTRY_PASSWORD:-}"
+      ACCESS_TOKEN: "${ACCESS_TOKEN}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ${MACHINE_OWNERS_HOST_FILE:?MACHINE_OWNERS_HOST_FILE is required}:/run/deploy-approval/machines.yaml:ro
-    # No DB volume — state is GitHub-only.
+      - ./machines.yaml:/run/deploy-approval/machines.yaml:ro
+      - ./secrets.yaml:/run/deploy-approval/secrets.yaml:ro
     ports:
       - "25001:25001"
     read_only: true

@@ -17,8 +17,7 @@ from ..config import (
 
 
 def test_config_defaults():
-    c = Config(github_token="tok", github_repos=["org/repo"],
-               agent_core_token="core-tok")
+    c = Config(github_token="tok", github_repos=["org/repo"])
     assert c.host == "0.0.0.0"
     assert c.port == 25001
     assert c.poll_enabled is True
@@ -27,30 +26,37 @@ def test_config_defaults():
 
 def test_validate_config_requires_token():
     with pytest.raises(ValueError, match="GITHUB_TOKEN is required"):
-        validate_config(Config(github_repos=["4paradigm/phanthymotus"], agent_core_token="tok"))
+        validate_config(Config(github_repos=["4paradigm/phanthymotus"]))
 
 
 def test_validate_config_default_repos():
     """Default github_repos includes the two official repos."""
-    c = Config(github_token="tok", agent_core_token="tok")
+    c = Config(github_token="tok")
     assert "4paradigm/phanthymotus" in c.github_repos
     assert "4paradigm/phanthymotus-driver" in c.github_repos
     # Explicit empty overrides defaults — must fail closed
     with pytest.raises(ValueError, match="GITHUB_REPOS is required"):
-        validate_config(Config(github_token="tok", agent_core_token="tok",
-                               github_repos=[]))
-
-
-def test_validate_config_requires_core_token():
-    with pytest.raises(ValueError, match="AGENT_CORE_TOKEN is required"):
-        validate_config(Config(github_token="tok", github_repos=["4paradigm/phanthymotus"]))
+        validate_config(Config(github_token="tok", github_repos=[]))
 
 
 def test_validate_config_requires_webhook_secret():
     with pytest.raises(ValueError, match="GITHUB_WEBHOOK_SECRET is empty"):
         validate_config(
             Config(github_token="tok", github_repos=["4paradigm/phanthymotus"],
-                   agent_core_token="tok", webhook_enabled=True)
+                   webhook_enabled=True)
+        )
+
+
+def test_validate_config_requires_polling():
+    with pytest.raises(ValueError, match="requires polling"):
+        validate_config(
+            Config(
+                github_token="tok",
+                github_repos=["4paradigm/phanthymotus"],
+                poll_enabled=False,
+                webhook_enabled=True,
+                github_webhook_secret="secret",
+            )
         )
 
 
@@ -87,7 +93,7 @@ def test_config_env_override(monkeypatch):
     """Explicit GITHUB_REPOS overrides the default."""
     monkeypatch.setenv("GITHUB_REPOS", "4paradigm/phanthymotus,4paradigm/phanthymotus-driver")
     monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    monkeypatch.setenv("AGENT_CORE_TOKEN", "core-tok")
+    monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
     cfg = load_config()
     assert cfg.github_repos == ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
 
@@ -96,7 +102,7 @@ def test_config_env_empty_fails_closed(monkeypatch):
     """Explicit empty GITHUB_REPOS must fail closed."""
     monkeypatch.setenv("GITHUB_REPOS", "")
     monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    monkeypatch.setenv("AGENT_CORE_TOKEN", "core-tok")
+    monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
     with pytest.raises(ValueError, match="GITHUB_REPOS is required"):
         load_config()
 
@@ -104,7 +110,7 @@ def test_config_env_empty_fails_closed(monkeypatch):
 def test_config_env_unset_uses_default(monkeypatch):
     """GITHUB_REPOS unset uses DEFAULT_GITHUB_REPOS."""
     monkeypatch.setenv("GITHUB_TOKEN", "tok")
-    monkeypatch.setenv("AGENT_CORE_TOKEN", "core-tok")
+    monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
     monkeypatch.delenv("GITHUB_REPOS", raising=False)
     cfg = load_config()
     assert "4paradigm/phanthymotus" in cfg.github_repos

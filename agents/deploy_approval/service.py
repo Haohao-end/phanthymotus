@@ -23,7 +23,11 @@ import logging
 from typing import Any
 
 from . import comments as comments_mod
-from .agent_core_client import AgentCoreClient, AgentCoreError
+from .agent_core_client import (
+    AgentCoreClient,
+    AgentCoreDeployOutcomeUncertain,
+    AgentCoreError,
+)
 from .case_runner import CaseRunner
 from .config import Config
 from .cos_client import CosClient
@@ -33,12 +37,16 @@ from .github_state_proxy import GitHubStateProxy, _validate_hidden_state
 from .models import BuildInfo, new_id, utc_now
 from .policy import Policy, PolicyError
 from .review_client import ReviewAgentClient, ReviewJobInfo
-from .registry_client import RegistryClient
+from .registry_client import RegistryClient, parse_reference
 
 logger = logging.getLogger(__name__)
 
 
 class DeployControllerError(Exception):
+    pass
+
+
+class DeployOutcomeUncertain(DeployControllerError):
     pass
 
 
@@ -196,7 +204,6 @@ class DeployController:
         core = AgentCoreClient(
             self.config,
             base_url,
-            token_env="AGENT_CORE_TOKEN",
             node_host=machine.node_host,
         )
         try:
@@ -324,6 +331,110 @@ class DeployController:
                 )
             )
         return build_infos
+
+    @staticmethod
+    def _canonical_component_snapshot(components: list[dict]) -> list[dict]:
+        canonical: list[dict] = []
+        for component in components or []:
+            if not isinstance(component, dict):
+                continue
+            canonical.append({
+                "component_id": str(component.get("component_id", "") or ""),
+                "target": str(component.get("target", "") or ""),
+                "driver_path": str(component.get("driver_path", "") or ""),
+                "variant": str(component.get("variant", "") or ""),
+                "review_image_tag": str(component.get("review_image_tag", "") or ""),
+                "image_ref": str(component.get("image_ref", "") or ""),
+                "resolved_platform": str(component.get("resolved_platform", "") or ""),
+            })
+        canonical.sort(key=lambda comp: comp["component_id"])
+        return canonical
+
+    @staticmethod
+    def _components_with_preserved_runtime_bindings(
+        fresh_components: list[dict],
+        old_components: list[dict],
+        deployments: list[dict],
+    ) -> list[dict] | None:
+        deployed_component_ids: set[str] = set()
+        for deployment in deployments or []:
+            if not isinstance(deployment, dict):
+                return None
+            if deployment.get("phase") != "deployed":
+                continue
+            component_ids = deployment.get("component_ids", [])
+            if not isinstance(component_ids, list) or not component_ids:
+                return None
+            for component_id in component_ids:
+                if not isinstance(component_id, str) or not component_id:
+                    return None
+                deployed_component_ids.add(component_id)
+
+        old_runtime_bindings: dict[str, str] = {}
+        for component in old_components or []:
+            if not isinstance(component, dict):
+                return None
+            component_id = component.get("component_id", "")
+            if not isinstance(component_id, str) or not component_id:
+                return None
+            runtime_id = component.get("runtime_id")
+            if component_id in deployed_component_ids:
+                if not isinstance(runtime_id, str) or not runtime_id:
+                    return None
+                old_runtime_bindings[component_id] = runtime_id
+
+        rebuilt: list[dict] = []
+        for component in fresh_components or []:
+            if not isinstance(component, dict):
+                return None
+            item = dict(component)
+            component_id = item.get("component_id", "")
+            if not isinstance(component_id, str) or not component_id:
+                return None
+            item.pop("runtime_id", None)
+            if component_id in deployed_component_ids:
+                runtime_id = old_runtime_bindings.get(component_id)
+                if not isinstance(runtime_id, str) or not runtime_id:
+                    return None
+                item["runtime_id"] = runtime_id
+            rebuilt.append(item)
+        return rebuilt
+
+    async def _build_component_snapshot(
+        self,
+        repo: str,
+        pr_number: int,
+        head_sha: str,
+        builds: list[BuildInfo],
+    ) -> list[dict] | None:
+        snapshot: list[dict] = []
+        for build in builds or []:
+            if not build.success or not build.deployable:
+                continue
+            resolved = await self._resolve_image_ref(
+                repo,
+                pr_number,
+                head_sha,
+                build,
+            )
+            if resolved is None:
+                return None
+            image_ref, resolved_platform = resolved
+            if not resolved_platform:
+                return None
+            component_id = hashlib.sha256(
+                f"{build.target}|{build.driver_path}|{build.variant}|{image_ref}".encode()
+            ).hexdigest()[:16]
+            snapshot.append({
+                "component_id": component_id,
+                "target": build.target,
+                "driver_path": build.driver_path,
+                "variant": build.variant,
+                "review_image_tag": build.image_tag,
+                "image_ref": image_ref,
+                "resolved_platform": resolved_platform,
+            })
+        return snapshot
 
     async def _find_latest_exact_review_job(
         self, repo: str, pr_number: int, head_sha: str,
@@ -597,45 +708,21 @@ class DeployController:
                     "Review lifecycle is stale. Refresh before requesting deploy.",
                 )
                 return True
-            deployable = [b for b in builds if b.success and b.deployable]
-            if not deployable:
+            components = await self._build_component_snapshot(
+                repo, pr_number, pr_head, builds,
+            )
+            if components is None:
+                await self._post_error(
+                    repo, pr_number,
+                    "Failed to resolve component snapshot for this HEAD.",
+                )
+                return True
+            if not components:
                 await self._post_error(
                     repo, pr_number,
                     "No deployable builds found for this HEAD.",
                 )
                 return True
-
-            # Resolve image references for each component
-            components = []
-            for b in deployable:
-                resolved = await self._resolve_image_ref(
-                    repo, pr_number, pr_head, b
-                )
-                if resolved is None:
-                    await self._post_error(
-                        repo, pr_number,
-                        f"Failed to resolve image for build {b.idx} ({b.target}).",
-                    )
-                    return True
-                image_ref, resolved_platform = resolved
-                if not resolved_platform:
-                    await self._post_error(
-                        repo, pr_number,
-                        f"Cannot resolve platform for {b.target} ({image_ref}). "
-                        "Request deploy failed.",
-                    )
-                    return True
-                # Generate stable component_id
-                comp_id_input = f"{b.target}|{b.driver_path}|{b.variant}|{image_ref}"
-                component_id = hashlib.sha256(comp_id_input.encode()).hexdigest()[:16]
-                components.append({
-                    "component_id": component_id,
-                    "target": b.target,
-                    "driver_path": b.driver_path,
-                    "variant": b.variant,
-                    "image_ref": image_ref,
-                    "resolved_platform": resolved_platform,
-                })
 
             # Determine compatible machine groups
             machine_groups = self._get_machine_groups_for_components(components)
@@ -713,14 +800,16 @@ class DeployController:
                 return True
 
             if state.get("command", {}).get("phase") == "uncertain":
-                refreshed = await self.get_builds_for_pr(repo, pr_number, pr_head)
-                if refreshed is None:
-                    await self._invalidate_review_required(
-                        repo, pr_number, state, pr_head, comment_id,
-                        "No exact review_done Job found for the current HEAD.",
-                    )
+                refresh_result = await self._refresh_uncertain_state(
+                    repo, pr_number, state,
+                )
+                if refresh_result == "deploy-requested":
+                    refreshed_state = await self.proxy.read_hidden_state(repo, pr_number)
+                    if refreshed_state is None:
+                        return True
+                    state = refreshed_state
+                else:
                     return True
-                state["review_job_id"] = refreshed[0]
 
             # Get machine info
             machine = self.policy.get_machine(machine_alias)
@@ -833,6 +922,7 @@ class DeployController:
             new_deployments = []
             health_records = []
             deploy_error = None
+            deploy_outcome_uncertain = False
             # Sequential per-component: deploy then immediately health check
             for comp in remaining:
                 image_ref = comp["image_ref"]
@@ -844,6 +934,10 @@ class DeployController:
                     await self._deploy_component(
                         core, node_id, image_ref, runtime_id,
                     )
+                except DeployOutcomeUncertain as e:
+                    deploy_outcome_uncertain = True
+                    deploy_error = str(e)
+                    break
                 except DeployControllerError as e:
                     deploy_error = str(e)
                     break
@@ -862,8 +956,7 @@ class DeployController:
                 if not health_result.get("passed", False):
                     deploy_error = (
                         f"health check failed for {comp.get('target', '')} "
-                        f"runtime={runtime_id}: status={health_result.get('status', '')} "
-                        f"image={health_result.get('running_image', '')} "
+                        f"runtime={runtime_id}: running_image={health_result.get('running_image', '')} "
                         f"(expected {image_ref})"
                     )
                     break
@@ -874,6 +967,37 @@ class DeployController:
                     "component_ids": [comp["component_id"]],
                     "phase": "deployed",
                 })
+
+            if deploy_outcome_uncertain:
+                state["deployments"] = list(existing_deployments) + list(new_deployments)
+                state["status"] = "deploy-requested"
+                state["command"] = {
+                    "comment_id": comment_id,
+                    "kind": "approve_deploy",
+                    "phase": "uncertain",
+                    "args": {"machine": machine_alias, "actor": actor},
+                }
+                state["last_processed_comment_id"] = comment_id
+                approve_attempt["outcome"] = "uncertain"
+                approve_attempt["health"] = health_records
+                self._record_approve_attempt(state, approve_attempt)
+                markdown = comments_mod.deploy_requested(
+                    repo,
+                    pr_number,
+                    pr_head,
+                    state.get("components", []),
+                    self._get_machine_groups_for_components(state.get("components", [])),
+                    gate_note=[
+                        "### Restart Recovery",
+                        "",
+                        "A deploy POST was attempted but its outcome is uncertain.",
+                        f"Send a NEW `/approve_deploy machine={machine_alias}`.",
+                        "No further deploy POSTs are allowed in this cycle.",
+                    ],
+                )
+                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                return True
 
             if deploy_error is not None:
                 state["deployments"] = list(state.get("deployments", [])) + list(new_deployments)
@@ -1346,15 +1470,20 @@ class DeployController:
         self, repo: str, pr_number: int, head_sha: str,
         build: BuildInfo,
     ) -> tuple[str, str] | None:
-        """Resolve mutable image tag to immutable digest + platform.
+        """Resolve the exact Review Agent image fact to immutable digest + platform.
 
         Returns (image_ref, platform) or None.
         """
         try:
-            image_tag = build.image_tag
-            if not image_tag:
+            review_image_tag = str(build.image_tag or "")
+            if not review_image_tag:
                 return None
-            resolved = await self.registry.resolve(image_tag)
+            family, _tag = parse_reference(review_image_tag)
+            resolved = await self.registry.resolve(
+                review_image_tag,
+                platform="",
+                allowed_prefixes=[family],
+            )
             if resolved is None:
                 return None
             image_ref = resolved.image_ref or ""
@@ -1592,6 +1721,10 @@ class DeployController:
         try:
             result = await core.deploy_driver(runtime_id, image_ref)
             return {"result": result}
+        except AgentCoreDeployOutcomeUncertain as e:
+            raise DeployOutcomeUncertain(
+                f"Deploy outcome uncertain for {runtime_id} on node {node_id}: {e}"
+            ) from e
         except AgentCoreError as e:
             raise DeployControllerError(
                 f"Deploy failed for {runtime_id} on node {node_id}: {e}"
@@ -1601,33 +1734,30 @@ class DeployController:
         self, core: AgentCoreClient, runtime_id: str,
         image_ref: str, component_label: str,
     ) -> dict:
-        """Bounded poll for a deployed component to reach running + exact image.
+        """Bounded poll for a deployed component to bind the exact image.
 
         CLEAN GATE:
         - pinned runtime_id
         - POST deploy immutable image
         - bounded poll existing /api/drivers/{runtime_id}/status
-        - status == running AND running_image == exact immutable image_ref
+        - running_image == exact immutable image_ref
 
-        Returns {"passed": bool, "running_image": str, "status": str}.
+        Returns {"passed": bool, "running_image": str}.
         """
         import asyncio
         import time
 
         deadline = time.time() + self.config.health_timeout_seconds
         interval = self.config.health_poll_interval_seconds
-        last_status = ""
         last_running = ""
         while time.time() < deadline:
             try:
                 status = await core.driver_status(runtime_id)
-                last_status = str(status.get("status", "") or "")
                 last_running = str(status.get("running_image", "") or "")
-                if last_status == "running" and last_running == image_ref:
+                if last_running == image_ref:
                     return {
                         "passed": True,
                         "running_image": last_running,
-                        "status": last_status,
                     }
             except Exception as e:
                 logger.warning(
@@ -1635,14 +1765,13 @@ class DeployController:
                 )
             await asyncio.sleep(interval)
         logger.error(
-            "health timeout %s runtime=%s after %ss: status=%s image=%s (expected %s)",
+            "health timeout %s runtime=%s after %ss: running_image=%s (expected %s)",
             component_label, runtime_id, self.config.health_timeout_seconds,
-            last_status, last_running, image_ref,
+            last_running, image_ref,
         )
         return {
             "passed": False,
             "running_image": last_running,
-            "status": last_status,
         }
 
     async def _run_automated_case(
@@ -2076,10 +2205,19 @@ class DeployController:
 
     async def _refresh_uncertain_state(
         self, repo: str, pr_number: int, state: dict,
-    ) -> None:
-        """Refresh an uncertain command without replaying the old comment."""
+    ) -> str:
+        """Refresh an uncertain command without replaying the old comment.
+
+        Returns:
+        - "deploy-requested" when a fresh immutable snapshot was rebuilt.
+        - "review-required" when the head drifted or no exact review job exists.
+        - "uncertain" when the rebuild could not complete but must stay pending.
+        - "noop" when the PR is no longer open/active.
+        """
         cmd = state.get("command", {})
         machine_alias = str(cmd.get("args", {}).get("machine", "") or "")
+        comment_id = int(cmd.get("comment_id", 0) or 0)
+        old_cursor = int(state.get("last_processed_comment_id", 0) or 0)
 
         pr_data = await self.proxy.get_pr(repo, pr_number)
         pr_state = pr_data.get("state", "")
@@ -2087,28 +2225,32 @@ class DeployController:
         current_head = pr_data.get("head", {}).get("sha", "")
 
         if pr_state != "open" or pr_merged:
-            return
+            return "noop"
 
         if not current_head or current_head != state.get("head_sha", ""):
             state["status"] = "review-required"
             state["review_job_id"] = ""
             state["components"] = []
             state["deployments"] = []
+            state["approve_attempts"] = []
+            state["approve_attempts_total"] = 0
+            state["approve_attempts_truncated"] = False
             state["case_results"] = {}
             state["test_result"] = ""
             state["cos"] = {"object_key": "", "sha256": "", "size": 0}
             state["command"] = {
-                "comment_id": int(cmd.get("comment_id", 0) or 0),
+                "comment_id": comment_id,
                 "kind": "approve_deploy",
                 "phase": "completed",
                 "args": dict(cmd.get("args", {}) or {}),
             }
+            state["last_processed_comment_id"] = max(old_cursor, comment_id)
             markdown = comments_mod.review_required(
                 repo, pr_number, current_head or state.get("head_sha", ""),
             )
             await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
             await self.proxy.project_status_label(repo, pr_number, "review-required")
-            return
+            return "review-required"
 
         lookup = await self.get_builds_for_pr(repo, pr_number, current_head)
         if lookup is None:
@@ -2116,48 +2258,144 @@ class DeployController:
             state["review_job_id"] = ""
             state["components"] = []
             state["deployments"] = []
+            state["approve_attempts"] = []
+            state["approve_attempts_total"] = 0
+            state["approve_attempts_truncated"] = False
             state["case_results"] = {}
             state["test_result"] = ""
             state["cos"] = {"object_key": "", "sha256": "", "size": 0}
             state["command"] = {
-                "comment_id": int(cmd.get("comment_id", 0) or 0),
+                "comment_id": comment_id,
                 "kind": "approve_deploy",
                 "phase": "completed",
                 "args": dict(cmd.get("args", {}) or {}),
             }
+            state["last_processed_comment_id"] = max(old_cursor, comment_id)
             markdown = comments_mod.review_required(
                 repo, pr_number, current_head,
             )
             await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
             await self.proxy.project_status_label(repo, pr_number, "review-required")
-            return
+            return "review-required"
 
-        review_job_id, _builds = lookup
-        state["review_job_id"] = review_job_id
-        state["status"] = "deploy-requested"
-        state["command"] = {
-            "comment_id": int(cmd.get("comment_id", 0) or 0),
+        review_job_id, builds = lookup
+        fresh_components = await self._build_component_snapshot(
+            repo, pr_number, current_head, builds,
+        )
+        if fresh_components is None:
+            logger.warning(
+                "uncertain recovery snapshot rebuild unavailable %s#%s head=%s job=%s",
+                repo, pr_number, current_head, review_job_id,
+            )
+            state["command"] = {
+                "comment_id": comment_id,
+                "kind": "approve_deploy",
+                "phase": "uncertain",
+                "args": dict(cmd.get("args", {}) or {}),
+            }
+            state["last_processed_comment_id"] = max(old_cursor, comment_id)
+            markdown = comments_mod.uncertain_comment(
+                repo, pr_number, current_head,
+            )
+            if machine_alias:
+                markdown += "\n\n" + "\n".join([
+                    "### Restart Recovery",
+                    "",
+                    "Validation facts are temporarily unavailable.",
+                    f"Try a new `/approve_deploy machine={machine_alias}` later.",
+                ])
+            await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+            return "uncertain"
+
+        old_review_job_id = str(state.get("review_job_id", "") or "")
+        old_components = self._canonical_component_snapshot(state.get("components", []))
+        fresh_canonical = self._canonical_component_snapshot(fresh_components)
+        same_snapshot = (
+            old_review_job_id == review_job_id and old_components == fresh_canonical
+        )
+        updated_state = dict(state)
+        updated_state["review_job_id"] = review_job_id
+        updated_state["status"] = "deploy-requested"
+        updated_state["command"] = {
+            "comment_id": comment_id,
             "kind": "approve_deploy",
             "phase": "completed",
             "args": dict(cmd.get("args", {}) or {}),
         }
-        gate_note = []
+        updated_state["last_processed_comment_id"] = max(old_cursor, comment_id)
+        if not same_snapshot:
+            fresh_reset_components: list[dict] = []
+            for component in fresh_components:
+                item = dict(component)
+                item.pop("runtime_id", None)
+                fresh_reset_components.append(item)
+            updated_state["components"] = fresh_reset_components
+            updated_state["deployments"] = []
+            updated_state["approve_attempts"] = []
+            updated_state["approve_attempts_total"] = 0
+            updated_state["approve_attempts_truncated"] = False
+            updated_state["case_results"] = {}
+            updated_state["test_result"] = ""
+            updated_state["cos"] = {"object_key": "", "sha256": "", "size": 0}
+        else:
+            preserved_components = self._components_with_preserved_runtime_bindings(
+                fresh_components,
+                state.get("components", []),
+                state.get("deployments", []),
+            )
+            if preserved_components is None:
+                logger.warning(
+                    "uncertain recovery runtime binding unavailable %s#%s head=%s job=%s",
+                    repo, pr_number, current_head, review_job_id,
+                )
+                state["command"] = {
+                    "comment_id": comment_id,
+                    "kind": "approve_deploy",
+                    "phase": "uncertain",
+                    "args": dict(cmd.get("args", {}) or {}),
+                }
+                state["last_processed_comment_id"] = max(old_cursor, comment_id)
+                markdown = comments_mod.uncertain_comment(
+                    repo, pr_number, current_head,
+                )
+                if machine_alias:
+                    markdown += "\n\n" + "\n".join([
+                        "### Restart Recovery",
+                        "",
+                        "Validation facts are temporarily unavailable.",
+                        f"Try a new `/approve_deploy machine={machine_alias}` later.",
+                    ])
+                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                return "uncertain"
+            updated_state["components"] = preserved_components
+            updated_state["deployments"] = list(state.get("deployments", []))
+
+        state.clear()
+        state.update(updated_state)
+
+        gate_note = [
+            "### Restart Recovery",
+            "",
+            "Validation facts were refreshed from the current HEAD.",
+        ]
+        if same_snapshot:
+            gate_note.append("Previously confirmed deployments were preserved.")
+        else:
+            gate_note.append("Old validation snapshot was replaced.")
         if machine_alias:
-            gate_note = [
-                "### Restart Recovery",
-                "",
-                f"Machine Owner must clear the occupied runtime image for `{machine_alias}`.",
-                f"After cleanup send a NEW `/approve_deploy machine={machine_alias}`.",
-                "fresh HEAD + actor -> CLEAN GATE",
-            ]
+            gate_note.append(
+                f"Send a NEW `/approve_deploy machine={machine_alias}`."
+            )
+        gate_note.append("fresh HEAD + actor -> CLEAN GATE")
         markdown = comments_mod.deploy_requested(
             repo, pr_number, current_head,
             state.get("components", []),
             self._get_machine_groups_for_components(state.get("components", [])),
-            gate_note=gate_note or None,
+            gate_note=gate_note,
         )
         await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
         await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+        return "deploy-requested"
 
     # ── Hidden state validation ──
 

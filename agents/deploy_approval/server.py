@@ -219,12 +219,6 @@ def create_app(config: Config | None = None):
 
 def main():
     config = load_config()
-    if not config.api_token:
-        logger.error(
-            "Refusing to start: API_TOKEN is required. Set API_TOKEN to a "
-            "random secret and pass it to the container."
-        )
-        raise SystemExit(1)
     app = create_app(config)
     uvicorn.run(app, host=config.host, port=config.port, log_level="info")
 

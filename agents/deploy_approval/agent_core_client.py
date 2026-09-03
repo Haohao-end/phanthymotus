@@ -2,8 +2,7 @@
 
 Covers driver/perception/actucore deploy+status, the MCP ping health check and
 the core ``POST /api/system/update`` adapter. No sockets, no SSH, no shell.
-Tokens are read from the machine's ``token_env`` env var at call time and never
-persisted.
+The only runtime credential is ``ACCESS_TOKEN``.
 """
 
 from __future__ import annotations
@@ -30,12 +29,15 @@ class AgentCoreError(Exception):
     pass
 
 
+class AgentCoreDeployOutcomeUncertain(AgentCoreError):
+    pass
+
+
 class AgentCoreClient:
     def __init__(
         self,
         config: Config,
         base_url: str = "",
-        token_env: str = "",
         ca_file: str = "",
         http: httpx.AsyncClient | None = None,
         node_host: str = "",
@@ -98,7 +100,6 @@ class AgentCoreClient:
                 )
         self.base_url = base_url.rstrip("/")
         self.node_host = node_host
-        self.token_env = token_env
         self.ca_file = ca_file
         self.http = http or httpx.AsyncClient(
             timeout=httpx.Timeout(
@@ -116,11 +117,7 @@ class AgentCoreClient:
 
     def _headers(self) -> dict:
         h = {}
-        token = ""
-        if self.token_env:
-            token = os.getenv(self.token_env, "")
-        if not token:
-            token = os.getenv("AGENT_CORE_TOKEN", "")
+        token = os.getenv("ACCESS_TOKEN", "")
         if token:
             h["Authorization"] = "Bearer " + token
         return h
@@ -146,12 +143,20 @@ class AgentCoreClient:
         # while /api/drivers/<id>/status and /api/mcp ping return an OBJECT.
         # Requiring an object here would break the real Agent Core contract.
 
-    async def request(self, method: str, path: str, json: dict | None = None):
+    async def request(
+        self,
+        method: str,
+        path: str,
+        json: dict | None = None,
+    ):
         url = self.base_url + path
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http,
-            agent_core_node=self.node_host,
-        )
+        try:
+            require_http_policy(
+                url, self.config, allow_private=self.config.allow_private_http,
+                agent_core_node=self.node_host,
+            )
+        except SecurityError as e:
+            raise AgentCoreError(str(e)) from e
         resp, data = await self._request_impl(method, path, json, url)
         self._check_code(data, method, path)
         return data
@@ -319,9 +324,13 @@ class AgentCoreClient:
         client error so a deploy POST can never carry a user-supplied tag."""
         if not isinstance(driver_id, str) or not driver_id:
             raise AgentCoreError("deploy_driver requires a non-empty driver id")
+        if not isinstance(image, str) or not image:
+            raise AgentCoreError(
+                "deploy image must be the immutable repo@sha256:<64hex> form"
+            )
         if "@" not in image:
             raise AgentCoreError(
-                "deploy image must be the immutable repo@sha256:<digest> form"
+                "deploy image must be the immutable repo@sha256:<64hex> form"
             )
         _family, _, _digest = image.rpartition("@")
         if not (_digest.startswith("sha256:") and len(_digest) == 71):
@@ -332,9 +341,24 @@ class AgentCoreClient:
             raise AgentCoreError(
                 "deploy image must be the immutable repo@sha256:<64hex> form"
             )
-        return await self.request(
-            "POST", f"/api/drivers/{driver_id}/deploy", {"image": image}
-        )
+        path = f"/api/drivers/{driver_id}/deploy"
+        url = self.base_url + path
+        try:
+            require_http_policy(
+                url, self.config, allow_private=self.config.allow_private_http,
+                agent_core_node=self.node_host,
+            )
+            resp, data = await self._request_impl("POST", path, {"image": image}, url)
+            self._check_code(data, "POST", path)
+            return data
+        except SecurityError as e:
+            raise AgentCoreError(str(e)) from e
+        except AgentCoreDeployOutcomeUncertain:
+            raise
+        except Exception as e:
+            raise AgentCoreDeployOutcomeUncertain(
+                f"agent-core deploy outcome uncertain: {e}"
+            ) from e
 
     async def driver_status(self, driver_id: str) -> dict:
         data = await self.request("GET", f"/api/drivers/{driver_id}/status")
@@ -343,15 +367,23 @@ class AgentCoreClient:
             raise AgentCoreError(
                 "agent-core driver_status data must be an object"
             )
-        status = inner.get("status")
-        if status is not None and not isinstance(status, str):
-            raise AgentCoreError("agent-core driver_status status must be a string")
-        running = inner.get("running_image")
-        if running is not None and not isinstance(running, str):
+        if "error" in inner:
             raise AgentCoreError(
-                "agent-core driver_status running_image must be a string"
+                f"agent-core driver_status error payload: {inner.get('error')!r}"
             )
-        return inner
+        if "running_image" in inner:
+            running = inner.get("running_image")
+            if not isinstance(running, str):
+                raise AgentCoreError(
+                    "agent-core driver_status running_image must be a string"
+                )
+            return {"running_image": running}
+        logs = inner.get("logs")
+        if "status" in inner and isinstance(logs, str):
+            return {"running_image": ""}
+        raise AgentCoreError(
+            "agent-core driver_status missing running_image for no-container shape"
+        )
 
     async def system_update(self, image: str) -> dict:
         return await self.request("POST", "/api/system/update", {"image": image})

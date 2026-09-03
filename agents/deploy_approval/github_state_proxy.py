@@ -132,8 +132,8 @@ def _validate_hidden_state(data: dict) -> dict:
             raise MalformedHiddenStateError("component must be a dict")
         comp_keys = set(comp.keys())
         if comp_keys not in (
-            {"component_id", "target", "driver_path", "variant", "image_ref", "resolved_platform"},
-            {"component_id", "target", "driver_path", "variant", "image_ref", "resolved_platform", "runtime_id"},
+            {"component_id", "target", "driver_path", "variant", "review_image_tag", "image_ref", "resolved_platform"},
+            {"component_id", "target", "driver_path", "variant", "review_image_tag", "image_ref", "resolved_platform", "runtime_id"},
         ):
             raise MalformedHiddenStateError("component keys must match the canonical schema")
         cid = comp.get("component_id", "")
@@ -142,6 +142,9 @@ def _validate_hidden_state(data: dict) -> dict:
         if cid in known_cids:
             raise MalformedHiddenStateError("duplicate component_id values")
         known_cids.append(cid)
+        review_image_tag = comp.get("review_image_tag", "")
+        if not isinstance(review_image_tag, str) or not review_image_tag:
+            raise MalformedHiddenStateError("review_image_tag missing")
         if comp.get("target") not in {"perception", "actucore", "driver"}:
             raise MalformedHiddenStateError(f"invalid component target: {comp.get('target')!r}")
         if not isinstance(comp.get("driver_path"), str):
@@ -202,12 +205,25 @@ def _validate_hidden_state(data: dict) -> dict:
             val = attempt.get(key, "")
             if not isinstance(val, str) or not val:
                 raise MalformedHiddenStateError(f"approve_attempt.{key} must be a non-empty string")
-        if attempt.get("outcome") not in {"blocked_occupied", "deployed", "failed"}:
+        if attempt.get("outcome") not in {"blocked_occupied", "deployed", "failed", "uncertain"}:
             raise MalformedHiddenStateError("approve_attempt.outcome invalid")
         preflight = attempt.get("preflight", [])
         health = attempt.get("health", [])
         if not isinstance(preflight, list) or not isinstance(health, list):
             raise MalformedHiddenStateError("approve_attempt preflight/health must be lists")
+        for h in health:
+            if not isinstance(h, dict):
+                raise MalformedHiddenStateError("approve_attempt health entries must be dicts")
+            if set(h.keys()) != {"component_id", "runtime_id", "running_image", "passed"}:
+                raise MalformedHiddenStateError("approve_attempt health keys must match the canonical schema")
+            if not isinstance(h.get("component_id", ""), str):
+                raise MalformedHiddenStateError("approve_attempt health component_id must be a string")
+            if not isinstance(h.get("runtime_id", ""), str):
+                raise MalformedHiddenStateError("approve_attempt health runtime_id must be a string")
+            if not isinstance(h.get("running_image", ""), str):
+                raise MalformedHiddenStateError("approve_attempt health running_image must be a string")
+            if not isinstance(h.get("passed"), bool):
+                raise MalformedHiddenStateError("approve_attempt health passed must be a bool")
     approve_attempts_total = data.get("approve_attempts_total", len(approve_attempts))
     if isinstance(approve_attempts_total, bool) or not isinstance(approve_attempts_total, int):
         raise MalformedHiddenStateError("approve_attempts_total must be a non-negative int")

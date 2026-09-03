@@ -104,6 +104,7 @@ def _component(
         "target": target,
         "driver_path": driver_path,
         "variant": variant,
+        "review_image_tag": "registry/repo:v1",
         "image_ref": image_ref,
         "resolved_platform": resolved_platform,
     }
@@ -193,7 +194,7 @@ def _load_manifest_and_log(archive_bytes: bytes):
 
 
 def test_default_supported_repos_include_both_real_repositories():
-    cfg = Config(github_token="tok", agent_core_token="tok")
+    cfg = Config(github_token="tok")
     assert cfg.github_repos == ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
 
 
@@ -224,14 +225,14 @@ async def test_same_pr_number_across_repositories_never_cross_binds_review_job(c
         "4paradigm/phanthymotus",
         17,
         head_a,
-        [{"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "tag-a"}],
+        [{"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag-a"}],
         completed_at="2026-09-01T10:00:00Z",
     )
     job_b_obj = _review_job(
         "4paradigm/phanthymotus-driver",
         17,
         head_b,
-        [{"target": "driver", "driver_path": "unitree/g1", "variant": "", "success": True, "image_tag": "tag-b"}],
+        [{"target": "driver", "driver_path": "unitree/g1", "variant": "", "success": True, "image_tag": "registry.example/driver:tag-b"}],
         completed_at="2026-09-01T11:00:00Z",
     )
     controller.review.list_jobs = AsyncMock(return_value=[
@@ -258,7 +259,7 @@ async def test_phanthymotus_core_only_is_not_deployable(controller, proxy, mock_
         "4paradigm/phanthymotus",
         1,
         "a" * 40,
-        [{"target": "CORE", "driver_path": "", "variant": "", "success": True, "image_tag": "tag-core"}],
+        [{"target": "CORE", "driver_path": "", "variant": "", "success": True, "image_tag": "registry.example/repo:tag-core"}],
         completed_at="2026-09-01T10:00:00Z",
     )
     controller.review.list_jobs = AsyncMock(return_value=[review_job])
@@ -282,8 +283,8 @@ async def test_phanthymotus_core_plus_perception_deploys_only_perception(control
         1,
         "a" * 40,
         [
-            {"target": "CORE", "driver_path": "", "variant": "", "success": True, "image_tag": "tag-core"},
-            {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "tag-perception"},
+            {"target": "CORE", "driver_path": "", "variant": "", "success": True, "image_tag": "registry.example/repo:tag-core"},
+            {"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag-perception"},
         ],
         completed_at="2026-09-01T10:00:00Z",
     )

@@ -201,7 +201,7 @@ def _component(component_id: str, target: str, *, variant: str = "5.11",
         "driver_path": driver_path,
 
         "variant": variant,
-
+        "review_image_tag": "registry/repo:v1",
         "image_ref": "registry/repo@sha256:" + image_digest,
 
         "resolved_platform": "linux/arm64",

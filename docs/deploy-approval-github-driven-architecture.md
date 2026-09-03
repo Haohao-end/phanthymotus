@@ -10,9 +10,42 @@ Deploy Controller 只负责部署审批与状态编排，**代码不修改**；�
 2. Deploy Controller
 3. 外部只读/执行系统：Review Agent、Agent Core、COS
 
-权威业务状态只存在于 GitHub PR 的 lifecycle comment hidden JSON 中。Deploy Controller 不持久化业务状态，不依赖 SQLite、DB_PATH、DeploymentStore、local cursor、local lock、rollback state 或 webhook 双写。
+GitHub hidden lifecycle JSON 是 Deploy Approval 唯一权威的持久化业务状态存储。Deploy Controller 不持久化业务状态，不依赖 SQLite、DB_PATH、DeploymentStore、local cursor、local lock、rollback state 或 webhook 双写。
 
-`phanthymotus` 只部署 `perception` / `actucore`，`CORE` 不作为可部署组件；`phanthymotus-driver` 以 `driver_path` 作为机器策略身份，但 runtime id 必须通过 Agent Core 的精确 image repository 匹配得到，不能直接从 `driver_path` 拼接或模糊推导。Deploy Controller 通过配置的 `node_host` 连接到已存在的 Agent Core API，不做 Agent Core registration。Registry 只作为 `/request_deploy` 内部的镜像解析实现细节，不作为独立 actor 或独立控制面。
+Deploy Approval is restart-safe stateless, but intentionally single-replica / single-writer. Exactly one `GitHubCommandWatcher` serially processes mutating commands. Multiple concurrent Deploy Controller replicas are unsupported because the current hidden-state protocol has no CAS/distributed lock. Running replicas >1 would violate the at-most-once unsafe-side-effect model.
+
+Polling reuses the upstream `POLL_INTERVAL_SECONDS` setting. Default: 30 seconds.
+POLL_ENABLED must be true. Webhook is supplementary only.
+
+Source matrix:
+
+- Review Agent API: job / build / target / `review_image_tag` source facts
+- Registry: only immutable verification / resolution of that exact `review_image_tag`
+- Agent Core: runtime identity / current `running_image` / MCP evidence
+- GitHub hidden JSON: restart-safe persistence snapshot
+
+`phanthymotus` 只部署 `perception` / `actucore`，`CORE` 不作为可部署组件；`phanthymotus-driver` 以 `driver_path` 作为机器策略身份，但 runtime id 必须通过 Agent Core 的精确 image repository 匹配得到，不能直接从 `driver_path` 拼接或模糊推导。Deploy Controller 通过配置的 `node_host` 连接到已存在的 Agent Core API，不做 Agent Core registration。Registry 只作为 `/request_deploy` 内部的 exact Review Agent image 解析与 immutable verification 实现细节，不作为独立 actor 或独立控制面。
+
+fresh Review Agent build_results + fresh Registry immutable resolution
+↓
+fresh static component snapshot
+↓
+compare old/fresh snapshot
+same snapshot:
+preserve deployments
+preserve runtime_id ONLY from old health-confirmed deployed component
+changed snapshot:
+replace static snapshot
+clear deployment/case/COS validation state
+NO rollback
+
+Agent Core no-container response 只在 `running_image` / `error` 均缺失、`status` key 存在且 `logs` 为字符串时归一化为 `running_image=""`。`status` VALUE 不参与 CLEAN / health / case 决策；`error` 或 malformed shape 继续 fail closed。
+
+unsafe deploy POST 进入未知结果时：
+command.phase=uncertain
+status=deploy-requested
+ZERO later POST
+NEW approve only
 
 ## Actor
 
@@ -129,7 +162,8 @@ Deploy Controller 命令之间完全无状态。active runtime path 禁止依赖
 - 绑定 `review_job_id`
 - 只取该 Job 中所有 successful deployable components
 - CORE 排除
-- mutable image tag 必须通过现有 Registry client 一次性解析成 immutable `repository@sha256:...`
+- `review_image_tag` 必须直接来自 Review Agent API 的 `build_results[].image_tag`
+- mutable image tag 只允许通过现有 Registry client 一次性解析成 immutable `repository@sha256:...`
 - 保存 `resolved_platform`
 - hidden JSON 持久化 validation snapshot
 - `status: deploy-requested`

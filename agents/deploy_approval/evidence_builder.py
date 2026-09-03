@@ -25,7 +25,6 @@ _SECRET_PATTERNS = [
     "cos_secret",
     "cos_key",
     "github_token",
-    "agent_core_token",
 ]
 
 
@@ -169,6 +168,7 @@ class EvidenceBuilder:
                 "target": str(comp.get("target", "") or ""),
                 "driver_path": str(comp.get("driver_path", "") or ""),
                 "variant": str(comp.get("variant", "") or ""),
+                "review_image_tag": str(comp.get("review_image_tag", "") or ""),
                 "platform": str(comp.get("resolved_platform", "") or ""),
                 "image_ref": str(comp.get("image_ref", "") or ""),
                 "runtime_id": str(comp.get("runtime_id", "") or ""),

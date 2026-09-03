@@ -1,4 +1,4 @@
-"""GitHub command watcher — polls PR comments every 60 seconds.
+"""GitHub command watcher — polls PR comments using `POLL_INTERVAL_SECONDS`.
 
 This is the ONLY active poller for Deploy Approval. It polls configured
 repositories/open PRs, reads comments, identifies commands newer than the
@@ -35,7 +35,7 @@ class DeployCommandError(Exception):
 
 
 class GitHubCommandWatcher:
-    """Polls PR comments every 60 seconds and dispatches commands.
+    """Polls PR comments using `POLL_INTERVAL_SECONDS` and dispatches commands.
 
     Exactly one serial command worker. Processes comments in ascending order.
     """
@@ -74,7 +74,7 @@ class GitHubCommandWatcher:
                 await self._poll_once()
             except Exception as e:
                 logger.error("command watcher poll cycle failed: %s", e)
-            await asyncio.sleep(self.config.github_command_poll_interval_seconds)
+            await asyncio.sleep(self.config.poll_interval_seconds)
 
     async def _poll_once(self) -> None:
         """One poll cycle over all configured repos and open PRs.

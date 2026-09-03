@@ -111,6 +111,7 @@ def _component(**overrides):
         "target": "perception",
         "driver_path": "",
         "variant": "5.11",
+        "review_image_tag": "registry/repo:v1",
         "image_ref": "registry/repo@sha256:" + "a" * 64,
         "resolved_platform": "linux/arm64",
         "runtime_id": "perception",
@@ -1018,7 +1019,7 @@ async def test_deploy_requested_comment_shows_short_immutable_digest(controller,
                 "target": "perception",
                 "driver_path": "",
                 "success": True,
-                "image_tag": "private.example.com/perception:latest",
+                "image_tag": "private.example.com/perception:v1",
                 "variant": "5.11",
             }
         ],
@@ -1052,7 +1053,7 @@ async def test_deploy_requested_comment_does_not_expose_registry_credentials_or_
                 "target": "perception",
                 "driver_path": "",
                 "success": True,
-                "image_tag": "private.example.com/perception:latest",
+                "image_tag": "private.example.com/perception:v1",
                 "variant": "5.11",
             }
         ],
@@ -1532,6 +1533,5 @@ def test_agent_core_client_ipv6_node_host_fails_closed(config):
         AgentCoreClient(
             config,
             base_url="http://[::1]:15678",
-            token_env="AGENT_CORE_TOKEN",
             node_host="::1",
         )

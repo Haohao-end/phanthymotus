@@ -13,7 +13,7 @@ Developer → GitHub PR → Review Agent → Deploy Controller → Agent Core �
 
 - **Only persistence is the GitHub lifecycle comment hidden state.**
 - No SQLite, no DeploymentStore, no DB_PATH, no persistence beyond GitHub.
-- **GitHubCommandWatcher** polls PR comments every 60 seconds.
+- **GitHubCommandWatcher** polls PR comments using `POLL_INTERVAL_SECONDS` from the upstream environment. Default: 30 seconds.
 - **GitHubStateProxy** reads/writes hidden state JSON in the lifecycle comment.
 - **DeployController** is stateless between commands — it reads state from the lifecycle comment, validates, and writes back.
 
@@ -41,16 +41,23 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 ## Key Contracts
 
 - **Stateless:** No SQLite, no DB_PATH, no DeploymentStore. All state is in the GitHub lifecycle comment hidden state.
-- **GitHub-only persistence:** The lifecycle comment is the ONLY source of truth. No restart survives without it.
-- **60-second polling:** PR comments are polled every 60 seconds. No webhook required.
+- **GitHub hidden lifecycle JSON is the ONLY authoritative persistent Deploy Approval business-state store.** Fresh facts come from Review Agent / Registry / Agent Core and are copied into hidden state to make the snapshot restart-safe.
+- **Restart-safe, single-replica / single-writer:** Deploy Approval is intentionally restart-safe stateless, but only one `GitHubCommandWatcher` serially processes mutating commands. Multiple concurrent Deploy Controller replicas are unsupported because the current hidden-state protocol has no CAS/distributed lock, and replicas >1 would violate the at-most-once unsafe-side-effect model.
+- **Polling:** PR comments are polled using `POLL_INTERVAL_SECONDS` from the upstream environment. Default: 30 seconds. No webhook required.
+- **POLL_ENABLED must be true.** Webhook is supplementary only.
 - **Hidden state JSON:** The lifecycle comment carries a `<!-- deploy-approval-state:v1\n{...}\n-->` marker with validated JSON state.
 - **Trusted identity:** The lifecycle comment author must match the authenticated GitHub bot identity derived from `GITHUB_TOKEN` via `GET /user` at startup.
 - **Top-level status labels:** only `review-required`, `reviewing`, `deploy-ready`, `deploy-requested`, `testing`, `succeeded`, `failed`.
 - **Supported repos:** exactly `4paradigm/phanthymotus` and `4paradigm/phanthymotus-driver`. Unknown repos fail closed.
 - **review_done lookup:** `/request_deploy` binds the latest exact `review_done` Job for repo + PR + full HEAD; Review Agent API does not receive a `pr_number` kwarg.
+- **Source matrix:** Review Agent API is the sole source of job/build/target/image candidate facts; Registry only verifies/resolves that exact Review Agent image tag; Agent Core only supplies runtime identity, current `running_image`, and MCP evidence; GitHub persists the deployment snapshot.
 - **Deployability:** `phanthymotus` deploys `perception` and `actucore`, not `CORE`; `phanthymotus-driver` deploys exact driver paths.
 - **Variant contract:** perception variants are canonical `5.11` and `6.1`. Legacy `jetson-jp5.11` / `jetson-jp6.1` are normalized only at config load.
 - **Clean gate:** `/approve_deploy` reads `running_image` for all selected components before any deploy POST. If any `running_image` is non-empty, zero deployment is performed and the owner must clear the occupied runtime image manually, then send a new `/approve_deploy`.
+- **Agent Core no-container response:** the current compatibility shape normalizes to `running_image=""` only when `running_image` and `error` are absent, `status` key exists, and `logs` is a string. The `status` VALUE has zero CLEAN/health/case business influence. Error or malformed shapes fail closed.
+- status VALUE has zero CLEAN/health/case business influence.
+- error/malformed shapes fail closed.
+- **unsafe deploy POST:** if the POST outcome is unknown after the unsafe attempt begins, the command becomes `command.phase=uncertain`, `status=deploy-requested`, `approve_attempt.outcome=uncertain`, and there is ZERO later POST.
 - **review_done → deploy-ready only:** No automatic deployment is created.
 - **PR Author only:** Only the GitHub PR author can run `/request_deploy`.
 - **Authorization:** `/approve_deploy` requires the actor to be the selected machine owner OR a write/maintain/admin repo collaborator. `/record_test` requires the actor to be an owner of any actually deployed machine OR a write/maintain/admin repo collaborator. Self-approval is allowed if the actor satisfies the authorization rule.
@@ -107,10 +114,21 @@ machines:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GITHUB_TOKEN` | (required) | GitHub API token |
-| `GITHUB_COMMAND_POLL_INTERVAL_SECONDS` | 60 | Poll interval for PR comments |
-| `AGENT_CORE_TOKEN` | (required) | Token for Agent Core communication |
-| `REVIEW_AGENT_BASE_URL` | http://host.docker.internal:25000 | Review Agent URL |
-| `MACHINE_OWNERS_FILE` | /run/deploy-approval/machines.yaml | Machine owners YAML |
-| `API_TOKEN` | (required) | Control API token |
-| `COS_*` | "" | Optional COS evidence storage |
+Deploy Approval does not define a new runtime env namespace.
+
+It reuses the upstream existing keys below and fixed read-only files:
+
+| Runtime input | Source |
+| --- | --- |
+| `GITHUB_TOKEN` | upstream existing env |
+| `GITHUB_REPOS` | upstream existing env |
+| `POLL_ENABLED` | upstream existing env |
+| `POLL_INTERVAL_SECONDS` | upstream existing env |
+| `WEBHOOK_ENABLED` | upstream existing env |
+| `GITHUB_WEBHOOK_SECRET` | upstream existing env |
+| `REGISTRY` | upstream existing env |
+| `REGISTRY_USER` | upstream existing env |
+| `REGISTRY_PASSWORD` | upstream existing env |
+| `ACCESS_TOKEN` | upstream existing env from `/opt/phanthy-motus/.env` |
+| `machines.yaml` | fixed read-only machine policy file |
+| `secrets.yaml` | fixed read-only COS secrets file |

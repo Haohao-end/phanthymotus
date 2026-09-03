@@ -93,6 +93,7 @@ def _component(**overrides):
         "target": "perception",
         "driver_path": "",
         "variant": "5.11",
+        "review_image_tag": "registry/repo:v1",
         "image_ref": "registry/repo@sha256:" + "a" * 64,
         "resolved_platform": "linux/arm64",
         "runtime_id": "perception",

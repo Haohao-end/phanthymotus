@@ -19,11 +19,9 @@ from ..service import DeployController, DeployControllerError
 def config():
     return Config(
         github_token="tok",
-        api_token="tok",
-        agent_core_token="tok",
         github_repos=["repo"],
         machine_owners_file="/dev/null",
-        github_command_poll_interval_seconds=60,
+        poll_interval_seconds=30,
     )
 
 
@@ -90,6 +88,7 @@ def _component(**overrides):
         "target": "perception",
         "driver_path": "",
         "variant": "5.11",
+        "review_image_tag": "registry/repo:v1",
         "image_ref": "registry/repo@sha256:" + "a" * 64,
         "resolved_platform": "linux/arm64",
         "runtime_id": "perception",
@@ -145,7 +144,7 @@ async def test_request_deploy_re_reads_command_identity_from_github(controller, 
         "head": {"sha": "a" * 40},
         "user": {"id": 111, "login": "alice"},
     }
-    review_job = _review_job("job-1", "a" * 40, [{"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "tag"}], completed_at="2026-09-01T10:00:00Z")
+    review_job = _review_job("job-1", "a" * 40, [{"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag"}], completed_at="2026-09-01T10:00:00Z")
     controller.review.list_jobs = AsyncMock(return_value=[review_job])
     controller.review.get_job = AsyncMock(return_value=review_job)
     controller.registry.resolve.return_value = SimpleNamespace(image_ref="registry/repo@sha256:" + "b" * 64, platform="linux/arm64")
@@ -167,7 +166,7 @@ async def test_request_deploy_allows_current_pr_author_id(controller, proxy, moc
         "user": {"id": 111, "login": "alice"},
     }
     proxy.read_hidden_state = AsyncMock(return_value=_state(status="deploy-ready", review_job_id="job-1", components=[]))
-    review_job = _review_job("job-1", "a" * 40, [{"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "tag"}], completed_at="2026-09-01T10:00:00Z")
+    review_job = _review_job("job-1", "a" * 40, [{"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag"}], completed_at="2026-09-01T10:00:00Z")
     controller.review.list_jobs = AsyncMock(return_value=[review_job])
     controller.review.get_job = AsyncMock(return_value=review_job)
     controller.registry.resolve.return_value = SimpleNamespace(image_ref="registry/repo@sha256:" + "b" * 64, platform="linux/arm64")
@@ -243,9 +242,9 @@ async def test_request_deploy_unauthorized_has_zero_registry_and_deploy_side_eff
 @pytest.mark.asyncio
 async def test_latest_exact_head_review_done_selects_newest_completed_timestamp(controller):
     head_sha = "a" * 40
-    job_new = _review_job("job-new", head_sha, [{"target": "perception", "driver_path": "", "variant": "6.1", "success": True, "image_tag": "tag-new"}], completed_at="2026-09-01T11:00:00Z")
+    job_new = _review_job("job-new", head_sha, [{"target": "perception", "driver_path": "", "variant": "6.1", "success": True, "image_tag": "registry.example/repo:tag-new"}], completed_at="2026-09-01T11:00:00Z")
     controller.review.list_jobs = AsyncMock(return_value=[
-        _review_job("job-old", head_sha, [{"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "tag-old"}], completed_at="2026-09-01T10:00:00Z"),
+        _review_job("job-old", head_sha, [{"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag-old"}], completed_at="2026-09-01T10:00:00Z"),
         job_new,
     ])
     controller.review.get_job = AsyncMock(return_value=job_new)
@@ -259,9 +258,9 @@ async def test_latest_exact_head_review_done_selects_newest_completed_timestamp(
 @pytest.mark.asyncio
 async def test_latest_exact_head_review_done_binds_builds_from_same_selected_job(controller):
     head_sha = "a" * 40
-    job_new = _review_job("job-new", head_sha, [{"target": "actucore", "driver_path": "", "variant": "6.1", "success": True, "image_tag": "tag-new"}], completed_at="2026-09-01T11:00:00Z")
+    job_new = _review_job("job-new", head_sha, [{"target": "actucore", "driver_path": "", "variant": "6.1", "success": True, "image_tag": "registry.example/repo:tag-new"}], completed_at="2026-09-01T11:00:00Z")
     controller.review.list_jobs = AsyncMock(return_value=[
-        _review_job("job-old", head_sha, [{"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "tag-old"}], completed_at="2026-09-01T10:00:00Z"),
+        _review_job("job-old", head_sha, [{"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag-old"}], completed_at="2026-09-01T10:00:00Z"),
         job_new,
     ])
     controller.review.get_job = AsyncMock(return_value=job_new)
@@ -270,15 +269,15 @@ async def test_latest_exact_head_review_done_binds_builds_from_same_selected_job
 
     assert job_id == "job-new"
     assert [b.target for b in builds] == ["actucore"]
-    assert builds[0].image_tag == "tag-new"
+    assert builds[0].image_tag == "registry.example/repo:tag-new"
 
 
 @pytest.mark.asyncio
 async def test_latest_exact_head_review_done_equal_timestamp_distinct_jobs_fails_closed(controller):
     head_sha = "a" * 40
     controller.review.list_jobs = AsyncMock(return_value=[
-        _review_job("job-a", head_sha, [{"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "tag-a"}], completed_at="2026-09-01T11:00:00Z"),
-        _review_job("job-b", head_sha, [{"target": "perception", "driver_path": "", "variant": "6.1", "success": True, "image_tag": "tag-b"}], completed_at="2026-09-01T11:00:00Z"),
+        _review_job("job-a", head_sha, [{"target": "perception", "driver_path": "", "variant": "5.11", "success": True, "image_tag": "registry.example/repo:tag-a"}], completed_at="2026-09-01T11:00:00Z"),
+        _review_job("job-b", head_sha, [{"target": "perception", "driver_path": "", "variant": "6.1", "success": True, "image_tag": "registry.example/repo:tag-b"}], completed_at="2026-09-01T11:00:00Z"),
     ])
 
     assert await controller.get_builds_for_pr("repo", 1, head_sha) is None

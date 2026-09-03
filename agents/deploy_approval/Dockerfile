@@ -20,16 +20,13 @@ COPY agents/deploy_approval/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -i "${PYPI_MIRROR}" -r requirements.txt
 
 COPY agents/ /app/agents/
-
-# Runtime state only under /data (config + certs are mounted read-only).
-RUN mkdir -p /data
 WORKDIR /app
 
 EXPOSE 25001
 
 # Non-root runtime user (no Docker socket / SSH mounted).
 RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app \
-    && chown -R app:app /app /data
+    && chown -R app:app /app
 USER app
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \

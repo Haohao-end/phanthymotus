@@ -15,11 +15,10 @@ def make_config(**overrides):
         github_api_url="https://api.github.com",
         webhook_enabled=True,
         github_webhook_secret="test-secret",
-        api_token="test-token",
-        agent_core_token="test-core-token",
         machine_owners_file="/dev/null",
         github_repos=["4paradigm/phanthymotus"],
         poll_enabled=True,
+        poll_interval_seconds=30,
         health_timeout_seconds=0.05,
         health_poll_interval_seconds=0.0,
     )

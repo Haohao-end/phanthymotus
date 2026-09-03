@@ -37,21 +37,21 @@ _FIXED_CASES: list[dict[str, Any]] = [
     {
         "id": "perception-health-check",
         "target": "perception",
-        "description": "Verify perception driver is running and MCP is responsive",
+        "description": "Verify the expected deployed image is bound and MCP is responsive",
         "requires_mcp": True,
         "timeout": 30,
     },
     {
         "id": "actucore-health-check",
         "target": "actucore",
-        "description": "Verify actucore driver is running and MCP is responsive",
+        "description": "Verify the expected deployed image is bound and MCP is responsive",
         "requires_mcp": True,
         "timeout": 30,
     },
     {
         "id": "driver-health-check",
         "target": "driver",
-        "description": "Verify driver is running and MCP is responsive",
+        "description": "Verify the expected deployed image is bound and MCP is responsive",
         "requires_mcp": True,
         "timeout": 30,
     },
@@ -292,16 +292,7 @@ class CaseRunner:
                     "error": f"driver_status failed: {e}",
                 }
 
-            status = str(driver_status.get("status", "") or "")
             running_image = str(driver_status.get("running_image", "") or "")
-            if status != "running":
-                logs.append(f"FAIL: Driver status is {status}, expected running")
-                return {
-                    "passed": False,
-                    "case_id": case_id,
-                    "logs": logs,
-                    "error": f"Driver status is {status}",
-                }
             if not running_image:
                 logs.append("FAIL: Running image is empty")
                 return {
@@ -320,7 +311,7 @@ class CaseRunner:
                     "logs": logs,
                     "error": f"Running image mismatch: {running_image}",
                 }
-            logs.append("PASS: Driver is running with expected image")
+            logs.append("PASS: Expected image is bound")
 
             if case.get("requires_mcp", False):
                 try:

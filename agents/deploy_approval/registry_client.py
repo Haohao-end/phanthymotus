@@ -91,6 +91,36 @@ class RegistryClient:
             follow_redirects=False,
         )
 
+    async def resolve(
+        self,
+        ref: str,
+        platform: str = "",
+        allowed_prefixes: list[str] | None = None,
+    ) -> ResolvedImage:
+        """Resolve the exact Review Agent image tag to an immutable image.
+
+        ``ref`` is the Review Agent source fact. The registry is only allowed to
+        verify/resolve that exact image reference; it never chooses a different
+        candidate. The repository portion of the resolved immutable reference
+        must match the repository portion of ``ref``.
+        """
+        allowed_prefixes = allowed_prefixes or []
+        if "@" in ref:
+            family, _, digest = ref.rpartition("@")
+            if not family or not digest:
+                raise RegistryError(f"malformed reference {ref!r}")
+            if not DIGEST_RE.fullmatch(digest):
+                raise RegistryError(f"immutable reference {ref!r} has an invalid digest")
+            resolved = await self.verify_digest(ref, allowed_prefixes)
+        else:
+            family, _tag = parse_reference(ref)
+            resolved = await self.resolve_tag(ref, allowed_prefixes, platform=platform)
+        if resolved.family != family:
+            raise RegistryError(
+                f"registry resolved repository {resolved.family!r} does not match source repository {family!r}"
+            )
+        return resolved
+
     async def resolve_tag(
         self,
         ref: str,
@@ -396,8 +426,8 @@ class RegistryClient:
         return "https", host, path
 
     def _auth_headers(self, family: str) -> dict[str, str]:
-        user = os.getenv(self.config.registry_user_env, "")
-        password = os.getenv(self.config.registry_password_env, "")
+        user = os.getenv("REGISTRY_USER", "")
+        password = os.getenv("REGISTRY_PASSWORD", "")
         if not user:
             return {}
         token = base64.b64encode(f"{user}:{password}".encode()).decode()
@@ -432,8 +462,8 @@ class RegistryClient:
                 f"registry Bearer realm host {realm_host!r} is not the "
                 "registry host or in REGISTRY_AUTH_HOST_ALLOWLIST"
             )
-        user = os.getenv(self.config.registry_user_env, "")
-        password = os.getenv(self.config.registry_password_env, "")
+        user = os.getenv("REGISTRY_USER", "")
+        password = os.getenv("REGISTRY_PASSWORD", "")
         headers = {}
         if user:
             auth = base64.b64encode(f"{user}:{password}".encode()).decode()
