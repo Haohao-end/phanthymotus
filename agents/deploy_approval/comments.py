@@ -407,7 +407,7 @@ def superseded_comment(repo: str, pr_number: int, old_head: str,
 def uncertain_comment(
     repo: str, pr_number: int, head_sha: str,
 ) -> str:
-    """status: uncertain — crash recovery state."""
+    """deploy-requested lifecycle with command.phase=uncertain."""
     return "\n".join([
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
@@ -417,16 +417,19 @@ def uncertain_comment(
         "**Command phase:** `uncertain`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
         "",
-        "restart / next poll",
-        "- executing -> uncertain",
+        "Background polling keeps this command `uncertain`.",
         "- ZERO automatic replay",
-        "- last_processed_comment_id >= command.comment_id",
+        "- ZERO deployment",
+        "- The old `/approve_deploy` comment will not be replayed.",
         "",
-        "- fresh current full HEAD",
-        "- list_jobs(repo,status=review_done)",
-        "- rebind the latest exact review_done Job",
+        "**Next action \u2014 Machine Owner**",
         "",
-        "No automatic recovery. Manual intervention required.",
+        "`/approve_deploy machine=<alias>`",
+        "",
+        "Only a NEW `/approve_deploy` starts recovery validation:",
+        "- re-check the current full HEAD",
+        "- refresh the validation / immutable image snapshot",
+        "- then run the running_image-only CLEAN GATE",
         "",
         last_checked_line(),
     ])

@@ -89,7 +89,7 @@
   <text x="521" y="328" class="mono msg">build + review</text>
 
   <path d="M505 372 L307 372" class="green"/>
-  <text x="406" y="363" text-anchor="middle" class="mono msg">review_done + build_results[]</text>
+  <text x="406" y="363" text-anchor="middle" class="mono msg">review complete</text>
 
   <rect x="238" y="392" width="138" height="24" class="statusOk"/>
   <text x="307" y="408" text-anchor="middle" class="mono statusText" fill="#425A4B">status: deploy-ready</text>
@@ -105,14 +105,8 @@
   <path d="M307 552 L712 552" class="orange"/>
   <text x="510" y="543" text-anchor="middle" class="mono msg">fresh PR + full HEAD + hidden state</text>
 
-  <path d="M712 592 L505 592" class="blue"/>
-  <text x="608" y="583" text-anchor="middle" class="mono msg">list_jobs(repo, status=review_done)</text>
-
-  <path d="M505 630 L712 630" class="green"/>
-  <text x="608" y="621" text-anchor="middle" class="mono msg">latest exact PR + HEAD Review Job</text>
-
-  <path d="M712 670 L307 670" class="green"/>
-  <text x="510" y="661" text-anchor="middle" class="mono msg">write current validation snapshot</text>
+  <path d="M712 630 L307 630" class="green"/>
+  <text x="510" y="621" text-anchor="middle" class="mono msg">validate current HEAD + write validation snapshot</text>
 
   <rect x="228" y="690" width="158" height="24" class="statusWait"/>
   <text x="307" y="706" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
@@ -199,11 +193,11 @@
   <path d="M712 1760 L307 1760" class="green"/>
   <text x="510" y="1751" text-anchor="middle" class="mono msg">rebind COS metadata · terminal status unchanged</text>
 
-  <rect x="212" y="1744" width="126" height="24" class="statusOk"/>
-  <text x="275" y="1760" text-anchor="middle" class="mono statusText" fill="#425A4B">status: succeeded</text>
+  <rect x="212" y="1654" width="126" height="24" class="statusOk"/>
+  <text x="275" y="1670" text-anchor="middle" class="mono statusText" fill="#425A4B">status: succeeded</text>
 
-  <rect x="350" y="1744" width="106" height="24" class="statusFail"/>
-  <text x="403" y="1760" text-anchor="middle" class="mono statusText" fill="#8F4B4B">status: failed</text>
+  <rect x="350" y="1654" width="106" height="24" class="statusFail"/>
+  <text x="403" y="1670" text-anchor="middle" class="mono statusText" fill="#8F4B4B">status: failed</text>
 
   <line x1="40" y1="1800" x2="1360" y2="1800" stroke="#E7E5E4"/>
 
@@ -220,17 +214,11 @@
   <text x="510" y="1939" text-anchor="middle" class="mono msg">last_processed_comment_id >= command.comment_id</text>
 
   <path d="M307 1988 L712 1988" class="blue"/>
-  <text x="510" y="1979" text-anchor="middle" class="mono msg">fresh current full HEAD</text>
-
-  <path d="M712 2028 L505 2028" class="blue"/>
-  <text x="608" y="2019" text-anchor="middle" class="mono msg">list_jobs(repo,status=review_done)</text>
-
-  <path d="M505 2066 L712 2066" class="green"/>
-  <text x="608" y="2057" text-anchor="middle" class="mono msg">exact current-HEAD Review Job / not found</text>
+  <text x="510" y="1979" text-anchor="middle" class="mono msg">fresh current full HEAD + hidden state</text>
 
   <!-- Developer next action -->
   <path d="M712 2106 L307 2106" class="red"/>
-  <text x="510" y="2097" text-anchor="middle" class="mono msg">HEAD drift OR exact Review Job missing</text>
+  <text x="510" y="2097" text-anchor="middle" class="mono msg">HEAD drift OR validation unavailable</text>
 
   <rect x="225" y="2126" width="164" height="24" class="statusFail"/>
   <text x="307" y="2142" text-anchor="middle" class="mono statusText" fill="#8F4B4B">status: review-required</text>
@@ -240,7 +228,7 @@
 
   <!-- Machine Owner next action -->
   <path d="M712 2218 L307 2218" class="green"/>
-  <text x="510" y="2209" text-anchor="middle" class="mono msg">same HEAD + exact Review Job → refresh snapshot</text>
+  <text x="510" y="2209" text-anchor="middle" class="mono msg">same HEAD -> refresh validation snapshot</text>
 
   <rect x="228" y="2238" width="158" height="24" class="statusWait"/>
   <text x="307" y="2254" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
@@ -254,8 +242,4 @@
   <path d="M307 2368 L712 2368" class="orange"/>
   <text x="510" y="2359" text-anchor="middle" class="mono msg">fresh HEAD + actor → CLEAN GATE</text>
 
-  <text x="40" y="2404" class="mono small">no-container response -> running_image empty</text>
-  <text x="40" y="2424" class="mono small">POST outcome unknown -> command.phase=uncertain</text>
-  <text x="40" y="2444" class="mono small">fresh Review build_results + Registry snapshot</text>
-  <text x="40" y="2464" class="mono small">POLL_ENABLED=true required; webhook supplementary</text>
 </svg>

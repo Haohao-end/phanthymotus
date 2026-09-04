@@ -26,7 +26,14 @@ def test_config_defaults():
 
 def test_validate_config_requires_token():
     with pytest.raises(ValueError, match="GITHUB_TOKEN is required"):
-        validate_config(Config(github_repos=["4paradigm/phanthymotus"]))
+        validate_config(
+            Config(
+                github_repos=[
+                    "4paradigm/phanthymotus",
+                    "4paradigm/phanthymotus-driver",
+                ]
+            )
+        )
 
 
 def test_validate_config_default_repos():
@@ -42,8 +49,14 @@ def test_validate_config_default_repos():
 def test_validate_config_requires_webhook_secret():
     with pytest.raises(ValueError, match="GITHUB_WEBHOOK_SECRET is empty"):
         validate_config(
-            Config(github_token="tok", github_repos=["4paradigm/phanthymotus"],
-                   webhook_enabled=True)
+            Config(
+                github_token="tok",
+                github_repos=[
+                    "4paradigm/phanthymotus",
+                    "4paradigm/phanthymotus-driver",
+                ],
+                webhook_enabled=True,
+            )
         )
 
 
@@ -52,7 +65,10 @@ def test_validate_config_requires_polling():
         validate_config(
             Config(
                 github_token="tok",
-                github_repos=["4paradigm/phanthymotus"],
+                github_repos=[
+                    "4paradigm/phanthymotus",
+                    "4paradigm/phanthymotus-driver",
+                ],
                 poll_enabled=False,
                 webhook_enabled=True,
                 github_webhook_secret="secret",

@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from .. import agent_core_client as agent_core_client_module
+from .. import comments as comments_mod
 from ..agent_core_client import (
     AgentCoreClient,
     AgentCoreDeployOutcomeUncertain,
@@ -24,6 +25,7 @@ from ..github_state_proxy import GitHubStateProxy, _validate_hidden_state
 from ..models import BuildInfo, MachineInfo
 from ..policy import Policy
 from ..review_client import ReviewJobInfo
+from ..github_command_watcher import GitHubCommandWatcher
 from ..router_webhook import webhook
 from ..service import DeployController, DeployControllerError, DeployOutcomeUncertain
 from .conftest import make_config
@@ -523,6 +525,185 @@ async def test_new_approve_from_uncertain_refreshes_before_clean_gate():
 
 
 @pytest.mark.asyncio
+async def test_watcher_uncertain_without_new_approve_does_not_refresh_review():
+    controller, proxy, policy, github, review, registry, config = _controller()
+    state = _state()
+    state["command"]["phase"] = "uncertain"
+    state["last_processed_comment_id"] = 17
+
+    async def _read_hidden_state(*args, **kwargs):
+        return state
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_hidden_state)
+    proxy.get_pr = AsyncMock(
+        return_value={
+            "state": "open",
+            "merged": False,
+            "head": {"sha": "a" * 40},
+            "user": {"id": 111, "login": "alice"},
+        }
+    )
+    proxy.get_issue_comments = AsyncMock(
+        return_value=[
+            {
+                "id": 17,
+                "body": "/approve_deploy machine=test-machine",
+                "user": {"id": 111, "login": "owner1"},
+            }
+        ]
+    )
+    proxy.is_bot_comment = MagicMock(return_value=False)
+    controller.review.list_jobs = AsyncMock(side_effect=AssertionError("unexpected review refresh"))
+    controller.review.get_job = AsyncMock(side_effect=AssertionError("unexpected review refresh"))
+    controller.registry.resolve = AsyncMock(side_effect=AssertionError("unexpected registry refresh"))
+    controller._core_for_node = AsyncMock(side_effect=AssertionError("unexpected Agent Core lookup"))
+    controller._deploy_component = AsyncMock(side_effect=AssertionError("unexpected deploy"))
+    controller._wait_for_deploy_health = AsyncMock(side_effect=AssertionError("unexpected health check"))
+    controller._run_automated_case = AsyncMock(side_effect=AssertionError("unexpected case run"))
+    controller.on_command = AsyncMock(return_value=True)
+
+    watcher = GitHubCommandWatcher(config, proxy, controller)
+
+    await watcher._process_pr("repo", 1)
+
+    assert state["command"]["phase"] == "uncertain"
+    assert controller.on_command.await_count == 0
+    assert controller.review.list_jobs.await_count == 0
+    assert controller.review.get_job.await_count == 0
+    assert controller.registry.resolve.await_count == 0
+    assert controller._core_for_node.await_count == 0
+    assert controller._deploy_component.await_count == 0
+    assert proxy.write_hidden_state.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_watcher_uncertain_new_approve_refreshes_review_before_clean_gate():
+    controller, proxy, policy, github, review, registry, config = _controller()
+    state = _state()
+    state["command"]["phase"] = "uncertain"
+    state["last_processed_comment_id"] = 17
+    review_job = ReviewJobInfo(
+        {
+            "id": "job-new",
+            "repo": "repo",
+            "pr_number": 1,
+            "head_sha": "a" * 40,
+            "status": "review_done",
+            "review_text": "review complete",
+            "options": {"build_only": False},
+            "completed_at": "2026-09-03T10:00:00Z",
+            "build_results": [
+                {
+                    "target": "perception",
+                    "driver_path": "",
+                    "variant": "5.11",
+                    "success": True,
+                    "image_tag": "registry.example/repo:v1",
+                }
+            ],
+        }
+    )
+    events: list[str] = []
+
+    async def _read_hidden_state(*args, **kwargs):
+        events.append("read_hidden_state")
+        return state
+
+    async def _get_pr(*args, **kwargs):
+        events.append("get_pr")
+        return {
+            "state": "open",
+            "merged": False,
+            "head": {"sha": "a" * 40},
+            "user": {"id": 111, "login": "alice"},
+        }
+
+    async def _get_issue_comments(*args, **kwargs):
+        events.append("get_issue_comments")
+        return [
+            {
+                "id": 17,
+                "body": "/approve_deploy machine=test-machine",
+                "user": {"id": 111, "login": "owner1"},
+            },
+            {
+                "id": 99,
+                "body": "/approve_deploy machine=test-machine",
+                "user": {"id": 111, "login": "owner1"},
+            },
+        ]
+
+    async def _list_jobs(*args, **kwargs):
+        events.append("review.list_jobs")
+        return [review_job]
+
+    async def _get_job(*args, **kwargs):
+        events.append("review.get_job")
+        return review_job
+
+    async def _resolve(*args, **kwargs):
+        events.append("registry.resolve")
+        return SimpleNamespace(
+            image_ref="registry.example/repo@sha256:" + "b" * 64,
+            platform="linux/arm64",
+        )
+
+    async def _list_drivers():
+        events.append("list_drivers")
+        return [
+            {
+                "id": "perception",
+                "target": "perception",
+                "image": "registry.example/repo:v1",
+            }
+        ]
+
+    async def _driver_status(runtime_id):
+        events.append(f"driver_status:{runtime_id}")
+        return {"status": "running", "running_image": "occupied@sha256:" + "c" * 64}
+
+    async def _deploy_component(*args, **kwargs):
+        events.append("deploy")
+        return {"result": {"code": 0}}
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_hidden_state)
+    proxy.get_pr = AsyncMock(side_effect=_get_pr)
+    proxy.get_issue_comments = AsyncMock(side_effect=_get_issue_comments)
+    proxy.is_bot_comment = MagicMock(return_value=False)
+    proxy.comment_identity = AsyncMock(return_value=("111", "owner1"))
+    proxy.persist_cursor = AsyncMock()
+    controller.review.list_jobs = AsyncMock(side_effect=_list_jobs)
+    controller.review.get_job = AsyncMock(side_effect=_get_job)
+    controller.registry.resolve = AsyncMock(side_effect=_resolve)
+    core = AsyncMock()
+    core.list_drivers = AsyncMock(side_effect=_list_drivers)
+    core.driver_status = AsyncMock(side_effect=_driver_status)
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._deploy_component = AsyncMock(side_effect=_deploy_component)
+    controller._wait_for_deploy_health = AsyncMock(side_effect=AssertionError("deploy health should not run on occupied gate"))
+    controller._run_automated_case = AsyncMock(side_effect=AssertionError("automated case should not run on occupied gate"))
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    real_on_command = controller.on_command
+    controller.on_command = AsyncMock(wraps=real_on_command)
+
+    watcher = GitHubCommandWatcher(config, proxy, controller)
+
+    await watcher._process_pr("repo", 1)
+
+    assert controller.on_command.await_count == 1
+    assert controller.on_command.call_args.args[3] == 99
+    assert state["command"]["phase"] == "completed"
+    assert "review.list_jobs" in events
+    assert "get_issue_comments" in events
+    assert events.index("get_issue_comments") < events.index("review.list_jobs")
+    assert events.index("review.list_jobs") < events.index("list_drivers")
+    assert events.index("list_drivers") < events.index("driver_status:perception")
+    assert "deploy" not in events
+    assert proxy.write_hidden_state.await_count >= 1
+
+
+@pytest.mark.asyncio
 async def test_deploy_post_transport_timeout_becomes_uncertain():
     class Transport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request):
@@ -785,7 +966,10 @@ def test_poll_disabled_webhook_enabled_fails_config():
         validate_config(
             Config(
                 github_token="tok",
-                github_repos=["4paradigm/phanthymotus"],
+                github_repos=[
+                    "4paradigm/phanthymotus",
+                    "4paradigm/phanthymotus-driver",
+                ],
                 poll_enabled=False,
                 webhook_enabled=True,
                 github_webhook_secret="secret",
@@ -1189,7 +1373,26 @@ def test_docs_define_no_container_adapter_contract():
     assert "error/malformed shapes fail closed" in text
 
 
-def test_svg_footer_is_inside_visible_viewbox():
+def test_uncertain_is_not_documented_as_top_level_status():
+    docs = Path("docs/deploy-approval-github-driven-architecture.md").read_text(encoding="utf-8")
+    comments = Path("agents/deploy_approval/comments.py").read_text(encoding="utf-8")
+    assert "`uncertain` 只能出现在 `command.phase`" not in docs
+    assert "approve_attempt.outcome=uncertain" in docs
+    assert "status: uncertain" not in comments
+    assert "deploy-requested lifecycle with command.phase=uncertain" in comments
+    top_level_statuses = {
+        "review-required",
+        "reviewing",
+        "deploy-ready",
+        "deploy-requested",
+        "testing",
+        "succeeded",
+        "failed",
+    }
+    assert "uncertain" not in top_level_statuses
+
+
+def test_svg_footer_is_removed_from_final_diagram():
     import xml.etree.ElementTree as ET
 
     text = Path("docs/deploy-sequence.svg").read_text(encoding="utf-8")
@@ -1197,22 +1400,35 @@ def test_svg_footer_is_inside_visible_viewbox():
     assert root.attrib["viewBox"] == "0 0 1400 2500"
     assert root.attrib["width"] == "1400"
     assert root.attrib["height"] == "2500"
-    footer_texts = {
+    removed_footer_texts = {
         "no-container response -> running_image empty",
         "POST outcome unknown -> command.phase=uncertain",
         "fresh Review build_results + Registry snapshot",
         "POLL_ENABLED=true required; webhook supplementary",
     }
+    all_text_nodes = []
     footer_ys = {}
     for el in root.iter():
         if not isinstance(el.tag, str) or not el.tag.endswith("text"):
             continue
         txt = "".join(el.itertext()).strip()
-        if txt in footer_texts:
+        all_text_nodes.append(txt)
+        if txt in removed_footer_texts:
             footer_ys[txt] = int(float(el.attrib["y"]))
-    assert footer_texts == set(footer_ys)
-    assert max(footer_ys.values()) == 2464
-    assert max(footer_ys.values()) < 2500
+    for footer_text in removed_footer_texts:
+        assert footer_text not in text
+    assert not footer_ys
+    assert all(
+        txt not in removed_footer_texts
+        for txt in all_text_nodes
+    )
+    for el in root.iter():
+        if not isinstance(el.tag, str) or not el.tag.endswith("text"):
+            continue
+        y = int(float(el.attrib["y"]))
+        if y >= 2400:
+            txt = "".join(el.itertext()).strip()
+            assert txt not in removed_footer_texts
 
 
 def test_docs_define_unsafe_post_uncertain_contract():
@@ -1230,11 +1446,49 @@ def test_docs_define_poll_required_webhook_supplementary_contract():
     assert "Webhook is supplementary only." in text
 
 
+def test_uncertain_comment_requires_new_approve_before_validation_refresh():
+    text = comments_mod.uncertain_comment("repo", 1, "a" * 40)
+    assert "**Status:** `deploy-requested`" in text
+    assert "**Command phase:** `uncertain`" in text
+    assert "ZERO automatic replay" in text
+    assert "**Next action \u2014 Machine Owner**" in text
+    assert "`/approve_deploy machine=<alias>`" in text
+    assert "NEW `/approve_deploy`" in text
+    assert "running_image-only CLEAN GATE" in text
+    assert "Background polling keeps this command `uncertain`" in text
+    assert "list_jobs(repo,status=review_done)" not in text
+    assert "Manual intervention required." not in text
+    assert "restart / next poll" not in text
+
+
 def test_svg_contains_final_recovery_outcome_contract():
     text = Path("docs/deploy-sequence.svg").read_text(encoding="utf-8")
-    assert "no-container response -> running_image empty" in text
-    assert "POST outcome unknown -> command.phase=uncertain" in text
-    assert "fresh Review build_results + Registry snapshot" in text
-    assert "POLL_ENABLED=true required; webhook supplementary" in text
+    expected_flow_texts = {
+        "restart / next poll -> read hidden state",
+        "executing -> uncertain · ZERO automatic replay",
+        "last_processed_comment_id >= command.comment_id",
+        "fresh current full HEAD + hidden state",
+        "HEAD drift OR validation unavailable",
+        "status: review-required",
+        "Developer: /request_bot_review",
+        "same HEAD -> refresh validation snapshot",
+        "status: deploy-requested",
+        "Machine Owner clears occupied runtime image",
+        "NEW /approve_deploy machine=<alias>",
+        "fresh HEAD + actor → CLEAN GATE",
+    }
+    for snippet in expected_flow_texts:
+        assert snippet in text
+    stale_terms = {
+        "list_jobs",
+        "Review Job",
+        "review_done",
+        "build_results",
+        "Review Agent API",
+        "/api/jobs",
+        "GitHub-published review/build result",
+        "publish review/build result",
+    }
+    for term in stale_terms:
+        assert term not in text
     assert "status == stopped" not in text
-    assert "status == running" not in text

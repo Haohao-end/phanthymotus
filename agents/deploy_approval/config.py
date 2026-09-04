@@ -40,7 +40,6 @@ class Config:
     github_repos: list[str] = field(
         default_factory=lambda: list(DEFAULT_GITHUB_REPOS)
     )
-    poll_initial_lookback_hours: int = 24 * 7
     github_comment_max_pages: int = 20
     github_comment_max_comments: int = 500
     github_comment_max_bytes: int = 4 * 1024 * 1024
@@ -238,17 +237,22 @@ def load_config() -> Config:
 def validate_config(cfg: Config) -> None:
     if not cfg.github_token:
         raise ValueError("GITHUB_TOKEN is required")
+    if not isinstance(cfg.github_repos, list):
+        raise ValueError("GITHUB_REPOS must be a list")
     if not cfg.github_repos:
         raise ValueError("GITHUB_REPOS is required")
     if not cfg.poll_enabled:
         raise ValueError(
             "Deploy Approval requires polling; webhook does not replace the GitHubCommandWatcher"
         )
-    unknown_repos = [repo for repo in cfg.github_repos if repo not in SUPPORTED_GITHUB_REPOS]
-    if unknown_repos:
+    for r in cfg.github_repos:
+        if not isinstance(r, str):
+            raise ValueError(f"GITHUB_REPOS member must be a string, got {r!r}")
+    required_repos = set(DEFAULT_GITHUB_REPOS)
+    if len(cfg.github_repos) != len(DEFAULT_GITHUB_REPOS) or set(cfg.github_repos) != required_repos:
         raise ValueError(
-            "unsupported repository in GITHUB_REPOS: "
-            + ", ".join(sorted(unknown_repos))
+            "GITHUB_REPOS must contain exactly: "
+            + ", ".join(DEFAULT_GITHUB_REPOS)
         )
     if cfg.webhook_enabled and not cfg.github_webhook_secret:
         raise ValueError(
@@ -260,8 +264,6 @@ def validate_config(cfg: Config) -> None:
         raise ValueError(f"APP_PORT must be 1..65535, got {cfg.port}")
     if not isinstance(cfg.host, str):
         raise ValueError("APP_HOST must be a string")
-    if not isinstance(cfg.github_repos, list):
-        raise ValueError("GITHUB_REPOS must be a list")
     if not isinstance(cfg.http_allowed_cidrs, list):
         raise ValueError("HTTP_ALLOWED_CIDRS must be a list")
     _int_fields = {
@@ -273,9 +275,6 @@ def validate_config(cfg: Config) -> None:
             raise ValueError(f"{name} must be an int, got {v!r}")
         if v <= 0:
             raise ValueError(f"{name} must be positive, got {v!r}")
-    for r in cfg.github_repos:
-        if not isinstance(r, str):
-            raise ValueError(f"GITHUB_REPOS member must be a string, got {r!r}")
     try:
         ipaddress.ip_address(cfg.host)
     except ValueError:

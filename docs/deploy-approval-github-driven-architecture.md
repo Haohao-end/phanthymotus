@@ -17,6 +17,29 @@ Deploy Approval is restart-safe stateless, but intentionally single-replica / si
 Polling reuses the upstream `POLL_INTERVAL_SECONDS` setting. Default: 30 seconds.
 POLL_ENABLED must be true. Webhook is supplementary only.
 
+## OPEN PR watcher enumeration
+
+GitHubCommandWatcher 只枚举两个支持仓库中的所有 OPEN PR。
+
+OPEN PR 枚举不使用 updated_at 年龄过滤，不使用 7-day lookback。
+
+GitHub API 参数固定为：
+
+- `state=open`
+- `sort=updated`
+- `direction=desc`
+- `per_page=100`
+
+从 `page=1` 开始持续翻页，直到 batch 为空或长度不足 100。没有 `page=5` / 500 PR 截断。
+
+分页重叠按 PR number 去重。
+
+不枚举 closed/merged PR。
+
+如果枚举到的 PR 在命令执行前或 unsafe deploy POST 前发生 merge/close，现有 fresh PR gate 会拒绝它，ZERO deploy POST。
+
+merge 后正式 release / production deployment 属于 main/release workflow，不属于 Deploy Approval。
+
 Source matrix:
 
 - Review Agent API: job / build / target / `review_image_tag` source facts
@@ -112,7 +135,7 @@ hidden JSON 是唯一权威业务状态。至少包含：
 
 - `state.status` 是 authoritative lifecycle state
 - `command.phase` 只允许 `completed`、`executing`、`uncertain`
-- `uncertain` 只能出现在 `command.phase`
+- `uncertain` 不是 top-level lifecycle status；在 hidden state 中只允许作为 `command.phase=uncertain` 或 `approve_attempt.outcome=uncertain` 出现。
 
 ## 无状态边界
 

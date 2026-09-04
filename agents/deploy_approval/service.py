@@ -2032,7 +2032,6 @@ class DeployController:
                 await self._handle_uncertain_if_needed(repo, pr_number, state)
                 return
             if cmd_phase == "uncertain":
-                await self._refresh_uncertain_state(repo, pr_number, state)
                 return
 
             if current_head and current_head != state.get("head_sha", ""):

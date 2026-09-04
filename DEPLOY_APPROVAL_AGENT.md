@@ -44,6 +44,7 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 - **GitHub hidden lifecycle JSON is the ONLY authoritative persistent Deploy Approval business-state store.** Fresh facts come from Review Agent / Registry / Agent Core and are copied into hidden state to make the snapshot restart-safe.
 - **Restart-safe, single-replica / single-writer:** Deploy Approval is intentionally restart-safe stateless, but only one `GitHubCommandWatcher` serially processes mutating commands. Multiple concurrent Deploy Controller replicas are unsupported because the current hidden-state protocol has no CAS/distributed lock, and replicas >1 would violate the at-most-once unsafe-side-effect model.
 - **Polling:** PR comments are polled using `POLL_INTERVAL_SECONDS` from the upstream environment. Default: 30 seconds. No webhook required.
+- **Open-PR watcher enumeration:** `GitHubCommandWatcher` enumerates all open PRs in both supported repositories. Enumeration uses `state=open`, `sort=updated`, `direction=desc`, `per_page=100` and continues paging until the batch is empty or shorter than 100. There is no age/lookback cutoff, no 500-PR truncation, and page overlap is deduplicated by PR number. Closed/merged PRs are not enumerated by Deploy Approval.
 - **POLL_ENABLED must be true.** Webhook is supplementary only.
 - **Hidden state JSON:** The lifecycle comment carries a `<!-- deploy-approval-state:v1\n{...}\n-->` marker with validated JSON state.
 - **Trusted identity:** The lifecycle comment author must match the authenticated GitHub bot identity derived from `GITHUB_TOKEN` via `GET /user` at startup.
@@ -62,6 +63,7 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 - **PR Author only:** Only the GitHub PR author can run `/request_deploy`.
 - **Authorization:** `/approve_deploy` requires the actor to be the selected machine owner OR a write/maintain/admin repo collaborator. `/record_test` requires the actor to be an owner of any actually deployed machine OR a write/maintain/admin repo collaborator. Self-approval is allowed if the actor satisfies the authorization rule.
 - **Exact HEAD required:** GitHub HEAD is re-checked at each decision point; drift supersedes the deployment.
+- **Open-PR watcher boundary:** If an enumerated PR is merged or closed before command execution or before an unsafe deploy POST, the existing fresh PR gates reject it and Deploy Approval performs zero deploy POST. Post-merge release deployment is outside Deploy Approval.
 - **No rollback/reject/cancel/resume:** These commands are not supported.
 - **COS evidence:** The default archive contains exactly `manifest.json` and `evidence.log`. Failed deployments, test results, and case logs are uploaded to private COS.
 

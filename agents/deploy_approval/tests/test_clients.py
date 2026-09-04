@@ -9,7 +9,7 @@ import pytest
 import httpx
 
 from ..agent_core_client import AgentCoreClient, AgentCoreError
-from ..config import Config
+from ..config import Config, validate_config
 from .conftest import make_config
 
 
@@ -46,6 +46,41 @@ def _client():
     cfg = make_config(allow_private_http=False)
     cfg.ca_file = ""
     return cfg
+
+
+def _open_pr(number: int, updated_at: str, *, marker: str = "") -> dict:
+    pr = {"number": number, "updated_at": updated_at}
+    if marker:
+        pr["marker"] = marker
+    return pr
+
+
+@pytest.mark.parametrize(
+    "github_repos, should_pass, expected_error",
+    [
+        ([], False, "GITHUB_REPOS is required"),
+        (["4paradigm/phanthymotus"], False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus-driver"], False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus", "4paradigm/phanthymotus"], False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus-driver", "4paradigm/phanthymotus-driver"], False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver", "4paradigm/phanthymotus"], False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver", "some/other-repo"], False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"], True, ""),
+        (["4paradigm/phanthymotus-driver", "4paradigm/phanthymotus"], True, ""),
+    ],
+)
+def test_validate_config_requires_exact_supported_repo_set(github_repos, should_pass, expected_error):
+    cfg = Config(
+        github_token="tok",
+        github_repos=github_repos,
+        poll_enabled=True,
+        github_webhook_secret="secret",
+    )
+    if should_pass:
+        validate_config(cfg)
+    else:
+        with pytest.raises(ValueError, match=expected_error):
+            validate_config(cfg)
 
 
 def test_agent_core_accepts_code_200():
@@ -188,63 +223,116 @@ def test_agent_core_oversize_response_fails_closed():
         asyncio.run(c.driver_status("driver"))
 
 
-def test_github_poll_prs_bounded_and_covers_closed():
-    # The poller's PR enumeration must cover recently-updated closed/merged PRs
-    # (so a production `/deploy` posted after merge is seen) and be bounded by the
-    # initial lookback window; it never scans unbounded history.
+def test_github_list_open_prs_reads_past_500_and_ignores_age():
     from ..github_client import GitHubClient
-    from datetime import datetime, timezone, timedelta
+    from urllib.parse import parse_qs, urlparse
 
     cfg = make_config(allow_private_http=False)
     cfg.github_token = "gh-token"
-    cfg.poll_initial_lookback_hours = 24 * 7
     cfg.github_api_url = "https://api.github.com"
 
-    now = datetime.now(timezone.utc)
-    open_pr = {"number": 3, "updated_at": now.isoformat()}
-    closed_pr = {
-        "number": 5,
-        "updated_at": (now - timedelta(hours=1)).isoformat(),
+    old_ts = "2010-01-01T00:00:00Z"
+    fresh_ts = "2026-09-03T12:00:00Z"
+    page_batches = {
+        1: [_open_pr(i, fresh_ts) for i in range(1, 101)],
+        2: [_open_pr(i, fresh_ts) for i in range(101, 201)],
+        3: [_open_pr(i, fresh_ts) for i in range(201, 301)],
+        4: [_open_pr(i, fresh_ts) for i in range(301, 401)],
+        5: [_open_pr(i, fresh_ts) for i in range(401, 501)],
+        6: [_open_pr(i, fresh_ts) for i in range(501, 601)],
+        7: [_open_pr(601, old_ts)],
     }
 
-    class FakeTransport(httpx.AsyncBaseTransport):
-        def __init__(self, prs_by_page):
-            self.prs_by_page = prs_by_page
+    requested_pages: list[int] = []
+    requested_queries: list[dict[str, str]] = []
 
+    class FakeTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request):
-            from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(str(request.url)).query)
-            st = qs.get("state", ["open"])[0]
-            try:
-                page = int(qs.get("page", ["1"])[0])
-            except ValueError:
-                page = 1
-            batch = self.prs_by_page.get((st, page), [])
+            requested_pages.append(int(qs.get("page", ["1"])[0]))
+            requested_queries.append({
+                "state": qs.get("state", [""])[0],
+                "sort": qs.get("sort", [""])[0],
+                "direction": qs.get("direction", [""])[0],
+                "per_page": qs.get("per_page", [""])[0],
+            })
+            page = requested_pages[-1]
+            return httpx.Response(200, json=page_batches.get(page, []), request=request)
+
+    gh = GitHubClient(cfg, http=httpx.AsyncClient(transport=FakeTransport()))
+    prs = asyncio.run(gh.list_open_prs("org/repo"))
+
+    assert len(prs) == 601
+    assert any(pr["number"] == 601 and pr["updated_at"] == old_ts for pr in prs)
+    assert requested_pages == [1, 2, 3, 4, 5, 6, 7]
+    assert all(
+        q == {"state": "open", "sort": "updated", "direction": "desc", "per_page": "100"}
+        for q in requested_queries
+    )
+
+
+def test_github_list_open_prs_never_requests_closed():
+    from ..github_client import GitHubClient
+    from urllib.parse import parse_qs, urlparse
+
+    cfg = make_config(allow_private_http=False)
+    cfg.github_token = "gh-token"
+    cfg.github_api_url = "https://api.github.com"
+
+    requested_states: list[str] = []
+
+    class FakeTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            qs = parse_qs(urlparse(str(request.url)).query)
+            state = qs.get("state", [""])[0]
+            requested_states.append(state)
+            if state != "open":
+                raise AssertionError(f"unexpected state {state!r}")
+            page = int(qs.get("page", ["1"])[0])
+            batch = [_open_pr(i, "2026-09-03T12:00:00Z") for i in range(1, 101)] if page == 1 else []
             return httpx.Response(200, json=batch, request=request)
 
-    tr = FakeTransport({
-        ("open", 1): [open_pr],
-        ("closed", 1): [closed_pr],
-    })
-    client = httpx.AsyncClient(transport=tr)
-    gh = GitHubClient(cfg, http=client)
-    prs = asyncio.run(gh.poll_prs("org/repo"))
-    nums = {p["number"] for p in prs}
-    assert 3 in nums and 5 in nums, "poll_prs must cover open + recent closed PRs"
+    gh = GitHubClient(cfg, http=httpx.AsyncClient(transport=FakeTransport()))
+    prs = asyncio.run(gh.list_open_prs("org/repo"))
+
+    assert len(prs) == 100
+    assert requested_states == ["open", "open"]
+    assert "closed" not in requested_states
 
 
-def test_within_cutoff_parses_github_timestamp():
-    from ..github_client import _within_cutoff
-    import time as _time
-    cutoff = _time.time() - 3600
-    # recent timestamp passes, old fails, empty fails closed
-    import datetime as _dt
-    recent = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    assert _within_cutoff(recent, cutoff) is True
-    old = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=30)
-    assert _within_cutoff(old.isoformat(), cutoff) is False
-    assert _within_cutoff("", cutoff) is False
-    assert _within_cutoff("not-a-date", cutoff) is False
+def test_github_list_open_prs_deduplicates_page_overlap():
+    from ..github_client import GitHubClient
+    from urllib.parse import parse_qs, urlparse
+
+    cfg = make_config(allow_private_http=False)
+    cfg.github_token = "gh-token"
+    cfg.github_api_url = "https://api.github.com"
+
+    requested_pages: list[int] = []
+
+    class FakeTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            qs = parse_qs(urlparse(str(request.url)).query)
+            page = int(qs.get("page", ["1"])[0])
+            requested_pages.append(page)
+            if page == 1:
+                batch = [_open_pr(i, f"2026-09-03T12:{i:02d}:00Z", marker="page1") for i in range(1, 101)]
+            elif page == 2:
+                batch = [
+                    _open_pr(100, "2026-09-03T13:00:00Z", marker="page2"),
+                    _open_pr(101, "2026-09-03T13:01:00Z", marker="page2"),
+                ]
+            else:
+                batch = []
+            return httpx.Response(200, json=batch, request=request)
+
+    gh = GitHubClient(cfg, http=httpx.AsyncClient(transport=FakeTransport()))
+    prs = asyncio.run(gh.list_open_prs("org/repo"))
+
+    assert requested_pages == [1, 2]
+    assert len(prs) == 101
+    assert sum(1 for pr in prs if pr["number"] == 100) == 1
+    assert next(pr for pr in prs if pr["number"] == 100)["marker"] == "page2"
 
 def test_real_agent_core_list_envelopes_accept_list_data():
     """The real Agent Core wraps /api/drivers and /api/mcp as

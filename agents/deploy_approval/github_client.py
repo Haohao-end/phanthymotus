@@ -9,9 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import datetime as _dt
 import logging
-import time as _time
 
 import httpx
 
@@ -25,20 +23,6 @@ from .clients_common import (
 )
 
 logger = logging.getLogger(__name__)
-
-def _within_cutoff(updated_iso: str, cutoff_epoch: float) -> bool:
-    """True when the GitHub ISO-8601 ``updated_at`` is at/after the cutoff."""
-    if not updated_iso:
-        return False
-    try:
-        ts = _dt.datetime.fromisoformat(updated_iso.replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=_dt.timezone.utc)
-        return ts.timestamp() >= cutoff_epoch
-    except (ValueError, TypeError):
-        # Unparseable update time: fail closed (do not scan unknown-age PRs).
-        return False
-
 
 @dataclass
 class PrSnapshot:
@@ -171,68 +155,56 @@ class GitHubClient:
         return comments
 
     async def list_open_prs(self, repo: str) -> list[dict]:
-        """List open PRs (head ref + head sha + number) for a repo."""
-        return await self.poll_prs(repo)
-
-    async def poll_prs(self, repo: str) -> list[dict]:
-        """Bounded enumeration of PRs for command polling.
-
-        Covers both open PRs and recently-updated closed/merged PRs so a
-        production deploy command posted after the PR was merged (and therefore
-        closed) is still seen. The returned set is bounded by
-        ``poll_initial_lookback_hours`` (updated-since cutoff) and a hard page
-        cap so the poll never scans unbounded history. Results are de-duplicated
-        by PR number and sorted by ``updated`` descending (most-recent first).
-        """
-        cutoff = _time.time() - self.config.poll_initial_lookback_hours * 3600
+        """List all open PRs for a repo, newest-first, with page overlap dedupe."""
         seen: dict[int, dict] = {}
-        for state in ("open", "closed"):
-            page = 1
-            while True:
-                url = self.api(f"/repos/{repo}/pulls")
-                require_http_policy(
-                    url, self.config,
-                    allow_private=self.config.allow_private_http
-                )
-                resp = await stream_request(
-                    self.http, "GET", url, self.config.max_response_bytes,
-                    headers=self._headers(),
-                    params={
-                        "state": state,
-                        "sort": "updated",
-                        "direction": "desc",
-                        "per_page": 100,
-                        "page": page,
-                    }, timeout=self.config.total_timeout)
-                try:
-                    require_2xx(resp.status_code, "github list PRs")
-                except SecurityError as e:
-                    raise GitHubError(str(e)) from e
-                batch = await self._read_json_list(resp)
-                if not batch:
-                    break
-                for pr in batch:
-                    num = int(pr.get("number") or 0)
-                    if num <= 0:
-                        continue
-                    updated = pr.get("updated_at") or ""
-                    if _within_cutoff(updated, cutoff):
-                        seen[num] = pr
-                # At most 5 pages per state (500 PRs) — a bounded poll. The
-                # GitHub `sort=updated`+`direction=desc` means older PRs beyond
-                # the cutoff appear at the back; stop early once a full page is
-                # strictly older than the cutoff.
-                if len(batch) < 100 or page >= 5:
-                    break
-                if all(
-                    not _within_cutoff(x.get("updated_at") or "", cutoff)
-                    for x in batch
-                ):
-                    break
-                page += 1
+        page = 1
+        while True:
+            url = self.api(f"/repos/{repo}/pulls")
+            require_http_policy(
+                url, self.config,
+                allow_private=self.config.allow_private_http
+            )
+            resp = await stream_request(
+                self.http, "GET", url, self.config.max_response_bytes,
+                headers=self._headers(),
+                params={
+                    "state": "open",
+                    "sort": "updated",
+                    "direction": "desc",
+                    "per_page": 100,
+                    "page": page,
+                }, timeout=self.config.total_timeout)
+            try:
+                require_2xx(resp.status_code, "github list open PRs")
+            except SecurityError as e:
+                raise GitHubError(str(e)) from e
+            batch = await self._read_json_list(resp)
+            if not batch:
+                break
+            for pr in batch:
+                if not isinstance(pr, dict):
+                    continue
+                num = pr.get("number")
+                if isinstance(num, bool) or not isinstance(num, int) or num <= 0:
+                    continue
+                seen[num] = pr
+            if len(batch) < 100:
+                break
+            page += 1
 
-        def _sort_key(pr):
-            return pr.get("updated_at") or ""
+        def _sort_key(pr: dict):
+            updated = pr.get("updated_at")
+            if not isinstance(updated, str):
+                updated = ""
+            try:
+                from datetime import datetime, timezone
+
+                ts = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                return (1, ts.timestamp(), updated)
+            except (TypeError, ValueError):
+                return (0, 0.0, updated)
 
         return sorted(seen.values(), key=_sort_key, reverse=True)
 
