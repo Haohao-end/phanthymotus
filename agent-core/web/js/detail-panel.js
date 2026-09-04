@@ -14,10 +14,9 @@ import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
-import { HTMSGRenderer }    from './renderers/htmsg.js';
 import { openDetailPanelMobile, closeDetailPanelMobile } from './mobile.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, LidarRenderer, HTMSGRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, LidarRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
 
 let _panel    = null;
 let _renderer = null;
@@ -45,7 +44,14 @@ export function showTopicDetail(topicPath, format) {
   _renderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
   _renderer.mount(body, 'detail');
 
-  // Connect WebSocket — /ws/bus/* is proxied through agent-core
+  // Connect WebSocket — /ws/bus/* is proxied through agent-core.
+  // Skip it when the topic is unresolved: `/ws/bus` with nothing after it
+  // matches no route (`/ws/bus/{topic:path}`), so the handshake fails and
+  // uvicorn logs a 500 that looks like a server fault rather than "no topic".
+  if (!topicPath || topicPath === '/') {
+    console.debug('[detail-panel] no topic yet, not opening a bus WS');
+    return;
+  }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const wsHost = location.host;
   const wsUrl = `${proto}://${wsHost}/ws/bus${topicPath}`;

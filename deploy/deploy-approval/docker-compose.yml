@@ -1,0 +1,51 @@
+services:
+  deploy-approval:
+    build:
+      context: ../..
+      dockerfile: agents/deploy_approval/Dockerfile
+    image: phanthy-motus/deploy-approval:local
+    container_name: deploy-approval
+    # ── Single-replica / single-writer topology ───────────────────────
+    # Deploy Approval is restart-safe stateless, but intentionally
+    # single-replica / single-writer. Exactly one GitHubCommandWatcher serially
+    # processes mutating commands. Multiple concurrent Deploy Controller
+    # replicas are unsupported because the current hidden-state protocol has no
+    # CAS/distributed lock. Running replicas >1 would violate the at-most-once
+    # unsafe-side-effect model.
+    restart: unless-stopped
+    environment:
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+      GITHUB_REPOS: "${GITHUB_REPOS:-4paradigm/phanthymotus,4paradigm/phanthymotus-driver}"
+      POLL_ENABLED: "${POLL_ENABLED:-true}"
+      POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-30}"
+      WEBHOOK_ENABLED: "${WEBHOOK_ENABLED:-false}"
+      GITHUB_WEBHOOK_SECRET: "${GITHUB_WEBHOOK_SECRET:-}"
+      REGISTRY: "${REGISTRY:-}"
+      REGISTRY_USER: "${REGISTRY_USER:-}"
+      REGISTRY_PASSWORD: "${REGISTRY_PASSWORD:-}"
+      ACCESS_TOKEN: "${ACCESS_TOKEN}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./machines.yaml:/run/deploy-approval/machines.yaml:ro
+      - ./secrets.yaml:/run/deploy-approval/secrets.yaml:ro
+    ports:
+      - "25001:25001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:25001/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"

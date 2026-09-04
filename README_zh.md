@@ -82,6 +82,10 @@ Dashboard（`http://<设备IP>:15678`）提供：
 
 ![智能体定义](docs/images/agent-definition.png)
 
+### 飞书消息渠道
+
+通过飞书自建应用与 Agent 双向收发文本和附件。完整步骤见[飞书 Channel 配置与收发验收](docs/feishu-channel-setup.md)。
+
 ### 历史日志
 
 浏览历史 Agent 会话，查看完整事件轨迹和工具调用结果。
@@ -109,6 +113,7 @@ Dashboard（`http://<设备IP>:15678`）提供：
 | Perception WebSocket | 15721 |
 | ActuCore MCP | 15730 |
 | PR Review Agent（可选） | 25000 |
+| Deploy Approval Agent（可选） | 25001 |
 
 硬件驱动端口请参见 [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)。
 
@@ -124,6 +129,8 @@ Dashboard（`http://<设备IP>:15678`）提供：
 ## 贡献
 
 参见 [CONTRIBUTING.md](CONTRIBUTING.md) 了解开发环境搭建、架构细节和贡献指南。
+
+在人工审批门禁后部署已评审、已构建的镜像，是一个可选、独立的部署控制面服务，不属于机器人 `sense → think → act` 主数据面。详见 [DEPLOY_APPROVAL_AGENT.md](DEPLOY_APPROVAL_AGENT.md)。
 
 ## 许可证
 

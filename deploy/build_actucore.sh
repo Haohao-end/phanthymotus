@@ -52,18 +52,12 @@ TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
 
 BUILD_ARGS=""
 # ── 根据 jp_version 选择 base image  ────────────────────────
-case "${JP_VERSION}" in
-    5.11)
-        BUILD_ARGS="${BUILD_ARGS} JP_VERSION=511"
-        ;;
-    6.1)
-        BUILD_ARGS="${BUILD_ARGS} JP_VERSION=61"
-        ;;
-    *)
-        echo "Unknown JetPack version: ${JP_VERSION} (support: 5.11, 6.1)"
-        exit 1
-        ;;
-esac
+# 表在 build_common.sh 的 jetpack_vars 里，build_perception.sh 共用同一份。
+jetpack_vars "${JP_VERSION}" || exit 1
+BUILD_ARGS="${BUILD_ARGS} JP_VERSION=${JP_ARG}"
+
+# Dockerfile.jetson 基于 L4T base image —— 只有 arm64
+CPU_ARCH="arm64"
 
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/actucore:${TAG}"
 
@@ -72,6 +66,7 @@ echo "Building actucore image (Jetson only)"
 echo "PyTorch for JetPack: JP${JP_VERSION}"
 echo "Image  : ${FULL_IMAGE}"
 echo "Arch   : ${ARCH} (native=${IS_ARM64})"
+echo "Runs on: ${ACC_ARCH} / ${CPU_ARCH}"
 echo "Push   : ${PUSH_ENABLED}"
 echo "============================================"
 
@@ -110,6 +105,9 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
     fi
     if [[ ! "${SYNC_CONFIRM}" =~ ^[Nn] ]]; then
         echo "Registering image to resource-center (${RESOURCE_CENTER_URL})..."
+        # cards 目前为空：actucore/plugins/ 还没有任何已注册的卡片（见
+        # actucore/main.py 的卡片注册区注释和 actucore/README.md）。第一个卡片落地时
+        # 把它加进这个数组，不要漏掉。
         HTTP_STATUS=$(curl -s -o /tmp/rc_register_resp.json -w "%{http_code}" \
             -X POST "${RESOURCE_CENTER_URL}/api/admin/register" \
             -H "Content-Type: application/json" \
@@ -119,9 +117,12 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                 \"registryImage\": \"actucore\",
                 \"tag\": \"${TAG}\",
                 \"category\": \"actucore\",
+                \"acc_arch\": \"${ACC_ARCH}\",
+                \"cpu_arch\": \"${CPU_ARCH}\",
                 \"name\": \"ActuCore\",
                 \"port\": 15730,
-                \"description\": \"执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制，以 processor 卡片接入\"
+                \"description\": \"执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制，以 processor 卡片接入\",
+                \"cards\": []
             }")
 
         if [ "${HTTP_STATUS}" = "200" ] || [ "${HTTP_STATUS}" = "201" ]; then

@@ -73,32 +73,42 @@ def _push_factory(topic: str):
         # 处理 perf_span 类型消息（来自 perception TTS 等组件）
         if topic == '/perception/perf_spans':
             try:
-                import json, perf_log, config
+                import json
                 text = data.decode('utf-8') if isinstance(data, bytes) else data
                 span_data = json.loads(text)
                 if span_data.get('type') == 'perf_span':
-                    trace_id = span_data.pop('trace_id', None)
-                    if trace_id:
-                        # 直接归属（trace_id 由 agent-core 透传）
-                        perf_log.commit_spans(trace_id, [span_data], source='perception')
-                    else:
-                        # 兼容旧版本 perception: fallback 到时间窗口匹配
-                        span_start = span_data.get('start_ts', 0)
-                        conn = config._get_conn()
-                        row = conn.execute(
-                            '''SELECT trace_id FROM perf_spans
-                               WHERE span LIKE 'tool:tts%' AND start_ts <= ? AND start_ts >= ? - 30
-                               ORDER BY start_ts DESC LIMIT 1''',
-                            (span_start, span_start)
-                        ).fetchone()
-                        conn.close()
-                        if row:
-                            perf_log.commit_spans(row[0], [span_data], source='perception')
-                    if row:
-                        perf_log.commit_spans(row[0], [span_data], source='perception')
+                    # commit_spans and the fallback lookup are both synchronous
+                    # SQLite. Running them here blocked the event loop — and so
+                    # every audio WS send on it — once per utterance, exactly at
+                    # the utterance boundary where playback is most sensitive.
+                    await asyncio.to_thread(_commit_perf_span, span_data)
             except Exception:
                 pass
     return _push
+
+
+def _commit_perf_span(span_data: dict) -> None:
+    """Attribute one perception perf span to a trace. Blocking; off-loop only."""
+    import perf_log, config
+    trace_id = span_data.pop('trace_id', None)
+    if trace_id:
+        # 直接归属（trace_id 由 agent-core 透传）
+        perf_log.commit_spans(trace_id, [span_data], source='perception')
+        return
+    # 兼容旧版本 perception: fallback 到时间窗口匹配
+    span_start = span_data.get('start_ts', 0)
+    conn = config._get_conn()
+    try:
+        row = conn.execute(
+            '''SELECT trace_id FROM perf_spans
+               WHERE span LIKE 'tool:tts%' AND start_ts <= ? AND start_ts >= ? - 30
+               ORDER BY start_ts DESC LIMIT 1''',
+            (span_start, span_start)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row:
+        perf_log.commit_spans(row[0], [span_data], source='perception')
 
 
 def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
@@ -115,12 +125,32 @@ def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
 
 # ── Internal API (called by mcp_manage directly) ───────────────────────────────
 
-async def register_topic_internal(topic: str, fmt: str, mcp_id: str) -> None:
-    """Register a topic in the registry; always check primary sub health."""
+async def register_topic_internal(topic: str, fmt: str, mcp_id: str,
+                                  producer: bool = True) -> None:
+    """Register a topic in the registry; always check primary sub health.
+
+    `producer=False` 表示这是消费者声明的输入（topic_in）：它只说明「我想吃什么格式」，
+    不能改写别人发布的总线格式。一个 topic 的格式由发布方说了算 —— 它决定了 DDS 订阅用
+    哪种消息类型（ros2_bridge._resolve_msg_type）和仪表盘挑哪个渲染器，被消费者改掉会
+    让整条总线读不出数据。
+    """
     if not topic:
         return
     existing = _topic_registry.get(topic)
+    if existing and not producer:
+        if existing.get('format') != fmt:
+            print(f'[inspection] ignored consumer format {fmt!r} for {topic} '
+                  f'(producer says {existing.get("format")!r}, from {existing.get("mcp_id")})')
+        # 格式不动，但仍要确保订阅健康
+        _ensure_primary_sub(topic, existing.get('format', ''), asyncio.get_event_loop())
+        return
     if not (existing and existing.get('format') == fmt and existing.get('mcp_id') == mcp_id):
+        # 格式变了 → 订阅要重建：msg type 是按 format 选的，旧订阅还挂在错误的类型上
+        # （例如被消费者污染成 image/jpeg 后，CompressedImage 订阅永远收不到 String 帧）。
+        if existing and existing.get('format') != fmt and topic in _active_primary_subs:
+            print(f'[inspection] {topic} format {existing.get("format")!r} → {fmt!r}, '
+                  f'rebuilding subscription')
+            _active_primary_subs.discard(topic)
         _topic_registry[topic] = {
             'format':        fmt,
             'mcp_id':        mcp_id,

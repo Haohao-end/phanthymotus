@@ -42,6 +42,7 @@ RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/
 
 COPY web/      /work/web/
 COPY src/      /work/src/
+COPY tools/    /work/tools/
 COPY resource/ /work/resource/
 COPY deploy/   /deploy/
 
@@ -51,6 +52,13 @@ COPY resource/memory/defaults/ /opt/defaults/memory/
 ARG IMAGE_TAG=unknown
 ENV IMAGE_TAG=${IMAGE_TAG}
 RUN echo "${IMAGE_TAG}" > /work/VERSION
+
+# One write per log line instead of 8 KB block flushes that can tear a Docker
+# log record mid-write.
+ENV PYTHONUNBUFFERED=1
+# ANSI colour codes are control bytes; in a non-tty container log they are
+# exactly the "garbage characters" that make `docker logs` unreadable.
+ENV RCUTILS_COLORIZED_OUTPUT=0
 
 EXPOSE 15678
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && uv run src/start.py"]

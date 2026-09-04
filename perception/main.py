@@ -14,6 +14,12 @@ WebSocket ASR 端口: config.ws_port（默认 15721）
 
 from __future__ import annotations
 
+# First, before anything can write to stdout: make every log line one atomic,
+# control-character-free write, so concurrent writers cannot tear a Docker log
+# record. See utils/logsafe.py.
+from utils import logsafe
+logsafe.install()
+
 import asyncio
 import json
 import logging
@@ -37,8 +43,23 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelna
                     datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 # suppress noisy third-party loggers
-for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx', 'dashscope'):
+for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
+
+# Cap on how much of an MCP argument dict reaches the log. A tool call can carry
+# an image, a base64 payload or a long utterance, so an unbounded repr here is how
+# a single log line grows past the point where Docker can frame it — the result
+# side was already capped, the argument side was not.
+_LOG_ARG_CHARS = 500
+
+
+def _brief(obj) -> str:
+    """One-line, length-capped repr for logging an MCP payload."""
+    text = repr(obj)
+    if len(text) <= _LOG_ARG_CHARS:
+        return text
+    return f"{text[:_LOG_ARG_CHARS]}…[+{len(text) - _LOG_ARG_CHARS} chars]"
+
 
 # ── ACP: SSE event bus (thread-safe) ─────────────────────────────────────────
 
@@ -84,19 +105,16 @@ class PerceptionBundle:
 
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from plugins.tts import TTSPlugin
-            self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
-            log.info("TTSPlugin loaded")
-
-        if plugins_cfg.get("htmsg", {}).get("enabled", False):
-            import re, socket
-            namespace = plugins_cfg["htmsg"].get("namespace", "").strip()
-            if not namespace:
-                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
-            from plugins.htmsg import HTMSGPlugin
-            plugin = HTMSGPlugin(plugins_cfg["htmsg"], namespace, executor)
-            self._plugins.append(plugin)
-            plugin.start()
-            log.info("HTMSGPlugin loaded (namespace=%s)", namespace)
+            # Guarded: TTSPlugin validates its engine configuration in the
+            # constructor (backend, speaker_id, engine name). An unusable TTS
+            # config must not take ASR/VOP/OCR down with it — the tool simply
+            # does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
+                log.info("TTSPlugin loaded")
+            except Exception:
+                log.error("TTSPlugin failed to load; continuing without TTS",
+                          exc_info=True)
 
         if plugins_cfg.get("vop", {}).get("enabled", False):
             import re, socket
@@ -107,6 +125,11 @@ class PerceptionBundle:
             plugin = VideoObjectPerceptionPlugin(plugins_cfg["vop"], namespace, executor)
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
+
+        if plugins_cfg.get("ocr", {}).get("enabled", False):
+            from plugins.ocr import OCRPlugin
+            self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
+            log.info("OCRPlugin loaded")
 
     def get_all_tools(self) -> list:
         tools = []
@@ -123,6 +146,16 @@ class PerceptionBundle:
             if p.PREFIX == prefix:
                 return p.dispatch(name, args)
         return None
+
+    def owns(self, full_name: str) -> bool:
+        """True when some loaded plugin claims this tool name.
+
+        Lets the caller tell a genuinely unknown tool apart from a loaded
+        plugin returning None for an action it does not handle. Mirrors
+        `dispatch`'s prefix split so the two can never disagree.
+        """
+        prefix, _, _ = full_name.partition("_")
+        return any(p.PREFIX == prefix for p in self._plugins)
 
     def tts_synthesize_raw(self, text: str) -> bytes:
         for p in self._plugins:
@@ -232,19 +265,16 @@ def make_handler():
                     if not text:
                         self._send(200, json.dumps({"ok": False, "info": "text is required"}))
                         return
-                    # Build ad-hoc adapter from inline credentials if provided
-                    api_key = req.get("api_key", "")
-                    if api_key:
-                        from plugins.tts import AliyunDashScopeTTSAdapter
-                        adapter = AliyunDashScopeTTSAdapter(
-                            api_key=api_key,
-                            model=req.get("model", ""),
-                            voice=req.get("voice", ""),
-                            url=req.get("url", ""),
-                        )
-                        pcm = adapter.synthesize(text)
-                    else:
-                        pcm = _bundle.tts_synthesize_raw(text)
+                    # Inline cloud credentials are not supported: this endpoint
+                    # tests the on-device sherpa-onnx TTS the plugin actually
+                    # serves. Fail loudly rather than silently ignoring the key.
+                    if req.get("api_key", ""):
+                        self._send(200, json.dumps({
+                            "ok": False,
+                            "info": "inline api_key is not supported; /tts/test exercises the on-device TTS plugin",
+                        }))
+                        return
+                    pcm = _bundle.tts_synthesize_raw(text)
                     import base64 as _b64, io, wave
                     buf = io.BytesIO()
                     with wave.open(buf, 'wb') as w:
@@ -291,10 +321,23 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({args})")
+                        log.info(f"[mcp] tools/call: {name}({_brief(args)})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
-                        err(-32601, f"Unknown tool: {name}")
+                        # `dispatch` returns None for two very different things:
+                        # no plugin owns the name, or a plugin owns it and
+                        # declined the action. Reporting both as "Unknown tool"
+                        # is actively misleading — it sent a debugging session
+                        # hunting a tool-registration race that did not exist,
+                        # when the tool was registered the whole time.
+                        if _bundle.owns(name):
+                            log.warning(
+                                "[mcp] %s declined action %r", name, args.get("action")
+                            )
+                            err(-32603, f"Tool {name} does not handle action "
+                                        f"{args.get('action')!r}")
+                        else:
+                            err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
                             log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")

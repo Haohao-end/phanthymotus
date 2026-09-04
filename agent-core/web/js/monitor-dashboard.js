@@ -15,9 +15,9 @@ import { MappingRenderer }   from './renderers/mapping.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
-import { HTMSGRenderer }    from './renderers/htmsg.js';
+import { resolveDerivedTopics } from './topic-derive.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, HTMSGRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
 const CELL_SIZE = 280;  // minimum px per grid cell
 const GAP = 12;         // px gap between cells
@@ -86,6 +86,9 @@ async function _fetchAndBuild() {
   const canvasCards = layout.cards || [];
   const connections = layout.connections || [];
   const canvasTools = new Set(canvasCards.map(c => `${c.mcpId}:${c.toolName}`));
+
+  // The layout is not a reliable record of derived topics — see topic-derive.js.
+  await resolveDerivedTopics(canvasCards, connections);
 
   const topicSet = new Set();
   _topicMcpMap = {};  // reset
@@ -238,6 +241,15 @@ function _applyPlacement(el, col, row, colSpan, rowSpan) {
 }
 
 function _connectWs(topicPath, format, renderer) {
+  // An unresolved topic used to build `/ws/bus` with nothing after it. That
+  // matches no route (the endpoint is `/ws/bus/{topic:path}`), so Starlette
+  // failed the handshake and uvicorn logged `ASGI callable returned without
+  // completing handshake` + a 500 — noise that reads like a server fault when
+  // the real state is simply "this card has no topic yet".
+  if (!topicPath || topicPath === '/') {
+    console.debug('[monitor] no topic yet, not opening a bus WS');
+    return null;
+  }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const wsUrl = `${proto}://${location.host}/ws/bus${topicPath}`;
 
@@ -287,8 +299,11 @@ function _refreshRenderer(topicPath) {
   const renderer = _createRenderer(card.format, card.mode);
   renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard');
   card.renderer = renderer;
-  // Re-wire WS
-  card.ws.onmessage = (ev) => _handleWsMessage(ev, card.renderer, card.format);
+  // Re-wire WS. Optional: _connectWs returns null for a card whose topic is
+  // not resolved yet, and a mode switch on such a card must not throw.
+  if (card.ws) {
+    card.ws.onmessage = (ev) => _handleWsMessage(ev, card.renderer, card.format);
+  }
 }
 
 function _switchMode(topicPath, newMode, modeBtns) {

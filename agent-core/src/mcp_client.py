@@ -43,10 +43,29 @@ _pending_tools: dict[str, str] = {}               # action_id → tool_name (资
 
 # ── 内部 JSON-RPC 助手 ─────────────────────────────────────────────────────────
 
+# Key under which _jrpc reports a JSON-RPC `error` object. Callers that only look
+# for their own keys (`content`, `tools`, ...) behave exactly as before — they see
+# a dict without those keys, which is what `{}` gave them. Callers that care read
+# this key.
+JRPC_ERROR_KEY = '_jrpc_error'
+
+
 async def _jrpc(session: aiohttp.ClientSession, url: str, method: str, params: dict, req_id: int = 1) -> dict:
+    """Send one JSON-RPC request. On an `error` response, report it, don't drop it.
+
+    This used to be `return data.get('result', {})`, which discarded the `error`
+    object outright — so a driver that correctly answered
+    `-32601 Unknown tool: move` came back as `{}`, and `call_tool` handed the
+    model `"{}"`: indistinguishable from a successful call returning nothing.
+    Observed on R1 with locomotion: the robot never moved, the model announced
+    "好的，我要转身了", and when told it had not moved it retried the identical
+    bad call, because nothing in the transcript said anything had failed.
+    """
     payload = {'jsonrpc': '2.0', 'id': req_id, 'method': method, 'params': params}
     async with session.post(url, json=payload) as resp:
         data = await resp.json(content_type=None)
+    if isinstance(data, dict) and data.get('error') is not None and 'result' not in data:
+        return {JRPC_ERROR_KEY: data['error']}
     return data.get('result', {})
 
 
@@ -317,6 +336,31 @@ async def call_tool(full_name: str, args: dict) -> str:
             return f'工具名格式错误: {full_name}'
         _, mcp_id, tool_name = parts
 
+        # A split tool's real name has four segments
+        # (`mcp__<id>__loco__move`), and models sometimes emit the action
+        # without the tool segment (`mcp__<id>__move`). That used to fall
+        # through here as tool_name='move' with no `action` injected, so the
+        # driver got a tool it does not have and the call silently did nothing.
+        # Recover when the action name is unambiguous, and say so rather than
+        # guessing quietly.
+        info_probe = registry.get(mcp_id) or {}
+        if tool_name not in (info_probe.get('tools') or []):
+            matches = {
+                (s['tool'], s['action'])
+                for s in (info_probe.get('split_map') or {}).values()
+                if s.get('action') == tool_name
+            }
+            if len(matches) == 1:
+                real_tool, real_action = matches.pop()
+                print(f'[mcp] {full_name} is not a tool name — resolved to '
+                      f'{real_tool}(action={real_action}); the model dropped the tool segment')
+                tool_name = real_tool
+                args = {**args, 'action': real_action}
+            elif matches:
+                opts = ', '.join(sorted(f'mcp__{mcp_id}__{t}__{a}' for t, a in matches))
+                return (f'工具名 {full_name} 不明确：{len(matches)} 个工具都有 '
+                        f'{tool_name} 动作。请使用完整名称之一：{opts}')
+
     info = registry.get(mcp_id)
     if not info:
         return f'MCP {mcp_id} 未注册'
@@ -359,6 +403,12 @@ async def call_tool(full_name: str, args: dict) -> str:
         if meta.get('has_config_schema'):
             saved_cfg = _get_tool_config(mcp_id, tool_name)
             if saved_cfg:
+                # Drop keys the current schema no longer advertises; a stale row
+                # would otherwise be replayed on every start. See tool_config.
+                from tool_config import find_tool, split_config_by_scope
+                _shared, _inst = split_config_by_scope(find_tool(mcp_id, tool_name), saved_cfg)
+                saved_cfg = {**_shared, **_inst}
+            if saved_cfg:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     cfg_result = await _jrpc(session, url, 'tools/call', {
                         'name':      tool_name,
@@ -386,6 +436,18 @@ async def call_tool(full_name: str, args: dict) -> str:
         print(f'[mcp] {full_name} timeout after {timeout.total}s')
         return msg
 
+    # The driver answered with a JSON-RPC error. Hand it to the model verbatim —
+    # this is the difference between "the model retries correctly" and "the model
+    # believes it moved the robot".
+    jrpc_err = result.get(JRPC_ERROR_KEY)
+    if jrpc_err is not None:
+        code = jrpc_err.get('code') if isinstance(jrpc_err, dict) else None
+        emsg = jrpc_err.get('message') if isinstance(jrpc_err, dict) else str(jrpc_err)
+        print(f'[mcp] {full_name} → error {code}: {emsg}')
+        valid = sorted((info.get('split_map') or {}).keys()) or sorted(info.get('tools') or [])
+        hint = f' 该设备可用工具：{", ".join(valid)}' if code == -32601 and valid else ''
+        return f'[{tool_name}] 调用失败（{code}）：{emsg}。此次调用未执行任何动作。{hint}'
+
     # MCP call result: list of content items
     content_items = result.get('content', [])
     if not content_items:
@@ -396,6 +458,18 @@ async def call_tool(full_name: str, args: dict) -> str:
     texts  = [c.get('text', '') for c in content_items if c.get('type') == 'text']
 
     if images:
+        # 与 Read 读图同一个开关。关闭时按**失败**返回，不要返回「成功但没有图像」——
+        # 模型会把成功结果当成「我拿到了这张图」，然后凭 mime 和字节数编出画面内容。
+        from event.desktop import vision_input_enabled
+        if not vision_input_enabled():
+            lines = list(texts)
+            for img in images:
+                mime = img.get('mimeType', 'image/jpeg')
+                approx = len(img.get('data', '')) * 3 // 4
+                lines.append(
+                    f'Error: cannot parse image contents — this model does not accept '
+                    f'image input. Image: [{mime} | {approx} bytes]')
+            return '\n'.join(lines)
         parts_list = []
         for img in images:
             data   = img.get('data', '')
@@ -489,20 +563,23 @@ async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
     if tool_name == 'channel_reply':
         action = args.get('action', '')
         if action == 'send':
-            text = args.get('text', '')
-            if not text:
-                return 'Error: "text" field is required.'
+            text = args.get('text', '') or ''
+            files = args.get('files', []) or []
+            if not text and not files:
+                return 'Error: provide "text" and/or "files".'
             from channel.manager import manager as channel_mgr
-            channels_with_context = list(channel_mgr._get_last_context().keys())
-            if not channels_with_context:
-                return (
-                    'Error: No active conversation context. '
-                    'A user must send a message to the bot first before it can reply. '
-                    'Ask the user to send a message in Feishu/Telegram/Slack.'
-                )
-            channel_id = channels_with_context[-1]
-            return await channel_mgr.send_to_channel(channel_id, text)
-        return f'Error: Unknown action "{action}". Use action="send" with a "text" field.'
+            # instance_id 由 llm.py 从画布绑定注入（_bound_instance_ids），
+            # 用它解析卡片上选的 channel —— 卡片配置必须真正决定回复去向
+            return await channel_mgr.send_reply(
+                instance_id=args.get('instance_id', ''),
+                text=text,
+                files=files,
+                mention_open_id=args.get('mention_open_id', ''),
+                source_message_id=args.get('source_message_id', ''),
+                expect_reply=args.get('expect_reply', False),
+                trusted_bot_id=args.get('trusted_bot_id', ''),
+            )
+        return f'Error: Unknown action "{action}". Use action="send" with "text" and/or "files".'
 
     # Default: return info for other internal tools
     return json.dumps({'status': 'ok', 'tool': tool_name})
@@ -516,6 +593,27 @@ def _should_await_completion(completion_spec: dict, action: str | None) -> bool:
     if not actions_list:
         return True  # 无 filter → 所有 action 都是异步的
     return action in actions_list
+
+
+async def cancel_and_reap(tasks) -> None:
+    """Cancel tasks and wait for the cancellation to actually be delivered.
+
+    `Task.cancel()` only *requests* cancellation — the task stays pending until
+    the loop gets to resume it and raise CancelledError inside it. Cancelling and
+    then dropping the reference is what filled the log with
+
+        Task was destroyed but it is pending!
+        task: <Task pending ... coro=<Event.wait() ...>>
+        task: <Task pending ... coro=<await_pending.<locals>._wait_all() ...>>
+
+    on every barge-in: the barrier's outer task and the inner `Event.wait()`
+    children of its `gather` were both abandoned mid-cancellation.
+    """
+    live = [t for t in tasks if not t.done()]
+    for task in live:
+        task.cancel()
+    if live:
+        await asyncio.gather(*live, return_exceptions=True)
 
 
 async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120,
@@ -540,13 +638,20 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
         if cancel_event:
             wait_task = asyncio.create_task(_wait_all())
             cancel_task = asyncio.create_task(cancel_event.wait())
-            done, pending = await asyncio.wait(
-                [wait_task, cancel_task],
-                timeout=effective_timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for p in pending:
-                p.cancel()
+            try:
+                done, _unfinished = await asyncio.wait(
+                    [wait_task, cancel_task],
+                    timeout=effective_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                # Also runs when *this* coroutine is cancelled from outside, which
+                # is the common case: on barge-in `_acp_barrier` cancels the task
+                # running await_pending as soon as a steering message arrives.
+                # Without the finally, CancelledError propagated straight out and
+                # left _wait_all and its Event.wait() children orphaned — the
+                # "Task was destroyed but it is pending!" pair in the R1 logs.
+                await cancel_and_reap([wait_task, cancel_task])
             if cancel_task in done:
                 # 用户打断：清理所有 pending
                 for aid in aids:
@@ -555,7 +660,21 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
                     _pending_timeouts.pop(aid, None)
                     _pending_tools.pop(aid, None)
                 return {"status": "cancelled"}
+            if wait_task not in done:
+                # Unlike wait_for, asyncio.wait() does not raise on timeout — it
+                # returns with an empty `done`. Falling through from here reported
+                # a silent timeout as {"status": "completed"}, so a barrier that
+                # waited out its full 120s looked identical to one that succeeded.
+                # That is precisely the case _acp_barrier_log was added to make
+                # attributable: an ACP completion callback that never arrives
+                # (self-signed cert rejected, AGENT_CORE_URL misconfigured).
+                # Converge on the TimeoutError path below, which already clears
+                # pending and reports "timeout".
+                raise asyncio.TimeoutError()
         else:
+            # Not reached from the agent loop: it creates a cancel_event for every
+            # turn (event/llm.py:887), so the branch above is the live one. Kept
+            # for direct callers.
             await asyncio.wait_for(_wait_all(), timeout=effective_timeout)
 
         # 清理已完成的
@@ -598,13 +717,13 @@ async def sync(action_ids: list[str] | None = None, timeout: float = 120,
         wait_task = asyncio.create_task(_wait_all())
         if cancel_event:
             cancel_task = asyncio.create_task(cancel_event.wait())
-            done, pending = await asyncio.wait(
-                [wait_task, cancel_task], return_when=asyncio.FIRST_COMPLETED
-            )
-            for p in pending:
-                p.cancel()
+            try:
+                done, _pending = await asyncio.wait(
+                    [wait_task, cancel_task], return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                await cancel_and_reap([wait_task, cancel_task])
             if cancel_task in done:
-                wait_task.cancel()
                 raise asyncio.CancelledError()
         else:
             await wait_task

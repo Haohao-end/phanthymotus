@@ -50,6 +50,10 @@ WORKDIR /work
 COPY actucore/main.py     /work/main.py
 COPY actucore/plugins/    /work/plugins/
 COPY actucore/config.yaml /work/config.yaml
+# Atomic-write stdout guard. The build context is the repo root, so this reuses
+# perception's copy instead of adding a fourth one to keep in sync — see the
+# DUPLICATION note in perception/utils/logsafe.py.
+COPY perception/utils/logsafe.py /work/logsafe.py
 # Agent Core reads /deploy/service.yml out of the image to merge the compose
 # fragment — dropping this COPY silently falls back to the legacy docker-run path.
 COPY actucore/deploy/     /deploy/

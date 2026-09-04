@@ -18,6 +18,16 @@ MCP server 端口: config.mcp_port（默认 15730）
 
 from __future__ import annotations
 
+# First, before anything can write to stdout: make every log line one atomic,
+# control-character-free write, so concurrent writers cannot tear a Docker log
+# record. Without this, actucore produced a log the daemon could not read back at
+# all — `docker logs` failed outright with "log message is too large
+# (1952739189 > 1000000)", i.e. the framing had come apart and a length prefix
+# was being read out of garbage. Same module perception installs; the Dockerfile
+# copies it out of perception/utils/ rather than keeping a fourth duplicate.
+import logsafe
+logsafe.install()
+
 import json
 import logging
 import os
@@ -42,6 +52,21 @@ log = logging.getLogger(__name__)
 # suppress noisy third-party loggers
 for _quiet in ('urllib3', 'httpcore', 'httpx'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
+
+# Cap on how much of an MCP argument/result dict reaches the log. Card configs
+# carry whole maps and voxel grids, so an unbounded repr here is how a single log
+# line grows past the point where Docker can frame it — the result side was
+# already capped, the argument side was not.
+_LOG_ARG_CHARS = 500
+
+
+def _brief(obj) -> str:
+    """One-line, length-capped repr for logging an MCP payload."""
+    text = repr(obj)
+    if len(text) <= _LOG_ARG_CHARS:
+        return text
+    return f"{text[:_LOG_ARG_CHARS]}…[+{len(text) - _LOG_ARG_CHARS} chars]"
+
 
 # ── ACP: SSE event bus (thread-safe) ─────────────────────────────────────────
 
@@ -96,7 +121,7 @@ class ActuCoreBundle:
         #            log.info("XPlugin loaded")
         #
         # 需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步，参照
-        # perception/main.py 里 htmsg/vop 的写法：namespace 为空时用
+        # perception/main.py 里 vop 的写法：namespace 为空时用
         # re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname()) 兜底。
         #
         # 卡片契约（PREFIX 不能含下划线、action.enum 必须含 "info" 等）见 README.md。
@@ -222,7 +247,7 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({args})")
+                        log.info(f"[mcp] tools/call: {name}({_brief(args)})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
