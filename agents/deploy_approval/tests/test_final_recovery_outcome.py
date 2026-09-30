@@ -2366,3 +2366,477 @@ async def test_visible_history_rollover_preserves_oldest_events():
     # The new event is not silently lost: it stays reserved for the caller's write
     # and the shrunk main history retains the newest kept events
     assert "Bulk event 59" in rewritten_visible
+
+
+# ── Visible history preservation regression tests ───────────────────────────
+
+from ..github_state_proxy import (
+    VISIBLE_HISTORY_END_MARKER,
+    VISIBLE_HISTORY_START_MARKER,
+    _build_history_block,
+    _parse_visible_history,
+)
+
+
+def _visible_history_marker_counts(visible: str) -> tuple[int, int, int]:
+    """Return (history_heading_count, start_marker_count, end_marker_count)."""
+    return (
+        visible.count("### History"),
+        visible.count(VISIBLE_HISTORY_START_MARKER),
+        visible.count(VISIBLE_HISTORY_END_MARKER),
+    )
+
+
+def _event_titles(visible: str) -> list[str]:
+    _, events = _parse_visible_history(visible)
+    return [str(e.get("event", "")) for e in events]
+
+
+def _make_history_state(status: str = "succeeded", test_result: str = "pass") -> dict:
+    st = _state()
+    st["status"] = status
+    st["test_result"] = test_result
+    st["command"] = {
+        "comment_id": 17, "kind": "record_test", "phase": "completed",
+        "args": {"actor": "alice"},
+    }
+    st["last_processed_comment_id"] = 17
+    return st
+
+
+def _seed_lifecycle_with_history(proxy, repo: str, pr_number: int, state: dict):
+    """Install store-emulating mocks so writes update the same comment body."""
+    visible = _lifecycle_visible(repo, pr_number, status=state["status"])
+    body_holder = {"body": _lifecycle_body(repo, pr_number, state, visible)}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _state):
+        from ..github_state_proxy import _build_hidden_state_body
+        body_holder["body"] = _build_hidden_state_body(vis, _state)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    return body_holder
+
+
+def _existing_history_events(count: int = 2) -> list[dict]:
+    return [
+        {"event": "Deployment requested", "machine": "test-machine", "ip": "127.0.0.1",
+         "components": "perception", "result": "",
+         "timestamp": "2026-09-30 10:00:00"},
+        {"event": "Machine `test-machine` deployed", "machine": "test-machine",
+         "ip": "127.0.0.1", "components": "perception", "result": "",
+         "timestamp": "2026-09-30 10:05:00"},
+    ][:count]
+
+
+def _prime_history(body_holder: dict, repo: str, pr_number: int, state: dict):
+    """Inject an existing visible History block into the stored lifecycle body."""
+    from ..github_state_proxy import _build_hidden_state_body
+    history_block = _build_history_block(_existing_history_events())
+    body = body_holder["body"]
+    visible, _, _ = body.partition("<!-- deploy-approval-state:v1")
+    new_visible = visible.rstrip() + "\n\n### History\n\n" + history_block + "\n"
+    body_holder["body"] = _build_hidden_state_body(new_visible, state)
+
+
+@pytest.mark.asyncio
+async def test_event_none_rewrite_preserves_visible_history():
+    """event=None rewrite must carry over ALL existing visible history events,
+    add no new event, and keep exactly one History section."""
+    controller, proxy, _policy, _github, _config = _controller()
+    state = _make_history_state()
+    body_holder = _seed_lifecycle_with_history(proxy, "repo", 1, state)
+    _prime_history(body_holder, "repo", 1, state)
+
+    fresh_markdown = _lifecycle_visible("repo", 1, status="succeeded")
+
+    await controller._write_lifecycle_with_history(
+        "repo", 1, state, fresh_markdown, event=None,
+    )
+
+    written_visible = proxy.write_hidden_state.call_args.args[2]
+    headings, starts, ends = _visible_history_marker_counts(written_visible)
+    assert headings == 1
+    assert starts == 1
+    assert ends == 1
+    titles = _event_titles(written_visible)
+    assert "Deployment requested" in titles
+    assert "Machine `test-machine` deployed" in titles
+    # No new event was fabricated by the event=None rewrite
+    assert len(titles) == 2
+
+
+@pytest.mark.asyncio
+async def test_terminal_cos_metadata_rebind_preserves_visible_history():
+    """COS metadata rebind must update state.cos while keeping the terminal
+    History (Test recorded) intact and emitting no new lifecycle event."""
+    controller, proxy, _policy, _github, _config = _controller()
+    state = _make_history_state()
+    body_holder = _seed_lifecycle_with_history(proxy, "repo", 1, state)
+    _prime_history(body_holder, "repo", 1, state)
+
+    # Simulate the terminal record_test write: Test recorded event added
+    terminal_md = comments_mod.succeeded_comment("repo", 1, "a" * 40)
+    recorded_event = {
+        "event": "Test recorded",
+        "lifecycle": "`testing` → `succeeded`",
+        "result": "pass",
+        "timestamp": comments_mod.beijing_now_str(),
+    }
+    await controller._write_lifecycle_with_history(
+        "repo", 1, state, terminal_md, event=recorded_event,
+    )
+    assert proxy.write_hidden_state.await_count == 1
+    first_write = proxy.write_hidden_state.call_args.args[2]
+    assert _event_titles(first_write).count("Test recorded") == 1
+
+    proxy.write_hidden_state.reset_mock()
+    fresh_state = _make_history_state()
+    fresh_state["head_sha"] = "a" * 40
+
+    async def _read_state(_repo, _pr):
+        return dict(fresh_state)
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    rebind_md = comments_mod.succeeded_comment(
+        "repo", 1, "a" * 40,
+        cos_object_key="phanthymotus_pr/phanthymotus/2026-09/pr-1/evidence.log.gz",
+        cos_bundle_sha256="ab" * 32,
+        cos_bundle_size=1024,
+    )
+    rebound = await controller._rebind_terminal_cos_if_current(
+        "repo", 1,
+        expected_head="a" * 40,
+        expected_terminal_status="succeeded",
+        expected_comment_id=17,
+        expected_command_kind="record_test",
+        expected_test_result="pass",
+        cos_metadata={"object_key": "phanthymotus_pr/phanthymotus/2026-09/pr-1/evidence.log.gz",
+                      "sha256": "ab" * 32, "size": 1024},
+        markdown=rebind_md,
+    )
+    assert rebound is True
+    assert proxy.write_hidden_state.await_count == 1
+
+    # state.cos updated correctly
+    written_state = proxy.write_hidden_state.call_args.args[3]
+    assert written_state["cos"]["object_key"] == \
+        "phanthymotus_pr/phanthymotus/2026-09/pr-1/evidence.log.gz"
+    assert written_state["cos"]["size"] == 1024
+
+    # Terminal History intact; no new event; exactly one History section
+    written_visible = proxy.write_hidden_state.call_args.args[2]
+    headings, starts, ends = _visible_history_marker_counts(written_visible)
+    assert (headings, starts, ends) == (1, 1, 1)
+    titles = _event_titles(written_visible)
+    assert titles.count("Test recorded") == 1
+    assert len(titles) == 3  # 2 pre-existing + Test recorded, nothing new
+
+
+@pytest.mark.asyncio
+async def test_terminal_cos_presigned_url_rebind_preserves_visible_history():
+    """Full record_test two-phase terminal flow: terminal write → COS metadata
+    rebind → presigned URL rebind. Final visible keeps the COS download block,
+    the full existing History, and exactly one Test recorded event."""
+    controller, proxy, _policy, _github, _config = _controller()
+    state = _make_history_state()
+    body_holder = _seed_lifecycle_with_history(proxy, "repo", 1, state)
+    _prime_history(body_holder, "repo", 1, state)
+
+    object_key = "phanthymotus_pr/phanthymotus/2026-09/pr-1/evidence-" + "a" * 40 + ".log.gz"
+
+    # Phase 0: terminal write with Test recorded event
+    terminal_md = comments_mod.succeeded_comment("repo", 1, "a" * 40)
+    recorded_event = {
+        "event": "Test recorded",
+        "lifecycle": "`testing` → `succeeded`",
+        "result": "pass",
+        "timestamp": comments_mod.beijing_now_str(),
+    }
+    await controller._write_lifecycle_with_history(
+        "repo", 1, state, terminal_md, event=recorded_event,
+    )
+
+    proxy.write_hidden_state.reset_mock()
+    fresh_state = _make_history_state()
+
+    async def _read_state(_repo, _pr):
+        return dict(fresh_state)
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    cos_metadata = {"object_key": object_key, "sha256": "cd" * 32, "size": 2048}
+
+    # Phase 1: COS metadata rebind
+    md_no_url = comments_mod.succeeded_comment(
+        "repo", 1, "a" * 40,
+        cos_object_key=object_key, cos_bundle_sha256="cd" * 32, cos_bundle_size=2048,
+    )
+    ok1 = await controller._rebind_terminal_cos_if_current(
+        "repo", 1,
+        expected_head="a" * 40, expected_terminal_status="succeeded",
+        expected_comment_id=17, expected_command_kind="record_test",
+        expected_test_result="pass", cos_metadata=cos_metadata, markdown=md_no_url,
+    )
+    assert ok1 is True
+
+    # Phase 2: presigned URL rebind
+    md_with_url = comments_mod.succeeded_comment(
+        "repo", 1, "a" * 40,
+        cos_object_key=object_key, cos_bundle_sha256="cd" * 32, cos_bundle_size=2048,
+        cos_download_url="https://bucket.cos.ap-beijing.myqcloud.com/signed?token=x",
+    )
+    ok2 = await controller._rebind_terminal_cos_if_current(
+        "repo", 1,
+        expected_head="a" * 40, expected_terminal_status="succeeded",
+        expected_comment_id=17, expected_command_kind="record_test",
+        expected_test_result="pass", cos_metadata=cos_metadata, markdown=md_with_url,
+    )
+    assert ok2 is True
+    assert proxy.write_hidden_state.await_count == 2
+
+    final_visible = proxy.write_hidden_state.call_args.args[2]
+    # COS evidence block present with correct key/sha/size rendering
+    assert "Download COS evidence" in final_visible
+    assert object_key in final_visible
+    assert "@sha256:cdcdcdcdcdcd" in final_visible  # sha256[:12] rendered
+    assert "2.0 KB" in final_visible
+
+    # History fully preserved across both rebinds
+    headings, starts, ends = _visible_history_marker_counts(final_visible)
+    assert (headings, starts, ends) == (1, 1, 1)
+    titles = _event_titles(final_visible)
+    assert titles.count("Test recorded") == 1
+    assert "Deployment requested" in titles
+    assert "Machine `test-machine` deployed" in titles
+
+
+@pytest.mark.asyncio
+async def test_history_rewrite_does_not_duplicate_events():
+    """Repeated event=None rewrites must be idempotent: event count never grows,
+    every original event appears exactly once, markers stay unique."""
+    controller, proxy, _policy, _github, _config = _controller()
+    state = _make_history_state()
+    body_holder = _seed_lifecycle_with_history(proxy, "repo", 1, state)
+    _prime_history(body_holder, "repo", 1, state)
+
+    fresh_markdown = _lifecycle_visible("repo", 1, status="succeeded")
+
+    for _ in range(2):
+        await controller._write_lifecycle_with_history(
+            "repo", 1, state, fresh_markdown, event=None,
+        )
+
+    written_visible = proxy.write_hidden_state.call_args.args[2]
+    headings, starts, ends = _visible_history_marker_counts(written_visible)
+    assert (headings, starts, ends) == (1, 1, 1)
+    titles = _event_titles(written_visible)
+    assert len(titles) == 2
+    for expected in ("Deployment requested", "Machine `test-machine` deployed"):
+        assert titles.count(expected) == 1
+
+
+@pytest.mark.asyncio
+async def test_history_rewrite_preserves_archive_links():
+    """event=None rewrite must keep the trusted archive comment linkage:
+    the Archived history block and its History Archive Page link survive,
+    without duplication, alongside the main visible History."""
+    controller, proxy, _policy, _github, _config = _controller()
+    state = _make_history_state()
+    body_holder = _seed_lifecycle_with_history(proxy, "repo", 1, state)
+    _prime_history(body_holder, "repo", 1, state)
+
+    from ..comments import BOT_MARKER
+    from ..github_state_proxy import _history_archive_marker
+    archive_body = "\n".join([
+        BOT_MARKER,
+        _history_archive_marker("repo", 1, 1),
+        "### History Archive Page 1",
+        "",
+        "Archived oldest history events.",
+    ])
+    proxy.get_issue_comments = AsyncMock(return_value=[
+        {"id": 42, "body": body_holder["body"]},
+        {"id": 77, "body": archive_body, "html_url":
+            "https://github.com/repo/pull/1#issuecomment-77"},
+    ])
+
+    fresh_markdown = _lifecycle_visible("repo", 1, status="succeeded")
+
+    await controller._write_lifecycle_with_history(
+        "repo", 1, state, fresh_markdown, event=None,
+    )
+
+    written_visible = proxy.write_hidden_state.call_args.args[2]
+    assert "### Archived history" in written_visible
+    assert "History Archive Page 1" in written_visible
+    assert written_visible.count("History Archive Page 1") == 1
+    # Main history still intact
+    headings, starts, ends = _visible_history_marker_counts(written_visible)
+    assert (headings, starts, ends) == (1, 1, 1)
+    assert len(_event_titles(written_visible)) == 2
+
+
+@pytest.mark.asyncio
+async def test_history_isolated_between_prs():
+    """History events, archive links, and lifecycle markers must never leak
+    across PRs or repos.
+
+    Uses fully disjoint sentinel event titles with exact membership/equality
+    assertions (no substring overlap possible):
+      - repo#289   → EVENT_ALPHA_REPO_ONE_289
+      - repo#290   → EVENT_BETA_REPO_ONE_290
+      - repo2#289  → EVENT_GAMMA_REPO_TWO_289  (different repo, same PR number)
+    Each lifecycle also gets its own trusted archive comment with a unique
+    html_url; rewrites must keep only the matching archive link per lifecycle.
+    """
+    controller, proxy, _policy, _github, _config = _controller()
+
+    EVENT_289 = "EVENT_ALPHA_REPO_ONE_289"
+    EVENT_290 = "EVENT_BETA_REPO_ONE_290"
+    EVENT_R2 = "EVENT_GAMMA_REPO_TWO_289"
+
+    ARCHIVE_URL_289 = "https://example.invalid/archive/alpha-289"
+    ARCHIVE_URL_290 = "https://example.invalid/archive/beta-290"
+    ARCHIVE_URL_R2 = "https://example.invalid/archive/gamma-repo2-289"
+
+    from ..comments import BOT_MARKER, lifecycle_marker
+    from ..github_state_proxy import (
+        _build_hidden_state_body,
+        _history_archive_marker,
+    )
+
+    def _make_spec(repo: str, pr: int, event_title: str):
+        """Seed a lifecycle primed with exactly one unique sentinel event."""
+        state = _make_history_state()
+        body_holder = _seed_lifecycle_with_history(proxy, repo, pr, state)
+        body = body_holder["body"]
+        visible, _, _ = body.partition("<!-- deploy-approval-state:v1")
+        history_block = _build_history_block([
+            {"event": event_title, "machine": f"m-{repo}-{pr}",
+             "ip": "127.0.0.1", "components": "perception", "result": "",
+             "timestamp": "2026-09-30 10:00:00"},
+        ])
+        new_visible = visible.rstrip() + "\n\n### History\n\n" + history_block + "\n"
+        body_holder["body"] = _build_hidden_state_body(new_visible, state)
+        return state, body_holder
+
+    def _archive_body(repo: str, pr: int) -> str:
+        return "\n".join([
+            BOT_MARKER,
+            _history_archive_marker(repo, pr, 1),
+            "### History Archive Page 1",
+            "",
+            "Archived oldest history events.",
+        ])
+
+    state_289, holder_289 = _make_spec("repo", 289, EVENT_289)
+    state_290, holder_290 = _make_spec("repo", 290, EVENT_290)
+    state_r2, holder_r2 = _make_spec("repo2", 289, EVENT_R2)
+
+    # Store emulation keyed by (repo, pr)
+    bodies = {
+        ("repo", 289): holder_289,
+        ("repo", 290): holder_290,
+        ("repo2", 289): holder_r2,
+    }
+    archive_urls = {
+        ("repo", 289): ARCHIVE_URL_289,
+        ("repo", 290): ARCHIVE_URL_290,
+        ("repo2", 289): ARCHIVE_URL_R2,
+    }
+
+    async def _find_trusted(repo, pr):
+        return {"id": 42, "body": bodies[(repo, pr)]["body"]}
+
+    async def _write_hidden_state(repo, pr, vis, _state):
+        bodies[(repo, pr)]["body"] = _build_hidden_state_body(vis, _state)
+        return {"id": 42}
+
+    async def _get_comments(repo, pr):
+        # Only this repo/pr's lifecycle comment and its own archive comment.
+        return [
+            {"id": 42, "body": bodies[(repo, pr)]["body"]},
+            {"id": 77, "body": _archive_body(repo, pr),
+             "html_url": archive_urls[(repo, pr)]},
+        ]
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(side_effect=_get_comments)
+    # Archive comments are trusted GitHub App comments (sync method).
+    proxy.is_bot_comment = MagicMock(return_value=True)
+
+    fresh_289 = _lifecycle_visible("repo", 289, status="succeeded")
+    fresh_290 = _lifecycle_visible("repo", 290, status="succeeded")
+    fresh_r2 = _lifecycle_visible("repo2", 289, status="succeeded")
+
+    await controller._write_lifecycle_with_history(
+        "repo", 289, state_289, fresh_289, event=None)
+    await controller._write_lifecycle_with_history(
+        "repo", 290, state_290, fresh_290, event=None)
+    await controller._write_lifecycle_with_history(
+        "repo2", 289, state_r2, fresh_r2, event=None)
+
+    visible_289 = proxy.write_hidden_state.call_args_list[0].args[2]
+    visible_290 = proxy.write_hidden_state.call_args_list[1].args[2]
+    visible_r2 = proxy.write_hidden_state.call_args_list[2].args[2]
+
+    # Exactly one History section per rewritten lifecycle.
+    headings_289, starts_289, ends_289 = _visible_history_marker_counts(visible_289)
+    headings_290, starts_290, ends_290 = _visible_history_marker_counts(visible_290)
+    headings_r2, starts_r2, ends_r2 = _visible_history_marker_counts(visible_r2)
+    assert (headings_289, starts_289, ends_289) == (1, 1, 1)
+    assert (headings_290, starts_290, ends_290) == (1, 1, 1)
+    assert (headings_r2, starts_r2, ends_r2) == (1, 1, 1)
+
+    titles_289 = _event_titles(visible_289)
+    titles_290 = _event_titles(visible_290)
+    titles_r2 = _event_titles(visible_r2)
+
+    # Exact event-title equality: each lifecycle carries exactly its own
+    # sentinel event — no duplication, no fabrication, no cross-contamination.
+    assert titles_289 == [EVENT_289]
+    assert titles_290 == [EVENT_290]
+    assert titles_r2 == [EVENT_R2]
+
+    # Exact membership: sentinel events never appear in another lifecycle.
+    assert EVENT_289 not in titles_290
+    assert EVENT_289 not in titles_r2
+    assert EVENT_290 not in titles_289
+    assert EVENT_290 not in titles_r2
+    assert EVENT_R2 not in titles_289
+    assert EVENT_R2 not in titles_290
+
+    # Archive link isolation: each visible keeps only its own archive URL.
+    assert ARCHIVE_URL_289 in visible_289
+    assert ARCHIVE_URL_290 not in visible_289
+    assert ARCHIVE_URL_R2 not in visible_289
+    assert ARCHIVE_URL_290 in visible_290
+    assert ARCHIVE_URL_289 not in visible_290
+    assert ARCHIVE_URL_R2 not in visible_290
+    assert ARCHIVE_URL_R2 in visible_r2
+    assert ARCHIVE_URL_289 not in visible_r2
+    assert ARCHIVE_URL_290 not in visible_r2
+
+    # "History Archive Page 1" link appears exactly once per lifecycle.
+    assert visible_289.count("History Archive Page 1") == 1
+    assert visible_290.count("History Archive Page 1") == 1
+    assert visible_r2.count("History Archive Page 1") == 1
+
+    # Lifecycle markers stay bound to their own repo/pr.
+    assert lifecycle_marker("repo", 289) in visible_289
+    assert lifecycle_marker("repo", 290) not in visible_289
+    assert lifecycle_marker("repo2", 289) not in visible_289
+    assert lifecycle_marker("repo", 290) in visible_290
+    assert lifecycle_marker("repo", 289) not in visible_290
+    assert lifecycle_marker("repo2", 289) not in visible_290
+    assert lifecycle_marker("repo2", 289) in visible_r2
+    assert lifecycle_marker("repo", 289) not in visible_r2
+    assert lifecycle_marker("repo", 290) not in visible_r2

@@ -601,7 +601,14 @@ class DeployController:
             "size": size,
         }
         if markdown:
-            await self.proxy.write_hidden_state(repo, pr_number, markdown, fresh_state)
+            # Terminal rebind must NOT bypass the history-aware lifecycle writer:
+            # a direct write_hidden_state would replace the visible lifecycle and
+            # drop the existing visible History (Test recorded, deployments, ...).
+            # event=None: refresh terminal rendering + state.cos only — the
+            # history-preserving writer carries existing events over verbatim.
+            await self._write_lifecycle_with_history(
+                repo, pr_number, fresh_state, markdown, event=None,
+            )
         return True
 
     def _resolve_component_runtime(
@@ -2836,6 +2843,9 @@ class DeployController:
             _, existing_events = _parse_visible_history(existing_visible)
 
         # 3. Build the prospective new visible markdown with event + existing events
+        #    _build_history_block emits only the marker-delimited event section;
+        #    the "### History" heading is not part of it, so it is carried here
+        #    to keep exactly one heading in every rendered lifecycle.
         if event is not None:
             # _insert_history_into_visible reads existing events from visible markdown.
             # new_visible_markdown is a fresh renderer output with no history section.
@@ -2843,10 +2853,22 @@ class DeployController:
             # then let _insert_history_into_visible prepend the new event on top.
             if existing_events:
                 existing_history_block = _build_history_block(existing_events)
-                temp_visible = new_visible_markdown.rstrip() + "\n\n" + existing_history_block + "\n"
+                temp_visible = (
+                    new_visible_markdown.rstrip()
+                    + "\n\n### History\n\n" + existing_history_block + "\n"
+                )
             else:
                 temp_visible = new_visible_markdown
             final_visible = _insert_history_into_visible(temp_visible, event)
+        elif existing_events:
+            # event=None rewrite (e.g. terminal COS metadata/presigned-URL rebind):
+            # no new history event may be created, but the existing visible history
+            # events MUST be carried over into the fresh renderer output.
+            existing_history_block = _build_history_block(existing_events)
+            final_visible = (
+                new_visible_markdown.rstrip()
+                + "\n\n### History\n\n" + existing_history_block + "\n"
+            )
         else:
             final_visible = new_visible_markdown
 
