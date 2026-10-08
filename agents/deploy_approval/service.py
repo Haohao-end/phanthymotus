@@ -1195,14 +1195,17 @@ class DeployController:
                 return True
 
             # Write executing state only after ALL gates pass.
+            # History-aware rewrite (event=None): "Deploying..." is a transient
+            # visible body, but existing visible History events MUST survive
+            # this durable persist that happens before the unsafe deploy POST.
             state["command"] = {
                 "comment_id": comment_id,
                 "kind": "approve_deploy",
                 "phase": "executing",
                 "args": {"machine": machine_alias, "actor": actor},
             }
-            await self.proxy.write_hidden_state(
-                repo, pr_number, "Deploying...", state
+            await self._write_lifecycle_with_history(
+                repo, pr_number, state, "Deploying...", event=None,
             )
 
             new_deployments = []
@@ -1504,6 +1507,20 @@ class DeployController:
             testing_markdown = comments_mod.testing(
                 repo, pr_number, pr_head, case_result="",
             )
+            # The LAST machine also gets its own per-machine history event,
+            # mirroring the partial-coverage path, so every successful machine
+            # appears exactly once in the visible History (newest-first).
+            machine_info = self.policy.get_machine(machine_alias)
+            last_machine_event = {
+                "event": f"Machine `{machine_alias}` deployed",
+                "machine": machine_alias,
+                "ip": machine_info.node_host if machine_info else "",
+                "timestamp": comments_mod.beijing_now_str(),
+            }
+            await self._write_lifecycle_with_history(
+                repo, pr_number, state, testing_markdown,
+                event=last_machine_event,
+            )
             event = {
                 "event": "All components deployed",
                 "lifecycle": "`deploy-requested` \u2192 `testing`",
@@ -1552,7 +1569,12 @@ class DeployController:
                 case_markdown = comments_mod.testing(
                     repo, pr_number, pr_head, case_result=case_result_str,
                 )
-                await self.proxy.write_hidden_state(repo, pr_number, case_markdown, fresh)
+                # History-aware refresh (event=None): the fresh renderer output
+                # must carry over the existing visible History events; no new
+                # event is created by an advisory case result refresh.
+                await self._write_lifecycle_with_history(
+                    repo, pr_number, fresh, case_markdown, event=None,
+                )
             elif case_results:
                 logger.warning(
                     "CASE_RESULT_DROPPED repo=%s pr=%s: fresh state mismatch, "

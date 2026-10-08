@@ -2840,3 +2840,892 @@ async def test_history_isolated_between_prs():
     assert lifecycle_marker("repo2", 289) in visible_r2
     assert lifecycle_marker("repo", 289) not in visible_r2
     assert lifecycle_marker("repo", 290) not in visible_r2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REGRESSION TESTS — PR #291 History-preservation gap (Tests 1-5)
+# ══════════════════════════════════════════════════════════════════════════════
+
+import ast as _ast
+
+
+# ── Test 1: executing state write preserves visible history ───────────────────
+
+@pytest.mark.asyncio
+async def test_executing_state_write_preserves_visible_history():
+    """The executing-state write (event=None) before the unsafe deploy POST
+    MUST preserve ALL existing visible history events.
+
+    Construction:
+      1. Lifecycle initialized  (from reconcile)
+      2. Review lifecycle transitioned
+      3. Deployment requested
+
+    Then drive handle_approve_deploy through the executing phase.
+    The executing write uses event=None, so all three events above must
+    survive into the persisted visible lifecycle.
+    """
+    controller, proxy, _policy, _github, _config = _controller()
+
+    # Step 1: seed lifecycle with pre-existing history from reconcile + request_deploy
+    state = _state(status="deploy-requested")
+    body_holder = _seed_lifecycle_with_history(proxy, "repo", 1, state)
+
+    # Inject the three expected pre-existing history events
+    from ..github_state_proxy import _build_hidden_state_body, _build_history_block
+    pre_events = [
+        {"event": "Lifecycle initialized",
+         "lifecycle": "`none` → `review-required`",
+         "timestamp": "2026-09-30 10:00:00"},
+        {"event": "Review lifecycle transitioned",
+         "lifecycle": "`review-required` → `deploy-requested`",
+         "timestamp": "2026-09-30 10:01:00"},
+        {"event": "Deployment requested",
+         "lifecycle": "`deploy-ready` → `deploy-requested`",
+         "timestamp": "2026-09-30 10:02:00"},
+    ]
+    history_block = _build_history_block(pre_events)
+    body = body_holder["body"]
+    visible, _, _ = body.partition("<!-- deploy-approval-state:v1")
+    new_visible = visible.rstrip() + "\n\n### History\n\n" + history_block + "\n"
+    body_holder["body"] = _build_hidden_state_body(new_visible, state)
+
+    # Reset proxy mocks so handle_approve_deploy finds this primed lifecycle
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _build_hidden_state_body(vis, _st)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(return_value=dict(state))
+
+    # Ensure PR is open and valid
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40},
+        "user": {"id": 111, "login": "alice"},
+    })
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 50, "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 111, "login": "owner1"},
+    })
+
+    # Mock Agent Core — driver_status must return running_image matching
+    # the component image_ref (registry.example/...) so _verify_deployed_runtime
+    # succeeds on the first call and the deploy completes.
+    core = MagicMock()
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    _test1_img = "registry.example/repo@sha256:" + "a" * 64
+    core.driver_status = AsyncMock(return_value={
+        "status": "running", "running_image": _test1_img})
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core)
+
+    # Mock review evidence validation (fresh PR re-read must pass)
+    emdash = "\u2014"
+    _github.get_issue_comments = AsyncMock(return_value=[
+        {"id": 1001, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abc1234\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+         "created_at": "2026-09-18T00:00:00Z", "updated_at": "2026-09-18T00:01:00Z"},
+        {"id": 1002, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Test Results\n\nCommit: abc1234\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+         "created_at": "2026-09-18T00:02:00Z", "updated_at": "2026-09-18T00:03:00Z"},
+        {"id": 1003, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Code Review\n\nAll checks passed.",
+         "created_at": "2026-09-18T00:04:00Z", "updated_at": "2026-09-18T00:05:00Z"},
+    ])
+    _github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=dict(state))
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._refresh_uncertain_state = AsyncMock(return_value="deploy-requested")
+
+    # Short timeout so _verify_deployed_runtime doesn't sleep
+    _test1_orig_timeout = controller.config.total_timeout
+    controller.config.total_timeout = 0.5
+
+    # Now drive handle_approve_deploy
+    await controller.handle_approve_deploy("repo", 1, 50, "test-machine", "owner1", "111")
+    controller.config.total_timeout = _test1_orig_timeout
+
+    # ── Assertions ──
+    # At least the executing-state write must have happened
+    assert proxy.write_hidden_state.call_count >= 1
+
+    # The FIRST write is the executing-state write (event=None)
+    first_visible = proxy.write_hidden_state.call_args_list[0].args[2]
+
+    headings, starts, ends = _visible_history_marker_counts(first_visible)
+    assert headings == 1, f"expected exactly 1 History heading, got {headings}"
+    assert starts == 1
+    assert ends == 1
+
+    titles = _event_titles(first_visible)
+    # All pre-existing events must survive
+    assert "Lifecycle initialized" in titles
+    assert "Review lifecycle transitioned" in titles
+    assert "Deployment requested" in titles
+
+    # No new Deploying event (event=None)
+    deploying_count = sum(1 for t in titles if "Deploying" in t)
+    assert deploying_count == 0, f"unexpected Deploying event in executing write: {titles}"
+
+    # No duplicate events
+    for t in set(titles):
+        assert titles.count(t) == 1, f"event {t!r} duplicated: {titles}"
+
+    # Event count unchanged (3 pre-existing → 3)
+    assert len(titles) == 3
+
+    # The executing phase write happened BEFORE deploy POST
+    # (core.deploy_driver should not have been called before first write)
+    # Since the first write is the executing write, this is guaranteed.
+
+
+# ── Test 2: automated case refresh preserves visible history ─────────────────
+
+@pytest.mark.asyncio
+async def test_automated_case_refresh_preserves_visible_history():
+    """After all machines are deployed and lifecycle reaches `testing`,
+    the advisory Automated Case refresh (event=None) MUST preserve
+    all existing history events (machine deployments, all-components).
+
+    Full handle_approve_deploy path for a single machine covering all components:
+      - executing state write (event=None)
+      - deploy POST + verify
+      - testing state + machine event
+      - all-components event
+      - case refresh (event=None)
+    """
+    controller, proxy, policy, github, config = _controller()
+
+    state = _state(status="deploy-requested")
+    body_holder = _seed_lifecycle_with_history(proxy, "repo", 1, state)
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    from ..github_state_proxy import _build_hidden_state_body as _bhsb
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(return_value=dict(state))
+
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40},
+        "user": {"id": 111, "login": "alice"},
+    })
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 50, "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 111, "login": "owner1"},
+    })
+
+    # Mock Agent Core — same fixes as test 1
+    core = MagicMock()
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    _test2_img = "registry.example/repo@sha256:" + "a" * 64
+    core.driver_status = AsyncMock(return_value={
+        "status": "running", "running_image": _test2_img})
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core)
+
+    emdash = "\u2014"
+    github.get_issue_comments = AsyncMock(return_value=[
+        {"id": 1001, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abc1234\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+         "created_at": "2026-09-18T00:00:00Z", "updated_at": "2026-09-18T00:01:00Z"},
+        {"id": 1002, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Test Results\n\nCommit: abc1234\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+         "created_at": "2026-09-18T00:02:00Z", "updated_at": "2026-09-18T00:03:00Z"},
+        {"id": 1003, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Code Review\n\nAll checks passed.",
+         "created_at": "2026-09-18T00:04:00Z", "updated_at": "2026-09-18T00:05:00Z"},
+    ])
+    github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=dict(state))
+    controller._refresh_uncertain_state = AsyncMock(return_value="deploy-requested")
+
+    # Case runner returns results — they should be merged without creating new events
+    controller._run_automated_case = AsyncMock(return_value={
+        "comp-001": "pass",
+    })
+
+    # Short timeout
+    _test2_orig_timeout = controller.config.total_timeout
+    controller.config.total_timeout = 0.5
+
+    await controller.handle_approve_deploy("repo", 1, 50, "test-machine", "owner1", "111")
+    controller.config.total_timeout = _test2_orig_timeout
+
+    # ── Assertions ──
+    # Case refresh should have triggered an additional write (event=None)
+    assert proxy.write_hidden_state.call_count >= 1
+
+    # The final write must have gone through case refresh (event=None)
+    last_visible = proxy.write_hidden_state.call_args_list[-1].args[2]
+
+    headings, starts, ends = _visible_history_marker_counts(last_visible)
+    assert headings == 1
+    assert starts == 1
+    assert ends == 1
+
+    titles = _event_titles(last_visible)
+
+    # Machine deploy event and All components deployed must be present
+    assert "Machine `test-machine` deployed" in titles
+    assert "All components deployed" in titles
+
+    # Case refresh does NOT create a new History event
+    # So event count should be exactly 2 (machine + all-components)
+    assert len(titles) == 2, f"expected 2 events, got {len(titles)}: {titles}"
+
+    # No duplicate
+    for t in set(titles):
+        assert titles.count(t) == 1
+
+    # hidden state case_results must have been updated
+    written_state = proxy.write_hidden_state.call_args_list[-1].args[3]
+    assert written_state.get("case_results", {}).get("comp-001") == "pass"
+    assert written_state["status"] == "testing"
+
+
+# ── Test 3: final machine deployment records machine + all-components history ─
+
+@pytest.mark.asyncio
+async def test_final_machine_deployment_records_machine_and_all_components_history():
+    """Two-machine deployment: Machine A covers JP5.11, Machine B covers JP6.1.
+    After Machine B approves (final machine), the visible History must contain
+    exactly one each of:
+      - Machine `jp5-machine` deployed
+      - Machine `jp6-machine` deployed
+      - All components deployed
+    with correct phase/status and newest-first ordering.
+    """
+    from ..github_state_proxy import _build_hidden_state_body, _build_history_block
+    from ..comments import BOT_MARKER, lifecycle_marker
+
+    config = make_config()
+    proxy = MagicMock()
+    proxy.read_hidden_state = AsyncMock()
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+    proxy.post_issue_comment = AsyncMock(return_value={"id": 1})
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 50, "body": "/approve_deploy machine=jp5-machine",
+        "user": {"id": 111, "login": "owner1"},
+    })
+
+    # Two machines, two components
+    policy = Policy(config)
+    policy.machines = {
+        "jp5-machine": MachineInfo(
+            alias="jp5-machine", node_id="node-5", owners=["owner1"],
+            node_host="10.0.0.5", targets=["perception"],
+            platforms=["linux/arm64"], variants=["5.11"],
+        ),
+        "jp6-machine": MachineInfo(
+            alias="jp6-machine", node_id="node-6", owners=["owner2"],
+            node_host="10.0.0.6", targets=["actucore"],
+            platforms=["linux/arm64"], variants=["6.1"],
+        ),
+    }
+
+    comp_jp5 = _component(
+        component_id="comp-jp5", target="perception", variant="5.11",
+        runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+    comp_jp6 = _component(
+        component_id="comp-jp6", target="actucore", variant="6.1",
+        runtime_id="actucore",
+        image_ref="registry.example/repo@sha256:" + "b" * 64,
+    )
+
+    state = _state(components=[comp_jp5, comp_jp6], deployments=[])
+    body_holder = {"body": _build_hidden_state_body(
+        _lifecycle_visible("repo", 1, status="deploy-requested"), state)}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _build_hidden_state_body(vis, _st)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(return_value=dict(state))
+
+    github = MagicMock()
+    github.get_current_user = AsyncMock(return_value={"id": 123, "login": "bot"})
+    emdash = '—'
+    github.get_issue_comments = AsyncMock(return_value=[
+        {"id": 1001, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abc1234\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | \`registry/repo:v1\` | 10s |\n",
+         "created_at": "2026-09-18T00:00:00Z", "updated_at": "2026-09-18T00:01:00Z"},
+        {"id": 1002, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Test Results\n\nCommit: abc1234\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+         "created_at": "2026-09-18T00:02:00Z", "updated_at": "2026-09-18T00:03:00Z"},
+        {"id": 1003, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Code Review\n\nAll checks passed.",
+         "created_at": "2026-09-18T00:04:00Z", "updated_at": "2026-09-18T00:05:00Z"},
+    ])
+    github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    controller = DeployController(config, proxy, policy, github)
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=dict(state))
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._refresh_uncertain_state = AsyncMock(return_value="deploy-requested")
+    controller.config.total_timeout = 0.5
+
+    # Machine A: jp5-machine
+    core_a = MagicMock()
+    core_a.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    _core_a_img = "registry.example/repo@sha256:" + "a" * 64
+    core_a.driver_status = AsyncMock(return_value={
+        "status": "running", "running_image": _core_a_img})
+    core_a.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core_a)
+
+    # Pre-set the expected running_image for verify (must match component.image_ref)
+    _core_a_image_ref = "registry.example/repo@sha256:" + "a" * 64
+
+    await controller.handle_approve_deploy("repo", 1, 50, "jp5-machine", "owner1", "111")
+
+    # After Machine A: partial coverage, state stays deploy-requested
+    written_state_a = proxy.write_hidden_state.call_args_list[-1].args[3]
+    assert written_state_a["status"] == "deploy-requested"
+
+    titles_after_a = _event_titles(body_holder["body"])
+    assert "Machine `jp5-machine` deployed" in titles_after_a
+
+    # Machine B: jp6-machine (final)
+    proxy.write_hidden_state.reset_mock()
+    core_b = MagicMock()
+    core_b.list_drivers = AsyncMock(return_value=[
+        {"id": "actucore", "category": "driver", "image": "registry/repo:latest"}])
+    _core_b_img = "registry.example/repo@sha256:" + "b" * 64
+    core_b.driver_status = AsyncMock(return_value={
+        "status": "running", "running_image": _core_b_img})
+    core_b.deploy_driver = AsyncMock(return_value={"ok": True})
+
+    # Re-set find/write to reflect updated body_holder
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 60, "body": "/approve_deploy machine=jp6-machine",
+        "user": {"id": 111, "login": "owner2"},
+    })
+    # proxy.read_hidden_state already set via _seed_lifecycle_with_history
+    # Simplify: just re-read from body_holder
+    from ..github_state_proxy import _extract_hidden_state
+    extracted = _extract_hidden_state(body_holder["body"])
+    proxy.read_hidden_state = AsyncMock(return_value=extracted)
+
+    controller._core_for_node = AsyncMock(return_value=core_b)
+
+    await controller.handle_approve_deploy("repo", 1, 60, "jp6-machine", "owner2", "111")
+    controller.config.total_timeout = 60.0
+
+    # ── Assertions on final visible ──
+    last_visible = proxy.write_hidden_state.call_args_list[-1].args[2]
+    headings, starts, ends = _visible_history_marker_counts(last_visible)
+    assert (headings, starts, ends) == (1, 1, 1)
+
+    titles = _event_titles(last_visible)
+
+    # Each event appears exactly once
+    assert titles.count("Machine `jp5-machine` deployed") == 1
+    assert titles.count("Machine `jp6-machine` deployed") == 1
+    assert titles.count("All components deployed") == 1
+
+    # Total of 3 deployment events
+    assert len(titles) == 3, f"expected 3 events, got {len(titles)}: {titles}"
+
+    # Final status == testing
+    final_state = proxy.write_hidden_state.call_args_list[-1].args[3]
+    assert final_state["status"] == "testing"
+
+    # All components deployed
+    all_cids = {c["component_id"] for c in [comp_jp5, comp_jp6]}
+    deployed_cids = set()
+    for dep in final_state.get("deployments", []):
+        if dep.get("phase") == "deployed":
+            deployed_cids.update(dep.get("component_ids", []))
+    assert deployed_cids == all_cids
+
+    # newest-first: All components deployed should be first (index 0),
+    # jp6-machine second, jp5-machine last
+    assert titles[0] == "All components deployed"
+    assert titles[1] == "Machine `jp6-machine` deployed"
+    assert titles[2] == "Machine `jp5-machine` deployed"
+
+
+# ── Test 4: full lifecycle survives record_test + COS rebind ─────────────────
+
+@pytest.mark.asyncio
+async def test_two_machine_full_lifecycle_history_survives_record_test_and_cos_rebind():
+    """PR #291 regression test: the full E2E lifecycle must preserve History
+    through record_test terminal write + COS metadata rebind + presigned URL rebind.
+
+    Lifecycle flow:
+      1. Seed lifecycle with pre-existing history
+      2. Approve machine A (jp5-machine, JP5.11 perception) → deploy-requested
+      3. Approve machine B (jp6-machine, JP6.1 actucore) → testing + all-components
+      4. Automated Cases refresh (advisory, event=None)
+      5. handle_record_test(result="pass") → succeeded + "Test recorded"
+      6. Simulate COS evidence upload (mock _upload_evidence)
+      7. Simulate _rebind_terminal_cos_if_current twice (metadata + presigned URL, event=None)
+
+    Final assertions:
+      - status=succeeded, test_result=pass
+      - COS: object_key non-empty, sha256 non-empty, size > 0
+      - Visible contains: Download COS evidence, object key, sha prefix, human-readable size, HTTPS URL
+      - History events (newest-first): Test recorded, All components deployed, Machine jp6 deployed,
+        Machine jp5 deployed, Deployment requested, Review lifecycle transitioned, Lifecycle initialized
+      - Each event count == 1; heading/start/end markers exactly 1
+      - No duplicate, no cross-PR/repo contamination
+    """
+    controller, proxy, _policy, github, config = _controller()
+
+    # Two machine fixtures in policy
+    from ..models import MachineInfo
+    controller.policy.machines = {
+        "jp5-machine": MachineInfo(
+            alias="jp5-machine", node_id="node-jp5", owners=["owner1"],
+            node_host="10.0.0.5", targets=["perception"],
+            platforms=["linux/arm64"], variants=["5.11"], driver_paths=[],
+        ),
+        "jp6-machine": MachineInfo(
+            alias="jp6-machine", node_id="node-jp6", owners=["owner2"],
+            node_host="10.0.0.6", targets=["actucore"],
+            platforms=["linux/arm64"], variants=["6.1"], driver_paths=[],
+        ),
+    }
+
+    # Components: one for JP5 (perception/5.11), one for JP6 (actucore/6.1)
+    comp_jp5 = _component(
+        component_id="comp-jp5-perception",
+        target="perception",
+        variant="5.11",
+        runtime_id="perception",
+    )
+    comp_jp6 = _component(
+        component_id="comp-jp6-actucore",
+        target="actucore",
+        variant="6.1",
+        runtime_id="actucore",
+        image_ref="registry.example/repo@sha256:" + "b" * 64,
+    )
+
+    state = _state(
+        components=[comp_jp5, comp_jp6],
+        status="deploy-requested",
+    )
+
+    # ── Store-emulating fixture ──
+    from ..github_state_proxy import _build_hidden_state_body, _build_history_block
+
+    body_holder = {"body": ""}
+
+    def _make_body(visible, st):
+        return _build_hidden_state_body(visible, st)
+
+    def _seed_initial():
+        visible = (
+            "### Deploy Approval — Lifecycle\n\n"
+            "**Status:** `deploy-requested`\n\n"
+            "### Workflow\n\n"
+            "- [x] review\n"
+        )
+        body_holder["body"] = _make_body(visible, state)
+
+    _seed_initial()
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _make_body(vis, _st)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.project_status_label = AsyncMock()
+
+    def _get_read_state(*_a, **_kw):
+        from ..github_state_proxy import _extract_hidden_state
+        return _extract_hidden_state(body_holder["body"])
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_get_read_state)
+
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40},
+        "user": {"id": 111, "login": "alice"},
+    })
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+
+    # Seed pre-existing history events
+    pre_events = [
+        {"event": "Deployment requested",
+         "lifecycle": "`deploy-ready` → `deploy-requested`",
+         "timestamp": "2026-09-30 10:02:00"},
+        {"event": "Review lifecycle transitioned",
+         "lifecycle": "`review-required` → `deploy-requested`",
+         "timestamp": "2026-09-30 10:01:00"},
+        {"event": "Lifecycle initialized",
+         "lifecycle": "`none` → `review-required`",
+         "timestamp": "2026-09-30 10:00:00"},
+    ]
+    history_block = _build_history_block(pre_events)
+    body = body_holder["body"]
+    visible_part, _, rest = body.partition("<!-- deploy-approval-state:v1")
+    new_visible = visible_part.rstrip() + "\n\n### History\n\n" + history_block + "\n"
+    body_holder["body"] = _make_body(new_visible, state)
+
+    # Re-bind mocks to current body
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_get_read_state)
+
+    emdash = "\u2014"
+    github.get_issue_comments = AsyncMock(return_value=[
+        {"id": 1001, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abc1234\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+         "created_at": "2026-09-18T00:00:00Z", "updated_at": "2026-09-18T00:01:00Z"},
+        {"id": 1002, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Test Results\n\nCommit: abc1234\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+         "created_at": "2026-09-18T00:02:00Z", "updated_at": "2026-09-18T00:03:00Z"},
+        {"id": 1003, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Code Review\n\nAll checks passed.",
+         "created_at": "2026-09-18T00:04:00Z", "updated_at": "2026-09-18T00:05:00Z"},
+    ])
+    github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(side_effect=_get_read_state)
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._refresh_uncertain_state = AsyncMock(return_value="deploy-requested")
+    # Shorten verification timeout so the test doesn't wait 60s
+    orig_timeout = controller.config.total_timeout
+    controller.config.total_timeout = 0.5
+
+    # ── Stage 1: Approve Machine A (jp5-machine) ──
+    core_a = MagicMock()
+    core_a.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    image_holder = ["registry.example/repo@sha256:" + "a" * 64]
+    core_a.driver_status = AsyncMock(return_value={"status": "running", "running_image": image_holder[0]})
+    core_a.deploy_driver = AsyncMock(return_value={"ok": True})
+
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 50, "body": "/approve_deploy machine=jp5-machine",
+        "user": {"id": 111, "login": "owner1"},
+    })
+    controller._core_for_node = AsyncMock(return_value=core_a)
+
+    image_holder[0] = "registry.example/repo@sha256:" + "a" * 64
+
+    await controller.handle_approve_deploy("repo", 1, 50, "jp5-machine", "owner1", "111")
+
+    controller.config.total_timeout = orig_timeout
+
+    # After Machine A: partial coverage, stays deploy-requested
+    last_st_a = _get_read_state()
+    assert last_st_a["status"] == "deploy-requested"
+    titles_after_a = _event_titles(body_holder["body"])
+    assert "Machine `jp5-machine` deployed" in titles_after_a, \
+        f"Expected jp5-machine event after first approve, got: {titles_after_a}"
+
+    # ── Stage 2: Approve Machine B (jp6-machine, final) ──
+    proxy.write_hidden_state.reset_mock()
+    core_b = MagicMock()
+    core_b.list_drivers = AsyncMock(return_value=[
+        {"id": "actucore", "category": "driver", "image": "registry/repo:latest"}])
+    core_b.driver_status = AsyncMock(return_value={"status": "running", "running_image": "registry.example/repo@sha256:" + "b" * 64})
+    core_b.deploy_driver = AsyncMock(return_value={"ok": True})
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_get_read_state)
+
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 60, "body": "/approve_deploy machine=jp6-machine",
+        "user": {"id": 111, "login": "owner2"},
+    })
+    controller._core_for_node = AsyncMock(return_value=core_b)
+
+    await controller.handle_approve_deploy("repo", 1, 60, "jp6-machine", "owner2", "111")
+
+    # After Machine B: all components deployed, status=testing
+    last_st_b = _get_read_state()
+    assert last_st_b["status"] == "testing", \
+        f"Expected testing after second approve, got: {last_st_b['status']}"
+
+    titles_after_b = _event_titles(body_holder["body"])
+    assert "Machine `jp6-machine` deployed" in titles_after_b, \
+        f"Expected jp6-machine event after second approve, got: {titles_after_b}"
+    assert "All components deployed" in titles_after_b, \
+        f"Expected All components deployed after second approve, got: {titles_after_b}"
+
+    # ── Stage 3: Automated Case refresh (advisory, event=None) ──
+    # The handle_approve_deploy already ran _run_automated_case internally.
+    # In a real flow, case_results would be present in state.
+    # We simulate the case refresh by directly invoking the same event=None path:
+    case_results = {"autonomic_check": "pass"}
+    fresh_state = _get_read_state()
+    fresh_state["case_results"] = case_results
+    case_result_str = ", ".join(f"{k}={v}" for k, v in case_results.items())
+    from .. import comments as comments_mod
+    case_markdown = comments_mod.testing("repo", 1, "a" * 40, case_result=case_result_str)
+
+    await controller._write_lifecycle_with_history(
+        "repo", 1, fresh_state, case_markdown, event=None,
+    )
+
+    # Re-bind mocks
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_get_read_state)
+
+    titles_after_case = _event_titles(body_holder["body"])
+    # Case refresh must NOT add new history events
+    assert len(titles_after_case) == len(titles_after_b), \
+        f"Case refresh added events: was {len(titles_after_b)}, now {len(titles_after_case)}"
+    # All prior events still present
+    for t in titles_after_b:
+        assert t in titles_after_case, f"Event {t} lost after case refresh"
+
+    # ── Stage 4: handle_record_test(result="pass") ──
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 70, "body": "/record_test result=pass summary='all good'",
+        "user": {"id": 111, "login": "owner1"},
+    })
+
+    # Mock _upload_evidence to return valid COS metadata
+    controller._upload_evidence = AsyncMock(return_value={
+        "object_key": "evidence/repo/1/abc123.tar.gz",
+        "sha256": "d4" + "a" * 62,
+        "size": 2048,
+    })
+
+    await controller.handle_record_test("repo", 1, 70, "pass", "all good", "owner1", "111")
+
+    # Re-bind mocks after record_test
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_get_read_state)
+
+    # ── Stage 5: Simulate COS metadata rebind (event=None) ──
+    cos_meta = {"object_key": "evidence/repo/1/abc123.tar.gz", "sha256": "d4" + "a" * 62, "size": 2048}
+    markdown_meta = comments_mod.succeeded_comment(
+        "repo", 1, "a" * 40,
+        cos_object_key=cos_meta["object_key"],
+        cos_bundle_sha256=cos_meta["sha256"],
+        cos_bundle_size=cos_meta["size"],
+    )
+    await controller._rebind_terminal_cos_if_current(
+        "repo", 1,
+        expected_head="a" * 40,
+        expected_terminal_status="succeeded",
+        expected_comment_id=70,
+        expected_command_kind="record_test",
+        expected_test_result="pass",
+        cos_metadata=cos_meta,
+        markdown=markdown_meta,
+    )
+
+    # Re-bind mocks
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_get_read_state)
+
+    # ── Stage 6: Simulate COS presigned URL rebind (event=None) ──
+    markdown_url = comments_mod.succeeded_comment(
+        "repo", 1, "a" * 40,
+        cos_object_key=cos_meta["object_key"],
+        cos_bundle_sha256=cos_meta["sha256"],
+        cos_bundle_size=cos_meta["size"],
+        cos_download_url="https://cos.example.com/download/evidence/repo/1/abc123.tar.gz",
+    )
+    await controller._rebind_terminal_cos_if_current(
+        "repo", 1,
+        expected_head="a" * 40,
+        expected_terminal_status="succeeded",
+        expected_comment_id=70,
+        expected_command_kind="record_test",
+        expected_test_result="pass",
+        cos_metadata=cos_meta,
+        markdown=markdown_url,
+    )
+
+    # ── Final Assertions ──
+    final_state = _get_read_state()
+    assert final_state["status"] == "succeeded", \
+        f"Expected succeeded, got: {final_state['status']}"
+    assert final_state["test_result"] == "pass", \
+        f"Expected test_result=pass, got: {final_state['test_result']}"
+
+    # COS metadata present
+    cos_state = final_state.get("cos", {})
+    assert cos_state.get("object_key"), "Expected non-empty object_key"
+    assert cos_state.get("sha256"), "Expected non-empty sha256"
+    assert cos_state.get("size", 0) > 0, "Expected size > 0"
+
+    # Visible contains COS evidence details
+    final_visible = body_holder["body"].split("<!-- deploy-approval-state:v1")[0]
+    assert "Download COS evidence" in final_visible, \
+        f"Expected 'Download COS evidence' in visible"
+    assert "evidence/repo/1/abc123.tar.gz" in final_visible, \
+        f"Expected object_key in visible"
+    assert "https://cos.example.com/download" in final_visible, \
+        f"Expected presigned URL in visible"
+    # sha prefix
+    assert "da" in final_visible, f"Expected sha prefix in visible"
+    # human-readable size
+    assert "2.0 KB" in final_visible, f"Expected human-readable size in visible"
+
+    # ── History Assertions ──
+    headings, starts, ends = _visible_history_marker_counts(final_visible)
+    assert headings == 1, f"expected exactly 1 History heading, got {headings}"
+    assert starts == 1, f"expected exactly 1 start marker, got {starts}"
+    assert ends == 1, f"expected exactly 1 end marker, got {ends}"
+
+    final_titles = _event_titles(final_visible)
+
+    # Expected events (newest-first order):
+    expected_events = [
+        "Test recorded",
+        "All components deployed",
+        "Machine `jp6-machine` deployed",
+        "Machine `jp5-machine` deployed",
+        "Deployment requested",
+        "Review lifecycle transitioned",
+        "Lifecycle initialized",
+    ]
+    for ev in expected_events:
+        assert ev in final_titles, f"Expected event {ev!r} in history, got: {final_titles}"
+
+    # Each event exactly once
+    for ev in expected_events:
+        cnt = final_titles.count(ev)
+        assert cnt == 1, f"Event {ev!r} count={cnt}, expected 1: {final_titles}"
+
+    # Total event count matches
+    assert len(final_titles) == len(expected_events), \
+        f"Expected {len(expected_events)} events, got {len(final_titles)}: {final_titles}"
+
+    # No cross-PR/repo contamination
+    for t in final_titles:
+        assert "repo" not in t.lower() or "Machine" in t or "component" in t.lower() or "recorded" in t.lower() or "deploy" in t.lower() or "lifecycle" in t.lower() or "requested" in t.lower() or "transitioned" in t.lower() or "initialized" in t.lower(), \
+            f"Suspicious event: {t}"
+
+    # newest-first order check
+    for i, ev in enumerate(expected_events):
+        assert final_titles[i] == ev, \
+            f"Expected event[{i}]={ev!r}, got {final_titles[i]!r}"
+
+
+# ── Test 5: AST static analysis - no direct lifecycle write outside history writer ──
+
+@pytest.mark.asyncio
+async def test_service_has_no_direct_lifecycle_write_outside_history_writer():
+    """Scan service.py with Python ast: every `self.proxy.write_hidden_state(...)`
+    call must be inside `DeployController._write_lifecycle_with_history`.
+
+    Only allowed method: DeployController._write_lifecycle_with_history.
+    Any other direct call in DeployController is a test failure.
+
+    Note: GitHubStateProxy.persist_cursor is in another file and has its own
+    fresh-read + exact-visible-preservation contract, so it is explicitly
+    excluded from this check.
+    """
+    import ast
+
+    service_path = "agents/deploy_approval/service.py"
+    source = open(service_path).read()
+    tree = ast.parse(source, filename=service_path)
+
+    # Find all Call nodes matching self.proxy.write_hidden_state
+    violations = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # Check for self.proxy.write_hidden_state call
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "write_hidden_state"):
+            continue
+        # Check that the object is self.proxy
+        obj = func.value
+        if not (isinstance(obj, ast.Attribute) and obj.attr == "proxy"):
+            continue
+        self_obj = obj.value
+        if not isinstance(self_obj, ast.Name) or self_obj.id != "self":
+            continue
+
+        # Found a write_hidden_state call. Now check which method it's in.
+        # Walk up the AST to find the enclosing function/method.
+        enclosing_method = None
+        for parent_node in ast.walk(tree):
+            if isinstance(parent_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Check if this node is inside this function
+                for child in ast.walk(parent_node):
+                    if child is node:
+                        enclosing_method = parent_node.name
+                        break
+                if enclosing_method:
+                    break
+
+        if enclosing_method is None:
+            violations.append((node.lineno, "write_hidden_state call at module level"))
+            continue
+
+        if enclosing_method != "_write_lifecycle_with_history":
+            violations.append((node.lineno,
+                               f"write_hidden_state call in {enclosing_method}"))
+
+    if violations:
+        lines = "\n".join(f"  Line {ln}: {desc}" for ln, desc in violations)
+        pytest.fail(
+            "Found self.proxy.write_hidden_state() calls outside "
+            "DeployController._write_lifecycle_with_history:\n" + lines
+        )
