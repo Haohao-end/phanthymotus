@@ -338,13 +338,16 @@ class GitHubClient:
         Returns a sorted, deduplicated list of repository full_names
         authorized for the current GitHub App installation.
 
-        Raises GitHubError on non-2xx, malformed schema, or pagination limit.
+        Raises GitHubError on non-2xx, malformed schema, pagination
+        inconsistency, or incomplete collection.
         """
         url = "/installation/repositories"
         repos: list[str] = []
         seen: set[str] = set()
         page = 1
         max_pages = 10  # bounded pagination per spec
+        expected_total: int | None = None
+        total_batch_entries: int = 0
         while page <= max_pages:
             resp = await self._request(
                 "GET", url,
@@ -365,11 +368,20 @@ class GitHubClient:
                 raise GitHubError(
                     "installation/repositories: invalid total_count"
                 )
+            # total_count must be consistent across all pages
+            if expected_total is None:
+                expected_total = total_count
+            elif total_count != expected_total:
+                raise GitHubError(
+                    f"installation/repositories: total_count changed from "
+                    f"{expected_total} to {total_count} on page {page}"
+                )
             repositories = data.get("repositories")
             if not isinstance(repositories, list):
                 raise GitHubError(
                     "installation/repositories: expected repositories list"
                 )
+            total_batch_entries += len(repositories)
             for item in repositories:
                 if not isinstance(item, dict):
                     raise GitHubError(
@@ -390,6 +402,19 @@ class GitHubClient:
         if page > max_pages:
             raise GitHubError(
                 f"installation repository pagination exceeded {max_pages} pages"
+            )
+        # Final completeness validation: the sum of all page batch lengths
+        # must equal total_count (no missing pages), and the number of
+        # unique repos must also equal total_count (no silent dedup).
+        if total_batch_entries != expected_total:
+            raise GitHubError(
+                f"installation/repositories: total batch entries "
+                f"{total_batch_entries} != total_count {expected_total}"
+            )
+        if len(seen) != expected_total:
+            raise GitHubError(
+                f"installation/repositories: unique repos "
+                f"{len(seen)} != total_count {expected_total}"
             )
         return sorted(repos)
 

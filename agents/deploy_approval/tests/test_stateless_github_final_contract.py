@@ -237,6 +237,8 @@ async def test_webhook_re_reads_comment_through_proxy(config, proxy, controller,
         "comment": {"id": 99},
     }
     request = _fake_webhook_request(config, proxy, controller, payload, "sha256=" + "0" * 64)
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
 
     with patch("agents.deploy_approval.router_webhook._verify_signature_impl", return_value=True):
         mock_github.get_comment.return_value = {"id": 99, "body": "/request_deploy"}
@@ -255,6 +257,8 @@ async def test_webhook_recognized_command_returns_deferred(config, proxy, contro
         "comment": {"id": 99},
     }
     request = _fake_webhook_request(config, proxy, controller, payload, "sha256=" + "0" * 64)
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
 
     with patch("agents.deploy_approval.router_webhook._verify_signature_impl", return_value=True):
         mock_github.get_comment.return_value = {"id": 99, "body": "/request_deploy"}
@@ -272,6 +276,8 @@ async def test_webhook_command_has_zero_controller_dispatch(config, proxy, contr
         "comment": {"id": 99},
     }
     request = _fake_webhook_request(config, proxy, controller, payload, "sha256=" + "0" * 64)
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
     controller.handle_request_deploy = AsyncMock()
     controller.handle_approve_deploy = AsyncMock()
     controller.handle_record_test = AsyncMock()
@@ -294,6 +300,8 @@ async def test_webhook_command_has_zero_hidden_state_write(config, proxy, contro
         "comment": {"id": 99},
     }
     request = _fake_webhook_request(config, proxy, controller, payload, "sha256=" + "0" * 64)
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
     proxy.write_hidden_state = AsyncMock()
 
     with patch("agents.deploy_approval.router_webhook._verify_signature_impl", return_value=True):
@@ -661,7 +669,9 @@ def test_cos_production_source_contains_no_placeholder_signed_url():
 
 @pytest.mark.asyncio
 async def test_cos_metadata_written_only_after_real_upload_success(controller, proxy, mock_github):
-    state = _state()
+    state = _state(components=[_component(component_id="comp-001", target="perception")],
+                   deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
+                   case_results={"comp-001": "pass"})
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
@@ -676,7 +686,8 @@ async def test_cos_metadata_written_only_after_real_upload_success(controller, p
     assert written_state["cos"]["sha256"] == "b" * 64
 
     proxy.write_hidden_state.reset_mock()
-    proxy.read_hidden_state = AsyncMock(return_value=_state())
+    # Use _state() with no components so bound_ids is empty and A4 check passes
+    proxy.read_hidden_state = AsyncMock(return_value=_state(components=[], deployments=[]))
     controller._upload_evidence = AsyncMock(return_value={"object_key": "", "sha256": "", "size": 0})
     await controller.handle_record_test("repo", 1, 102, "pass", "", "owner1", "")
 
@@ -935,6 +946,9 @@ async def test_restart_old_approve_comment_never_replayed(controller, proxy, con
 
     from ..github_command_watcher import GitHubCommandWatcher
 
+    config.active_repos = ["repo"]
+    config.auth_valid = True
+
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
     await watcher._process_pr("repo", 1)
@@ -1031,7 +1045,10 @@ def test_hidden_state_validator_accepts_exact_canonical_statuses():
 
 @pytest.mark.asyncio
 async def test_record_test_fail_uses_failed(controller, proxy, mock_github):
-    state = _state(status="testing", deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}])
+    state = _state(status="testing", components=[_component(component_id="comp-001", target="perception")],
+                   deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
+                   case_results={"comp-001": "fail"},
+                   last_processed_comment_id=0)
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()

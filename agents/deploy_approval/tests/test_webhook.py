@@ -59,6 +59,8 @@ async def test_unknown_repository_fails_closed(config):
 
     config.webhook_enabled = True
     config.github_webhook_secret = "secret"
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
 
     mock_proxy = MagicMock()
 

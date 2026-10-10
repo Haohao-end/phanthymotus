@@ -82,8 +82,17 @@ async def webhook(request: Request):
             detail="Malformed repo/pr_number/comment.id",
         )
 
-    if repo not in (config.github_repos or []):
-        logger.warning("webhook for un-allowlisted repo %r ignored", repo)
+    # Webhook mutation gate: use runtime-authorized active_repos,
+    # NOT the static DESIRED_REPOS (config.github_repos).
+    # Also require the auth snapshot to be valid.
+    if not config.active_repos or not getattr(config, "auth_valid", True):
+        logger.warning(
+            "webhook for repo %r ignored: no active repos or auth invalid",
+            repo,
+        )
+        raise HTTPException(status_code=403, detail="Authorization not available")
+    if repo not in config.active_repos:
+        logger.warning("webhook for unauthorized repo %r ignored", repo)
         raise HTTPException(status_code=404, detail="Repository not allowed")
 
     # Re-read comment from GitHub API (don't trust webhook body)

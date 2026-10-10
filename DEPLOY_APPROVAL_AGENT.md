@@ -242,19 +242,19 @@ machines:
   condition, not a startup failure.
 
 Startup resolves `ACTIVE_REPOS = DESIRED_REPOS ∩ AUTHORIZED_REPOS` via a
-single fresh `GET /installation/repositories` call at process startup.
-There is **no authorization cache**, no periodic refresh, and no second
-installation ID.
+fresh `GET /installation/repositories` call at process startup.
 
-When the administrator later adds the driver repository to the same GitHub App
-installation, a **restart** of the Deploy Approval process is sufficient:
-
-* no source code change
-* no `GITHUB_REPOS` change
-* no second installation ID
-* no rebuild required (permission change alone)
-* fresh startup discovery makes the driver active
-* `ACTIVE_REPOS` becomes `[main, driver]`
+**Authorization hot-reload (no restart required):** The Watcher periodically
+(every 120 seconds, using monotonic clock) forces a fresh installation token
+refresh via `GitHubAppAuth.refresh_installation_token()`, then re-fetches
+`GET /installation/repositories` with the new token.  The complete paginated
+repository list is validated; if the Driver repository becomes authorized, it
+is added to `ACTIVE_REPOS` and enters a **pending-baseline** gate where all
+its open PRs are baselined (cursor = max observed comment ID) before any
+command dispatch resumes.  If the Driver repository is revoked, it is
+removed at the next successful auth refresh cycle (up to ~120s) from `ACTIVE_REPOS`.  Auth recovery (invalid → valid)
+also triggers a full Driver re-baseline to prevent replay of commands posted
+during the authorization outage.
 
 Review Agent evidence is sourced exclusively from trusted GitHub PR
 conversation comments.  Deploy Approval does **not** access:

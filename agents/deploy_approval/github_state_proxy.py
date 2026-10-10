@@ -616,7 +616,12 @@ def _build_hidden_state_body(visible_markdown: str, state: dict) -> str:
         )
     hidden_block = f"{HIDDEN_STATE_MARKER}{hidden_json}\n-->"
     if visible_markdown:
-        return visible_markdown.rstrip() + "\n\n" + hidden_block
+        # Collapse all trailing newlines to a single newline before adding
+        # the standard two-newline separator.  This keeps the boundary before
+        # the hidden-state marker perfectly idempotent when persist_cursor
+        # re-reads body[:idx].rstrip() and re-serialises.
+        vm = visible_markdown.rstrip("\n") + "\n"
+        return vm + "\n\n" + hidden_block
     return hidden_block
 
 
@@ -1113,32 +1118,81 @@ class GitHubStateProxy:
             comment = await self.find_trusted_lifecycle_comment(repo, pr_number)
             if comment is None:
                 return None
+            first_comment_id = comment.get("id")
             body = comment.get("body", "")
             if not isinstance(body, str):
                 return None
 
-            # Extract existing visible markdown (everything before the marker)
+            # Locate hidden-state block to replace only the JSON payload.
+            # Preserving body[:idx] byte-for-byte so the visible History
+            # markdown is never re-serialised or normalised.
             idx = body.find(HIDDEN_STATE_MARKER)
             if idx < 0:
                 return None
-            visible_markdown = body[:idx].rstrip()
 
-            # Parse fresh hidden state
+            # Parse and validate fresh hidden state from the existing comment.
             fresh_state = _extract_hidden_state(body)
             if fresh_state is None:
                 return None
             fresh_state = _validate_hidden_state(fresh_state)
 
-            # Advance cursor without lowering it
+            # Advance cursor without lowering it — strictly increasing only.
+            # Reject bool (subclass of int) and non-int cursors outright.
+            if not isinstance(comment_id, int) or isinstance(comment_id, bool):
+                logger.warning(
+                    "persist_cursor %s#%s rejected non-int cursor: %r",
+                    repo, pr_number, comment_id,
+                )
+                return fresh_state
             old_cursor = fresh_state.get("last_processed_comment_id", 0)
-            if comment_id > old_cursor:
-                fresh_state["last_processed_comment_id"] = comment_id
+            if comment_id <= old_cursor:
+                # Cursor already at or past target — silent no-op.
+                # Prevents replay of stale commands from lowering the cursor.
+                return fresh_state
+            fresh_state["last_processed_comment_id"] = comment_id
 
-            # Write back with preserved visible markdown
-            await self.write_hidden_state(
-                repo, pr_number, visible_markdown, fresh_state,
+            # Build the new hidden block and splice it into the existing body.
+            hidden_json = json.dumps(
+                fresh_state, ensure_ascii=False, separators=(",", ":"),
             )
-            return fresh_state
+            if len(hidden_json.encode("utf-8")) > _MAX_HIDDEN_STATE_BYTES:
+                raise GitHubStateProxyError(
+                    f"hidden state JSON exceeds {_MAX_HIDDEN_STATE_BYTES} bytes"
+                )
+            new_hidden_block = (
+                f"{HIDDEN_STATE_MARKER}{hidden_json}\n-->"
+            )
+            new_body = body[:idx] + new_hidden_block
+            if len(new_body.encode("utf-8")) > _MAX_COMMENT_BODY_BYTES:
+                raise GitHubStateProxyError("comment body exceeds max size")
+
+            # Update existing comment in-place.
+            # TOCTOU guard (A2-04/A2-05): re-fetch the trusted comment and
+            # verify BOTH comment ID and body have not changed since we read
+            # them above.  If either differs, new_body built from the stale
+            # read would corrupt a concurrently-updated lifecycle comment —
+            # abort safely (fail-closed).  GitHub PATCH has no CAS; we rely
+            # on the single-writer constraint plus this identity check.
+            existing = await self.find_trusted_lifecycle_comment(
+                repo, pr_number,
+            )
+            if existing is not None:
+                existing_id = existing.get("id")
+                existing_body = existing.get("body", "")
+                if (
+                    isinstance(existing_id, int)
+                    and isinstance(existing_body, str)
+                    and existing_id == first_comment_id
+                    and existing_body == body
+                ):
+                    # update_comment raises on HTTP non-2xx / network error;
+                    # returns None on HTTP 2xx success.  No exception =>
+                    # write succeeded.  Do NOT check result is not None.
+                    await self.update_comment(
+                        repo, existing_id, new_body,
+                    )
+                    return fresh_state
+            return None
         except TrustedIdentityRequiredError:
             raise
         except Exception as e:

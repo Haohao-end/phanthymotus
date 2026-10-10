@@ -741,7 +741,7 @@ async def test_watcher_uncertain_without_new_approve_does_not_refresh_review():
 
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
-    await watcher._process_pr("repo", 1)
+    await watcher._process_pr("4paradigm/phanthymotus", 1)
 
     assert state["command"]["phase"] == "uncertain"
     assert controller.on_command.await_count == 0
@@ -753,6 +753,8 @@ async def test_watcher_uncertain_without_new_approve_does_not_refresh_review():
 @pytest.mark.asyncio
 async def test_watcher_uncertain_new_approve_refreshes_review_before_final_pre_deploy_validation():
     controller, proxy, policy, github, config = _controller()
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
     state = _state()
     state["command"]["phase"] = "uncertain"
     state["last_processed_comment_id"] = 17
@@ -842,7 +844,7 @@ async def test_watcher_uncertain_new_approve_refreshes_review_before_final_pre_d
     proxy.get_comment = AsyncMock(side_effect=_get_comment)
     proxy.is_bot_comment = MagicMock(return_value=False)
     proxy.comment_identity = AsyncMock(return_value=("111", "owner1"))
-    proxy.persist_cursor = AsyncMock()
+    proxy.persist_cursor = AsyncMock(return_value={"last_processed_comment_id": 99})
     core = AsyncMock()
     core.list_drivers = AsyncMock(side_effect=_list_drivers)
     core.driver_status = AsyncMock(side_effect=_driver_status)
@@ -856,7 +858,7 @@ async def test_watcher_uncertain_new_approve_refreshes_review_before_final_pre_d
 
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
-    await watcher._process_pr("repo", 1)
+    await watcher._process_pr("4paradigm/phanthymotus", 1)
 
     assert controller.on_command.await_count == 1
     assert controller.on_command.call_args.args[3] == 99
@@ -1071,6 +1073,8 @@ def test_poll_disabled_webhook_enabled_fails_config():
 async def test_webhook_remains_supplementary_zero_dispatch():
     controller, proxy, policy, github, config = _controller()
     config.webhook_enabled = True
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
     payload = {
         "action": "created",
         "repository": {"full_name": "4paradigm/phanthymotus"},
@@ -3507,7 +3511,10 @@ async def test_two_machine_full_lifecycle_history_survives_record_test_and_cos_r
     # The handle_approve_deploy already ran _run_automated_case internally.
     # In a real flow, case_results would be present in state.
     # We simulate the case refresh by directly invoking the same event=None path:
-    case_results = {"autonomic_check": "pass"}
+    case_results = {
+        "comp-jp5-perception": "pass",
+        "comp-jp6-actucore": "pass",
+    }
     fresh_state = _get_read_state()
     fresh_state["case_results"] = case_results
     case_result_str = ", ".join(f"{k}={v}" for k, v in case_results.items())
@@ -3729,3 +3736,3678 @@ async def test_service_has_no_direct_lifecycle_write_outside_history_writer():
             "Found self.proxy.write_hidden_state() calls outside "
             "DeployController._write_lifecycle_with_history:\n" + lines
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCKER-1 — IPv4 approve selector exact revalidation (external fast acceptance)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_ipv4_approve_selector_survives_final_comment_revalidation_and_persists_alias():
+    """A literal IPv4 selector must survive final comment revalidation and
+    persist ONLY the canonical MachineInfo.alias in hidden state/history.
+    """
+    controller, proxy, _policy, _github, _config = _controller()
+
+    # IPv4 selector — literal, as written by the user in the GitHub comment
+    ip_selector = "10.100.129.72"
+    canonical_alias = "tianyi2-005"
+
+    state = _state(status="deploy-requested")
+    body_holder = _seed_lifecycle_with_history(proxy, "repo", 1, state)
+
+    from ..github_state_proxy import _build_hidden_state_body as _bhsb
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(return_value=dict(state))
+
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 50, "body": f"/approve_deploy machine={ip_selector}",
+        "user": {"id": 111, "login": "owner1"},
+    })
+
+    core = MagicMock()
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    img = "registry.example/repo@sha256:" + "a" * 64
+    core.driver_status = AsyncMock(return_value={"status": "running", "running_image": img})
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core)
+
+    emdash = "\u2014"
+    _github.get_issue_comments = AsyncMock(return_value=[
+        {"id": 1001, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abc1234\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+         "created_at": "2026-09-18T00:00:00Z", "updated_at": "2026-09-18T00:01:00Z"},
+        {"id": 1002, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Test Results\n\nCommit: abc1234\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+         "created_at": "2026-09-18T00:02:00Z", "updated_at": "2026-09-18T00:03:00Z"},
+        {"id": 1003, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Code Review\n\nAll checks passed.",
+         "created_at": "2026-09-18T00:04:00Z", "updated_at": "2026-09-18T00:05:00Z"},
+    ])
+    _github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=dict(state))
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._refresh_uncertain_state = AsyncMock(return_value="deploy-requested")
+    orig_timeout = controller.config.total_timeout
+    controller.config.total_timeout = 0.5
+
+    # Two real machines: canonical alias path + IPv4 selector.
+    from ..models import MachineInfo
+    controller.policy.machines = {
+        canonical_alias: MachineInfo(
+            alias=canonical_alias, node_id="node-tianyi",
+            owners=["owner1"], node_host=ip_selector,
+            targets=["perception"], platforms=["linux/arm64"],
+            variants=["5.11"], driver_paths=[],
+        ),
+        "other-machine": MachineInfo(
+            alias="other-machine", node_id="node-other",
+            owners=["owner2"], node_host="10.0.0.9",
+            targets=["actucore"], platforms=["linux/arm64"],
+            variants=["6.1"], driver_paths=[],
+        ),
+    }
+
+    # Re-seed the store after policy change.
+    body_holder["body"] = _bhsb(
+        _lifecycle_visible("repo", 1, status="deploy-requested"),
+        state,
+    )
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+
+    comp_jp5 = _component(
+        component_id="comp-jp5-perception", target="perception",
+        variant="5.11", runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+    state = _state(components=[comp_jp5], status="deploy-requested")
+    body_holder["body"] = _bhsb(
+        _lifecycle_visible("repo", 1, status="deploy-requested"),
+        state,
+    )
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(return_value=dict(state))
+
+    from ..github_state_proxy import _extract_hidden_state
+
+    async def _read_state(*_a, **_kw):
+        return _extract_hidden_state(body_holder["body"])
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    await controller.handle_approve_deploy("repo", 1, 50, ip_selector, "owner1", "111")
+
+    controller.config.total_timeout = orig_timeout
+
+    # Canonical alias persisted in hidden state — NOT the raw IPv4 selector.
+    hidden = await _read_state()
+    assert hidden["deployments"] == [{"machine": canonical_alias, "component_ids": ["comp-jp5-perception"], "phase": "deployed"}], \
+        f"expected canonical alias in deployments, got {hidden.get('deployments')}"
+    assert hidden.get("last_processed_comment_id") == 50
+
+    # IPv4 selector reached the deploy path: one deploy POST occurred.
+    assert core.deploy_driver.await_count == 1
+
+    # The original IP comment passes exact final revalidation — no revoked event.
+    titles = _event_titles(body_holder["body"])
+    assert titles.count("Approval revoked") == 0
+
+
+@pytest.mark.asyncio
+async def test_ipv4_approve_rejects_edited_selector_before_unsafe_post():
+    """If the approval comment is edited after preflight (IP->alias,
+    alias->IP), final exact-comment revalidation MUST fail closed and
+    no unsafe deploy POST may fire.
+
+    The persisted state keeps only canonical MachineInfo.alias.
+    """
+    controller, proxy, _policy, github, _config = _controller()
+
+    alias = "tianyi2-005"
+    ip_selector = "10.100.129.72"
+    orig_comment = f"/approve_deploy machine={ip_selector}"
+
+    state = _state(status="deploy-requested")
+    body_holder = _seed_lifecycle_with_history(proxy, "repo", 1, state)
+    from ..github_state_proxy import _build_hidden_state_body as _bhsb, _extract_hidden_state
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(return_value=dict(state))
+
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+
+    async def _read_state(*_a, **_kw):
+        return _extract_hidden_state(body_holder["body"])
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    # Policy carries both machines (canonical alias + literal IP resolution).
+    from ..models import MachineInfo
+    controller.policy.machines = {
+        alias: MachineInfo(
+            alias=alias, node_id="node-tianyi",
+            owners=["owner1"], node_host=ip_selector,
+            targets=["perception"], platforms=["linux/arm64"],
+            variants=["5.11"], driver_paths=[],
+        ),
+        "other": MachineInfo(
+            alias="other", node_id="node-other",
+            owners=["owner2"], node_host="10.0.0.9",
+            targets=["actucore"], platforms=["linux/arm64"],
+            variants=["6.1"], driver_paths=[],
+        ),
+    }
+
+    core = MagicMock()
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    img = "registry.example/repo@sha256:" + "a" * 64
+    core.driver_status = AsyncMock(return_value={"status": "running", "running_image": img})
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core)
+
+    emdash = "\u2014"
+    github.get_issue_comments = AsyncMock(return_value=[
+        {"id": 1001, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abc1234\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+         "created_at": "2026-09-18T00:00:00Z", "updated_at": "2026-09-18T00:01:00Z"},
+        {"id": 1002, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Test Results\n\nCommit: abc1234\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+         "created_at": "2026-09-18T00:02:00Z", "updated_at": "2026-09-18T00:03:00Z"},
+        {"id": 1003, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Code Review\n\nAll checks passed.",
+         "created_at": "2026-09-18T00:04:00Z", "updated_at": "2026-09-18T00:05:00Z"},
+    ])
+    github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(side_effect=_read_state)
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._refresh_uncertain_state = AsyncMock(return_value="deploy-requested")
+    orig_timeout = controller.config.total_timeout
+    controller.config.total_timeout = 0.5
+
+    # Machine with JP5 component.
+    comp_jp5 = _component(
+        component_id="comp-jp5-perception", target="perception",
+        variant="5.11", runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+    state = _state(components=[comp_jp5], status="deploy-requested")
+    body_holder["body"] = _bhsb(
+        _lifecycle_visible("repo", 1, status="deploy-requested"),
+        state,
+    )
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+
+    # ── Case 1: literal IPv4 comment is revalidated exactly ──
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 50, "body": orig_comment,
+        "user": {"id": 111, "login": "owner1"},
+    })
+    await controller.handle_approve_deploy("repo", 1, 50, ip_selector, "owner1", "111")
+    controller.config.total_timeout = orig_timeout
+    assert core.deploy_driver.await_count == 1
+
+    hidden = await _read_state()
+    assert hidden["deployments"] == [{"machine": alias, "component_ids": ["comp-jp5-perception"], "phase": "deployed"}], \
+        f"expected canonical alias, got {hidden.get('deployments')}"
+    assert "Approval revoked" not in _event_titles(body_holder["body"])
+
+    # ── Case 2: comment edited IP -> alias ──
+    proxy.write_hidden_state.reset_mock()
+    orig_comment_a = "/approve_deploy machine=other"
+    body_holder["body"] = _bhsb(
+        _lifecycle_visible("repo", 1, status="deploy-requested"),
+        state,
+    )
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 50, "body": orig_comment_a,
+        "user": {"id": 111, "login": "owner1"},
+    })
+    core.deploy_driver.reset_mock()
+    await controller.handle_approve_deploy("repo", 1, 50, ip_selector, "owner1", "111")
+    # Exact selector comparison fails: persisted selector was the IP, comment changed to another alias.
+    assert core.deploy_driver.await_count == 0
+    titles = _event_titles(body_holder["body"])
+    assert titles.count("Approval revoked") == 1, f"expected Approval revoked, got {titles}"
+    assert "Machine `other` selected" not in titles
+
+    # ── Case 3: comment edited alias -> IP (different from the parsed selector) ──
+    proxy.write_hidden_state.reset_mock()
+    body_holder["body"] = _bhsb(
+        _lifecycle_visible("repo", 1, status="deploy-requested"),
+        state,
+    )
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 50, "body": "/approve_deploy machine=10.100.0.9",
+        "user": {"id": 111, "login": "owner1"},
+    })
+    core.deploy_driver.reset_mock()
+    await controller.handle_approve_deploy("repo", 1, 50, ip_selector, "owner1", "111")
+    assert core.deploy_driver.await_count == 0
+    titles = _event_titles(body_holder["body"])
+    assert titles.count("Approval revoked") == 1, f"expected Approval revoked, got {titles}"
+
+
+# ── Blocker-2 — zero coverage ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_zero_coverage_approve_writes_valid_state_and_preserves_existing_deployments():
+    """A machine that covers zero remaining components must still:
+      - persist a schema-valid completed command (args.machine present),
+      - preserve existing successful deployments in hidden state and the
+        visible deploy_requested rendering,
+      - write History exactly once (no duplicate events),
+      - never fire a deploy POST.
+
+    The written state is validated through the production `_validate_hidden_state`
+    (same validation that precedes unsafe deploy POSTs).
+    """
+    controller, proxy, _policy, _github, _config = _controller()
+
+    from ..github_state_proxy import (
+        _build_hidden_state_body as _bhsb,
+        _extract_hidden_state,
+        _validate_hidden_state,
+    )
+
+    state = _state(
+        components=[
+            _component(component_id="comp-a", target="perception", runtime_id="perception"),
+            _component(component_id="comp-b", target="actucore", runtime_id="actucore"),
+        ],
+        deployments=[
+            {"machine": "old-machine", "component_ids": ["comp-a"], "phase": "deployed"},
+        ],
+        status="deploy-requested",
+        head_sha="a" * 40,
+        command={
+            "comment_id": 55,
+            "kind": "approve_deploy",
+            "phase": "completed",
+            "args": {"machine": "other-machine", "actor": "owner1"},
+        },
+        last_processed_comment_id=55,
+    )
+    body_holder = {"body": _bhsb(
+        _lifecycle_visible("repo", 1, status="deploy-requested"),
+        state,
+    )}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    async def _read_state(*_a, **_kw):
+        return _extract_hidden_state(body_holder["body"])
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 55, "body": "/approve_deploy machine=other-machine",
+        "user": {"id": 111, "login": "owner1"},
+    })
+
+    # Policy: zero coverage for other-machine on both components.
+    from ..models import MachineInfo
+    controller.policy.machines = {
+        "other-machine": MachineInfo(
+            alias="other-machine", node_id="node-x",
+            owners=["owner1"], node_host="10.0.0.9",
+            targets=["actucore"], platforms=["linux/arm64"],
+            variants=["6.1"], driver_paths=[],
+        ),
+        "good-machine": MachineInfo(
+            alias="good-machine", node_id="node-y",
+            owners=["owner2"], node_host="10.0.0.10",
+            targets=["perception"], platforms=["linux/arm64"],
+            variants=["5.11"], driver_paths=[],
+        ),
+    }
+
+    controller.config.total_timeout = 0.5
+
+    await controller.handle_approve_deploy("repo", 1, 55, "other-machine", "owner1", "111")
+
+    # Zero unsafe deploy POST.
+    assert proxy.write_hidden_state.await_count == 1
+
+    written_state = proxy.write_hidden_state.call_args.args[3]
+    assert written_state["status"] == "deploy-requested"
+    # Schema-valid completed command: args.machine present.
+    assert written_state["command"]["phase"] == "completed"
+    assert written_state["command"]["args"] == {
+        "machine": "other-machine", "actor": "owner1",
+    }, f"unexpected command args: {written_state['command'].get('args')}"
+    # Existing deployments preserved in hidden state.
+    assert written_state["deployments"] == [{"machine": "old-machine", "component_ids": ["comp-a"], "phase": "deployed"}]
+
+    # Validated through the production validator (same contract as pre-deploy).
+    _validate_hidden_state(written_state)
+
+    # Visible deploy_requested rendering carries existing deployments.
+    written_visible = proxy.write_hidden_state.call_args.args[2]
+    assert "old-machine" in written_visible, \
+        f"existing deployment missing from visible rendering: {written_visible}"
+
+    # History: exactly one Machine selected event, no duplicates.
+    titles = _event_titles(body_holder["body"])
+    assert titles.count(f"Machine `other-machine` selected") == 1
+    assert len(titles) == 1
+
+
+# ── Blocker-3A — atomic final machine + all-components ────────────────────────
+
+@pytest.mark.asyncio
+async def test_final_machine_and_all_components_history_are_persisted_atomically():
+    """The final machine that completes all components MUST persist BOTH
+    'Machine `<alias>` deployed' AND 'All components deployed' in a SINGLE
+    _write_lifecycle_with_history call using the `events=` parameter.
+
+    This eliminates the crash window between the two separate lifecycle writes.
+    """
+    controller, proxy, policy, github, config = _controller()
+
+    from ..models import MachineInfo
+    controller.policy.machines = {
+        "jp5-machine": MachineInfo(
+            alias="jp5-machine", node_id="node-5", owners=["owner1"],
+            node_host="10.0.0.5", targets=["perception"],
+            platforms=["linux/arm64"], variants=["5.11"], driver_paths=[],
+        ),
+        "jp6-machine": MachineInfo(
+            alias="jp6-machine", node_id="node-6", owners=["owner2"],
+            node_host="10.0.0.6", targets=["actucore"],
+            platforms=["linux/arm64"], variants=["6.1"], driver_paths=[],
+        ),
+    }
+
+    comp_jp5 = _component(
+        component_id="comp-jp5-perception", target="perception",
+        variant="5.11", runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+    comp_jp6 = _component(
+        component_id="comp-jp6-actucore", target="actucore",
+        variant="6.1", runtime_id="actucore",
+        image_ref="registry.example/repo@sha256:" + "b" * 64,
+    )
+
+    state = _state(components=[comp_jp5, comp_jp6], deployments=[])
+    from ..github_state_proxy import _build_hidden_state_body as _bhsb
+    body_holder = {"body": _bhsb(
+        _lifecycle_visible("repo", 1, status="deploy-requested"), state)}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(return_value=dict(state))
+
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 50, "body": "/approve_deploy machine=jp5-machine",
+        "user": {"id": 111, "login": "owner1"},
+    })
+
+    github = MagicMock()
+    github.get_current_user = AsyncMock(return_value={"id": 123, "login": "bot"})
+    emdash = "\u2014"
+    github.get_issue_comments = AsyncMock(return_value=[
+        {"id": 1001, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abc1234\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+         "created_at": "2026-09-18T00:00:00Z", "updated_at": "2026-09-18T00:01:00Z"},
+        {"id": 1002, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Test Results\n\nCommit: abc1234\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+         "created_at": "2026-09-18T00:02:00Z", "updated_at": "2026-09-18T00:03:00Z"},
+        {"id": 1003, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Code Review\n\nAll checks passed.",
+         "created_at": "2026-09-18T00:04:00Z", "updated_at": "2026-09-18T00:05:00Z"},
+    ])
+    github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=dict(state))
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._refresh_uncertain_state = AsyncMock(return_value="deploy-requested")
+    controller.config.total_timeout = 0.5
+
+    # Machine A: partial coverage
+    core_a = MagicMock()
+    core_a.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    core_a.driver_status = AsyncMock(return_value={"status": "running", "running_image": "registry.example/repo@sha256:" + "a" * 64})
+    core_a.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core_a)
+
+    await controller.handle_approve_deploy("repo", 1, 50, "jp5-machine", "owner1", "111")
+    assert proxy.write_hidden_state.call_count >= 1
+    written_state_a = proxy.write_hidden_state.call_args_list[-1].args[3]
+    assert written_state_a["status"] == "deploy-requested"
+
+    # Machine B: final machine → testing
+    proxy.write_hidden_state.reset_mock()
+    core_b = MagicMock()
+    core_b.list_drivers = AsyncMock(return_value=[
+        {"id": "actucore", "category": "driver", "image": "registry/repo:latest"}])
+    core_b.driver_status = AsyncMock(return_value={"status": "running", "running_image": "registry.example/repo@sha256:" + "b" * 64})
+    core_b.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core_b)
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+
+    from ..github_state_proxy import _extract_hidden_state
+
+    async def _read_state(*_a, **_kw):
+        return _extract_hidden_state(body_holder["body"])
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 60, "body": "/approve_deploy machine=jp6-machine",
+        "user": {"id": 111, "login": "owner2"},
+    })
+
+    # ── Assertion: ONE durable testing-transition write ──
+    # Preparatory writes (executing "Deploying...") are normal safety design;
+    # the atomicity requirement applies to the final transition: exactly one
+    # write_hidden_state call whose persisted state has status "testing".
+    # We capture each call AT CALL TIME via deepcopy so stale references
+    # don't mask split writes.
+    from copy import deepcopy
+
+    captured_calls = []
+    original_write = proxy.write_hidden_state.side_effect
+
+    async def _capturing_write(_repo, _pr, vis, _st):
+        captured_calls.append({
+            "visible": deepcopy(vis),
+            "state": deepcopy(_st),
+        })
+        return await original_write(_repo, _pr, vis, _st)
+
+    proxy.write_hidden_state = AsyncMock(side_effect=_capturing_write)
+
+    # Single jp6-machine approve — the ONLY call. The deepcopy capture
+    # is installed BEFORE this call so the testing-transition write is
+    # recorded at the exact boundary.
+    await controller.handle_approve_deploy("repo", 1, 60, "jp6-machine", "owner2", "111")
+
+    testing_writes = [
+        c for c in captured_calls
+        if isinstance(c["state"], dict) and c["state"].get("status") == "testing"
+    ]
+    # The atomicity invariant applies to the FIRST durable transition
+    # from deploy-requested to testing.  Subsequent event=None advisory
+    # Case-refresh writes also carry status=testing and must be allowed.
+    assert len(testing_writes) >= 1, \
+        f"Expected at least 1 testing-transition write, got {len(testing_writes)}"
+
+    # The FIRST testing write must already contain both History events
+    # in newest-first order.  Subsequent advisory refreshes must NOT
+    # recreate the missing deploy-requested -> testing transition events.
+    testing_cap = testing_writes[0]
+    titles_first = _event_titles(testing_cap["visible"])
+    assert "All components deployed" in titles_first, \
+        f"FIRST testing write must have 'All components deployed', got {titles_first}"
+    assert "Machine `jp6-machine` deployed" in titles_first, \
+        f"FIRST testing write must have 'Machine jp6-machine deployed', got {titles_first}"
+    # Verify newest-first ordering in the FIRST write
+    idx_all = titles_first.index("All components deployed")
+    idx_machine = titles_first.index("Machine `jp6-machine` deployed")
+    assert idx_all < idx_machine, \
+        f"Expected 'All components deployed' before 'Machine jp6-machine deployed', got {titles_first}"
+
+    # Validate the first write itself for completeness
+    for bad_key in ("events", "history", "history_events"):
+        assert bad_key not in testing_cap["state"], \
+            f"Hidden state must not have '{bad_key}'; found in {testing_cap['state'].keys()}"
+
+    # Validate with production validators.
+    from ..github_state_proxy import _build_hidden_state_body as _bhsb, _validate_hidden_state
+    roundtrip = _bhsb(testing_cap["visible"], testing_cap["state"])
+    _validate_hidden_state(_extract_hidden_state(roundtrip))
+
+    # Subsequent advisory Case-refresh writes (if any) must NOT introduce
+    # a second missing History transition: they preserve existing events.
+    for extra_cap in testing_writes[1:]:
+        extra_titles = _event_titles(extra_cap["visible"])
+        assert extra_titles == titles_first, \
+            f"Advisory refresh must not change History events. Before: {titles_first}, After: {extra_titles}"
+
+
+    # ── Visible history: both events present, newest-first ──
+    titles = _event_titles(testing_cap["visible"])
+    assert titles.count("Machine `jp6-machine` deployed") == 1, \
+        f"Expected 1 'Machine jp6-machine deployed' in history, got {titles}"
+    assert titles.count("All components deployed") == 1, \
+        f"Expected 1 'All components deployed' in history, got {titles}"
+    assert titles[0] == "All components deployed", \
+        f"Expected 'All components deployed' first (newest), got {titles}"
+    assert titles[1] == "Machine `jp6-machine` deployed", \
+        f"Expected 'Machine jp6-machine deployed' second, got {titles}"
+
+    # Partial machine history (jp5) must still be present.
+    assert "Machine `jp5-machine` deployed" in testing_cap["visible"]
+
+    # Confirm persisted component IDs and machine aliases.
+    final_state = testing_cap["state"]
+    deployed_ids = set()
+    for dep in final_state.get("deployments", []):
+        if dep.get("phase") == "deployed":
+            deployed_ids.update(dep.get("component_ids", []))
+    assert "comp-jp5-perception" in deployed_ids
+    assert "comp-jp6-actucore" in deployed_ids
+
+    # Zero extra deploy POSTs beyond the two expected (one per machine).
+    assert core_b.deploy_driver.call_count == 1
+
+    # Validate the final persisted body (body_holder mirrors the last write).
+    titles_body = _event_titles(body_holder["body"])
+    assert titles_body[0] == "All components deployed"
+    assert titles_body[1] == "Machine `jp6-machine` deployed"
+
+    final_state2 = await _read_state()
+    assert final_state2["status"] == "testing"
+    assert final_state2["head_sha"] == "a" * 40
+
+
+
+# ── Blocker-3B — testing reconcile repairs missing case_results ───────────────
+
+@pytest.mark.asyncio
+async def test_testing_reconcile_repairs_missing_case_results_without_redeploy():
+    """When reconcile_pr finds status=testing with incomplete case_results,
+    it must re-run ONLY the advisory Automated Cases, merge results, and
+    refresh visible testing markdown with event=None.
+
+    No deploy POST should fire during recovery.
+    History must remain exactly once.
+    """
+    from ..github_state_proxy import (
+        _build_hidden_state_body as _bhsb,
+        _extract_hidden_state,
+    )
+
+    config = make_config()
+    proxy = MagicMock()
+    proxy.project_status_label = AsyncMock()
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+    proxy.get_comment = AsyncMock(return_value={"id": 50, "body": "/approve_deploy machine=jp5-machine",
+        "user": {"id": 111, "login": "owner1"}})
+
+    policy = Policy(config)
+    policy.machines = {
+        "m1": MachineInfo(
+            alias="m1", node_id="n1", owners=["owner1"], node_host="10.0.0.1",
+            targets=["perception"], platforms=["linux/arm64"], variants=["5.11"],
+        ),
+    }
+
+    comp = _component(
+        component_id="comp-001", target="perception", variant="5.11",
+        runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+
+    # Simulate crash: status=testing, empty case_results
+    crash_state = {
+        **_state(components=[comp], deployments=[
+            {"machine": "m1", "component_ids": ["comp-001"], "phase": "deployed"},
+        ]),
+        "status": "testing",
+        "case_results": {},
+        "command": {
+            "comment_id": 50, "kind": "approve_deploy",
+            "phase": "completed", "args": {"machine": "m1", "actor": "alice"},
+        },
+    }
+
+    body_holder = {"body": _bhsb(
+        _lifecycle_visible("repo", 1, status="testing"), crash_state)}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    async def _read_state(*_a, **_kw):
+        return _extract_hidden_state(body_holder["body"])
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    controller = DeployController(config, proxy, policy, MagicMock())
+    controller.config.total_timeout = 0.5
+
+    # Mock case runner — will return the missing results
+    controller._run_automated_case = AsyncMock(return_value={"comp-001": "pass"})
+
+    await controller.reconcile_pr("repo", 1)
+
+    # Must write once (case merge with event=None)
+    assert proxy.write_hidden_state.call_count == 1
+
+    # Written state has merged case_results
+    written_state = proxy.write_hidden_state.call_args.args[3]
+    assert written_state["case_results"]["comp-001"] == "pass"
+
+    # Status remains testing
+    assert written_state["status"] == "testing"
+
+    # Titles preserved — no churn
+    titles = _event_titles(body_holder["body"])
+    # No duplicate deploy events
+    for t in titles:
+        assert titles.count(t) == 1, f"event {t!r} duplicated in reconcile repair"
+
+    # Second reconcile: already complete, no churn
+    proxy.write_hidden_state.reset_mock()
+    await controller.reconcile_pr("repo", 1)
+    assert proxy.write_hidden_state.call_count == 0, \
+        f"Expected zero writes on second reconcile, got {proxy.write_hidden_state.call_count}"
+
+
+# ── Blocker-3B continued — no duplicate complete history ─────────────────────
+
+@pytest.mark.asyncio
+async def test_testing_reconcile_does_not_duplicate_complete_history():
+    """Second reconcile on already-complete testing state must make zero writes
+    and produce no duplicate/history churn.
+    """
+    from ..github_state_proxy import (
+        _build_hidden_state_body as _bhsb,
+        _extract_hidden_state,
+    )
+
+    config = make_config()
+    proxy = MagicMock()
+    proxy.project_status_label = AsyncMock()
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+
+    policy = Policy(config)
+    policy.machines = {
+        "m1": MachineInfo(
+            alias="m1", node_id="n1", owners=["owner1"], node_host="10.0.0.1",
+            targets=["perception"], platforms=["linux/arm64"], variants=["5.11"],
+        ),
+    }
+
+    comp = _component(
+        component_id="comp-001", target="perception", variant="5.11",
+        runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+
+    # Already-complete testing state
+    complete_state = {
+        **_state(components=[comp], deployments=[
+            {"machine": "m1", "component_ids": ["comp-001"], "phase": "deployed"},
+        ]),
+        "status": "testing",
+        "case_results": {"comp-001": "pass"},
+        "command": {
+            "comment_id": 50, "kind": "approve_deploy",
+            "phase": "completed", "args": {"machine": "m1", "actor": "alice"},
+        },
+    }
+
+    body_holder = {"body": _bhsb(
+        _lifecycle_visible("repo", 1, status="testing"), complete_state)}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    async def _read_state(*_a, **_kw):
+        return _extract_hidden_state(body_holder["body"])
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    controller = DeployController(config, proxy, policy, MagicMock())
+
+    await controller.reconcile_pr("repo", 1)
+
+    # Zero writes — state already complete.
+    assert proxy.write_hidden_state.call_count == 0
+
+    # History untouched.
+    titles = _event_titles(body_holder["body"])
+    for t in titles:
+        assert titles.count(t) == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HEAD DRIFT — history uses previous status (external fast acceptance)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_request_deploy_head_drift_history_uses_previous_status():
+    """handle_request_deploy HEAD drift must capture old_status BEFORE
+    state reset and render it in the History lifecycle event.
+
+    Produces:
+      `deploy-ready` → `review-required`
+    instead of:
+      `review-required` → `review-required`
+    """
+    controller, proxy, _policy, _github, _config = _controller()
+
+    # Seed lifecycle with pre-existing History including Lifecycle initialized.
+    from ..github_state_proxy import _build_hidden_state_body as _bhsb, _build_history_block
+    state = _state(status="deploy-requested")
+    body_holder = {"body": _bhsb(
+        _lifecycle_visible("repo", 1, status="deploy-requested"), state)}
+
+    pre_events = [
+        {"event": "Lifecycle initialized",
+         "lifecycle": "`none` → `review-required`",
+         "timestamp": "2026-09-30 10:00:00"},
+        {"event": "Review lifecycle transitioned",
+         "lifecycle": "`review-required` → `deploy-requested`",
+         "timestamp": "2026-09-30 10:01:00"},
+        {"event": "Deployment requested",
+         "lifecycle": "`deploy-ready` → `deploy-requested`",
+         "timestamp": "2026-09-30 10:02:00"},
+    ]
+    history_block = _build_history_block(pre_events)
+    body = body_holder["body"]
+    visible, _, _ = body.partition("<!-- deploy-approval-state:v1")
+    new_visible = visible.rstrip() + "\n\n### History\n\n" + history_block + "\n"
+    body_holder["body"] = _bhsb(new_visible, state)
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(return_value=dict(state))
+
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "b" * 40},  # DRIFTED HEAD
+        "user": {"id": 111, "login": "alice"},
+    })
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+
+    # The /request_deploy comment
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 30, "body": "/request_deploy",
+        "user": {"id": 111, "login": "alice"},
+    })
+
+    # Simulate a deploy-ready state with review evidence.
+    state["status"] = "deploy-ready"
+    state["review_evidence"] = {
+        "build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z",
+        "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40,
+        "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z",
+        "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z",
+        "review_author_id": "7950763",
+    }
+    state["head_sha"] = "a" * 40
+    state["command"] = {
+        "comment_id": 30, "kind": "request_deploy",
+        "phase": "completed", "args": {},
+    }
+    state["last_processed_comment_id"] = 30
+    body_holder["body"] = _bhsb(
+        _lifecycle_visible("repo", 1, status="deploy-ready"), state)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(return_value=dict(state))
+
+    controller._check_review_permissions = AsyncMock(return_value=None)
+    controller._ensure_deploy_ready_evidence = AsyncMock(return_value={
+        "build_comment_id": 1, "test_comment_id": 2, "code_review_comment_id": 3,
+    })
+
+    await controller.handle_request_deploy("repo", 1, 30)
+
+    # ── Assertions ──
+    assert proxy.write_hidden_state.call_count >= 1
+
+    # History event must use old_status "deploy-ready", NOT "review-required".
+    written_visible = proxy.write_hidden_state.call_args.args[2]
+    titles = _event_titles(written_visible)
+
+    # Find the HEAD drift event
+    drift_event = None
+    for t in titles:
+        if "HEAD drift detected" in t:
+            drift_event = t
+            break
+
+    assert drift_event is not None, f"Expected 'HEAD drift detected' event in history, got {titles}"
+
+    # The lifecycle portion must show deploy-ready -> review-required
+    written_state = proxy.write_hidden_state.call_args.args[3]
+    # Check the body contains the correct lifecycle text
+    assert "`deploy-ready` \\u2192 `review-required`" in body_holder["body"] or \
+           "`deploy-ready` → `review-required`" in body_holder["body"], \
+        f"Expected 'deploy-ready → review-required' in body, got:\n{body_holder['body'][:2000]}"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_head_drift_history_uses_previous_status():
+    """reconcile_pr HEAD drift must capture old_status BEFORE state reset
+    and render it in the History lifecycle event.
+    """
+    from ..github_state_proxy import _build_hidden_state_body as _bhsb, _build_history_block
+
+    config = make_config()
+    proxy = MagicMock()
+    proxy.project_status_label = AsyncMock()
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "b" * 40},  # DRIFTED HEAD
+        "user": {"id": 111, "login": "alice"},
+    })
+
+    policy = Policy(config)
+    policy.machines = {
+        "test-machine": MachineInfo(
+            alias="test-machine", node_id="n1", owners=["owner1"],
+            node_host="127.0.0.1", targets=["perception"],
+            platforms=["linux/arm64"], variants=["5.11"],
+        ),
+    }
+
+    comp = _component(
+        component_id="comp-001", target="perception", variant="5.11",
+        runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+
+    # Seed lifecycle with existing history and deploy-requested status.
+    state = _state(components=[comp], status="deploy-requested", command={"comment_id": 17, "kind": "approve_deploy", "phase": "completed", "args": {"machine": "test-machine"}})
+    body_holder = {"body": _bhsb(
+        _lifecycle_visible("repo", 1, status="deploy-requested"), state)}
+
+    pre_events = [
+        {"event": "Lifecycle initialized",
+         "lifecycle": "`none` → `review-required`",
+         "timestamp": "2026-09-30 10:00:00"},
+        {"event": "Review lifecycle transitioned",
+         "lifecycle": "`review-required` → `deploy-requested`",
+         "timestamp": "2026-09-30 10:01:00"},
+    ]
+    history_block = _build_history_block(pre_events)
+    body = body_holder["body"]
+    visible, _, _ = body.partition("<!-- deploy-approval-state:v1")
+    new_visible = visible.rstrip() + "\n\n### History\n\n" + history_block + "\n"
+    body_holder["body"] = _bhsb(new_visible, state)
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(return_value=dict(state))
+
+    # Old head (not drifted yet for the state)
+    state["head_sha"] = "a" * 40
+
+    controller = DeployController(config, proxy, policy, MagicMock())
+
+    await controller.reconcile_pr("repo", 1)
+
+    # ── Assertions ──
+    assert proxy.write_hidden_state.call_count >= 1
+
+    # The lifecycle portion must show deploy-requested -> review-required
+    assert "`deploy-requested` \\u2192 `review-required`" in body_holder["body"] or \
+           "`deploy-requested` → `review-required`" in body_holder["body"], \
+        f"Expected 'deploy-requested → review-required' in body, got:\n{body_holder['body'][:2000]}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# record_test — must not prematurely terminate incomplete testing
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_record_test_does_not_prematurely_terminate_incomplete_testing():
+    """handle_record_test must only accept status==\"testing\" and all
+    components deployed AND all bound component case results must be
+    terminal (pass, fail, n/a).  A "running" or missing case must not
+    cause premature terminal transition.
+    """
+    controller, proxy, _policy, _github, _config = _controller()
+
+    from ..github_state_proxy import (
+        _build_hidden_state_body as _bhsb,
+        _extract_hidden_state,
+    )
+
+    # State: status=testing, all components deployed, but case result
+    # is "running" (non-terminal) — should NOT be accepted.
+    comp = _component(
+        component_id="comp-001", target="perception", variant="5.11",
+        runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+    testing_state = _state(
+        components=[comp],
+        deployments=[
+            {"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"},
+        ],
+        status="testing",
+        case_results={"comp-001": "running"},
+    )
+    body_holder = {"body": _bhsb(
+        _lifecycle_visible("repo", 1, status="testing"), testing_state)}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    async def _read_state(*_a, **_kw):
+        return _extract_hidden_state(body_holder["body"])
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+
+    # record_test comment
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 70, "body": "/record_test result=pass summary='all good'",
+        "user": {"id": 111, "login": "owner1"},
+    })
+
+    # Should be rejected because case result is "running" (non-terminal).
+    result = await controller.handle_record_test("repo", 1, 70, "pass", "all good", "owner1", "111")
+    assert result is True  # handled (returned early with not-ready message)
+
+    # No terminal write should have happened.
+    assert proxy.write_hidden_state.call_count == 0
+
+    # State unchanged.
+    hidden = await _read_state()
+    assert hidden["status"] == "testing"
+
+
+@pytest.mark.asyncio
+async def test_record_test_incomplete_cases_cannot_finalize():
+    """When bound component case results are not yet terminal, record_test
+    must respond with a 'command not ready' message and MUST NOT mutate
+    hidden state or post a terminal lifecycle comment.
+
+    Terminal case values are only: pass, fail, n/a.
+    Any other value (including missing keys and "running") blocks finalization.
+    """
+    controller, proxy, _policy, _github, _config = _controller()
+
+    from ..github_state_proxy import (
+        _build_hidden_state_body as _bhsb,
+        _extract_hidden_state,
+    )
+
+    comp = _component(
+        component_id="comp-001", target="perception", variant="5.11",
+        runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+
+    # Case 1: missing case result key
+    state_missing = _state(
+        components=[comp],
+        deployments=[
+            {"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"},
+        ],
+        status="testing",
+        case_results={},
+    )
+    body_holder = {"body": _bhsb(
+        _lifecycle_visible("repo", 1, status="testing"), state_missing)}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    async def _read_state(*_a, **_kw):
+        return _extract_hidden_state(body_holder["body"])
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 80, "body": "/record_test result=pass summary='ok'",
+        "user": {"id": 111, "login": "owner1"},
+    })
+
+    result = await controller.handle_record_test("repo", 1, 80, "pass", "ok", "owner1", "111")
+    assert result is True
+    assert proxy.write_hidden_state.call_count == 0
+    assert (await _read_state())["status"] == "testing"
+
+    # Case 2: case result is "running"
+    proxy.write_hidden_state.reset_mock()
+    state_running = _state(
+        components=[comp],
+        deployments=[
+            {"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"},
+        ],
+        status="testing",
+        case_results={"comp-001": "running"},
+    )
+    body_holder["body"] = _bhsb(
+        _lifecycle_visible("repo", 1, status="testing"), state_running)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    result = await controller.handle_record_test("repo", 1, 81, "fail", "bad", "owner1", "111")
+    assert result is True
+    assert proxy.write_hidden_state.call_count == 0
+    assert (await _read_state())["status"] == "testing"
+
+    # Case 3: all terminal — should proceed (fail is terminal)
+    proxy.write_hidden_state.reset_mock()
+    state_terminal = _state(
+        components=[comp],
+        deployments=[
+            {"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"},
+        ],
+        status="testing",
+        case_results={"comp-001": "fail"},
+    )
+    body_holder["body"] = _bhsb(
+        _lifecycle_visible("repo", 1, status="testing"), state_terminal)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    result = await controller.handle_record_test("repo", 1, 82, "fail", "bad", "owner1", "111")
+    assert result is True
+    assert proxy.write_hidden_state.call_count == 1
+    written_state = proxy.write_hidden_state.call_args.args[3]
+    assert written_state["status"] == "failed"
+
+@pytest.mark.asyncio
+async def test_real_hidden_state_serialization():
+    """Production _build_hidden_state_body + _extract_hidden_state round-trip
+    must preserve all fields and pass _validate_hidden_state."""
+    from ..github_state_proxy import (
+        _build_hidden_state_body,
+        _extract_hidden_state,
+        _validate_hidden_state,
+    )
+
+    original = _state(
+        status="testing",
+        test_result="pass",
+        case_results={"comp-001": "pass"},
+        command={
+            "comment_id": 50,
+            "kind": "approve_deploy",
+            "phase": "completed",
+            "args": {"machine": "test-machine", "actor": "alice"},
+        },
+        deployments=[
+            {"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"},
+        ],
+        cos={"object_key": "evidence/repo/1/x.tar.gz", "sha256": "ab" * 32, "size": 1024},
+    )
+
+    body = _build_hidden_state_body(_lifecycle_visible("repo", 1, status="testing"), original)
+    recovered = _extract_hidden_state(body)
+
+    # Validation must pass.
+    _validate_hidden_state(recovered)
+
+    # Field fidelity.
+    assert recovered["status"] == "testing"
+    assert recovered["test_result"] == "pass"
+    assert recovered["case_results"]["comp-001"] == "pass"
+    assert recovered["deployments"][0]["machine"] == "test-machine"
+    assert recovered["cos"]["object_key"] == "evidence/repo/1/x.tar.gz"
+    assert recovered["cos"]["size"] == 1024
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DRIVER REPO RUNTIME AUTHORIZATION REFRESH
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_driver_repo_added_after_start_is_activated_without_restart():
+    """When the driver repo is granted to the GitHub App installation
+    while the Controller is running, the watcher must detect it on the
+    next auth refresh WITHOUT any restart or config change.
+    """
+    from ..config import DESIRED_REPOS
+    from ..github_client import GitHubClient
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]  # driver not yet active
+
+    proxy = MagicMock()
+    proxy.get_open_prs = AsyncMock(return_value=[])
+
+    controller = MagicMock()
+
+    github = MagicMock(spec=GitHubClient)
+    # Initially only phanthymotus
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus"]
+    )
+
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    # Simulate auth refresh: grant driver repo
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    )
+
+    await watcher._refresh_active_repos()
+
+    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    github_auth.refresh_installation_token.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_driver_repo_removed_after_start_is_deactivated():
+    """When driver repo authorization is removed, the watcher must
+    deactivate it from active_repos on the next auth refresh.
+    """
+    from ..config import DESIRED_REPOS
+    from ..github_client import GitHubClient
+
+    config = make_config()
+    config.active_repos = [
+        "4paradigm/phanthymotus",
+        "4paradigm/phanthymotus-driver",
+    ]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+
+    github = MagicMock(spec=GitHubClient)
+    # Driver repo no longer authorized
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus"]
+    )
+
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    await watcher._refresh_active_repos()
+
+    assert "4paradigm/phanthymotus-driver" not in config.active_repos
+    assert "4paradigm/phanthymotus" in config.active_repos
+
+
+@pytest.mark.asyncio
+async def test_driver_repo_authorization_refresh_failure_fails_closed():
+    """When the auth refresh call fails (e.g. 403, network error),
+    active_repos must remain UNCHANGED — never widen access.
+    """
+    from ..github_client import GitHubClient
+
+    config = make_config()
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github.list_installation_repositories = AsyncMock(
+        side_effect=Exception("network error")
+    )
+
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="fresh-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    await watcher._refresh_active_repos()
+
+    # Must remain unchanged
+    assert config.active_repos == ["4paradigm/phanthymotus"]
+    assert config.auth_valid is False
+    # Forced token refresh MUST precede repo discovery — it is attempted
+    # even though discovery itself fails.
+    github_auth.refresh_installation_token.assert_awaited_once()
+    # Repo discovery was attempted after the refresh failed.
+    github.list_installation_repositories.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_driver_repo_reactivated_without_replaying_old_commands():
+    """When driver repo authorization is re-granted after removal,
+    the watcher must NOT replay old commands from that repo.
+    It only updates active_repos — existing lifecycle state is preserved.
+    """
+    from ..config import DESIRED_REPOS
+    from ..github_client import GitHubClient
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    proxy.get_open_prs = AsyncMock(return_value=[])
+    controller = MagicMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    )
+
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    # First refresh adds driver
+    await watcher._refresh_active_repos()
+    assert "4paradigm/phanthymotus-driver" in config.active_repos
+
+    # Remove driver
+    config.active_repos = ["4paradigm/phanthymotus"]
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus"]
+    )
+    await watcher._refresh_active_repos()
+    assert "4paradigm/phanthymotus-driver" not in config.active_repos
+
+    # Re-add driver
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    )
+    await watcher._refresh_active_repos()
+    assert "4paradigm/phanthymotus-driver" in config.active_repos
+
+    # watcher.start() was never called — no commands dispatched
+    watcher.start()
+    # PR polling only iterates active repos — driver PRs would be polled
+    # but controller.on_command is only called for NEW comments > cursor.
+    # Since we never wrote any lifecycle state for driver PRs, no old
+    # commands are replayed.
+    await watcher._poll_once()
+    controller.on_command.assert_not_called()
+    await watcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_driver_repo_refresh_keeps_repo_isolation_and_single_writer():
+    """Auth refresh must not mix PR state between repos.
+    Each repo/PR pair has separate hidden state and lifecycle.
+    """
+    from ..github_client import GitHubClient
+
+    config = make_config()
+    config.active_repos = [
+        "4paradigm/phanthymotus",
+        "4paradigm/phanthymotus-driver",
+    ]
+
+    # PR #1 in phanthymotus with state
+    pr_state_phanthymotus = {
+        "version": 1, "head_sha": "a" * 40, "status": "testing",
+        "components": [], "deployments": [], "case_results": {},
+        "test_result": "", "cos": {"object_key": "", "sha256": "", "size": 0},
+        "approve_attempts": [], "approve_attempts_total": 0,
+        "approve_attempts_truncated": False,
+        "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+        "last_processed_comment_id": 0,
+    }
+
+    proxy = MagicMock()
+    # PR #5 in driver is separate
+    proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [{"number": 1}] if "phanthymotus" in repo else [{"number": 5}])
+    proxy.read_hidden_state = AsyncMock(return_value=dict(pr_state_phanthymotus))
+    proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
+    controller = MagicMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github.list_installation_repositories = AsyncMock(
+        return_value=config.active_repos
+    )
+
+    github_auth = MagicMock()
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    await watcher._poll_once()
+
+    # Controller was called once per repo (reconcile)
+    # But on_command was NOT called (no new commands)
+    controller.on_command.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_driver_repo_refresh_rejects_unlisted_repositories():
+    """GitHub list_installation_repositories may return arbitrary repos.
+    The watcher must ONLY activate repos within DESIRED_REPOS.
+    """
+    from ..config import DESIRED_REPOS
+    from ..github_client import GitHubClient
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github.list_installation_repositories = AsyncMock(
+        return_value=[
+            "4paradigm/phanthymotus",
+            "4paradigm/phanthymotus-driver",
+            "evil-org/malicious-repo",
+            "some-user/public-repo",
+        ]
+    )
+
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    await watcher._refresh_active_repos()
+
+    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "evil-org/malicious-repo" not in config.active_repos
+    assert "some-user/public-repo" not in config.active_repos
+
+
+@pytest.mark.asyncio
+async def test_driver_repo_refreshes_cached_installation_token():
+    """After a successful auth refresh that changes active_repos,
+    the watcher must force-refresh the installation token so new
+    repository scopes are visible.
+    """
+    from ..github_client import GitHubClient
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    )
+
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="fresh-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    await watcher._refresh_active_repos()
+
+    github_auth.refresh_installation_token.assert_called_once()
+    assert config.active_repos == [
+        "4paradigm/phanthymotus",
+        "4paradigm/phanthymotus-driver",
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADDITIONAL REQUIRED DRIVER AUTH TESTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_driver_refresh_failure_skips_poll_cycle():
+    """When _refresh_active_repos fails, the poll cycle must be skipped
+    for that iteration — no _poll_once should execute."""
+    from ..config import DESIRED_REPOS
+    from ..github_client import GitHubClient
+
+    config = make_config()
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    proxy.get_open_prs = AsyncMock(return_value=[])
+    controller = MagicMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github.list_installation_repositories = AsyncMock(
+        side_effect=Exception("network error")
+    )
+
+    github_auth = MagicMock()
+    call_order = []
+    _now = [1000.0]  # deterministic monotonic clock
+
+    async def mock_refresh():
+        call_order.append("refresh")
+        raise Exception("token network error")
+    async def mock_list():
+        call_order.append("list")
+        return ["4paradigm/phanthymotus"]
+    github_auth.refresh_installation_token = mock_refresh
+    github.list_installation_repositories = mock_list
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+    watcher._monotonic = lambda: _now[0]
+
+    # First: trigger auth refresh — it will fail
+    await watcher._refresh_active_repos_if_needed()
+    assert config.auth_valid is False
+    # Token refresh MUST have been called (force refresh before repo discovery)
+    assert "refresh" in call_order, "Expected refresh_installation_token to be called"
+    first_refresh_count = call_order.count("refresh")
+
+    # Second cycle: within the bounded interval the failed refresh already
+    # occupies this slot — no immediate hot-loop retry.
+    _now[0] += 1.0
+    call_order.clear()
+    await watcher._refresh_active_repos_if_needed()
+    assert config.auth_valid is False
+    assert call_order.count("refresh") == 0, \
+        "Failed refresh must occupy the interval slot — no hot-loop retry within the interval"
+
+    # After the interval elapses the refresh is retried (fail-closed, still failing).
+    _now[0] += watcher._auth_refresh_interval + 1.0
+    await watcher._refresh_active_repos_if_needed()
+    assert config.auth_valid is False
+    assert call_order.count("refresh") == 1, \
+        "Refresh must be retried after the interval elapses"
+
+    # Call _poll_once directly — active_repos is still set, but auth_valid is False
+    await watcher._poll_once()
+
+    # get_open_prs should NOT have been called because auth_valid is False
+    proxy.get_open_prs.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_driver_empty_active_set_never_falls_back_to_desired():
+    """When config.active_repos is empty, _poll_once must return immediately
+    without iterating any repos — no fallback to DESIRED_REPOS."""
+    config = make_config()
+    config.active_repos = []  # empty
+    config.auth_valid = True
+
+    proxy = MagicMock()
+    proxy.get_open_prs = AsyncMock(return_value=[])
+    controller = MagicMock()
+
+    github = MagicMock()
+    github_auth = MagicMock()
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    await watcher._poll_once()
+
+    # get_open_prs must NOT be called — empty active set skips polling
+    proxy.get_open_prs.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_driver_webhook_fails_closed_when_revoked():
+    """Webhook mutation must be rejected when config.auth_valid is False,
+    even if the repo is in the static allowlist."""
+    from ..router_webhook import webhook
+    from ..config import Config
+    from unittest.mock import AsyncMock, MagicMock
+    import json
+    from types import SimpleNamespace
+    import hmac
+    import hashlib
+
+    config = make_config()
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = False  # revoked
+
+    proxy = MagicMock()
+    controller = MagicMock()
+
+    # Build a valid HMAC signature
+    payload = _request_payload("/approve_deploy machine=test-machine")
+    body_bytes = json.dumps(payload).encode("utf-8")
+    secret = config.github_webhook_secret or "test-secret"
+    signature = "sha256=" + hmac.new(
+        secret.encode(), body_bytes, hashlib.sha256
+    ).hexdigest()
+
+    class _Request:
+        def __init__(self):
+            self.app = SimpleNamespace(
+                state=SimpleNamespace(config=config, proxy=proxy, controller=controller)
+            )
+            self.headers = {
+                "X-GitHub-Event": "issue_comment",
+                "X-Hub-Signature-256": signature,
+            }
+
+        async def stream(self):
+            yield body_bytes
+
+    request = _Request()
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc_info:
+        await webhook(request)
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_driver_token_refresh_precedes_repo_discovery():
+    """refresh_installation_token MUST be called BEFORE
+    list_installation_repositories in every auth refresh cycle."""
+    from ..github_client import GitHubClient
+
+    config = make_config()
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    )
+
+    github_auth = MagicMock()
+    call_order = []
+    async def mock_refresh():
+        call_order.append("refresh")
+        return "fresh-token"
+    async def mock_list():
+        call_order.append("list")
+        return ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    github_auth.refresh_installation_token = mock_refresh
+    github.list_installation_repositories = mock_list
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    await watcher._refresh_active_repos()
+
+    assert call_order == ["refresh", "list"], \
+        f"Expected ['refresh', 'list'], got {call_order}"
+
+
+@pytest.mark.asyncio
+async def test_driver_token_refresh_failure_does_not_publish_new_repos():
+    """When refresh_installation_token fails, active_repos must remain
+    unchanged and auth_valid must be set to False — no new repos published."""
+    from ..github_client import GitHubClient
+
+    config = make_config()
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(
+        side_effect=Exception("token refresh failed")
+    )
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    await watcher._refresh_active_repos()
+
+    # active_repos unchanged
+    assert config.active_repos == ["4paradigm/phanthymotus"]
+    # auth_valid must be False
+    assert config.auth_valid is False
+    # list_installation_repositories must NOT have been called
+    github.list_installation_repositories.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_driver_reactivation_baselines_pending_comments():
+    """When driver repo becomes active again, preexisting command comments
+    on driver PRs must NOT be dispatched as fresh approvals. The watcher
+    only picks up NEW comments after the baseline."""
+    from ..github_client import GitHubClient
+    from ..github_command_watcher import GitHubCommandWatcher
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]  # driver not yet active
+
+    proxy = MagicMock()
+    controller = MagicMock()
+    controller.on_command = AsyncMock(return_value=True)
+
+    async def _reconcile_pr(repo, pr_number):
+        """Simulate production reconcile_pr creating lifecycle state per-PR."""
+        if store.get(pr_number) is None:
+            store[pr_number] = {
+                "version": 1, "head_sha": "d" * 40, "status": "review-required",
+                "components": [], "deployments": [], "case_results": {},
+                "test_result": "", "cos": {"object_key": "", "sha256": "", "size": 0},
+                "approve_attempts": [], "approve_attempts_total": 0,
+                "approve_attempts_truncated": False,
+                "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+                "last_processed_comment_id": 0,
+            }
+        return store[pr_number]
+
+    controller.reconcile_pr = AsyncMock(side_effect=_reconcile_pr)
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    # Activate driver repo
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    )
+    await watcher._refresh_active_repos()
+    assert "4paradigm/phanthymotus-driver" in config.active_repos
+
+    # Driver PR that has old command comments (created before reactivation)
+    driver_pr = {"number": 42, "state": "open", "merged": False, "draft": False,
+                 "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
+    old_comment = {"id": 9001, "body": "/approve_deploy machine=test-machine",
+                   "user": {"id": 111, "login": "bob"}, "created_at": "2026-09-01T00:00:00Z"}
+    new_comment = {"id": 9002, "body": "/approve_deploy machine=test-machine",
+                   "user": {"id": 111, "login": "bob"}, "created_at": "2026-10-01T00:00:00Z"}
+
+    # State with empty baseline fields — triggers _baseline_pr
+    baseline_state = {
+        "version": 1, "head_sha": "c" * 40, "status": "review-required",
+        "components": [], "deployments": [], "case_results": {},
+        "test_result": "", "cos": {"object_key": "", "sha256": "", "size": 0},
+        "approve_attempts": [], "approve_attempts_total": 0,
+        "approve_attempts_truncated": False,
+        "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+        "last_processed_comment_id": 0,
+    }
+
+    proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [{"number": 42}] if "driver" in repo else [])
+    proxy.is_bot_comment = MagicMock(return_value=False)
+
+    # Stateful store: read_hidden_state returns the PERSISTED state.
+    store: dict = {42: dict(baseline_state)}
+
+    async def _read_state(_repo, _pr):
+        return None if store.get(_pr) is None else dict(store.get(_pr))
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
+    proxy.get_issue_comments = AsyncMock(return_value=[old_comment, new_comment])
+    proxy.comment_identity = AsyncMock(return_value=("111", "bob"))
+    proxy.get_pr = AsyncMock(return_value=driver_pr)
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(return_value=new_comment)
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+
+    persist_calls = []
+    async def _persist_cursor(repo, pr, cid):
+        persist_calls.append(cid)
+        # Cursor durability: persist mutates the stateful store.
+        if pr in store:
+            store[pr] = {
+                **store[pr],
+                "last_processed_comment_id": cid,
+            }
+        return {"last_processed_comment_id": cid}
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor)
+
+    # Cycle 1: baseline — old comments NOT dispatched
+    await watcher._poll_once()
+
+    # Controller must NOT have been dispatched for the old comment
+    controller.on_command.assert_not_called()
+    # Baseline cursor must have been persisted to max comment id
+    assert persist_calls, "Expected persist_cursor call during baseline"
+    assert max(persist_calls) == 9002, f"Expected baseline cursor 9002, got {persist_calls}"
+    # Durable: the store now reflects the baselined cursor.
+    assert store[42]["last_processed_comment_id"] == 9002
+
+    # Cycle 2: new comment appears above baseline cursor — IS dispatched
+    persist_calls.clear()
+    controller.on_command.reset_mock()
+    # Simulate a new comment (id=9003) appearing after baseline
+    newer_comment = {"id": 9003, "body": "/approve_deploy machine=test-machine",
+                     "user": {"id": 111, "login": "bob"}, "created_at": "2026-10-02T00:00:00Z"}
+
+    proxy.get_issue_comments = AsyncMock(return_value=[old_comment, new_comment, newer_comment])
+    proxy.get_comment = AsyncMock(return_value=newer_comment)
+
+    # This cycle: PR is NOT in _pending_baseline_repos anymore (discarded after cycle 1),
+    # so it goes through _process_pr path, which should dispatch the new comment (9003 > 9002)
+    await watcher._poll_once()
+
+    # New comment MUST be dispatched
+    controller.on_command.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_driver_repo_malformed_or_incomplete_installation_list_fails_closed():
+    """When list_installation_repositories returns malformed data,
+    auth refresh must fail closed — auth_valid=False, no new repos."""
+    from ..github_client import GitHubClient
+
+    config = make_config()
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="token")
+
+    # Case 1: dict entries without full_name
+    github = MagicMock(spec=GitHubClient)
+    github.list_installation_repositories = AsyncMock(
+        return_value=[{"bad_key": "value"}]
+    )
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+    await watcher._refresh_active_repos()
+    assert config.auth_valid is False
+
+    # Case 2: non-list return value
+    github.list_installation_repositories = AsyncMock(
+        return_value="not-a-list"
+    )
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
+    await watcher._refresh_active_repos()
+    assert config.auth_valid is False
+
+
+@pytest.mark.asyncio
+async def test_driver_authorized_new_pr_command_dispatch():
+    """When a driver repo is authorized, NEW PR commands on that repo
+    should be dispatched through the normal flow.
+
+    Two-cycle fixture (realistic): cycle 1 baselines the PR on first
+    observation (zero dispatch, durable cursor), then a NEW comment
+    appears above the durable cursor and cycle 2 dispatches exactly
+    that one.  Core and Driver PR identities remain separate.
+    """
+    from ..github_client import GitHubClient
+    from ..github_command_watcher import GitHubCommandWatcher
+
+    config = make_config()
+    config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    config.auth_valid = True
+
+    proxy = MagicMock()
+    controller = MagicMock()
+    controller.on_command = AsyncMock(return_value=True)
+
+    async def _reconcile_pr(repo, pr_number):
+        """Simulate production reconcile_pr creating lifecycle state per-PR."""
+        if store.get(pr_number) is None:
+            store[pr_number] = {
+                "version": 1, "head_sha": "d" * 40, "status": "review-required",
+                "components": [], "deployments": [], "case_results": {},
+                "test_result": "", "cos": {"object_key": "", "sha256": "", "size": 0},
+                "approve_attempts": [], "approve_attempts_total": 0,
+                "approve_attempts_truncated": False,
+                "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+                "last_processed_comment_id": 0,
+            }
+        return store[pr_number]
+
+    controller.reconcile_pr = AsyncMock(side_effect=_reconcile_pr)
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+
+    driver_pr = {"number": 10, "state": "open", "merged": False, "draft": False,
+                 "head": {"sha": "d" * 40}, "user": {"id": 111, "login": "carol"}}
+
+    first_comment = {"id": 7001, "body": "/approve_deploy machine=test-machine",
+                     "user": {"id": 111, "login": "carol"}, "created_at": "2026-10-09T00:00:00Z"}
+    newer_comment = {"id": 7002, "body": "/approve_deploy machine=test-machine",
+                     "user": {"id": 111, "login": "carol"}, "created_at": "2026-10-09T01:00:00Z"}
+
+    proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [{"number": 10}] if "driver" in repo else [])
+    proxy.is_bot_comment = MagicMock(return_value=False)
+
+    # Stateful store: read_hidden_state returns the PERSISTED state.
+    store: dict = {"state": None}
+    persisted_bodies = []
+
+    async def _read_state(_repo, _pr):
+        return None if store.get(_pr) is None else dict(store.get(_pr))
+
+    async def _persist_cursor(_repo, _pr, cid):
+        """Faithful production contract: only update last_processed_comment_id."""
+        pr_state = store.get(_pr)
+        if pr_state is not None:
+            pr_state["last_processed_comment_id"] = cid
+        persisted_bodies.append(cid)
+        return {"last_processed_comment_id": cid}
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
+
+    comments_holder = {"list": [first_comment]}
+    proxy.get_issue_comments = AsyncMock(
+        side_effect=lambda _repo, _pr: list(comments_holder["list"]))
+    proxy.comment_identity = AsyncMock(return_value=("111", "carol"))
+    proxy.get_pr = AsyncMock(return_value=driver_pr)
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(side_effect=lambda _repo, cid: (
+        newer_comment if cid == 7002 else first_comment))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    # ── Cycle 1: first observation — baseline only, zero dispatch ──
+    await watcher._poll_once()
+    controller.on_command.assert_not_called()
+    assert persisted_bodies and persisted_bodies[-1] == 7001, \
+        f"Expected baseline cursor 7001 persisted, got {persisted_bodies}"
+
+    # ── A NEW comment arrives above the durable cursor ──
+    comments_holder["list"].append(newer_comment)
+
+    # ── Cycle 2: normal processing — dispatch exactly the new comment ──
+    await watcher._poll_once()
+
+    controller.on_command.assert_called_once()
+    call_args = controller.on_command.call_args
+    # Dispatch must target the DRIVER repo (repo arg is 2nd positional).
+    dispatched_repo = call_args.args[1] if len(call_args.args) >= 2 else call_args.kwargs.get("repo")
+    assert dispatched_repo == "4paradigm/phanthymotus-driver", \
+        f"Expected dispatch on driver repo, got {call_args}"
+    # Cursor durability: last persist reflects the consumed comment.
+    assert persisted_bodies[-1] == 7002, \
+        f"Expected cursor advanced to 7002 after dispatch, got {persisted_bodies}"
+
+    # Core repo PRs remain polled independently (repo separation preserved).
+    # Core repo must be polled via get_open_prs during watcher cycle (no Core PRs in fixture)
+    core_pr_polls = [
+        c for c in proxy.get_open_prs.call_args_list
+        if c.args and "phanthymotus" in str(c.args[0])
+    ]
+    assert core_pr_polls, "Core repo get_open_prs must be polled independently"
+
+
+@pytest.mark.asyncio
+async def test_driver_authorization_grant_does_not_deploy_automatically():
+    """Granting the driver repo via auth refresh must NOT create any
+    deployment — it only updates active_repos."""
+    from ..github_client import GitHubClient
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    proxy.write_hidden_state = AsyncMock()
+    controller = MagicMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    )
+
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    # Refresh — this grants the driver repo
+    await watcher._refresh_active_repos()
+
+    # Driver should be active
+    assert "4paradigm/phanthymotus-driver" in config.active_repos
+
+    # NO write_hidden_state calls (no deployment)
+    proxy.write_hidden_state.assert_not_called()
+    # NO controller.on_command calls
+    controller.on_command.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_driver_required_repo_authorization_lost_fails_closed():
+    """When the required 4paradigm/phanthymotus repo disappears from
+    authorization, the system must fail closed: auth_valid=False,
+    active_repos=[], no further polling."""
+    from ..github_client import GitHubClient
+
+    config = make_config()
+    config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+
+    github = MagicMock(spec=GitHubClient)
+    # Only driver is authorized — required repo is missing
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus-driver"]
+    )
+
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    await watcher._refresh_active_repos()
+
+    # Must fail closed
+    assert config.auth_valid is False
+    assert config.active_repos == []
+
+
+@pytest.mark.asyncio
+async def test_record_test_terminal_fail_is_advisory_and_can_finalize():
+    """When all bound component case_results are terminal (including 'fail'),
+    record_test MUST finalize by transitioning to 'failed' status.
+    Terminal values are: pass, fail, n/a."""
+    controller, proxy, _policy, _github, _config = _controller()
+
+    from ..github_state_proxy import (
+        _build_hidden_state_body as _bhsb,
+        _extract_hidden_state,
+    )
+
+    comp = _component(
+        component_id="comp-001", target="perception", variant="5.11",
+        runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+
+    # State: all terminal case_results with 'fail'
+    state_terminal = _state(
+        components=[comp],
+        deployments=[
+            {"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"},
+        ],
+        status="testing",
+        case_results={"comp-001": "fail"},
+    )
+    body_holder = {"body": _bhsb(
+        _lifecycle_visible("repo", 1, status="testing"), state_terminal)}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    async def _read_state(*_a, **_kw):
+        return _extract_hidden_state(body_holder["body"])
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 82, "body": "/record_test result=fail summary='test failed'",
+        "user": {"id": 111, "login": "owner1"},
+    })
+
+    result = await controller.handle_record_test("repo", 1, 82, "fail", "test failed", "owner1", "111")
+    assert result is True
+    assert proxy.write_hidden_state.call_count == 1
+    written_state = proxy.write_hidden_state.call_args.args[3]
+    assert written_state["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_testing_reconcile_with_running_case_result_remains_pending():
+    """reconcile_pr with status=testing and a running case result must NOT
+    prematurely finalize — status stays 'testing'."""
+    from ..github_state_proxy import (
+        _build_hidden_state_body as _bhsb,
+        _extract_hidden_state,
+    )
+
+    config = make_config()
+    proxy = MagicMock()
+    proxy.project_status_label = AsyncMock()
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+
+    policy = Policy(config)
+    policy.machines = {
+        "test-machine": MachineInfo(
+            alias="test-machine", node_id="n1", owners=["owner1"],
+            node_host="127.0.0.1", targets=["perception"],
+            platforms=["linux/arm64"], variants=["5.11"],
+        ),
+    }
+
+    comp = _component(
+        component_id="comp-001", target="perception", variant="5.11",
+        runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+
+    state = _state(
+        components=[comp],
+        deployments=[
+            {"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"},
+        ],
+        status="testing",
+        case_results={"comp-001": "running"},
+    )
+    body_holder = {"body": _bhsb(
+        _lifecycle_visible("repo", 1, status="testing"), state)}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    async def _read_state(*_a, **_kw):
+        return _extract_hidden_state(body_holder["body"])
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+
+    controller = DeployController(config, proxy, policy, MagicMock())
+
+    await controller.reconcile_pr("repo", 1)
+
+    # Status should remain 'testing' — running case means not finalized
+    final_state = await _read_state()
+    assert final_state["status"] == "testing"
+
+
+@pytest.mark.asyncio
+async def test_driver_reactivation_advances_existing_pr_cursor_before_dispatch():
+    """When a driver repo is re-authorized, existing PRs with real cursor
+    state must have their cursor advanced to max(old, observed) BEFORE
+    any command dispatch — preventing revocation-period backlog replay."""
+    from ..github_client import GitHubClient
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]  # driver not active
+
+    proxy = MagicMock()
+    controller = MagicMock()
+    controller.on_command = AsyncMock(return_value=True)
+
+    async def _reconcile_pr(repo, pr_number):
+        """Simulate production reconcile_pr creating lifecycle state per-PR."""
+        if store.get(pr_number) is None:
+            store[pr_number] = {
+                "version": 1, "head_sha": "d" * 40, "status": "review-required",
+                "components": [], "deployments": [], "case_results": {},
+                "test_result": "", "cos": {"object_key": "", "sha256": "", "size": 0},
+                "approve_attempts": [], "approve_attempts_total": 0,
+                "approve_attempts_truncated": False,
+                "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+                "last_processed_comment_id": 0,
+            }
+        return store[pr_number]
+
+    controller.reconcile_pr = AsyncMock(side_effect=_reconcile_pr)
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth,
+    )
+
+    # Activate driver repo
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+    )
+    await watcher._refresh_active_repos()
+    assert "4paradigm/phanthymotus-driver" in config.active_repos
+
+    driver_pr = {"number": 42, "state": "open", "merged": False, "draft": False,
+                 "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
+
+    # Existing state: cursor=5000, so the PR was previously baselined.
+    existing_state = {
+        "version": 1, "head_sha": "c" * 40, "status": "review-required",
+        "components": [], "deployments": [], "case_results": {},
+        "test_result": "", "cos": {"object_key": "", "sha256": "", "size": 0},
+        "approve_attempts": [], "approve_attempts_total": 0,
+        "approve_attempts_truncated": False,
+        "command": {"comment_id": 5000, "kind": "", "phase": "completed", "args": {}},
+        "last_processed_comment_id": 5000,
+    }
+
+    old_comment = {"id": 9001, "body": "/approve_deploy machine=test-machine",
+                   "user": {"id": 111, "login": "bob"}}
+    newer_comment = {"id": 9002, "body": "/approve_deploy machine=test-machine",
+                     "user": {"id": 111, "login": "bob"}}
+
+    proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [{"number": 42}] if "driver" in repo else [])
+    proxy.is_bot_comment = MagicMock(return_value=False)
+    proxy.get_pr = AsyncMock(return_value=driver_pr)
+    proxy.comment_identity = AsyncMock(return_value=("111", "bob"))
+    proxy.get_comment = AsyncMock(return_value=newer_comment)
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+
+    store = {42: dict(existing_state)}
+
+    async def _read_state(_repo, _pr):
+        return None if store.get(_pr) is None else dict(store.get(_pr))
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
+
+    persist_calls = []
+
+    async def _persist_cursor(repo, pr, cid):
+        persist_calls.append(cid)
+        if pr in store:
+            store[pr] = {
+                **store[pr],
+                "last_processed_comment_id": cid,
+            }
+        return {"last_processed_comment_id": cid}
+
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor)
+
+    comments_holder = {"list": [old_comment, newer_comment]}
+    proxy.get_issue_comments = AsyncMock(
+        side_effect=lambda _repo, _pr: list(comments_holder["list"]))
+
+    # Cycle 1: reactivation baseline — cursor advances to max(5000, 9002)=9002
+    await watcher._poll_once()
+
+    # Zero dispatch during baseline
+    controller.on_command.assert_not_called()
+
+    # Cursor must be >= max observed comment id
+    assert persist_calls, "Expected persist_cursor call during reactivation baseline"
+    assert persist_calls[-1] == 9002, f"Expected cursor 9002, got {persist_calls[-1]}"
+    assert store[42]["last_processed_comment_id"] == 9002
+
+    # Cycle 2: new comment appears above baseline — IS dispatched
+    persist_calls.clear()
+    controller.on_command.reset_mock()
+    newest = {"id": 9003, "body": "/approve_deploy machine=test-machine",
+              "user": {"id": 111, "login": "bob"}}
+    comments_holder["list"].append(newest)
+    proxy.get_comment = AsyncMock(return_value=newest)
+
+    await watcher._poll_once()
+
+    controller.on_command.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_driver_reactivation_retries_failed_baseline_without_replay():
+    """When one PR's baseline fails during reactivation, the repo's
+    pending-baseline flag is NOT cleared; the failed PR is retried on the
+    next cycle.  Other PRs that succeeded must NOT be rebaselined.
+    No command dispatch occurs until ALL PRs are baselined."""
+    from ..github_client import GitHubClient
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+    controller.on_command = AsyncMock(return_value=True)
+    controller.reconcile_pr = AsyncMock(side_effect=None)
+
+    store = {}
+
+    def _make_state(pr_num):
+        return {
+            "version": 1, "head_sha": "c" * 40, "status": "review-required",
+            "components": [], "deployments": [], "case_results": {},
+            "test_result": "", "cos": {"object_key": "", "sha256": "", "size": 0},
+            "approve_attempts": [], "approve_attempts_total": 0,
+            "approve_attempts_truncated": False,
+            "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+            "last_processed_comment_id": 0,
+        }
+
+    store[42] = dict(_make_state(42))
+    store[43] = dict(_make_state(43))
+
+    async def _reconcile_pr(repo, pr_number):
+        """Simulate production reconcile_pr creating lifecycle state."""
+        if store.get(pr_number) is None:
+            store[pr_number] = dict(_make_state(pr_number))
+        return store[pr_number]
+
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth,
+    )
+
+    # Activate driver repo — two open PRs
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+    )
+    await watcher._refresh_active_repos()
+    assert "4paradigm/phanthymotus-driver" in config.active_repos
+
+    driver_pr_42 = {"number": 42, "state": "open", "merged": False, "draft": False,
+                    "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
+    driver_pr_43 = {"number": 43, "state": "open", "merged": False, "draft": False,
+                    "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
+
+    proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [
+        driver_pr_42, driver_pr_43
+    ] if "driver" in repo else [])
+    proxy.is_bot_comment = MagicMock(return_value=False)
+    proxy.get_pr = AsyncMock(return_value=driver_pr_42)
+    proxy.comment_identity = AsyncMock(return_value=("111", "bob"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 9001, "body": "/approve_deploy machine=test",
+        "user": {"id": 111, "login": "bob"},
+    })
+
+
+    async def _read_state(_repo, _pr):
+        pr = _pr
+        return None if store.get(pr) is None else dict(store.get(pr, {}))
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
+
+    persist_calls = []
+
+    async def _persist_cursor(repo, pr, cid):
+        persist_calls.append((pr, cid))
+        if pr in store:
+            store[pr]["last_processed_comment_id"] = cid
+        return {"last_processed_comment_id": cid}
+
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor)
+
+    def _make_comments(pr_num):
+        return [
+            {"id": 9000 + pr_num, "body": "/approve_deploy machine=test",
+             "user": {"id": 111, "login": "bob"}},
+        ]
+
+    proxy.get_issue_comments = AsyncMock(
+        side_effect=lambda _repo, _pr: _make_comments(_pr))
+
+    # Cycle 1: baseline PR 42 succeeds, PR 43 fails at persist_cursor boundary
+    # We inject failure at proxy.persist_cursor for PR #43 only.
+    original_persist = proxy.persist_cursor.side_effect
+
+    async def _persist_cursor_fail_on_43(repo, pr, cid):
+        if pr == 43:
+            raise Exception("baseline persist fail for PR 43")
+        return await original_persist(repo, pr, cid)
+
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor_fail_on_43)
+
+    await watcher._poll_once()
+
+    # PR 42 persisted (cursor advanced), PR 43 failed
+    assert persist_calls, "Expected at least one persist call"
+    pr42_persisted = any(c[0] == 42 for c in persist_calls)
+    assert pr42_persisted, "PR 42 should have been baselined"
+
+    # No dispatch during baseline
+    controller.on_command.assert_not_called()
+
+    # With the production fix, _pending_baseline_repos stays because PR 43 failed
+    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos, \
+        "Repo must remain pending while any PR baseline is incomplete"
+
+    # Cycle 2: PR 43 persist succeeds (restore working persist_cursor)
+    persist_calls.clear()
+
+    async def _persist_cursor_fixed(repo, pr, cid):
+        persist_calls.append((pr, cid))
+        if pr in store:
+            store[pr] = {
+                **store[pr],
+                "last_processed_comment_id": cid,
+                "command": {"comment_id": cid, "kind": "", "phase": "completed", "args": {}},
+            }
+        return {"last_processed_comment_id": cid}
+
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor_fixed)
+
+    await watcher._poll_once()
+
+    # PR 43 should have been retried and baselined
+    pr43_persisted = any(c[0] == 43 for c in persist_calls)
+    assert pr43_persisted, "PR 43 should have been retried and baselined"
+
+    # PR 42 must NOT have been rebaselined (no duplicate)
+    pr42_again = sum(1 for c in persist_calls if c[0] == 42)
+    assert pr42_again == 0, f"PR 42 must not be rebaselined on retry, got {pr42_again} extra persists"
+
+    # Repo pending flag cleared now that ALL PRs succeeded
+    assert "4paradigm/phanthymotus-driver" not in watcher._pending_baseline_repos
+
+    # Still no dispatch
+    controller.on_command.assert_not_called()
+
+    # Cycle 3: new comment beyond baseline — IS dispatched
+    persist_calls.clear()
+    controller.on_command.reset_mock()
+    new_comment_9100 = {"id": 9100, "body": "/approve_deploy machine=test",
+                        "user": {"id": 111, "login": "bob"}}
+
+    def _make_comments_cycle3(_repo, pr_num):
+        # Only PR 42 gets the new comment; PR 43 keeps only its old comment
+        if pr_num == 42:
+            return [
+                {"id": 9000 + pr_num, "body": "/approve_deploy machine=test",
+                 "user": {"id": 111, "login": "bob"}},
+                new_comment_9100,
+            ]
+        else:
+            return [
+                {"id": 9000 + pr_num, "body": "/approve_deploy machine=test",
+                 "user": {"id": 111, "login": "bob"}},
+            ]
+
+    proxy.get_issue_comments = AsyncMock(side_effect=_make_comments_cycle3)
+    proxy.get_comment = AsyncMock(return_value=new_comment_9100)
+
+    await watcher._poll_once()
+
+    controller.on_command.assert_called_once()
+    call_args = controller.on_command.call_args
+    dispatched_repo = call_args.args[1] if len(call_args.args) >= 2 else call_args.kwargs.get("repo")
+    assert dispatched_repo == "4paradigm/phanthymotus-driver"
+
+
+@pytest.mark.asyncio
+async def test_driver_reactivation_preserves_business_state_and_visible_history():
+    """Reactivation baseline must NOT reset business fields (components,
+    deployments, COS, History, command state) — only the cursor advances."""
+    from ..github_client import GitHubClient
+    from ..github_state_proxy import _build_hidden_state_body as _bhsb, _extract_hidden_state
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+    controller.on_command = AsyncMock(return_value=True)
+    controller.reconcile_pr = AsyncMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth,
+    )
+
+    # Activate driver repo
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+    )
+    await watcher._refresh_active_repos()
+    assert "4paradigm/phanthymotus-driver" in config.active_repos
+
+    driver_pr = {"number": 42, "state": "open", "merged": False, "draft": False,
+                 "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
+
+    # Existing state with deployed components, COS, History, etc.
+    body_holder = {"body": ""}
+
+    existing_state = _state(
+        components=[_component(component_id="comp-a", target="perception")],
+        deployments=[{"machine": "test-machine", "component_ids": ["comp-a"], "phase": "deployed"}],
+        status="deploy-requested",
+        cos={"object_key": "evidence/repo/42/x.tar.gz", "sha256": "ab" * 32, "size": 1024},
+        command={"comment_id": 5000, "kind": "", "phase": "completed", "args": {}},
+        last_processed_comment_id=5000,
+        head_sha="c" * 40,
+    )
+
+    visible_body = _bhsb(
+        _lifecycle_visible("repo", 42, status="deploy-requested"),
+        existing_state,
+    )
+    body_holder["body"] = visible_body
+
+    # Add a History section with an existing event
+    from ..github_state_proxy import _build_history_block
+    pre_events = [
+        {"event": "Lifecycle initialized",
+         "lifecycle": "`none` → `review-required`",
+         "timestamp": "2026-09-30 10:00:00"},
+    ]
+    history_block = _build_history_block(pre_events)
+    visible, _, _ = visible_body.partition("<!-- deploy-approval-state:v1")
+    body_holder["body"] = visible.rstrip() + "\n\n### History\n\n" + history_block + "\n" + visible_body[visible_body.find("<!-- deploy-approval-state:v1"):]
+
+    async def _read_state(_repo, _pr):
+        return _extract_hidden_state(body_holder["body"])
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 9001, "body": "/approve_deploy machine=test",
+                                                          "user": {"id": 111, "login": "bob"}}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [{"number": 42}] if "driver" in repo else [])
+    proxy.get_pr = AsyncMock(return_value=driver_pr)
+    proxy.comment_identity = AsyncMock(return_value=("111", "bob"))
+    proxy.get_comment = AsyncMock(return_value={"id": 9001, "body": "/approve_deploy machine=test",
+                                                  "user": {"id": 111, "login": "bob"}})
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+    proxy.is_bot_comment = MagicMock(return_value=False)
+
+    persist_calls = []
+
+    async def _persist_cursor(repo, pr, cid):
+        """Faithful production persist_cursor: advances cursor, preserves ALL
+        hidden-state fields and exact visible markdown bytes. ONLY last_processed_comment_id changes."""
+        persist_calls.append(cid)
+        # Read current state from body_holder (production: reads from hidden JSON)
+        state_after = _extract_hidden_state(body_holder["body"])
+        if state_after is not None:
+            state_after["last_processed_comment_id"] = cid
+            # Re-serialize preserving the visible markdown (byte-identical visible portion)
+            marker = "<!-- deploy-approval-state:v1"
+            visible_part = body_holder["body"][:body_holder["body"].find(marker)]
+            body_holder["body"] = _bhsb(visible_part, state_after)
+        return {"last_processed_comment_id": cid}
+
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor)
+
+    # Cycle 1: reactivation baseline
+    await watcher._poll_once()
+
+    # Cursor advanced but nothing else changed
+    assert persist_calls, "Expected persist_cursor call"
+    assert persist_calls[-1] == 9001, f"Expected cursor 9001, got {persist_calls[-1]}"
+
+    # Business state preserved
+    hidden = await _read_state("repo", 42)
+    assert hidden["status"] == "deploy-requested", \
+        f"Status should be preserved, got {hidden['status']}"
+    assert hidden["deployments"] == [
+        {"machine": "test-machine", "component_ids": ["comp-a"], "phase": "deployed"}
+    ], f"Deployments should be preserved: {hidden.get('deployments')}"
+    assert hidden["cos"]["object_key"] == "evidence/repo/42/x.tar.gz", \
+        f"COS should be preserved: {hidden.get('cos')}"
+    assert len(hidden["components"]) == 1, \
+        f"Components should be preserved: {hidden.get('components')}"
+
+    # No dispatch during baseline
+    controller.on_command.assert_not_called()
+
+    # Cycle 2: new comment above baseline — IS dispatched
+    persist_calls.clear()
+    controller.on_command.reset_mock()
+    newer_comment = {"id": 9002, "body": "/approve_deploy machine=test",
+                     "user": {"id": 111, "login": "bob"}}
+    proxy.get_issue_comments = AsyncMock(return_value=[
+        {"id": 9001, "body": "/approve_deploy machine=test", "user": {"id": 111, "login": "bob"}},
+        newer_comment,
+    ])
+    proxy.get_comment = AsyncMock(return_value=newer_comment)
+
+    await watcher._poll_once()
+
+    controller.on_command.assert_called_once()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V5 REGRESSION TESTS — Driver reactivation baseline production fixes
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_driver_reactivation_failed_existing_pr_remains_pending():
+    """When one PR's baseline persist fails, _pending_baseline_repos stays
+    and ZERO on_command dispatches occur.  On retry, the failed PR succeeds
+    and the repo is cleared."""
+    from ..github_client import GitHubClient
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+    controller.on_command = AsyncMock(return_value=True)
+    controller.reconcile_pr = AsyncMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth,
+    )
+
+    # Activate driver repo
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+    )
+    await watcher._refresh_active_repos()
+    assert "4paradigm/phanthymotus-driver" in config.active_repos
+
+    driver_pr_10 = {"number": 10, "state": "open", "merged": False, "draft": False,
+                    "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
+
+    proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [
+        driver_pr_10
+    ] if "driver" in repo else [])
+    proxy.is_bot_comment = MagicMock(return_value=False)
+    proxy.get_pr = AsyncMock(return_value=driver_pr_10)
+    proxy.comment_identity = AsyncMock(return_value=("111", "bob"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 8010, "body": "/approve_deploy machine=test",
+        "user": {"id": 111, "login": "bob"},
+    })
+
+    store = {10: {
+        "version": 1, "head_sha": "c" * 40, "status": "review-required",
+        "components": [], "deployments": [], "case_results": {},
+        "test_result": "", "cos": {"object_key": "", "sha256": "", "size": 0},
+        "approve_attempts": [], "approve_attempts_total": 0,
+        "approve_attempts_truncated": False,
+        "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+        "last_processed_comment_id": 0,
+    }}
+
+    async def _read_state(_repo, _pr):
+        return None if store.get(_pr) is None else dict(store.get(_pr, {}))
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
+
+    persist_calls = []
+
+    async def _persist_cursor(repo, pr, cid):
+        persist_calls.append((pr, cid))
+        if pr in store:
+            store[pr]["last_processed_comment_id"] = cid
+        return {"last_processed_comment_id": cid}
+
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor)
+
+    def _make_comments(pr_num):
+        return [{"id": 8000 + pr_num, "body": "/approve_deploy machine=test",
+                 "user": {"id": 111, "login": "bob"}}]
+
+    proxy.get_issue_comments = AsyncMock(
+        side_effect=lambda _repo, _pr: _make_comments(_pr))
+
+    # Cycle 1: baseline persist fails
+    async def _persist_cursor_fail(repo, pr, cid):
+        if pr == 10:
+            raise Exception("baseline persist fail")
+        return await _persist_cursor(repo, pr, cid)
+
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor_fail)
+
+    await watcher._poll_once()
+
+    # Repo must remain pending
+    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos, \
+        "Repo must remain pending when PR baseline fails"
+    # Zero dispatch
+    controller.on_command.assert_not_called()
+
+    # Cycle 2: persist succeeds
+    persist_calls.clear()
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor)
+
+    await watcher._poll_once()
+
+    # Repo pending cleared
+    assert "4paradigm/phanthymotus-driver" not in watcher._pending_baseline_repos, \
+        "Repo pending must clear after all PRs succeed"
+    controller.on_command.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_driver_reactivation_successful_pr_not_rebaselined_during_retry():
+    """PR #10 succeeds baseline first.  PR #11 fails.  On retry, PR #10 is NOT
+    rebaselined (progress tracking prevents duplicate baseline), PR #11 retries
+    and succeeds.  New comments after PR #10's successful baseline ARE dispatched."""
+    from ..github_client import GitHubClient
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+    controller.on_command = AsyncMock(return_value=True)
+    controller.reconcile_pr = AsyncMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth,
+    )
+
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+    )
+    await watcher._refresh_active_repos()
+
+    driver_pr_10 = {"number": 10, "state": "open", "merged": False, "draft": False,
+                    "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
+    driver_pr_11 = {"number": 11, "state": "open", "merged": False, "draft": False,
+                    "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
+
+    proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [
+        driver_pr_10, driver_pr_11
+    ] if "driver" in repo else [])
+    proxy.is_bot_comment = MagicMock(return_value=False)
+    proxy.get_pr = AsyncMock(return_value=driver_pr_10)
+    proxy.comment_identity = AsyncMock(return_value=("111", "bob"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 8010, "body": "/approve_deploy machine=test",
+        "user": {"id": 111, "login": "bob"},
+    })
+
+    store = {
+        10: {"version": 1, "head_sha": "c" * 40, "status": "review-required",
+             "components": [], "deployments": [], "case_results": {},
+             "test_result": "", "cos": {"object_key": "", "sha256": "", "size": 0},
+             "approve_attempts": [], "approve_attempts_total": 0,
+             "approve_attempts_truncated": False,
+             "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+             "last_processed_comment_id": 0},
+        11: {"version": 1, "head_sha": "c" * 40, "status": "review-required",
+             "components": [], "deployments": [], "case_results": {},
+             "test_result": "", "cos": {"object_key": "", "sha256": "", "size": 0},
+             "approve_attempts": [], "approve_attempts_total": 0,
+             "approve_attempts_truncated": False,
+             "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+             "last_processed_comment_id": 0},
+    }
+
+    async def _read_state(_repo, _pr):
+        return None if store.get(_pr) is None else dict(store.get(_pr, {}))
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
+
+    persist_calls = []
+
+    async def _persist_cursor(repo, pr, cid):
+        persist_calls.append((pr, cid))
+        if pr in store:
+            store[pr]["last_processed_comment_id"] = cid
+        return {"last_processed_comment_id": cid}
+
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor)
+
+    def _make_comments(pr_num):
+        return [{"id": 8000 + pr_num, "body": "/approve_deploy machine=test",
+                 "user": {"id": 111, "login": "bob"}}]
+
+    proxy.get_issue_comments = AsyncMock(
+        side_effect=lambda _repo, _pr: _make_comments(_pr))
+
+    # Cycle 1: PR 10 succeeds, PR 11 fails
+    async def _persist_fail_11(repo, pr, cid):
+        if pr == 11:
+            raise Exception("fail PR 11")
+        return await _persist_cursor(repo, pr, cid)
+
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_fail_11)
+    await watcher._poll_once()
+
+    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos
+    assert any(c[0] == 10 for c in persist_calls), "PR 10 should be baselined"
+    controller.on_command.assert_not_called()
+
+    # Cycle 2: retry — PR 10 must NOT be rebaselined
+    persist_calls.clear()
+
+    async def _persist_fail_11_again(repo, pr, cid):
+        # PR 11 still fails on first attempt of cycle 2
+        if pr == 11 and not getattr(_persist_fail_11_again, "_retry_second", False):
+            _persist_fail_11_again._retry_second = True
+            raise Exception("fail PR 11 again")
+        return await _persist_cursor(repo, pr, cid)
+
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_fail_11_again)
+    await watcher._poll_once()
+
+    # PR 10 must NOT appear again
+    pr10_rebase = sum(1 for c in persist_calls if c[0] == 10)
+    assert pr10_rebase == 0, f"PR 10 must not be rebaselined during retry, got {pr10_rebase}"
+    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos
+
+    # Cycle 3: PR 11 finally succeeds
+    persist_calls.clear()
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor)
+    await watcher._poll_once()
+
+    pr11_persisted = any(c[0] == 11 for c in persist_calls)
+    assert pr11_persisted, "PR 11 should be baselined on retry"
+    assert "4paradigm/phanthymotus-driver" not in watcher._pending_baseline_repos
+    controller.on_command.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_driver_reactivation_new_generation_resets_only_driver_progress():
+    """Remove and re-grant driver: previous per-PR progress does NOT leak
+    across auth generations.  Core repo remains active throughout."""
+    from ..github_client import GitHubClient
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    config.auth_valid = True
+
+    proxy = MagicMock()
+    controller = MagicMock()
+    controller.on_command = AsyncMock(return_value=True)
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth,
+    )
+
+    # Step 1: Revoke driver
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus"],
+    )
+    await watcher._refresh_active_repos()
+    assert "4paradigm/phanthymotus-driver" not in config.active_repos
+    assert "4paradigm/phanthymotus-driver" not in watcher._pending_baseline_repos
+    assert watcher._baseline_progress.get("4paradigm/phanthymotus-driver") is None, \
+        "Progress must be cleared on revoke"
+
+    # Core still active
+    assert "4paradigm/phanthymotus" in config.active_repos
+
+    # Step 2: Re-grant driver — new generation
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+    )
+    await watcher._refresh_active_repos()
+    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos
+    # New generation: progress reset
+    assert watcher._baseline_progress.get("4paradigm/phanthymotus-driver") == set(), \
+        "New auth generation must start with empty progress set"
+
+    # Core unaffected
+    assert "4paradigm/phanthymotus" in config.active_repos
+
+
+@pytest.mark.asyncio
+async def test_driver_reactivation_preserves_exact_visible_history_and_command():
+    """Production persist_cursor preserves exact visible History, archive
+    markers, COS, command kind/phase/args, components, deployments, and
+    review evidence; only cursor advances."""
+    from ..github_client import GitHubClient
+    from ..github_state_proxy import _build_hidden_state_body as _bhsb, _extract_hidden_state
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]
+
+    proxy = MagicMock()
+    controller = MagicMock()
+    controller.on_command = AsyncMock(return_value=True)
+    controller.reconcile_pr = AsyncMock()
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth,
+    )
+
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+    )
+    await watcher._refresh_active_repos()
+
+    driver_pr = {"number": 42, "state": "open", "merged": False, "draft": False,
+                 "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
+
+    body_holder = {"body": ""}
+
+    existing_state = _state(
+        components=[_component(component_id="comp-a", target="perception")],
+        deployments=[{"machine": "test-machine", "component_ids": ["comp-a"], "phase": "deployed"}],
+        status="deploy-requested",
+        cos={"object_key": "evidence/repo/42/x.tar.gz", "sha256": "ab" * 32, "size": 1024},
+        command={"comment_id": 5000, "kind": "", "phase": "completed", "args": {}},
+        last_processed_comment_id=5000,
+        head_sha="c" * 40,
+    )
+
+    visible_body = _bhsb(
+        _lifecycle_visible("repo", 42, status="deploy-requested"),
+        existing_state,
+    )
+    body_holder["body"] = visible_body
+
+    # Add a History section with an existing event
+    from ..github_state_proxy import _build_history_block
+    pre_events = [
+        {"event": "Lifecycle initialized",
+         "lifecycle": "`none` → `review-required`",
+         "timestamp": "2026-09-30 10:00:00"},
+    ]
+    history_block = _build_history_block(pre_events)
+    visible, _, _ = visible_body.partition("<!-- deploy-approval-state:v1")
+    body_holder["body"] = visible.rstrip() + "\n\n### History\n\n" + history_block + "\n" + visible_body[visible_body.find("<!-- deploy-approval-state:v1"):]
+
+    prev_visible_before = body_holder["body"][:body_holder["body"].find("<!-- deploy-approval-state:v1")]
+
+    async def _read_state(_repo, _pr):
+        return _extract_hidden_state(body_holder["body"])
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 9001, "body": "/approve_deploy machine=test",
+                                                          "user": {"id": 111, "login": "bob"}}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [{"number": 42}] if "driver" in repo else [])
+    proxy.get_pr = AsyncMock(return_value=driver_pr)
+    proxy.comment_identity = AsyncMock(return_value=("111", "bob"))
+    proxy.get_comment = AsyncMock(return_value={"id": 9001, "body": "/approve_deploy machine=test",
+                                                  "user": {"id": 111, "login": "bob"}})
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+    proxy.is_bot_comment = MagicMock(return_value=False)
+
+    persist_calls = []
+
+    async def _persist_cursor(repo, pr, cid):
+        """Faithful persist_cursor: advances cursor, updates body_holder
+        so _read_state can verify, preserving exact visible markdown.
+        ONLY last_processed_comment_id changes — command is preserved."""
+        persist_calls.append(cid)
+        state_after = await proxy.read_hidden_state(repo, pr)
+        if state_after is not None:
+            state_after["last_processed_comment_id"] = cid
+            # Preserve exact visible markdown bytes (everything before the hidden state marker).
+            marker = "<!-- deploy-approval-state:v1\n"
+            vis_prefix = body_holder["body"][:body_holder["body"].find(marker)]
+            hidden_json = json.dumps(state_after, ensure_ascii=False, separators=(",", ":"))
+            new_hidden_block = marker + hidden_json + "\n-->"
+            body_holder["body"] = vis_prefix + new_hidden_block
+        return {"last_processed_comment_id": cid}
+
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor)
+
+    # Cycle 1: reactivation baseline
+    await watcher._poll_once()
+
+    # Cursor advanced
+    assert persist_calls[-1] == 9001
+
+    # Visible markdown before marker is EXACTLY preserved
+    visible_after = body_holder["body"][:body_holder["body"].find("<!-- deploy-approval-state:v1")]
+    assert visible_after == prev_visible_before, \
+        f"Visible history must be byte-identical. Old: {repr(prev_visible_before[:80])}\nNew: {repr(visible_after[:80])}"
+
+    # Hidden state business fields preserved
+    hidden = await _read_state("repo", 42)
+    assert hidden["status"] == "deploy-requested"
+    assert hidden["deployments"] == [
+        {"machine": "test-machine", "component_ids": ["comp-a"], "phase": "deployed"}
+    ]
+    assert hidden["cos"]["object_key"] == "evidence/repo/42/x.tar.gz"
+    assert len(hidden["components"]) == 1
+    assert hidden["last_processed_comment_id"] == 9001
+
+    # No dispatch during baseline
+    controller.on_command.assert_not_called()
+
+    # Cycle 2: new comment above baseline — IS dispatched
+    persist_calls.clear()
+    controller.on_command.reset_mock()
+    newer_comment = {"id": 9002, "body": "/approve_deploy machine=test",
+                     "user": {"id": 111, "login": "bob"}}
+    proxy.get_issue_comments = AsyncMock(return_value=[
+        {"id": 9001, "body": "/approve_deploy machine=test", "user": {"id": 111, "login": "bob"}},
+        newer_comment,
+    ])
+    proxy.get_comment = AsyncMock(return_value=newer_comment)
+
+    await watcher._poll_once()
+
+    controller.on_command.assert_called_once()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V6 NEW REGRESSION TESTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_driver_startup_existing_pr_baselines_before_command_dispatch():
+    """Startup finds Driver already ACTIVE: existing PR comments from
+    authorization-gap period are durably baselined BEFORE any dispatch,
+    then NEW higher comment is processed. Core polling remains unaffected.
+    """
+    from ..github_client import GitHubClient
+    from ..github_command_watcher import GitHubCommandWatcher
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    config.auth_valid = True
+
+    proxy = MagicMock()
+    controller = MagicMock()
+    controller.on_command = AsyncMock(return_value=True)
+
+    async def _reconcile_pr(repo, pr_number):
+        pr_state = store.get(pr_number)
+        if pr_state is None:
+            pr_state = {
+                "version": 1, "head_sha": "d" * 40, "status": "review-required",
+                "components": [], "deployments": [], "case_results": {},
+                "test_result": "", "cos": {"object_key": "", "sha256": "", "size": 0},
+                "approve_attempts": [], "approve_attempts_total": 0,
+                "approve_attempts_truncated": False,
+                "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+                "last_processed_comment_id": 0,
+            }
+            store[pr_number] = pr_state
+        return pr_state
+
+    controller.reconcile_pr = AsyncMock(side_effect=_reconcile_pr)
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth
+    )
+
+    # Startup baseline gate — Driver already active
+    watcher.mark_repos_pending_baseline(["4paradigm/phanthymotus-driver"])
+
+    driver_pr = {"number": 42, "state": "open", "merged": False, "draft": False,
+                 "head": {"sha": "d" * 40}, "user": {"id": 111, "login": "carol"}}
+    old_gap_comment = {"id": 8001, "body": "/approve_deploy machine=test-machine",
+                       "user": {"id": 111, "login": "carol"}}
+    new_comment = {"id": 8002, "body": "/approve_deploy machine=test-machine",
+                   "user": {"id": 111, "login": "carol"}}
+
+    proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [{"number": 42}] if "driver" in repo else [])
+    proxy.is_bot_comment = MagicMock(return_value=False)
+
+    store = {42: None}
+
+    async def _read_state(_repo, _pr):
+        return None if store.get(_pr) is None else dict(store.get(_pr))
+
+    async def _persist_cursor(_repo, _pr, cid):
+        if _pr in store and store[_pr] is not None:
+            store[_pr]["last_processed_comment_id"] = cid
+        return {"last_processed_comment_id": cid}
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
+
+    comments_holder = {"list": [old_gap_comment, new_comment]}
+    proxy.get_issue_comments = AsyncMock(
+        side_effect=lambda _repo, _pr: list(comments_holder["list"]))
+    proxy.comment_identity = AsyncMock(return_value=("111", "carol"))
+    proxy.get_pr = AsyncMock(return_value=driver_pr)
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(return_value=new_comment)
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+
+    # Cycle 1: baseline — old gap comments NOT dispatched
+    await watcher._poll_once()
+    controller.on_command.assert_not_called()
+    assert store[42]["last_processed_comment_id"] >= 8002, \
+        f"Baseline cursor should be >= 8002, got {store[42]['last_processed_comment_id']}"
+
+    # Core polling unaffected
+    core_pr_polls = [c for c in proxy.get_open_prs.call_args_list if "phanthymotus" in str(c.args[0])]
+    assert core_pr_polls, "Core repo get_open_prs must still be polled"
+
+    # Cycle 2: NEW comment appears above baseline — IS dispatched
+    comments_holder["list"].append({"id": 8003, "body": "/approve_deploy machine=test-machine",
+                                    "user": {"id": 111, "login": "carol"}})
+    controller.on_command.reset_mock()
+    proxy.get_comment = AsyncMock(return_value={"id": 8003, "body": "/approve_deploy machine=test-machine",
+                                                 "user": {"id": 111, "login": "carol"}})
+
+    await watcher._poll_once()
+    controller.on_command.assert_called_once()
+    call_args = controller.on_command.call_args
+    dispatched_repo = call_args.args[1] if len(call_args.args) >= 2 else call_args.kwargs.get("repo")
+    assert dispatched_repo == "4paradigm/phanthymotus-driver"
+
+
+@pytest.mark.asyncio
+async def test_testing_reconcile_recovers_running_case_result_without_redeploy():
+    """Seed testing state with case_results={cid: "running"}. First reconcile
+    reruns advisory case, persists terminal result, preserves History,
+    ZERO unsafe deploy POST. Second reconcile: zero writes.
+    Test fail terminal and record_test continuation separately.
+    """
+    from ..github_state_proxy import (
+        _build_hidden_state_body as _bhsb,
+        _extract_hidden_state,
+    )
+
+    config = make_config()
+    proxy = MagicMock()
+    proxy.project_status_label = AsyncMock()
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+
+    policy = Policy(config)
+    policy.machines = {
+        "m1": MachineInfo(
+            alias="m1", node_id="n1", owners=["owner1"], node_host="10.0.0.1",
+            targets=["perception"], platforms=["linux/arm64"], variants=["5.11"],
+        ),
+    }
+
+    comp = _component(
+        component_id="comp-001", target="perception", variant="5.11",
+        runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+
+    # Seed: status=testing, case result = "running" (non-terminal)
+    running_state = _state(
+        components=[comp],
+        deployments=[
+            {"machine": "m1", "component_ids": ["comp-001"], "phase": "deployed"},
+        ],
+        status="testing",
+        case_results={"comp-001": "running"},
+        command={"comment_id": 50, "kind": "approve_deploy", "phase": "completed", "args": {"machine": "m1", "actor": "alice"}},
+        head_sha="a" * 40,
+    )
+    body_holder = {"body": _bhsb(
+        _lifecycle_visible("repo", 1, status="testing"), running_state)}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    async def _read_state(*_a, **_kw):
+        return _extract_hidden_state(body_holder["body"])
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+
+    controller = DeployController(config, proxy, policy, MagicMock())
+    controller.config.total_timeout = 0.5
+
+    # Mock case runner — returns terminal pass for the running case
+    controller._run_automated_case = AsyncMock(return_value={"comp-001": "pass"})
+
+    # First reconcile: reruns advisory case, persists terminal result
+    await controller.reconcile_pr("repo", 1)
+    assert proxy.write_hidden_state.call_count == 1, \
+        f"Expected 1 write on first reconcile, got {proxy.write_hidden_state.call_count}"
+    written = proxy.write_hidden_state.call_args.args[3]
+    assert written["case_results"]["comp-001"] == "pass", \
+        f"Expected terminal pass, got {written['case_results']}"
+    assert written["status"] == "testing"
+    # ZERO deploy POST
+    assert proxy.write_hidden_state.call_count == 1
+
+    # Second reconcile: already complete, no churn
+    proxy.write_hidden_state.reset_mock()
+    await controller.reconcile_pr("repo", 1)
+    assert proxy.write_hidden_state.call_count == 0, \
+        f"Expected zero writes on second reconcile, got {proxy.write_hidden_state.call_count}"
+
+    # Test fail terminal: record_test with fail should finalize
+    proxy.write_hidden_state.reset_mock()
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 90, "body": "/record_test result=fail summary='broken'",
+        "user": {"id": 111, "login": "owner1"},
+    })
+
+    result = await controller.handle_record_test("repo", 1, 90, "fail", "broken", "owner1", "111")
+    assert result is True
+    assert proxy.write_hidden_state.call_count == 1
+    final_written = proxy.write_hidden_state.call_args.args[3]
+    assert final_written["status"] == "failed", \
+        f"Expected failed status after terminal fail, got {final_written['status']}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# V7 NEW REGRESSION TESTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_driver_auth_refresh_recovery_rebaselines_driver_before_dispatch():
+    """When auth refresh fails then later succeeds with the SAME authorized
+    repo list, Driver must remain blocked until a new durable baseline is
+    persisted. No authorization-gap comments are replayed."""
+    from ..github_client import GitHubClient
+    from ..github_command_watcher import GitHubCommandWatcher
+
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
+
+    proxy = MagicMock()
+    controller = MagicMock()
+    controller.on_command = AsyncMock(return_value=True)
+
+    store: dict = {10: None}
+    persisted_bodies = []
+
+    async def _reconcile_pr(repo, pr_number):
+        pr_state = store.get(pr_number)
+        if pr_state is None:
+            pr_state = {
+                "version": 1, "head_sha": "d" * 40, "status": "review-required",
+                "components": [], "deployments": [], "case_results": {},
+                "test_result": "", "cos": {"object_key": "", "sha256": "", "size": 0},
+                "approve_attempts": [], "approve_attempts_total": 0,
+                "approve_attempts_truncated": False,
+                "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+                "last_processed_comment_id": 0,
+            }
+            store[pr_number] = pr_state
+        return pr_state
+
+    controller.reconcile_pr = AsyncMock(side_effect=_reconcile_pr)
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+
+    driver_pr = {"number": 10, "state": "open", "merged": False, "draft": False,
+                 "head": {"sha": "d" * 40}, "user": {"id": 111, "login": "carol"}}
+
+    old_comment = {"id": 7001, "body": "/approve_deploy machine=test-machine",
+                   "user": {"id": 111, "login": "carol"}, "created_at": "2026-10-09T00:00:00Z"}
+    comments_holder = {"list": [old_comment]}
+
+    proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [{"number": 10}] if "driver" in repo else [])
+    proxy.is_bot_comment = MagicMock(return_value=False)
+
+    async def _read_state(_repo, _pr):
+        return None if store.get(_pr) is None else dict(store.get(_pr))
+
+    async def _persist_cursor(_repo, _pr, cid):
+        if store.get(_pr) is not None:
+            store[_pr]["last_processed_comment_id"] = max(
+                store[_pr]["last_processed_comment_id"], cid)
+        persisted_bodies.append(cid)
+        return {"last_processed_comment_id": cid}
+
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.persist_cursor = AsyncMock(side_effect=_persist_cursor)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
+    proxy.get_issue_comments = AsyncMock(
+        side_effect=lambda _repo, _pr: list(comments_holder["list"]))
+    proxy.comment_identity = AsyncMock(return_value=("111", "carol"))
+    proxy.get_pr = AsyncMock(return_value=driver_pr)
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(return_value=old_comment)
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth)
+
+    # Cycle 1: auth refresh FAILS — auth_valid=False, no dispatch
+    github_auth.refresh_installation_token = AsyncMock(side_effect=Exception("token error"))
+    await watcher._refresh_active_repos_if_needed()
+    await watcher._poll_once()
+    assert not config.auth_valid
+    assert not getattr(watcher, '_baseline_progress', {}).get("4paradigm/phanthymotus-driver")
+    controller.on_command.assert_not_called()
+
+    # Cycle 2 step 1: token refresh recovers — driver enters pending (before poll)
+    watcher._last_auth_refresh = -999.0
+    github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
+    github.list_installation_repositories = AsyncMock(
+        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    await watcher._refresh_active_repos_if_needed()
+    assert config.auth_valid
+    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos,         "Driver must be pending immediately after auth recovery, before poll"
+
+    # Cycle 2 step 2: poll runs baseline — baseline succeeds, pending cleared
+    await watcher._poll_once()
+    assert "4paradigm/phanthymotus-driver" not in watcher._pending_baseline_repos
+    # Still zero dispatch because baseline only
+    controller.on_command.assert_not_called()
+
+    # Baseline succeeds
+    await watcher._refresh_active_repos_if_needed()
+    await watcher._poll_once()
+    assert "4paradigm/phanthymotus-driver" not in watcher._pending_baseline_repos
+    assert persisted_bodies and persisted_bodies[-1] == 7001
+
+    # A NEW comment above baseline should now dispatch
+    new_comment_7003 = {
+        "id": 7003, "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 111, "login": "carol"}, "created_at": "2026-10-09T02:00:00Z"}
+    comments_holder["list"].append(new_comment_7003)
+    proxy.get_comment = AsyncMock(return_value=new_comment_7003)
+    await watcher._refresh_active_repos_if_needed()
+    await watcher._poll_once()
+    controller.on_command.assert_called_once()
+    call_repo = controller.on_command.call_args.args[1]
+    assert call_repo == "4paradigm/phanthymotus-driver"
+
+
+@pytest.mark.asyncio
+async def test_driver_baseline_enumeration_failure_fails_closed():
+    """If open-PR enumeration fails for the Driver repo, pending stays and
+    no commands dispatch. The repo remains pending on retry."""
+    from ..github_client import GitHubClient, GitHubError
+    from ..github_command_watcher import GitHubCommandWatcher
+
+    config = make_config()
+    config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    config.auth_valid = True
+
+    proxy = MagicMock()
+    controller = MagicMock()
+    controller.on_command = AsyncMock(return_value=True)
+
+    github = MagicMock(spec=GitHubClient)
+    github_auth = MagicMock()
+    github_auth.refresh_installation_token = AsyncMock(return_value="token")
+
+    watcher = GitHubCommandWatcher(
+        config, proxy, controller, github=github, github_auth=github_auth)
+    # Seed driver as pending
+    watcher.mark_repos_pending_baseline(["4paradigm/phanthymotus-driver"])
+
+    # enumerate PRs fails
+    proxy.get_open_prs = AsyncMock(side_effect=GitHubError(500, "list failed"))
+    proxy.is_bot_comment = MagicMock(return_value=False)
+
+    await watcher._poll_once()
+    # Should remain pending
+    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos
+    controller.on_command.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_testing_reconcile_rejects_stale_snapshot_after_await():
+    """When HEAD or status changes between the advisory case await and
+    the post-await stale check, no stale case results are written and no
+    deploy POST fires."""
+    config = make_config()
+    proxy = MagicMock()
+    policy = Policy(config)
+    policy.machines = {}
+    controller = DeployController(config, proxy, policy, MagicMock())
+
+    comp = _component(
+        component_id="comp-001", target="perception", variant="5.11",
+        runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+    state = _state(
+        components=[comp],
+        deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
+        status="testing",
+        head_sha="a" * 40,
+        case_results={},
+    )
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.get_issue_comments = AsyncMock(return_value=[])
+    proxy.read_hidden_state = AsyncMock(return_value=dict(state))
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+    proxy.project_status_label = AsyncMock()
+
+    # Simulate HEAD drift AFTER the advisory case await
+    def _drifted_pr(*a, **kw):
+        return {"state": "open", "merged": False, "draft": False,
+                "head": {"sha": "b" * 40}, "user": {"id": 111, "login": "alice"}}
+
+    proxy.get_pr = AsyncMock(side_effect=[
+        {"state": "open", "merged": False, "draft": False,
+         "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"}},
+        _drifted_pr(),  # second call (post-await) returns drifted HEAD
+    ])
+    proxy.read_hidden_state = AsyncMock(side_effect=[
+        dict(state),  # first read
+        None,  # post-await: state gone
+    ])
+    controller._run_automated_case = AsyncMock(return_value={"comp-001": "pass"})
+
+    await controller.reconcile_pr("repo", 1)
+
+    # No writes because stale
+    assert proxy.write_hidden_state.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_alias_and_ipv4_selector_produce_same_canonical_machine():
+    """A valid alias selector and a valid IPv4 selector on distinct PRs
+    must each reach the deploy path, persist a canonical machine alias,
+    and edited selectors fail closed."""
+    controller, proxy, _policy, github, _config = _controller()
+
+    alias = "tianyi2-005"
+    ip_selector = "10.100.129.72"
+
+    from ..models import MachineInfo
+    controller.policy.machines = {
+        alias: MachineInfo(
+            alias=alias, node_id="node-tianyi", owners=["owner1"],
+            node_host=ip_selector, targets=["perception"],
+            platforms=["linux/arm64"], variants=["5.11"], driver_paths=[],
+        ),
+    }
+
+    core = MagicMock()
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    img = "registry.example/repo@sha256:" + "a" * 64
+    core.driver_status = AsyncMock(return_value={"status": "running", "running_image": img})
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core)
+
+    emdash = "\u2014"
+    github.get_issue_comments = AsyncMock(return_value=[
+        {"id": 1001, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Build Result\n\nCommit: abc1234\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+         "created_at": "2026-09-18T00:00:00Z", "updated_at": "2026-09-18T01:00Z"},
+        {"id": 1002, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Test Results\n\nCommit: abc1234\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+         "created_at": "2026-09-18T00:02:00Z", "updated_at": "2026-09-18T00:03:00Z"},
+        {"id": 1003, "user": {"id": "7950763", "login": "review-agent-bot"},
+         "body": f"<!-- pr-review-agent -->\n## PR Review Agent {emdash} Code Review\n\nAll checks passed.",
+         "created_at": "2026-09-18T00:04:00Z", "updated_at": "2026-09-18T00:05:00Z"},
+    ])
+    github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value={})
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._refresh_uncertain_state = AsyncMock(return_value="deploy-requested")
+    orig_timeout = controller.config.total_timeout
+    controller.config.total_timeout = 0.5
+
+    from ..github_state_proxy import _build_hidden_state_body as _bhsb
+    comp_jp5 = _component(
+        component_id="comp-jp5-perception", target="perception",
+        variant="5.11", runtime_id="perception",
+        image_ref="registry.example/repo@sha256:" + "a" * 64,
+    )
+    state = _state(components=[comp_jp5], status="deploy-requested")
+    body_holder = {"body": _bhsb(
+        _lifecycle_visible("repo", 1, status="deploy-requested"), state)}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": body_holder["body"]}
+
+    async def _write_hidden_state(_repo, _pr, vis, _st):
+        body_holder["body"] = _bhsb(vis, _st)
+        return {"id": 42}
+
+    async def _read_state(*_a, **_kw):
+        from ..github_state_proxy import _extract_hidden_state
+        return _extract_hidden_state(body_holder["body"])
+
+    # PR 1: alias selector
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+    proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    proxy.project_status_label = AsyncMock()
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 50, "body": f"/approve_deploy machine={alias}",
+        "user": {"id": 111, "login": "owner1"},
+    })
+    controller.config.total_timeout = orig_timeout
+    await controller.handle_approve_deploy("repo", 1, 50, alias, "owner1", "111")
+    hidden = await _read_state()
+    assert hidden["deployments"] == [{"machine": alias, "component_ids": ["comp-jp5-perception"], "phase": "deployed"}]
+
+    # PR 2: IPv4 selector — same machine, different PR
+    core.deploy_driver.reset_mock()
+    body_holder["body"] = _bhsb(
+        _lifecycle_visible("repo", 2, status="deploy-requested"), state)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 43, "body": body_holder["body"]}])
+    proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
+    proxy.get_pr = AsyncMock(return_value={
+        "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40}, "user": {"id": 111, "login": "alice"},
+    })
+    proxy.get_comment = AsyncMock(return_value={
+        "id": 51, "body": f"/approve_deploy machine={ip_selector}",
+        "user": {"id": 111, "login": "owner1"},
+    })
+    controller.config.total_timeout = orig_timeout
+    await controller.handle_approve_deploy("repo", 2, 51, ip_selector, "owner1", "111")
+    assert core.deploy_driver.await_count == 1
+    # Both reach deploy path

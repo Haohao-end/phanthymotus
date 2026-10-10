@@ -292,7 +292,7 @@ def create_app(config: Config | None = None):
     )
 
     # Single serial command watcher
-    watcher = GitHubCommandWatcher(config, proxy, controller)
+    watcher = GitHubCommandWatcher(config, proxy, controller, github=github, github_auth=github_auth)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -302,7 +302,9 @@ def create_app(config: Config | None = None):
         try:
             active_repos = await _resolve_active_repos(github, desired_repos)
             # config.github_repos now becomes ACTIVE_REPOS for all runtime code
-            config.github_repos = active_repos
+            config.active_repos = active_repos
+            config.auth_valid = True
+            watcher.mark_repos_pending_baseline(active_repos)
             try:
                 await _bootstrap_status_labels(github)
             except Exception as exc:

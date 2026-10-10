@@ -282,6 +282,8 @@ def test_webhook_driver_blocked_when_inactive():
         machine_owners_file="/dev/null",
         secrets_file="/dev/null",
     )
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
 
     app = FastAPI()
     app.state.config = config
@@ -324,6 +326,8 @@ def test_webhook_driver_allowed_when_active():
         machine_owners_file="/dev/null",
         secrets_file="/dev/null",
     )
+    config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    config.auth_valid = True
 
     proxy = AsyncMock()
     proxy.get_comment = AsyncMock(return_value={
@@ -428,6 +432,8 @@ async def test_first_observation_baseline_new_command_after_still_executes():
       -> on_command called exactly once for id=20
     """
     config = _make_config()
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
     proxy = MagicMock()
 
     hidden_state = [None]
@@ -479,6 +485,8 @@ async def test_first_observation_baseline_new_command_after_still_executes():
 @pytest.mark.asyncio
 async def test_existing_state_cursor_behavior_unchanged():
     config = _make_config()
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
     proxy = MagicMock()
     proxy.read_hidden_state = AsyncMock(return_value={
         "last_processed_comment_id": 5,
@@ -619,7 +627,10 @@ async def test_startup_main_only_active_repos():
     watcher_started = []
 
     class FakeWatcher:
-        def __init__(self, config, proxy, controller):
+        def __init__(self, config, proxy, controller, github=None, github_auth=None):
+            pass
+
+        def mark_repos_pending_baseline(self, repos):
             pass
         def start(self):
             watcher_started.append(True)
@@ -654,7 +665,8 @@ async def test_startup_main_only_active_repos():
         server_mod.GitHubCommandWatcher = orig_watcher
 
     assert watcher_started == [True]
-    assert cfg.github_repos == ["4paradigm/phanthymotus"]
+    assert cfg.github_repos == ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    assert cfg.active_repos == ["4paradigm/phanthymotus"]
 
 
 @pytest.mark.asyncio
@@ -708,11 +720,13 @@ async def test_startup_missing_main_watcher_not_started():
     watcher_started = []
 
     class FakeWatcher:
-        def __init__(self, config, proxy, controller):
+        def __init__(self, config, proxy, controller, github=None, github_auth=None):
+            pass
+
+        def mark_repos_pending_baseline(self, repos):
             pass
         def start(self):
             watcher_started.append(True)
-
         async def stop(self):
             pass
 
@@ -848,6 +862,8 @@ async def test_baseline_persist_failure_cycle2_still_zero_dispatch():
 async def test_new_command_after_recovered_baseline_executes():
     """Test B: After baseline recovered, new comment id=20 is dispatched."""
     config = _make_config()
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
     proxy = MagicMock()
 
     hidden_state = [None]
@@ -995,6 +1011,8 @@ async def test_baseline_persist_returns_low_cursor_zero_dispatch():
 async def test_zero_comments_first_observation_reconcile_creates_bot_comment():
     """Test E: initial comments empty, reconcile creates lifecycle bot comment id=100."""
     config = _make_config()
+    config.active_repos = ["4paradigm/phanthymotus"]
+    config.auth_valid = True
     proxy = MagicMock()
 
     hidden_state = [None]
@@ -1168,7 +1186,12 @@ async def test_startup_authorization_failure_closes_resources():
     watcher_started = []
 
     class FakeWatcher:
-        def __init__(self, config, proxy, controller):
+        def __init__(self, config, proxy, controller, github=None, github_auth=None):
+            pass
+
+        def mark_repos_pending_baseline(self, repos):
+            pass
+        def __init__(self, config, proxy, controller, github=None, github_auth=None):
             pass
         def start(self):
             watcher_started.append(True)
@@ -1277,7 +1300,12 @@ async def test_startup_cleanup_failure_does_not_mask_authorization_error():
     watcher_started = []
 
     class FakeWatcher:
-        def __init__(self, config, proxy, controller):
+        def __init__(self, config, proxy, controller, github=None, github_auth=None):
+            pass
+
+        def mark_repos_pending_baseline(self, repos):
+            pass
+        def __init__(self, config, proxy, controller, github=None, github_auth=None):
             pass
         def start(self):
             watcher_started.append(True)
@@ -1366,6 +1394,11 @@ async def test_lifespan_body_exception_cleanup_runs_once():
 
 
     class FakeWatcherCounting:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def mark_repos_pending_baseline(self, repos):
+            pass
         def __init__(self, *args, **kwargs):
             pass
         def start(self):
@@ -1477,6 +1510,11 @@ async def test_normal_shutdown_cleanup_exactly_once():
 
 
     class FakeWatcherNormal:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def mark_repos_pending_baseline(self, repos):
+            pass
         def __init__(self, *args, **kwargs):
             pass
         def start(self):

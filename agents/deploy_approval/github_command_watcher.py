@@ -20,11 +20,12 @@ Safety rules:
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 
 from . import commands as commands_mod
-from .config import Config
-from .github_client import GitHubError
+from .config import Config, SUPPORTED_GITHUB_REPOS
+from .github_client import GitHubClient, GitHubError
 from .github_state_proxy import GitHubStateProxy, GitHubStateProxyError
 
 logger = logging.getLogger(__name__)
@@ -79,18 +80,53 @@ class GitHubCommandWatcher:
         config: Config,
         proxy: GitHubStateProxy,
         controller: object,
+        github: GitHubClient | None = None,
+        github_auth: object | None = None,
     ):
         self.config = config
         self.proxy = proxy
         self.controller = controller
+        self._github = github
+        self._github_auth = github_auth
+        self._auth_refresh_interval = 120  # seconds
+        self._last_auth_refresh = -1.0  # never refreshed
+        self._monotonic = time.monotonic  # deterministic clock source
         self._task: asyncio.Task | None = None
         self._running = False
+        # Repos newly (re)activated by an auth refresh.  Each is baselined
+        # (cursor = max observed comment id, no dispatch) before normal
+        # command processing resumes, so preexisting comments never execute
+        # as fresh approvals.
+        self._pending_baseline_repos: set[str] = set()
+        # Per-repo set of PRs already baselined in the current
+        # pending-generation. Prevents rebaselining PRs that
+        # already succeeded this generation.
+        self._baseline_progress: dict[str, set[int]] = {}
 
     def start(self) -> None:
         if self._running:
             return
         self._running = True
         self._task = asyncio.create_task(self._poll_loop())
+
+    def mark_repos_pending_baseline(self, repos: list[str]) -> None:
+        """Seed the pending-baseline gate for externally resolved repos.
+
+        Used by server startup: the Controller resolves authorization BEFORE
+        the watcher's first poll, so newly active non-required repos (e.g.
+        the Driver repo) must be baselined BEFORE their first dispatch.
+        Without this, authorization-gap comments (posted during downtime or
+        revocation) could be replayed as fresh approvals.
+
+        The required Core repo is intentionally NOT touched — its polling is
+        unaffected.  Each seeded repo starts a fresh baseline generation.
+        """
+        required = "4paradigm/phanthymotus"
+        for repo in repos:
+            if repo == required:
+                continue
+            self._pending_baseline_repos.add(repo)
+            self._baseline_progress[repo] = set()
 
     async def stop(self) -> None:
         self._running = False
@@ -105,33 +141,358 @@ class GitHubCommandWatcher:
     async def _poll_loop(self) -> None:
         while self._running:
             try:
+                await self._refresh_active_repos_if_needed()
                 await self._poll_once()
             except Exception as e:
                 logger.error("command watcher poll cycle failed: %s", e)
             await asyncio.sleep(self.config.poll_interval_seconds)
+
+    async def _refresh_active_repos_if_needed(self) -> None:
+        """Periodically refresh runtime authorization before polling."""
+        if self._github is None or self._github_auth is None:
+            return
+        now = self._monotonic()
+        if self._last_auth_refresh >= 0.0 and (
+            (now - self._last_auth_refresh) < self._auth_refresh_interval
+        ):
+            return
+        # Timestamp set BEFORE the attempt: a failed refresh still occupies
+        # this interval slot, so the next cycle retries instead of hot-looping.
+        self._last_auth_refresh = now
+        await self._refresh_active_repos()
+
+    async def _refresh_active_repos(self) -> None:
+        """Refresh ACTIVE_REPOS from GitHub App installation authorization.
+
+        CORRECT AUTH SEQUENCE (fail-closed):
+        1. Force fresh installation token under existing single-flight lock.
+        2. GET /installation/repositories with the refreshed token.
+        3. Validate complete paginated response.
+        4. Compute new_active = config.github_repos \u2229 SUPPORTED_REPOS
+           \u2229 authorized_names — never expands the user's allowlist.
+        5. Ensure required repo is present.
+        6. Atomically publish new_active + auth_valid together.
+
+        On any failure: auth_valid=False, do NOT publish new repos,
+        and do NOT proceed with _poll_once() that cycle.
+        """
+        if self._github is None or self._github_auth is None:
+            return
+        old_active = list(self.config.active_repos)
+        old_auth_valid = getattr(self.config, "auth_valid", True)
+        try:
+            # Step 1: FORCE fresh installation token FIRST
+            try:
+                await self._github_auth.refresh_installation_token()
+            except Exception as tok_exc:
+                logger.warning(
+                    "auth refresh: forced token refresh failed \u2014 "
+                    "keeping previous active repos: %s", old_active,
+                )
+                self.config.auth_valid = False
+                return
+
+            # Step 2: Query repos with refreshed token
+            authorized_names = await self._github.list_installation_repositories()
+            if not isinstance(authorized_names, list):
+                logger.warning(
+                    "auth refresh: /installation/repositories returned non-list \u2014 "
+                    "keeping previous active repos: %s", old_active,
+                )
+                self.config.auth_valid = False
+                return
+
+            # Step 3: Validate each entry is a dict with full_name OR a plain string
+            authorized_set: set[str] = set()
+            for entry in authorized_names:
+                if isinstance(entry, dict):
+                    fn = entry.get("full_name")
+                    if not isinstance(fn, str):
+                        logger.warning(
+                            "auth refresh: malformed repo entry (no full_name) \u2014 "
+                            "keeping previous active repos: %s", old_active,
+                        )
+                        self.config.auth_valid = False
+                        return
+                    authorized_set.add(fn)
+                elif isinstance(entry, str):
+                    authorized_set.add(entry)
+                else:
+                    logger.warning(
+                        "auth refresh: malformed repo entry \u2014 "
+                        "keeping previous active repos: %s", old_active,
+                    )
+                    self.config.auth_valid = False
+                    return
+
+            # Step 4: Compute intersection of user-configured repos
+            # (config.github_repos) ∩ SUPPORTED_REPOS ∩ authorized_set.
+            # Iterate over config.github_repos to preserve stable ordering
+            # (Core first), preventing list-equality comparison flakiness.
+            new_active: list[str] = []
+            for repo in self.config.github_repos:
+                if repo in SUPPORTED_GITHUB_REPOS and repo in authorized_set:
+                    new_active.append(repo)
+
+            # Step 5: Required repo check \u2014 fail closed if lost
+            required = "4paradigm/phanthymotus"
+            if required not in new_active:
+                logger.warning(
+                    "auth refresh: required repo %r not authorized; "
+                    "failing closed",
+                    required,
+                )
+                self.config.auth_valid = False
+                self.config.active_repos = []
+                return
+
+            # Step 6: Atomically publish new_active + auth_valid
+            self.config.active_repos = new_active
+            self.config.auth_valid = True
+
+            # Auth recovery: if auth was previously invalid and is now valid
+            # again, mark the optional Driver repo pending for a new durable
+            # baseline EVEN IF authorized repo membership is identical to
+            # old_active.  This prevents replaying commands posted during the
+            # authorization outage.
+            old_active_set = set(old_active)
+            new_active_set = set(new_active)
+            # A1-02: clear any stale Core entries from pending/progress
+            # before evaluating the current cycle.  Core must NEVER enter
+            # the pending-baseline gate, period.
+            self._pending_baseline_repos.discard(required)
+            self._baseline_progress.pop(required, None)
+            if not old_auth_valid and old_active_set == new_active_set:
+                # Auth recovered with the same authorized set (order-independent).
+                # Only require Driver re-baseline when the Driver repo is
+                # actually authorized — adding it when absent would create
+                # a pending repo that can never be baselined and would
+                # interfere with Core polling.
+                driver = "4paradigm/phanthymotus-driver"
+                if driver in new_active_set:
+                    logger.info(
+                        "auth refresh: auth recovered with same repos %s — "
+                        "requiring Driver baseline",
+                        sorted(new_active_set),
+                    )
+                    self._pending_baseline_repos.add(driver)
+                    self._baseline_progress[driver] = set()
+            elif new_active_set != old_active_set:
+                added = set(new_active) - set(old_active)
+                # A1-02: only optional repos (Driver) enter pending-baseline; Core never does.
+                optional_added = {r for r in added if r != required}
+                removed = set(old_active) - set(new_active)
+                if added:
+                    logger.info("auth refresh: activated repos %s", sorted(added))
+                    self._pending_baseline_repos.update(optional_added)
+                    # Start a fresh baseline generation — do not carry over
+                    # PRs baselined under a prior authorization period.
+                    for r in optional_added:
+                        self._baseline_progress[r] = set()
+                if removed:
+                    logger.info("auth refresh: deactivated repos %s", sorted(removed))
+                    # Clear generation state for revoked repos; preserve
+                    # persisted lifecycle / History / cursor on disk.
+                    for r in removed:
+                        self._pending_baseline_repos.discard(r)
+                        self._baseline_progress.pop(r, None)
+        except Exception as e:
+            logger.warning(
+                "auth refresh failed: %s \u2014 failing closed",
+                type(e).__name__,
+            )
+            self.config.auth_valid = False
 
     async def _poll_once(self) -> None:
         """One poll cycle over all configured repos and open PRs.
 
         Processes repos/PRs/comments deterministically and sequentially.
         No asyncio.gather for mutating PR work.
+
+        Uses only runtime-authorized active_repos. Never falls back to
+        DESIRED_REPOS (config.github_repos). If active_repos is empty or
+        auth snapshot is invalid, skip polling this cycle.
         """
-        for repo in self.config.github_repos:
+        if not self.config.active_repos or not getattr(self.config, "auth_valid", True):
+            return
+        repos = self.config.active_repos
+        for repo in repos:
             try:
                 prs = await self.proxy.get_open_prs(repo)
             except GitHubError as e:
                 logger.warning("watcher list PRs %s: %s", repo, e)
                 continue
+            baseline_all = repo in self._pending_baseline_repos
             for pr in prs:
                 pr_number = int(pr.get("number") or 0)
                 if not pr_number:
                     continue
                 try:
-                    await self._process_pr(repo, pr_number)
+                    if baseline_all:
+                        # A1 fix: skip PRs already successfully baselined in the
+                        # CURRENT authorization generation. Re-baselining them
+                        # would advance their cursor past legitimate new
+                        # comments posted while a sibling PR keeps failing.
+                        if pr_number in self._baseline_progress.get(repo, set()):
+                            continue
+                        success = await self._baseline_pr(repo, pr_number)
+                        if success:
+                            self._baseline_progress.setdefault(repo, set())
+                            self._baseline_progress[repo].add(pr_number)
+                    else:
+                        await self._process_pr(repo, pr_number)
                 except Exception as e:
                     logger.error(
                         "watcher process %s#%s: %s", repo, pr_number, e
                     )
+            # Baselining uses per-PR progress tracking: only discard from
+            # _pending_baseline_repos when ALL open PRs for this repo have
+            # been successfully baselined this generation.  PRs whose
+            # baseline persist failed remain unbaselined and will be retried
+            # on the next cycle — commands are NOT dispatched while pending.
+            if baseline_all:
+                self._baseline_progress.setdefault(repo, set())
+                all_baselined = all(
+                    pr_number in self._baseline_progress[repo]
+                    for pr_number in [
+                        int(pr.get("number") or 0) for pr in prs
+                        if int(pr.get("number") or 0)
+                    ]
+                )
+                if all_baselined:
+                    self._pending_baseline_repos.discard(repo)
+
+    async def _baseline_pr(self, repo: str, pr_number: int) -> bool:
+        """Baseline one PR's command cursor without dispatching anything.
+
+        Used on first observation AND when a repo is newly (re)activated by an
+        authorization refresh: the cursor is advanced to the maximum comment
+        id observed on GitHub so preexisting comments never execute as fresh
+        approvals.  Commands posted AFTER the baseline persist are processed
+        normally by subsequent cycles.
+
+        For PRs that already have a baselined cursor (existing lifecycle state
+        from a previous authorized period), advance the cursor to the maximum
+        observed comment id using ``persist_cursor`` so that any commands
+        posted while the repo was unauthorized are skipped on reactivation.
+        """
+        initial_state = await self.proxy.read_hidden_state(repo, pr_number)
+
+        baseline_id = 0
+        if _needs_initial_comment_baseline(initial_state):
+            # --- First-observation / baseline-incomplete path ---
+            pr_info = await self.proxy.get_pr(repo, pr_number)
+            if not pr_info or pr_info.get("state") != "open":
+                if initial_state is None:
+                    await self.controller.reconcile_pr(repo, pr_number)
+                return False
+
+            # BEFORE reconcile: snapshot current comments.
+            try:
+                comments_before = await self.proxy.get_issue_comments(repo, pr_number)
+            except Exception as e:
+                logger.warning(
+                    "watcher baseline snapshot-before %s#%s: %s \u2014 fail closed",
+                    repo, pr_number, e,
+                )
+                return False
+
+            max_cid_before = 0
+            for c in comments_before:
+                cid = c.get("id")
+                if isinstance(cid, int) and not isinstance(cid, bool) and cid > max_cid_before:
+                    max_cid_before = cid
+
+            # Reconcile (may create lifecycle hidden state).
+            try:
+                await self.controller.reconcile_pr(repo, pr_number)
+            except Exception as e:
+                logger.warning(
+                    "watcher reconcile %s#%s: %s \u2014 skip baseline this cycle",
+                    repo, pr_number, e,
+                )
+                return False
+
+            # After reconcile: fresh read state.
+            state_after = await self.proxy.read_hidden_state(repo, pr_number)
+            if state_after is None:
+                return False
+
+            # AFTER reconcile: second snapshot.
+            try:
+                comments_after = await self.proxy.get_issue_comments(repo, pr_number)
+            except Exception as e:
+                logger.warning(
+                    "watcher baseline snapshot-after %s#%s: %s \u2014 fail closed",
+                    repo, pr_number, e,
+                )
+                return False
+
+            max_cid_after = 0
+            for c in comments_after:
+                cid = c.get("id")
+                if isinstance(cid, int) and not isinstance(cid, bool) and cid > max_cid_after:
+                    max_cid_after = cid
+
+            baseline_id = max(max_cid_before, max_cid_after)
+        else:
+            # --- Existing baselined PR \u2014 reactivation cursor advance ---
+            # The PR has a real cursor state. Advance cursor to max(old, observed)
+            # without resetting business fields.
+            pr_info = await self.proxy.get_pr(repo, pr_number)
+            if not pr_info or pr_info.get("state") != "open":
+                if initial_state is None:
+                    await self.controller.reconcile_pr(repo, pr_number)
+                return False
+
+            try:
+                comments = await self.proxy.get_issue_comments(repo, pr_number)
+            except Exception as e:
+                logger.warning(
+                    "watcher baseline snapshot-before %s#%s: %s \u2014 fail closed",
+                    repo, pr_number, e,
+                )
+                return False
+
+            max_cid = 0
+            for c in comments:
+                cid = c.get("id")
+                if isinstance(cid, int) and not isinstance(cid, bool) and cid > max_cid:
+                    max_cid = cid
+
+            old_cursor = initial_state.get("last_processed_comment_id", 0)
+            baseline_id = max(old_cursor, max_cid)
+
+        # Persist baseline cursor (shared by both paths).
+        try:
+            persisted = await self.proxy.persist_cursor(repo, pr_number, baseline_id)
+        except Exception as e:
+            logger.warning(
+                "watcher persist baseline %s#%s: %s \u2014 fail closed",
+                repo, pr_number, e,
+            )
+            return False
+
+        if not isinstance(persisted, dict):
+            logger.warning(
+                "watcher persist baseline %s#%s returned %s \u2014 fail closed",
+                repo, pr_number, type(persisted).__name__,
+            )
+            return False
+        persisted_cid = persisted.get("last_processed_comment_id")
+        if not isinstance(persisted_cid, int) or isinstance(persisted_cid, bool):
+            logger.warning(
+                "watcher persist baseline %s#%s invalid cursor \u2014 fail closed",
+                repo, pr_number,
+            )
+            return False
+        if persisted_cid < baseline_id:
+            logger.warning(
+                "watcher persist baseline %s#%s cursor %s < requested %s \u2014 fail closed",
+                repo, pr_number, persisted_cid, baseline_id,
+            )
+            return False
+        return True
 
     async def _process_pr(self, repo: str, pr_number: int) -> None:
         """Process commands for one PR.
@@ -328,6 +689,16 @@ class GitHubCommandWatcher:
                         repo, pr_number, comment_id,
                     ) or state
                 continue
+
+            # TOCTOU recheck: the auth snapshot was validated at cycle start,
+            # but awaits have run since. Fail closed if authorization was
+            # revoked while we were reading GitHub state.
+            if not getattr(self.config, "auth_valid", True) or repo not in self.config.active_repos:
+                logger.warning(
+                    "watcher auth snapshot invalid before dispatch %s#%s \u2014 fail closed",
+                    repo, pr_number,
+                )
+                return
 
             # Dispatch to controller — transient failure must NOT advance cursor
             try:

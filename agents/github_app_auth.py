@@ -110,6 +110,16 @@ class GitHubAppAuth:
                 return self._install_token
             return await self._refresh_installation_token()
 
+    async def refresh_installation_token(self) -> str:
+        """FORCE a refresh of the installation access token, ignoring expiry.
+
+        Use when repository authorization may have changed (e.g. a new repo
+        was granted to the GitHub App installation) so the new token carries
+        the updated repository scopes.
+        """
+        async with self._lock:
+            return await self._refresh_installation_token()
+
     @property
     def app_id(self) -> str:
         """Public read-only access to the GitHub App ID."""

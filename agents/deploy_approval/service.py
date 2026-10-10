@@ -724,6 +724,7 @@ class DeployController:
             if pr_head != state.get("head_sha", ""):
                 # HEAD drift: zero deploy, clear old validation snapshot, reset to review-required
                 old_head = state.get("head_sha", "")
+                old_status = state.get("status", "review-required")
                 state["status"] = "review-required"
                 state["head_sha"] = pr_head
                 state["review_evidence"] = {}
@@ -747,7 +748,7 @@ class DeployController:
                 )
                 event = {
                     "event": "HEAD drift detected",
-                    "lifecycle": f"`{state.get('status', 'review-required')}` \u2192 `review-required`",
+                    "lifecycle": f"`{old_status}` \u2192 `review-required`",
                     "timestamp": comments_mod.beijing_now_str(),
                 }
                 await self._write_lifecycle_with_history(
@@ -978,6 +979,9 @@ class DeployController:
                 await self._post_error(repo, pr_number, str(e))
                 return True
 
+            # Preserve the ORIGINAL selector (IPv4 or alias) from the comment
+            # for exact revalidation. Canonical alias is used for state/persistence.
+            machine_selector = machine_alias
             # Use canonical alias for all state persistence
             machine_alias = machine.alias
 
@@ -1023,7 +1027,7 @@ class DeployController:
                     "comment_id": comment_id,
                     "kind": "approve_deploy",
                     "phase": "completed",
-            # machine_alias added conditionally below
+                    "args": {"machine": machine_alias, "actor": actor},
                 }
                 state["last_processed_comment_id"] = comment_id
                 markdown = comments_mod.deploy_requested(
@@ -1035,7 +1039,7 @@ class DeployController:
                         "ZERO deploy POST.",
                         "Send a NEW `/approve_deploy machine=<alias-or-ip>` for a compatible machine.",
                     ],
-                    deployments=[],
+                    deployments=state.get("deployments", []),
                 )
                 event = {
                     "event": f"Machine `{machine_alias}` selected",
@@ -1097,7 +1101,7 @@ class DeployController:
 
             # Fresh exact approval comment re-validation
             validated_comment = await self._revalidate_approve_comment(
-                repo, comment_id, actor_id, machine_alias,
+                repo, comment_id, actor_id, machine_selector,
             )
             if validated_comment is None:
                 state["status"] = "deploy-requested"
@@ -1517,17 +1521,17 @@ class DeployController:
                 "ip": machine_info.node_host if machine_info else "",
                 "timestamp": comments_mod.beijing_now_str(),
             }
-            await self._write_lifecycle_with_history(
-                repo, pr_number, state, testing_markdown,
-                event=last_machine_event,
-            )
-            event = {
+            event_all = {
                 "event": "All components deployed",
                 "lifecycle": "`deploy-requested` \u2192 `testing`",
                 "timestamp": comments_mod.beijing_now_str(),
             }
+            # Atomic: write BOTH "All components deployed" and "Machine deployed"
+            # in a single hidden-state/comment write so a crash cannot leave
+            # incomplete History.  Newest-first: All components, then Machine.
             await self._write_lifecycle_with_history(
-                repo, pr_number, state, testing_markdown, event=event,
+                repo, pr_number, state, testing_markdown,
+                events=[event_all, last_machine_event],
             )
             # Project status label "testing" SECOND
             await self.proxy.project_status_label(repo, pr_number, "testing")
@@ -1656,6 +1660,19 @@ class DeployController:
                     repo, pr_number,
                     "Not all components are deployed yet. "
                     "Complete all machine approvals before recording test result.",
+                )
+                return True
+
+            # A4: All bound component IDs must have terminal case results
+            # before the test can be finalized. Missing or "running" blocks.
+            bound_ids = [c.get("component_id", "") for c in components if isinstance(c, dict) and c.get("component_id")]
+            case_results = state.get("case_results", {})
+            terminal_values = {"pass", "fail", "n/a"}
+            if bound_ids and not all(case_results.get(cid) in terminal_values for cid in bound_ids):
+                await self._post_command_not_ready(
+                    repo, pr_number, "testing",
+                    "Not all Automated Cases have terminal results yet (pass/fail/n/a). "
+                    "Await completion before finalizing record_test.",
                 )
                 return True
 
@@ -2794,6 +2811,7 @@ class DeployController:
         state: dict,
         new_visible_markdown: str,
         event: dict | None = None,
+        events: list[dict] | None = None,
     ) -> None:
         """Write lifecycle comment with automatic history management.
 
@@ -2803,7 +2821,13 @@ class DeployController:
         """
         comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
         if comment is None:
-            if event is not None:
+            if events is not None:
+                # Multiple events: newest-first; then insert existing fresh markdown
+                built = new_visible_markdown
+                for evt in reversed(events):
+                    built = _insert_history_into_visible(built, evt)
+                final_visible = built
+            elif event is not None:
                 final_visible = _insert_history_into_visible(new_visible_markdown, event)
             else:
                 final_visible = new_visible_markdown
@@ -2812,7 +2836,12 @@ class DeployController:
 
         existing_body = comment.get("body", "")
         if not isinstance(existing_body, str):
-            if event is not None:
+            if events is not None:
+                built = new_visible_markdown
+                for evt in reversed(events):
+                    built = _insert_history_into_visible(built, evt)
+                final_visible = built
+            elif event is not None:
                 final_visible = _insert_history_into_visible(new_visible_markdown, event)
             else:
                 final_visible = new_visible_markdown
@@ -2822,7 +2851,12 @@ class DeployController:
         from .github_state_proxy import HIDDEN_STATE_MARKER
         idx = existing_body.find(HIDDEN_STATE_MARKER)
         if idx < 0:
-            if event is not None:
+            if events is not None:
+                built = new_visible_markdown
+                for evt in reversed(events):
+                    built = _insert_history_into_visible(built, evt)
+                final_visible = built
+            elif event is not None:
                 final_visible = _insert_history_into_visible(new_visible_markdown, event)
             else:
                 final_visible = new_visible_markdown
@@ -2842,7 +2876,7 @@ class DeployController:
             and ("**Status:**" in existing_visible or "### Deploy Approval" in existing_visible)
         )
 
-        if is_legacy and event is not None:
+        if is_legacy and (event is not None or events is not None):
             # First meaningful event on a legacy comment
             # 1. Preserve legacy visible markdown in an archive
             legacy_snapshot = existing_visible
@@ -2868,7 +2902,23 @@ class DeployController:
         #    _build_history_block emits only the marker-delimited event section;
         #    the "### History" heading is not part of it, so it is carried here
         #    to keep exactly one heading in every rendered lifecycle.
-        if event is not None:
+        if events is not None:
+            # Multiple events: newest-first via repeated insertion.
+            # incoming events are already in newest-first order, so we
+            # insert them in reverse so the first (newest) ends up on top.
+            incoming = list(events)
+            if existing_events:
+                existing_history_block = _build_history_block(existing_events)
+                temp_visible = (
+                    new_visible_markdown.rstrip()
+                    + "\n\n### History\n\n" + existing_history_block + "\n"
+                )
+            else:
+                temp_visible = new_visible_markdown
+            final_visible = temp_visible
+            for evt in reversed(incoming):
+                final_visible = _insert_history_into_visible(final_visible, evt)
+        elif event is not None:
             # _insert_history_into_visible reads existing events from visible markdown.
             # new_visible_markdown is a fresh renderer output with no history section.
             # So we inject existing events first via a temporary placeholder,
@@ -3109,6 +3159,7 @@ class DeployController:
                 return
 
             if current_head and current_head != state.get("head_sha", ""):
+                old_status = state.get("status", "review-required")
                 self._reset_review_lifecycle_state(
                     state,
                     head_sha=current_head,
@@ -3125,7 +3176,7 @@ class DeployController:
                     markdown = comments_mod.review_required(repo, pr_number, current_head)
                     event = {
                         "event": "HEAD drift detected",
-                        "lifecycle": f"`{state.get('status', 'review-required')}` \u2192 `review-required`",
+                        "lifecycle": f"`{old_status}` \u2192 `review-required`",
                         "timestamp": comments_mod.beijing_now_str(),
                     }
                     await self._write_lifecycle_with_history(
@@ -3138,7 +3189,7 @@ class DeployController:
                     )
                 return
 
-            if state.get("status") in {"deploy-requested", "testing", "succeeded", "failed"}:
+            if state.get("status") in {"succeeded", "failed"}:
                 try:
                     await self.proxy.project_status_label(
                         repo, pr_number, state.get("status", "review-required"),
@@ -3147,6 +3198,107 @@ class DeployController:
                     logger.warning(
                         "reconcile label projection %s#%s: %s", repo, pr_number, e,
                     )
+                return
+
+            if state.get("status") == "deploy-requested":
+                try:
+                    await self.proxy.project_status_label(
+                        repo, pr_number, state.get("status", "review-required"),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "reconcile label projection %s#%s: %s", repo, pr_number, e,
+                    )
+                return
+
+            # ── testing status: reconcile missing/running case results ──
+            # A persisted "running" case must NOT strand the lifecycle in testing.
+            # Compute exact BOUND component DICTS from the authoritative components snapshot.
+            if state.get("status") == "testing":
+                bound_components = [
+                    c for c in state.get("components", [])
+                    if isinstance(c, dict) and c.get("component_id")
+                ]
+                bound_ids = [c.get("component_id", "") for c in bound_components]
+                case_results = state.get("case_results", {})
+                # Terminal values: pass, fail, n/a. NOT "running", NOT missing.
+                case_complete = all(
+                    case_results.get(cid) in ("pass", "fail", "n/a")
+                    for cid in bound_ids
+                ) if bound_ids else False
+
+                if not case_complete:
+                    # Recovery of absent or running case results — advisory only, ZERO deploy POST.
+                    # Preserve already terminal results when merging fresh case results.
+                    fresh_re = {}
+                    for cid in bound_ids:
+                        cr = case_results.get(cid)
+                        if cr is None or cr not in ("pass", "fail", "n/a"):
+                            fresh_re[cid] = None  # placeholder: rerun advisory
+
+                    if fresh_re:
+                        # Validate bound component and deployment snapshots
+                        deployments = state.get("deployments", [])
+                        bound_deploy_ids = set()
+                        for d in deployments:
+                            if d.get("phase") == "deployed":
+                                bound_deploy_ids.update(d.get("component_ids", []))
+                        if not all(cid in bound_deploy_ids for cid in bound_ids):
+                            logger.warning(
+                                "reconcile testing: bound components not all deployed, skipping recovery %s#%s",
+                                repo, pr_number,
+                            )
+                        else:
+                            try:
+                                bound_head = state.get("head_sha", "")
+                                case_results_merged = await self._run_automated_case(
+                                    repo, pr_number, bound_head, bound_components, deployments,
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "reconcile testing case recovery %s#%s: %s",
+                                    repo, pr_number, e,
+                                )
+                                case_results_merged = {}
+
+                            if case_results_merged:
+                                # Post-await stale-snapshot protection
+                                try:
+                                    post_head = (await self.proxy.get_pr(repo, pr_number)).get("head", {}).get("sha", "")
+                                except Exception:
+                                    post_head = None
+                                post_state = await self.proxy.read_hidden_state(repo, pr_number)
+                                stale = (
+                                    post_head != bound_head
+                                    or post_state is None
+                                    or post_state.get("head_sha") != bound_head
+                                    or post_state.get("status") != "testing"
+                                )
+                                if not stale:
+                                    # Merge only non-terminal results onto FRESH post_state
+                                    fresh_case_results = dict(post_state.get("case_results", {}))
+                                    for cid in bound_ids:
+                                        if fresh_case_results.get(cid) in ("pass", "fail", "n/a"):
+                                            continue
+                                        fresh_case_results[cid] = case_results_merged.get(cid, fresh_case_results.get(cid))
+                                    post_state["case_results"] = fresh_case_results
+                                    testing_markdown = comments_mod.testing(
+                                        repo, pr_number,
+                                        post_state.get("head_sha", ""),
+                                        case_result=", ".join(
+                                            f"{k}={v}" for k, v in fresh_case_results.items()
+                                        ),
+                                    )
+                                    await self._write_lifecycle_with_history(
+                                        repo, pr_number, post_state, testing_markdown, event=None,
+                                    )
+                                    try:
+                                        await self.proxy.project_status_label(repo, pr_number, "testing")
+                                    except Exception as e:
+                                        logger.warning(
+                                            "reconcile label projection %s#%s: %s", repo, pr_number, e,
+                                        )
+
                 return
 
         if pr_state != "open" or pr_merged:

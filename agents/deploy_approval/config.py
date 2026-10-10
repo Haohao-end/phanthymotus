@@ -33,6 +33,14 @@ SUPPORTED_GITHUB_REPOS = frozenset({
     "4paradigm/phanthymotus-driver",
 })
 
+# ── Authoritative desired (allowlisted) repositories ─────────────────
+# These are the ONLY repos that can ever be activated.
+# Runtime active repos = DESIRED_REPOS ∩ GitHub App installation repositories.
+DESIRED_REPOS = (
+    "4paradigm/phanthymotus",
+    "4paradigm/phanthymotus-driver",
+)
+
 # ── Authoritative production Review Agent GitHub identity ──────────────
 # This is the ONLY accepted identity for Review Agent PR comments.
 # It is NOT an env var. It is NOT configurable at runtime.
@@ -54,6 +62,8 @@ class Config:
     github_repos: list[str] = field(
         default_factory=lambda: list(DEFAULT_GITHUB_REPOS)
     )
+    active_repos: list[str] = field(default_factory=list)
+    auth_valid: bool = False
     github_comment_max_pages: int = 20
     github_comment_max_comments: int = 500
     github_comment_max_bytes: int = 4 * 1024 * 1024
