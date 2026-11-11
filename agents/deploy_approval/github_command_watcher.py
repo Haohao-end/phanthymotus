@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from . import commands as commands_mod
-from .config import Config, resolve_authorized_repos
+from .config import Config, DEFAULT_GITHUB_REPOS, resolve_authorized_repos
 from .github_client import (
     GitHubClient, GitHubError, GitHubRateLimitError, GitHubTransientError,
 )
@@ -1206,6 +1206,9 @@ class GitHubCommandWatcher:
             authorized_names = await self._github.list_installation_repositories()
             try:
                 new_active = resolve_authorized_repos(self.config.github_repos, authorized_names)
+                new_policy_active = resolve_authorized_repos(
+                    list(DEFAULT_GITHUB_REPOS), authorized_names,
+                )
             except RuntimeError:
                 self.config.auth_valid = False
                 self.config.active_repos = []
@@ -1214,6 +1217,7 @@ class GitHubCommandWatcher:
 
             # Step 6: Atomically publish new_active + auth_valid
             self.config.active_repos = new_active
+            self.config.policy_active_repos = new_policy_active
             self.config.auth_valid = True
 
             old_active_set = set(old_active)

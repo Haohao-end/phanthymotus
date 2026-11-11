@@ -401,17 +401,15 @@ class GitHubClient:
             raise GitHubError("repository policy file request is invalid")
         try:
             canonical_repo = validate_repository_names([repo])[0]
-            configured_repos = set(validate_repository_names(self.config.github_repos))
-            active_repos = set(validate_repository_names(
-                list(self.config.active_repos),
-                label="active installation repositories",
+            policy_active_repos = set(validate_repository_names(
+                list(self.config.policy_active_repos),
+                label="authorized official policy repositories",
                 allow_empty=True,
             ))
         except (TypeError, ValueError) as exc:
             raise GitHubError("repository policy authorization is invalid") from exc
         if (canonical_repo not in {name.lower() for name in DEFAULT_GITHUB_REPOS}
-                or canonical_repo not in configured_repos
-                or canonical_repo not in active_repos
+                or canonical_repo not in policy_active_repos
                 or self.config.auth_valid is not True):
             raise GitHubPermissionError(
                 "repository policy read requires current GitHub App authorization",
@@ -1137,7 +1135,19 @@ class GitHubClient:
                 f"installation/repositories: unique repos "
                 f"{len(seen)} != total_count {expected_total}"
             )
-        return sorted(repos)
+        try:
+            normalized_repos = validate_repository_names(
+                repos,
+                label="installation repositories",
+                allow_empty=True,
+            )
+        except ValueError as exc:
+            raise GitHubError("installation/repositories: invalid repository name") from exc
+        authorized_set = set(normalized_repos)
+        self.config.policy_active_repos = [
+            repo for repo in DEFAULT_GITHUB_REPOS if repo.lower() in authorized_set
+        ]
+        return sorted(repos, key=lambda repo: repo.lower())
 
     async def pr_state(self, repo: str, pr_number: int) -> PrSnapshot | None:
         """Strict, fail-closed snapshot of a PR for candidate creation.

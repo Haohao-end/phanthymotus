@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import urllib.parse
 from .models import BuildInfo
+from .image_ref import validate_image_ref
 
 BOT_MARKER = "<!-- deploy-approval-agent -->"
 _BEIJING = ZoneInfo("Asia/Shanghai")
@@ -199,11 +200,11 @@ def runtime_image_checks_block(
         if alias and node_host:
             policy_aliases_by_ip.setdefault(node_host, set()).add(alias.casefold())
     status_text = {
-        "match": "MATCH：运行镜像与审批目标一致",
-        "mismatch": "MISMATCH：运行镜像与当前审批目标不一致",
-        "not_running": "UNAVAILABLE：组件当前未运行，无法比较镜像",
-        "unavailable": "UNAVAILABLE：机器连接或状态不可用",
-        "identity_changed": "IDENTITY_CHANGED：机器身份绑定已变化，等待重新确认",
+        "match": "MATCH",
+        "mismatch": "MISMATCH",
+        "not_running": "UNAVAILABLE",
+        "unavailable": "UNAVAILABLE",
+        "identity_changed": "IDENTITY_CHANGED",
     }
     for check in runtime_checks:
         if not isinstance(check, dict):
@@ -226,10 +227,6 @@ def runtime_image_checks_block(
             or _canonical_ip(_record_value(check, "ip"))
             or "未记录"
         )
-        owners = _owner_names(check, diagnostic, physical, group)
-        owner = _owner_label(
-            owners, test_only=test_only is True, mention=test_only is False,
-        )
         # An explicit empty value means the current controller has revoked the
         # selector. Only use a live machine group when the check omitted it;
         # never revive a command parsed from Lifecycle Markdown history.
@@ -239,10 +236,6 @@ def runtime_image_checks_block(
         )
         command_selector = str(raw_selector or "").strip()
         selected_ip = _canonical_ip(command_selector)
-        selected_as_alias = bool(
-            command_selector == machine and machine
-            and not _canonical_ip(command_selector)
-        )
         identity_values = [value for value in (
             _field_flag(record, "identity_confirmed", "machine_identity_confirmed")
             for record in (check, diagnostic, group)
@@ -274,25 +267,48 @@ def runtime_image_checks_block(
             _field_flag(record, "repository_authorized", "repo_authorized")
             for record in (check, diagnostic, group)
         ) if value is not None), None)
-        binding_matches = bool(ip_value and group_node_host and ip_value == group_node_host)
+        physical_primary_ip = _canonical_ip(_machine_ip(physical))
+        physical_identity_matches = bool(
+            physical_primary_ip == ip_value
+            and physical_alias_counts.get(key, 0) == 1
+            and _machine_alias(physical).casefold() == key
+        )
+        binding_matches = bool(
+            ip_value and (
+                group_node_host == ip_value
+                if group_node_host else physical_identity_matches
+            )
+        )
         selector_is_safe = bool(
             selected_ip == ip_value and not duplicate_ip
-            and (not group_node_host or binding_matches)
+            and binding_matches
+            and identity_confirmed is True
+            and repo_authorization is True
         )
-        if selected_as_alias:
-            selector_is_safe = bool(
-                duplicate_ip and identity_confirmed is True and binding_matches
-                and physical_alias_counts.get(key, 0) == 1
-                and _machine_alias(physical).casefold() == key
-            )
-        if (not selector_is_safe
+        alias_selector_is_safe = bool(
+            command_selector
+            and not selected_ip
+            and duplicate_ip
+            and command_selector == _machine_alias(physical)
+            and _machine_alias(physical).casefold() == key
+            and physical_alias_counts.get(key, 0) == 1
+            and physical_identity_matches
+            and binding_matches
+            and identity_confirmed is True
+            and repo_authorization is True
+            and _field_flag(group, "approval_available") is True
+        )
+        if (not (selector_is_safe or alias_selector_is_safe)
                 or _field_flag(group, "approval_available") is False
-                or repo_authorization is False
+                or repo_authorization is not True
                 or (group and group_node_host and group_node_host != ip_value)
                 or identity_confirmed is False):
             command_selector = ""
-        target_image = _runtime_digest(check.get("target_image", ""))
-        observed_image = _runtime_digest(check.get("observed_image", ""))
+        target_image, observed_image = _runtime_image_values(check, component)
+        component_label = (
+            _runtime_component_label(component)
+            or str(check.get("component_id") or "未提供")
+        )
         checked_at = str(check.get("checked_at", "") or "未扫描")
         status = str(check.get("status", "unavailable") or "unavailable").casefold()
         if status not in status_text:
@@ -303,26 +319,37 @@ def runtime_image_checks_block(
             status_text_value = f"部署进行中；上次只读检查：{status_label}"
             next_step = "正在部署，请等待结果；不要重复审批"
         elif status == "match":
-            next_step = "MATCH：无需重新部署。"
+            next_step = "MATCH：运行镜像与审批目标一致，无需重新部署。"
         elif status == "mismatch":
+            difference = (
+                f"审批目标 {target_image} 与当前运行镜像 {observed_image} 不同"
+            )
             if command_selector:
                 next_step = (
-                    f"MISMATCH：直接重新审批：`/approve_deploy machine={_escape(command_selector)}`。"
-                    "`/request_deploy` 可选。"
+                    f"MISMATCH：{difference}，需要重新部署。直接重新审批："
+                    f"`/approve_deploy machine={_escape(command_selector)}`。"
+                    "/request_deploy 可选，不是前提。"
                 )
             else:
-                next_step = "MISMATCH：当前身份或仓库授权未确认，暂不生成审批命令。"
+                next_step = (
+                    f"MISMATCH：{difference}，需要重新部署；当前身份、仓库授权或主 IP "
+                    "未全部确认，暂不生成审批命令。"
+                )
         elif status == "unavailable":
-            next_step = "UNAVAILABLE：机器连接或状态不可用，不能确认是否需要重新部署。"
+            next_step = "机器连接或状态不可用，无法确认当前镜像；暂不生成重新部署命令。"
         elif status == "identity_changed":
             next_step = "身份绑定变化，等待重新确认；当前不生成审批命令。"
         elif status == "not_running":
-            next_step = "组件未运行，无法比较镜像；先确认机器状态，不生成重新部署命令。"
+            next_step = "组件当前未运行，无法比较镜像；先确认机器状态，不生成重新部署命令。"
+        owners = _owner_names(diagnostic, physical, group, supplied_context)
+        owner_label = _owner_label(
+            owners, test_only=bool(test_only), mention=not bool(test_only),
+        )
         rows.append("| " + " | ".join((
             f"`{_escape(machine)}`",
             f"`{_escape(ip_value)}`",
-            owner,
-            _escape(_runtime_component_label(component)),
+            owner_label,
+            _escape(component_label),
             f"`{_escape(target_image)}`",
             f"`{_escape(observed_image)}`" if observed_image else "未取得",
             _escape(checked_at),
@@ -336,7 +363,7 @@ def runtime_image_checks_block(
         _RUNTIME_CHECKS_START,
         "### 已部署组件镜像检查",
         "",
-        "| 机器 | 主 IP | Owner | 组件 | 审批目标 digest | 当前运行 digest | 状态 | 最后检查 | 下一步 |",
+        "| 机器 | IP | 负责人 | 组件 | 审批目标镜像 | 当前运行镜像 | 最后检查时间 | 状态 | 下一步 |",
         "|---|---|---|---|---|---|---|---|---|",
         *rows,
         "",
@@ -390,16 +417,16 @@ def _build_table(builds: list[BuildInfo], components: list[dict] | None = None) 
         for item in components or [] if isinstance(item, dict)
     }
     lines = [
-        "| target | variant/path | image | build | deploy approval |",
-        "|--------|--------------|-------|-------|-----------------|",
+        "| 组件 | 版本 / 路径 | 镜像 | 构建 | 部署适配 |",
+        "|---|---|---|---|---|",
     ]
     for b in builds:
         variant = _escape(b.variant or b.driver_path or chr(0x2014))
         image_ref = image_refs.get((b.target, b.driver_path, b.variant)) or b.image_tag
-        build_status = "success" if b.success else "failed"
-        eligibility = "deployable" if b.success and b.deployable else "unsupported"
+        build_status = "成功" if b.success else "失败"
+        eligibility = "可部署" if b.success and b.deployable else "不支持"
         if not b.success:
-            eligibility = "not deployable"
+            eligibility = "不可部署"
         lines.append(
             f"| {_escape(b.target)} | {variant} | `{_escape(image_ref)}` | "
             f"{build_status} | {eligibility} |"
@@ -575,28 +602,21 @@ def _testing_next_action(
     repo: str = "", pr_number: int = 0,
 ) -> str:
     evidence_url = _trusted_upload_page_url(evidence_url, repo, pr_number)
-    lines = []
     if evidence_complete:
-        lines.append("测试证据已上传。如需补充视频或图片：")
-        if evidence_url:
-            lines.append(f"[继续上传测试视频/图片](<{evidence_url}>)")
-        else:
-            lines.extend([
-                "[继续上传测试视频/图片][deploy-approval-upload]",
-                "若入口暂不可用，请查看下方附件区的状态说明。",
-            ])
+        lines = [
+            "测试证据已收到。审批人会据此核对本轮实际效果，并判断是否通过验收、是否可以合并。",
+            "如需补充视频或图片，可继续上传：",
+        ]
     else:
-        lines.extend(["请上传本轮测试视频或图片：", ""])
-        if evidence_url:
-            lines.append(f"[上传测试视频/图片](<{evidence_url}>)")
-        else:
-            lines.extend([
-                "[上传测试视频/图片][deploy-approval-upload]",
-                "若入口暂不可用，请查看下方附件区的状态说明。",
-            ])
-        lines.extend(["", "测试完成后，由本轮机器负责人在 PR 评论中输入：", "", "`/request_acceptance`"])
-        return "\n".join(lines)
-    lines.extend(["", "测试完成后，由本轮机器负责人在 PR 评论中输入：", "", "`/request_acceptance`"])
+        lines = [
+            "请把本轮开发的实际效果、视频或截图上传到这里，供审批人检查实现效果，",
+            "并作为是否通过验收、是否可以合并的依据：",
+        ]
+    if evidence_url:
+        lines.extend(["", f"[上传测试证据](<{evidence_url}>)"])
+    else:
+        lines.extend(["", "[上传测试证据][deploy-approval-upload]"])
+    lines.extend(["", "测试完成后，请由部署本轮的机器负责人在 PR 评论中输入 `/request_acceptance`。"])
     return "\n".join(lines)
 
 
@@ -818,51 +838,30 @@ def deploy_ready(
         f"**Bound HEAD:** `{_short(head_sha)}`",
         f"**Repository:** `{repo}`",
         "",
-        "### Workflow",
-        "",
-        _workflow_lines("deploy-ready"),
-        "",
-        "### Next action",
-        "",
-        "机器负责人请按下方已验证的机器命令审批：",
-        "",
+        ("代码审查和镜像构建已完成，当前 HEAD 未变化，当前版本已经可以部署。"
+         if approval_evidence_ready else
+         "当前 HEAD 的审核和镜像构建结果尚未确认完成，暂时不能部署。"),
     ]
     if commands:
-        lines.extend(commands)
+        lines.extend(["", "你可以直接执行下面对应机器的审批命令：", "", *commands])
     elif approval_evidence_ready:
-        lines.append("当前没有通过仓库授权、机器身份和组件兼容校验的可执行审批命令。")
+        lines.extend([
+            "",
+            "当前没有通过仓库授权、机器身份和组件兼容校验的可执行审批命令。",
+        ])
     else:
-        lines.append("Review/Build 证据尚未确认通过，暂不显示可执行部署审批方式。")
+        lines.extend([
+            "",
+            "审查或构建结果尚未确认通过，暂不显示可执行部署审批方式。",
+        ])
     if approval_evidence_ready and len(full_machine_aliases) == 1:
-        lines.extend(["", "当前只有一台完整适配机器，也可以直接使用简写：", "", "`/approve_deploy`"])
+        lines.extend(["", "当前只有一台完整适配机器，也可以直接使用简写 `/approve_deploy`。"])
     if approval_evidence_ready:
-        lines.extend(["", "也可以选择用 `/request_deploy` 申请部署。"])
-    lines.extend(["", "### Review evidence", ""])
-    lines.append(
-        f"- **Build Result:** {'success' if builds_passed else 'failed'}"
-    )
-    if evidence.get("test_skipped", False):
-        lines.append("- **Tests:** skipped")
-    elif evidence.get("test_comment_id", 0) == 0:
-        lines.append("- **Tests:** not run")
-    else:
-        lines.append(
-            f"- **Tests:** {int(evidence.get('test_passed', 0))} passed / "
-            f"{int(evidence.get('test_failed', 0))} failed"
-        )
-    lines.extend([
-        "- **Code Review:** findings available — manual review required",
-        "",
-        "> 请先阅读 Review Agent 的审查意见，再选择上方部署命令。",
-        "",
-        "### Components",
-        "",
-        _build_table(builds, components),
-    ])
+        lines.extend(["", "`/request_deploy` 也可以选择使用，但不是部署审批的前置步骤。"])
+    lines.extend(["", "### 构建结果", "", _build_table(builds, components)])
     return _lifecycle_body(lines)
 
 
-_V44_CANDIDATE_REVIEWERS = ("Haohao-end", "shiguangchuan", "kentcyq")
 _OWNER_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}\Z")
 
 
@@ -1076,54 +1075,227 @@ def _repo_policy_display_status(repo, status, diagnostics):
     app_authorized = _field_flag(
         status, "github_app_authorized", "app_authorized", "authorized",
     )
+    app_state = _record_value(
+        status, "github_app_status", "app_status", "installation_status",
+        "status", default="",
+    )
+    app_state_key = str(app_state or "").strip().casefold().replace("-", "_")
     if app_authorized is None:
-        app_state = _record_value(
-            status, "github_app_status", "app_status", "installation_status",
-            "status", default="",
-        )
-        app_authorized = isinstance(app_state, str) and app_state.strip().casefold() in {
+        app_authorized = app_state_key in {
             "authorized", "installed", "active", "available",
         }
-    machines_configured = _field_flag(status, "machines_configured", "machines_yaml_exists")
-    reviewers_configured = _field_flag(status, "reviewers_configured", "test_reviewers_yaml_exists")
-    missing_files = set(_display_values(status.get("missing_files")))
-    machines_yaml_state = status.get("machines_yaml_status")
-    reviewers_yaml_state = status.get("test_reviewers_yaml_status")
-    if machines_configured is None:
-        machines_configured = (
-            False if "machines.yaml" in missing_files
-            or isinstance(machines_yaml_state, str)
-            and machines_yaml_state.casefold() in {"missing", "absent", "not-found"} else
-            True if isinstance(machines_yaml_state, str)
-            and machines_yaml_state.casefold() in {"configured", "present", "valid", "exists"} else
-            None
-        )
-    if reviewers_configured is None:
-        reviewers_configured = (
-            False if "test_reviewers.yaml" in missing_files
-            or isinstance(reviewers_yaml_state, str)
-            and reviewers_yaml_state.casefold() in {"missing", "absent", "not-found"} else
-            True if isinstance(reviewers_yaml_state, str)
-            and reviewers_yaml_state.casefold() in {"configured", "present", "valid", "exists"} else
-            None
-        )
-    if not app_authorized:
-        app_status = "未授权或无法确认"
-    else:
-        app_status = "已授权"
-    machines_status = (
-        "已配置" if machines_configured is True else
-        "main 缺少" if machines_configured is False or "machines.yaml" in missing_files else
-        "配置无效" if isinstance(machines_yaml_state, str)
-        and machines_yaml_state.casefold() in {"invalid", "corrupt", "malformed"} else
-        "未配置或无法确认"
+    app_status = (
+        "已授权" if app_authorized else
+        "GitHub App 未授权" if app_state_key == "unauthorized" else
+        "未授权或无法确认"
     )
-    reviewers_status = (
-        "已配置" if reviewers_configured is True else
-        "main 缺少" if reviewers_configured is False or "test_reviewers.yaml" in missing_files else
-        "配置无效" if isinstance(reviewers_yaml_state, str)
-        and reviewers_yaml_state.casefold() in {"invalid", "corrupt", "malformed"} else
-        "未配置或无法确认"
+
+    def source_label(source):
+        return "正式 main" if source == "main" else (
+            "服务器本地临时配置" if source == "local_fallback" else ""
+        )
+
+    def state_key(value):
+        if isinstance(value, dict):
+            value = _record_value(value, "status", "state", default="")
+        return str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+
+    def source_key(value):
+        value = state_key(value)
+        if value in {"main", "formal_main", "official_main", "repository_main", "github_main"}:
+            return "main"
+        if value in {"local_fallback", "local", "server_local", "local_candidate"}:
+            return "local_fallback"
+        return ""
+
+    machines_configured_input = _field_flag(
+        status, "machines_configured", "machines_yaml_exists",
+    )
+    reviewers_configured_input = _field_flag(
+        status, "reviewers_configured", "test_reviewers_yaml_exists",
+    )
+    machines_yaml_state = state_key(status.get("machines_yaml_status"))
+    reviewers_yaml_state = state_key(status.get("test_reviewers_yaml_status"))
+    machines_source = source_key(status.get("machines_source"))
+    reviewers_source = source_key(status.get("test_reviewers_source"))
+    last_attempt_status = _record_value(status, "last_attempt_status", default={})
+    last_attempt_source = _record_value(status, "last_attempt_source", default={})
+    source_sha = _record_value(status, "source_sha", default={})
+    if not isinstance(last_attempt_status, dict):
+        last_attempt_status = {}
+    if not isinstance(last_attempt_source, dict):
+        last_attempt_source = {}
+    if not isinstance(source_sha, dict):
+        source_sha = {}
+    machines_attempt = state_key(last_attempt_status.get("machines.yaml"))
+    reviewers_attempt = state_key(last_attempt_status.get("test_reviewers.yaml"))
+    machines_attempt_source = source_key(last_attempt_source.get("machines.yaml"))
+    reviewers_attempt_source = source_key(last_attempt_source.get("test_reviewers.yaml"))
+    machines_has_snapshot = bool(
+        machines_source and source_sha.get("machines.yaml")
+    )
+    reviewers_has_snapshot = bool(
+        reviewers_source and source_sha.get("test_reviewers.yaml")
+    )
+    machines_local_state = state_key(_record_value(
+        status, "machines_local_candidate_status", "machines_candidate_status",
+    ))
+    reviewers_local_state = state_key(_record_value(
+        status, "test_reviewers_local_candidate_status", "test_reviewers_candidate_status",
+    ))
+    valid_states = {"configured", "present", "valid", "exists", "loaded", "ready"}
+    missing_states = {"missing", "absent", "not_found", "not_configured"}
+    invalid_states = {
+        "invalid", "corrupt", "malformed", "invalid_local", "invalid_schema",
+        "invalid_response",
+    }
+    unavailable_states = {"unavailable", "network_error", "temporary_error", "fetch_error"}
+
+    def file_configured(configured, source, file_state, local_state):
+        if not app_authorized:
+            return False
+        if file_state in missing_states:
+            return False
+        if (
+            file_state in invalid_states
+            or (local_state in invalid_states and source in {"", "local_fallback"})
+        ):
+            return False
+        if file_state in unavailable_states:
+            return configured is True and source in {"main", "local_fallback"}
+        if file_state in valid_states:
+            return configured is not False
+        if source == "local_fallback":
+            return configured is not False
+        return configured is True
+
+    machines_configured = file_configured(
+        machines_configured_input, machines_source,
+        machines_yaml_state, machines_local_state,
+    )
+    reviewers_configured = file_configured(
+        reviewers_configured_input, reviewers_source,
+        reviewers_yaml_state, reviewers_local_state,
+    )
+    def file_display(
+        source, file_state, local_state, configured, attempt, attempt_source,
+        has_snapshot,
+    ):
+        if not app_authorized:
+            previous_source = source_label(source)
+            return (
+                f"{app_status}；上次配置来源：{previous_source}"
+                if previous_source and has_snapshot else app_status
+            )
+        if (
+            file_state == "invalid_local"
+            or (local_state in invalid_states and source in {"", "local_fallback"})
+            or (attempt == "invalid_schema" and attempt_source == "local_fallback")
+        ):
+            if file_state == "invalid_local" or attempt == "invalid_local":
+                return (
+                    "服务器本地候选配置无法安全读取，当前没有可用配置。"
+                )
+            if (attempt == "invalid_schema"
+                    and source == "local_fallback" and has_snapshot):
+                return (
+                    "服务器本地临时配置：正式 main 尚未提供该文件；"
+                    "新的本地候选格式无效，继续使用服务器已验证的配置。"
+                )
+            return (
+                "正式 main 尚未提供该文件；服务器本地候选配置无效，"
+                "当前没有可用配置。"
+            )
+        if attempt == "network_error":
+            detail = (
+                "网络暂时不可用，继续使用上一份可信配置"
+                if has_snapshot else "网络暂时不可用，当前没有可用的上一份可信配置"
+            )
+            source_name = source_label(source)
+            return f"{source_name}：{detail}" if source_name else detail
+        if attempt == "local_error":
+            return (
+                "服务器本地候选配置暂不可读取；保留的上一份可信配置授权状态未确认"
+                if has_snapshot else "服务器本地候选配置暂不可读取，当前没有可用配置"
+            )
+        if attempt == "invalid_schema" and attempt_source == "main":
+            trusted_source = (
+                "服务器本地临时配置" if source == "local_fallback"
+                else "正式 main 配置" if source == "main"
+                else "配置"
+            )
+            if has_snapshot:
+                return f"正式 main 格式错误，继续使用上一份已验证的{trusted_source}。"
+            return "正式配置格式错误，当前没有有效配置"
+        if attempt == "invalid_response" or file_state == "invalid_response":
+            prior_source = source_label(source)
+            return (
+                f"正式 main 配置读取响应无效；保留的上一份{prior_source}配置授权状态未确认"
+                if has_snapshot and prior_source else
+                "正式 main 配置读取响应无效；保留的上一份可信配置授权状态未确认"
+                if has_snapshot else "正式仓库配置读取响应无效，当前没有有效配置"
+            )
+        if file_state in unavailable_states:
+            detail = (
+                "网络暂时不可用，继续使用上一份可信配置"
+                if has_snapshot else "网络暂时不可用，当前没有可用的上一份可信配置"
+            )
+            label = source_label(source)
+            return f"{label}：{detail}" if label else detail
+        if file_state in invalid_states:
+            label = source_label(source)
+            if has_snapshot:
+                return f"{label or '正式仓库'} 配置格式错误，继续使用上一份可信配置"
+            return f"{label or '正式仓库'} 配置格式错误，当前没有有效配置"
+        if file_state == "stale":
+            label = source_label(source)
+            if has_snapshot:
+                return (
+                    f"{label} 配置状态已过期，保留上一份可信配置；"
+                    "当前授权状态未确认"
+                )
+            return f"{label} 配置状态已过期，且没有可信快照" if label else (
+                "配置状态已过期，当前授权状态未确认"
+            )
+        if source == "main" and file_state in valid_states and configured:
+            return "正式 main：已使用正式仓库 main 配置"
+        if (file_state in missing_states and attempt == "not_found"
+                and attempt_source == "local_fallback"):
+            return "正式 main 尚未提供该文件，服务器本地候选配置也缺失，当前没有可用配置。"
+        if file_state in missing_states and attempt == "not_found":
+            return "正式 main 尚未提供该文件，服务器本地候选配置也缺失，当前没有可用配置。"
+        if source == "local_fallback" and configured:
+            return (
+                "服务器本地临时配置：正式 main 尚未提供该文件，"
+                "当前使用服务器已验证的配置。"
+            )
+        if source and not configured and has_snapshot:
+            label = source_label(source)
+            return (
+                f"{label} 配置快照状态未确认，保留上一份可信配置；"
+                "当前授权状态未确认"
+            )
+        if file_state == "unauthorized":
+            return (
+                "GitHub App 未授权" if app_state_key == "unauthorized"
+                else "配置读取未授权"
+            )
+        return "来源或状态未确认"
+
+    machines_status = file_display(
+        machines_source, machines_yaml_state, machines_local_state,
+        machines_configured, machines_attempt, machines_attempt_source,
+        machines_has_snapshot,
+    )
+    reviewers_status = file_display(
+        reviewers_source, reviewers_yaml_state, reviewers_local_state,
+        reviewers_configured, reviewers_attempt, reviewers_attempt_source,
+        reviewers_has_snapshot,
+    )
+    machines_main_missing = (
+        machines_yaml_state in missing_states and machines_attempt == "not_found"
+        and machines_attempt_source in {"main", "local_fallback"}
+        and not machines_configured
     )
     authorized_machines = _record_value(
         status, "authorized_machines", "machines",
@@ -1148,51 +1320,144 @@ def _repo_policy_display_status(repo, status, diagnostics):
             default=_record_value(diagnostics, "authorized_machine_count"),
         )
         authorized_count = (explicit_count if type(explicit_count) is int and explicit_count >= 0
-                            else 0 if machines_configured is False else None)
-    if machines_configured is False:
+                            else 0 if machines_main_missing else None)
+    if machines_configured is False and machines_main_missing:
         authorized_aliases = set()
         authorized_count = 0
+    elif not machines_configured:
+        authorized_aliases = set()
+        authorized_count = None
     reviewers = _display_values(_record_value(
         status, "reviewers", "test_reviewers", "acceptance_reviewers",
-        default=_record_value(diagnostics, "reviewers", "test_reviewers",
-                              "acceptance_reviewers"),
     ))
-    candidate_reviewers = _display_values(_record_value(
-        status, "candidate_reviewers",
-        default=_record_value(diagnostics, "candidate_reviewers"),
-    ))
-    candidate_reviewers = list(dict.fromkeys(
-        [*candidate_reviewers, *_V44_CANDIDATE_REVIEWERS]
-    ))
-    reviewer_display = (
-        "验收人：" + "、".join(_escape(name) for name in reviewers)
-        if reviewers else
-        "验收人：未配置或名单未提供"
+    if reviewers and reviewers_configured:
+        if reviewers_source == "local_fallback":
+            reviewer_label = (
+                "服务器本地临时配置：正式 main 尚未提供该文件，"
+                "当前使用服务器已验证的验收人名单"
+            )
+        elif reviewers_attempt == "network_error" or (
+                reviewers_attempt == "invalid_schema"
+                and reviewers_attempt_source == "main"):
+            reviewer_label = "上次可信验收人名单"
+        elif reviewers_source == "main":
+            reviewer_label = "当前仓库正式验收人"
+        else:
+            reviewer_label = "当前加载的验收人名单（来源未确认）"
+        reviewer_display = reviewer_label + "：" + "、".join(
+            _escape(name) for name in reviewers
+        )
+    else:
+        reviewer_display = "当前仓库已验证验收人：未配置或不可用"
+    count_display = str(authorized_count) if authorized_count is not None else "未确认"
+    known_no_authorization = bool(
+        machines_main_missing
+        or machines_configured and authorized_count == 0
     )
-    count_display = str(authorized_count) if authorized_count is not None else "未提供"
+    authorization_unknown = bool(
+        not app_authorized or not machines_configured
+        or authorized_count is None
+    )
     return {
         "repo": repo,
         "app_authorized": app_authorized,
         "app_status": app_status,
         "machines_configured": machines_configured is True,
-        "machines_configured_known": machines_configured is not None,
+        "machines_configured_known": machines_configured_input is not None,
         "machines_status": machines_status,
+        "machines_main_missing": machines_main_missing,
+        "known_no_authorization": known_no_authorization,
+        "authorization_unknown": authorization_unknown,
+        "machines_source": machines_source,
+        "test_reviewers_source": reviewers_source,
         "reviewers_configured": reviewers_configured is True,
         "reviewers_status": reviewers_status,
         "authorized_aliases": authorized_aliases,
         "authorized_count": authorized_count,
         "reviewers": reviewers,
         "reviewer_display": reviewer_display,
-        "candidate_reviewers": candidate_reviewers,
         "count_display": count_display,
     }
 
 
 def _runtime_digest(value):
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not value or value.strip() != value:
         return "未取得"
-    match = re.search(r"(?:@)?sha256:([0-9a-fA-F]{64})", value)
-    return f"sha256:{match.group(1).lower()}" if match else "未取得"
+    if re.fullmatch(r"sha256:[0-9a-fA-F]{64}", value):
+        return "sha256:" + value.split(":", 1)[1].lower()
+    digest = re.fullmatch(r"(.+@)sha256:([0-9a-fA-F]{64})", value)
+    if digest:
+        value = digest.group(1) + "sha256:" + digest.group(2).lower()
+    try:
+        return validate_image_ref(value)
+    except ValueError:
+        # Core reports its running image as a tag (for example ``v1.2.3``),
+        # while Driver observations may be complete OCI refs. Accept only a
+        # single syntactically valid tag when no repository is present.
+        if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}", value):
+            return value
+        return "未取得"
+
+
+def _runtime_image_values(check, component):
+    is_core = (
+        _record_value(component, "target") == "core"
+        or _record_value(check, "runtime_id") == "core"
+    )
+    if is_core:
+        target_tag = (
+            _record_value(check, "target_tag")
+            or _record_value(component, "target_tag")
+        )
+        target_image = (
+            target_tag
+            or _record_value(check, "target_image", "target_digest")
+            or _record_value(component, "image_ref")
+        )
+        observed_tag = (
+            _record_value(check, "current_tag")
+            or _record_value(check, "observed_image")
+            or _record_value(check, "running_image")
+            or _record_value(check, "observed_digest")
+        )
+        return _runtime_core_tag(target_image), _runtime_core_tag(observed_tag)
+
+    return (
+        _runtime_driver_image(
+            _record_value(check, "target_image")
+            or _record_value(check, "target_digest")
+            or _record_value(component, "image_ref")
+        ),
+        _runtime_driver_image(
+            _record_value(check, "observed_image")
+            or _record_value(check, "running_image")
+            or _record_value(check, "observed_digest")
+        ),
+    )
+
+
+def _runtime_driver_image(value):
+    if (isinstance(value, str)
+            and re.fullmatch(r"sha256:[0-9a-fA-F]{64}", value)):
+        return "sha256:" + value.split(":", 1)[1].lower()
+    if not isinstance(value, str) or "/" not in value:
+        return "未取得"
+    return _runtime_digest(value)
+
+
+def _runtime_core_tag(value):
+    if not isinstance(value, str) or not value or value.strip() != value:
+        return "未取得"
+    if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}", value):
+        return value
+    if "@sha256:" in value:
+        return "未取得"
+    slash = value.rfind("/")
+    colon = value.rfind(":")
+    if colon > slash:
+        tag = value[colon + 1:]
+        return tag if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}", tag) else "未取得"
+    return "未取得"
 
 
 def _lifecycle_machine_display_context(markdown):
@@ -1286,6 +1551,10 @@ def deploy_requested(
         if _canonical_ip(_machine_ip(row))
     }
     components = components if isinstance(components, list) else []
+    component_by_id = {
+        item.get("component_id"): item for item in components
+        if isinstance(item, dict) and isinstance(item.get("component_id"), str)
+    }
     component_ids = {
         item.get("component_id") for item in components
         if isinstance(item, dict) and isinstance(item.get("component_id"), str)
@@ -1558,12 +1827,12 @@ def deploy_requested(
             reasons.append("GitHub App 对该仓库的授权未确认。")
         elif not policy["machines_configured"]:
             reasons.append(
-                "当前仓库 main 缺少有效的 machines.yaml。"
-                if policy["machines_status"] == "main 缺少"
+                "当前仓库尚未配置有效的机器授权。"
+                if policy["machines_main_missing"]
                 else "当前仓库机器授权状态未确认。"
             )
         elif not authorized:
-            reasons.append("当前仓库 main 缺少机器授权。")
+            reasons.append("当前仓库已加载的机器策略未授权该机器。")
         if duplicate_ip:
             conflicting_aliases = _display_values(_record_value(
                 diagnostic, "ip_conflicts", "conflicting_aliases",
@@ -1629,8 +1898,8 @@ def deploy_requested(
     }
     physical_machine_count = len(inventory_rows)
     inventory_lines = [
-        "### Machine Inventory · 机器完整清单", "",
-        "| 编号 | 品牌 | 型号 | 别名 | 主 IP | 辅助 IP | Owner | 仓库授权 | Agent Core | 平台 | 当前 PR 组件兼容性 | 原因 |",
+        "### 已登记机器", "",
+        "| 编号 | 品牌 | 型号 | 别名 | 主 IP | 辅助 IP | 负责人 | 仓库授权 | Agent Core | 平台 | 当前 PR 组件兼容性 | 原因 |",
         "|---:|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for ordinal, (machine, state) in enumerate(zip(inventory_rows, machine_states), 1):
@@ -1673,37 +1942,33 @@ def deploy_requested(
         ])
 
     compatible_lines = [
-        "### Compatible Machines · 本轮适配机器", "",
+        "### 可以审批的机器", "",
     ]
     compatible_states = [item for item in machine_states if item["safe"]]
     if display_status == "deploying":
         compatible_lines.append("当前部署正在执行，请等待结果；此阶段不重复审批。")
     elif compatible_states:
         compatible_lines.extend([
-            "| 机器名称 | 主 IP | Owner | 审批命令 |",
+            "| 机器 | 主 IP | 负责人 | 审批命令 |",
             "|---|---|---|---|",
         ])
         for state in compatible_states:
             owner = _owner_label(state["owners"], test_only=test_only, mention=not test_only)
             command = f"/approve_deploy machine={state['command_selector']}"
-            compatible_lines.append("| " + " | ".join(_escape(value) for value in (
-                state["alias"], state["ip"], owner, command,
-            )) + " |")
+            compatible_lines.append(
+                "| " + " | ".join(_escape(value) for value in (
+                    state["alias"], state["ip"], owner,
+                )) + f" | `{_escape(command)}` |"
+            )
     else:
         compatible_lines.append("尚无通过仓库授权、身份、Agent Core、平台、组件及安全审批检查的机器。")
 
     pending_lines = [
-        "### Pending / Incompatible Machines · 待确认机器", "",
+        "### 暂不能审批的机器", "",
     ]
     pending_states = [item for item in machine_states if not item["safe"]]
-    known_no_authorization = (
-        policy["machines_status"] == "main 缺少"
-        or policy["authorized_count"] == 0
-    )
-    authorization_unknown = (
-        not policy["app_authorized"] or not policy["machines_configured"]
-        or policy["authorized_count"] is None
-    )
+    known_no_authorization = policy["known_no_authorization"]
+    authorization_unknown = policy["authorization_unknown"]
     if (known_no_authorization or authorization_unknown) and inventory_rows:
         if known_no_authorization and physical_machine_count == 21:
             pending_lines.extend([
@@ -1728,7 +1993,7 @@ def deploy_requested(
             reasons = "；".join(state["reasons"]) or "兼容性或安全审批条件未确认。"
             pending_lines.extend([
                 f"- 机器 `{_escape(state['alias'] or '未提供')}`",
-                f"  - Owner: {_owner_label(state['owners'], test_only=test_only, mention=not test_only)}",
+                f"  - 负责人：{_owner_label(state['owners'], test_only=test_only, mention=not test_only)}",
                 f"  - 主 IP：`{_escape(state['ip'] or '未提供')}`",
                 f"  - 状态：{_escape('重复 IP' if state['duplicate_ip'] else '待确认 / 不兼容')}",
                 f"  - 原因：{_escape(reasons)}",
@@ -1736,62 +2001,29 @@ def deploy_requested(
     elif inventory_rows:
         pending_lines.append("所有已登记机器均通过当前审批条件。")
 
-    policy_lines = [
-        "### Repository Authorization · 仓库授权", "",
-        f"- 仓库：`{_escape(repo)}`",
-        f"- GitHub App 授权：{policy['app_status']}",
-        f"- machines.yaml：{policy['machines_status']}",
-        f"- test_reviewers.yaml：{policy['reviewers_status']}",
-        f"- 已授权机器数量：{policy['count_display']}",
-        f"- {policy['reviewer_display']}",
-        "- 验收人候选账号（实际授权以当前仓库 test_reviewers.yaml 为准）："
-        + "、".join(_escape(name) for name in policy["candidate_reviewers"]),
-    ]
-    if inventory_rows and (
-            policy["machines_status"] == "main 缺少"
-            or policy["authorized_count"] == 0):
-        policy_lines.extend([
-            "",
-            "物理机器已登记，但当前仓库尚未授权。所有物理机器仍展示；未授权机器不会出现可执行审批命令。",
-        ])
-    elif inventory_rows and (
-            not policy["app_authorized"] or not policy["machines_configured"]
-            or policy["authorized_count"] is None):
-        policy_lines.extend([
-            "",
-            "当前仓库授权状态未确认。所有物理机器仍展示；未确认授权的机器不会出现可执行审批命令。",
-        ])
-
     runtime_rows = _record_rows(runtime_checks, ("checks", "runtime_checks", "items"))
-    runtime_lines = ["### Runtime Image Status · 运行镜像状态", ""]
+    runtime_lines = ["### 运行镜像状态", ""]
     if runtime_rows:
         runtime_lines.extend([
-            "| 机器 | 主 IP | Owner | 审批目标 digest | 当前运行 digest | 比较状态 | 最后扫描时间 | 下一步 |",
-            "|---|---|---|---|---|---|---|---|",
+            "| 机器 | IP | 负责人 | 组件 | 审批目标镜像 | 当前运行镜像 | 最后检查时间 | 状态 | 下一步 |",
+            "|---|---|---|---|---|---|---|---|---|",
         ])
         runtime_status_labels = {
-            "match": "MATCH：运行镜像与审批目标一致",
-            "mismatch": "MISMATCH：运行镜像与审批目标不一致",
-            "not_running": "UNAVAILABLE：组件未运行，无法比较镜像",
-            "unavailable": "UNAVAILABLE：机器连接或状态不可用",
-            "identity_changed": "IDENTITY_CHANGED：机器身份绑定已变化，等待重新确认",
+            "match": "MATCH",
+            "mismatch": "MISMATCH",
+            "not_running": "UNAVAILABLE",
+            "unavailable": "UNAVAILABLE",
+            "identity_changed": "IDENTITY_CHANGED",
         }
         for check in runtime_rows:
             alias = _machine_alias(check)
             alias_key_value = alias.casefold()
             machine_state = machine_state_by_alias.get(alias_key_value, {})
-            diagnostic = (
-                diagnostic_by_alias.get(alias_key_value)
-                or machine_state.get("diagnostic")
-                or diagnostics_by_ip.get(_canonical_ip(_machine_ip(check)), {})
-            )
             physical = (
                 inventory_by_alias.get(alias_key_value)
                 or machine_state.get("physical")
                 or inventory_by_ip.get(_canonical_ip(_machine_ip(check)), {})
             )
-            group = machine_state.get("group", {})
-            owners = _owner_names(check, diagnostic, physical, group)
             ip_value = (
                 _canonical_ip(_record_value(check, "primary_ip"))
                 or _canonical_ip(_record_value(check, "main_ip"))
@@ -1802,40 +2034,76 @@ def deploy_requested(
             status = str(_record_value(check, "status", default="unavailable")).casefold()
             if status not in runtime_status_labels:
                 status = "unavailable"
+            component = component_by_id.get(
+                _record_value(check, "component_id"), {},
+            )
+            target_image, observed_image = _runtime_image_values(check, component)
             if display_status == "deploying":
                 next_step = "正在部署，请等待结果；不要重复审批。"
             elif status == "match":
-                next_step = "MATCH：无需重新部署。"
+                next_step = "运行镜像与审批目标一致，无需重新部署。"
             elif status == "unavailable":
-                next_step = "UNAVAILABLE：等待机器恢复连接；当前不能判断是否需要重新部署。"
+                next_step = "机器连接或状态不可用，无法确认当前镜像；暂不生成重新部署命令。"
             elif status == "identity_changed":
                 next_step = "身份绑定变化，等待重新确认；当前不生成审批命令。"
             elif status == "not_running":
-                next_step = "UNAVAILABLE：组件未运行，先确认机器状态；不生成重新部署命令。"
+                next_step = "组件当前未运行，无法比较镜像；先确认机器状态，不生成重新部署命令。"
             else:
                 safe_state = safe_machines.get(alias_key_value)
-                selector = safe_state.get("command_selector", "") if safe_state else ""
-                if selector:
+                selector = str(
+                    safe_state.get("command_selector", "") or ""
+                ).strip() if safe_state else ""
+                selected_ip = _canonical_ip(selector)
+                safe_ip_selector = bool(
+                    selected_ip and selected_ip == ip_value
+                    and safe_state.get("ip") == ip_value
+                    and safe_state.get("identity_confirmed") is True
+                    and safe_state.get("authorized") is True
+                    and not safe_state.get("duplicate_ip")
+                ) if safe_state else False
+                safe_alias_selector = bool(
+                    selector and not selected_ip and selector == alias
+                    and safe_state.get("duplicate_ip") is True
+                    and safe_state.get("ip") == ip_value
+                    and safe_state.get("identity_confirmed") is True
+                    and safe_state.get("authorized") is True
+                ) if safe_state else False
+                if safe_ip_selector or safe_alias_selector:
+                    difference = (
+                        f"审批目标 {target_image} 与当前运行镜像 {observed_image} 不同，"
+                        "需要重新部署。"
+                    )
                     next_step = (
-                        f"MISMATCH：直接重新审批：`/approve_deploy machine={selector}`；"
+                        f"{difference}直接重新审批：`/approve_deploy machine={selector}`；"
                         "`/request_deploy` 可选。"
                     )
                 else:
-                    next_step = "MISMATCH：当前身份或仓库授权未确认，暂不生成审批命令。"
-            target_digest = _runtime_digest(_record_value(check, "target_image", "target_digest"))
-            observed_digest = _runtime_digest(_record_value(check, "observed_image", "observed_digest"))
+                    next_step = (
+                        "运行镜像与审批目标不一致，需要重新部署；但当前身份、仓库授权或主 IP "
+                        "未全部确认，暂不生成审批命令。"
+                    )
+            component_label = (
+                _runtime_component_label(component)
+                or str(_record_value(check, "component_id") or "未提供")
+            )
             checked_at = (
                 _record_value(check, "checked_at", "last_scanned_at", default="未扫描")
                 or "未扫描"
             )
-            owner = _owner_label(owners, test_only=test_only, mention=not test_only)
             status_label = runtime_status_labels[status]
             if display_status == "deploying":
                 status_label = f"部署进行中；上次只读检查：{status_label}"
+            owner_text = _owner_label(
+                machine_state.get("owners", []),
+                test_only=test_only,
+                mention=not test_only,
+            )
             runtime_lines.append("| " + " | ".join(_escape(value) for value in (
                 alias or _record_value(check, "machine", default="未提供"),
-                ip_value or "未提供", owner, target_digest, observed_digest,
-                status_label, checked_at, next_step,
+                ip_value or "未提供",
+                owner_text,
+                component_label,
+                target_image, observed_image, checked_at, status_label, next_step,
             )) + " |")
     else:
         runtime_lines.append("尚无可展示的机器镜像检查结果。")
@@ -1849,8 +2117,6 @@ def deploy_requested(
         f"**Bound HEAD:** `{_short(head_sha)}`",
         f"**Repository:** `{_escape(repo)}`",
         "",
-        *policy_lines,
-        "",
         *inventory_lines,
         "",
         *compatible_lines,
@@ -1859,27 +2125,26 @@ def deploy_requested(
         "",
         *runtime_lines,
         "",
-        "### Workflow",
-        "",
-        _workflow_lines(display_status),
-        "",
-        "### Next action",
-        "",
     ]
     if display_status == "deploying":
-        lines.append("正在部署，请等待结果；请勿重复审批。")
+        lines.extend([
+            "", "部署正在执行，请等待结果。完成后系统会核对运行镜像；所有组件确认完成后即可开始测试。",
+        ])
     elif compatible_states:
         lines.extend([
-            "等待对应机器负责人使用 Compatible Machines 中列出的命令审批。",
-            "`/request_deploy` 可选，不是直接审批的前提。",
+            "", "当前已经收到部署申请。请对应机器负责人在上表中执行本机审批命令。",
+            "审批通过后系统会执行部署并核对运行镜像；所有组件确认完成后会进入测试。",
         ])
     else:
-        lines.append("暂时没有通过完整安全检查的可执行审批命令；先解决 Pending / Incompatible Machines 中列出的原因。")
+        lines.extend([
+            "", "当前已经收到部署申请，但暂时没有通过安全检查的可部署机器。",
+            "请先处理上方列出的授权、身份或兼容问题；条件满足后，机器负责人的审批命令会显示在这里。",
+        ])
 
     if gate_note:
         lines.extend(["", *[_safe_display_text(note) for note in gate_note
                              if isinstance(note, str)]])
-    lines.extend(["", "### Current Deployment", ""])
+    lines.extend(["", "### 部署进度", ""])
     lines.append(_deployment_table(
         deployments, all_components or component_snapshot or components, group_rows,
     ))
@@ -1908,26 +2173,28 @@ def testing(
         reviewers = [name.strip() for name in acceptance_reviewers or []
                      if isinstance(name, str)
                      and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}", name.strip())]
-        next_action = []
         if reviewers:
             waiting_for = "、".join(f"@{_escape(name)}" for name in reviewers)
-            next_action.extend([
-                f"正在等待以下验收人确认：{waiting_for}。",
-                "其中一位验收人请在 PR 评论中执行其中一条命令：\n"
-                "- `/record_test result=pass`\n"
-                "- `/record_test result=fail`",
-            ])
+            next_action = [
+                f"已申请验收，正在等待 {waiting_for} 确认。",
+                "验收人确认后，会在 PR 评论中记录结果。",
+            ]
         else:
             if not acceptance_reviewers_configured:
-                reason = "当前仓库没有配置可用的验收账号，无法验收。请管理员检查 test_reviewers.yaml。"
+                reason = "当前仓库没有可用的验收人，暂时无法验收。请联系仓库管理员配置验收账号。"
             else:
-                reason = "验收名单中没有可用账号，无法验收。请管理员检查 test_reviewers.yaml。"
-            next_action.append(reason)
-        next_action = "\n\n".join(next_action)
+                reason = "当前没有可用的验收人，暂时无法验收。请联系仓库管理员检查验收账号。"
+            next_action = [reason]
+        upload_url = _trusted_upload_page_url(evidence_url, repo, pr_number)
+        upload_link = (
+            f"[补充上传测试证据](<{upload_url}>)" if upload_url
+            else "[补充上传测试证据][deploy-approval-upload]"
+        )
+        next_action.extend(["", f"需要补充本轮测试证据时，可{upload_link}。"])
     else:
         next_action = _testing_next_action(
             evidence_complete, evidence_url, repo=repo, pr_number=pr_number,
-        )
+        ).split("\n")
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
@@ -1935,32 +2202,9 @@ def testing(
         "",
         ("**Status:** `testing` · 测试完成 · 待验收"
          if acceptance_pending else "**Status:** `testing`"),
-        f"**Repository:** `{repo}`",
         "",
-        "### Workflow",
-        "",
-        ("已收到本轮验收申请。" if acceptance_pending else
-         _workflow_lines("testing", evidence_complete=evidence_complete,
-                         deployments_complete=deployments_complete,
-                         record_test_complete=record_test_complete)),
-        "",
-        "### Next action",
-        "",
-        *next_action.split("\n"),
+        *next_action,
     ]
-    if not (deployments_complete is True and deployments):
-        lines.extend(["", "### Current Deployment", ""])
-        if deployments:
-            lines.append(_deployment_table(deployments, components, machine_groups))
-        else:
-            lines.append("No deployment record is available for this round yet.")
-    if case_result:
-        lines.extend([
-            "",
-            f"**Automated case results:** {case_result}",
-            "Fixed Case results are advisory only.",
-        ])
-    lines.extend(_attempt_lines(attempt))
     return _lifecycle_body(lines)
 
 
@@ -2914,40 +3158,17 @@ def render_evidence_section(
         return _trusted_upload_page_url(candidate, repo, pr_number)
 
     lines = ["<!-- deploy-approval-evidence:start -->"]
-    if show_current_round:
-        current_key = (head, current_round)
-        current_group = groups[current_key]
+    upload_entry_url = current_upload_entry_url() if state.get("status") == "testing" else ""
+    if state.get("status") == "testing" and not upload_entry_url:
         lines.extend([
-            "<details open>",
-            round_summary(current_key, current_group),
-            "", *render_round(current_key, current_group), "", "</details>",
+            "",
+            '<a id="deploy-approval-upload-status"></a>',
+            "上传入口暂时不可用。请刷新 Summary；仍无法访问时联系管理员。",
         ])
-    test_statuses = {"testing", "succeeded", "failed"}
-    old = [(key, group) for key, group in groups.items()
-           if key != (head, current_round) and group.get("status") in test_statuses]
-    old.sort(key=lambda pair: round_sort_time(pair[0]), reverse=True)
-    if old:
-        lines.append("")
-        for key, group in old:
-            lines.extend(["<details>",
-                          round_summary(key, group),
-                          "", *render_round(key, group, historical=True), "", "</details>", ""])
-    for url in trusted_archive_urls:
-        lines.append(f"[查看原始归档](<{url}>)")
     lines.append("<!-- deploy-approval-evidence:end -->")
     if state.get("status") == "testing":
-        upload_entry_url = current_upload_entry_url()
         if upload_entry_url:
-            lines.extend([
-                "",
-                f"[deploy-approval-upload]: <{upload_entry_url}>",
-            ])
+            lines.extend(["", f"[deploy-approval-upload]: <{upload_entry_url}>"])
         else:
-            lines.extend([
-                "",
-                '<a id="deploy-approval-upload-status"></a>',
-                "**上传入口状态：** 当前轮安全上传链接暂不可用。请检查证据服务、访问权限和可信 HTTPS 上传入口配置，或联系管理员。",
-                "",
-                "[deploy-approval-upload]: #deploy-approval-upload-status",
-            ])
+            lines.extend(["", "[deploy-approval-upload]: #deploy-approval-upload-status"])
     return "\n".join(lines)

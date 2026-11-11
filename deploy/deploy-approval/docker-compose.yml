@@ -32,6 +32,13 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # Repository-scoped fallback candidates; each owner directory is read only.
+      - type: bind
+        source: /var/lib/deploy-approval/policy-candidates
+        target: /run/deploy-approval/policy-candidates
+        read_only: true
+        bind:
+          create_host_path: false
       # Persistent COS secrets — fixed host path, read-only inside container
       - type: bind
         source: "${DEPLOY_APPROVAL_CONFIG_DIR:?config directory required}/secrets.yaml"

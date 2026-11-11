@@ -135,16 +135,13 @@ def validate_repository_names(repos: list[str], *, label: str = "GITHUB_REPOS", 
 
 
 def resolve_authorized_repos(desired: list[str], authorized: list) -> list[str]:
-    """Intersect the configured allowlist with a complete installation snapshot."""
+    """Return exactly the configured allowlist ∩ complete Installation snapshot."""
     desired = validate_repository_names(desired)
     if not isinstance(authorized, list):
         raise ValueError("installation repositories must be a list")
     names = [entry.get("full_name") if isinstance(entry, dict) else entry for entry in authorized]
     authorized_set = set(validate_repository_names(names, label="installation repositories", allow_empty=True))
-    active = [repo for repo in desired if repo in authorized_set]
-    if desired[0] not in active:
-        raise RuntimeError(f"required repo {desired[0]!r} is not authorized for this GitHub App installation")
-    return active
+    return [repo for repo in desired if repo in authorized_set]
 
 
 @dataclass
@@ -161,6 +158,9 @@ class Config:
         default_factory=lambda: list(DEFAULT_GITHUB_REPOS)
     )
     active_repos: list[str] = field(default_factory=list)
+    # Official policy-source authorization is derived from the complete
+    # Installation repository snapshot, independently of the PR watchlist.
+    policy_active_repos: list[str] = field(default_factory=list)
     auth_valid: bool = False
     github_comment_max_pages: int = 20
     github_comment_max_comments: int = 500

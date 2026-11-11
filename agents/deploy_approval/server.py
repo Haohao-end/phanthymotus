@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
-from .config import Config, DEFAULT_GITHUB_REPOS, load_config, resolve_authorized_repos, validate_repository_names
+from .config import Config, DEFAULT_GITHUB_REPOS, load_config, validate_repository_names
 from .github_state_proxy import _ALLOWED_STATUS_LABELS
 from .github_client import GitHubClient
 from agents import github_app_auth
@@ -227,18 +227,34 @@ async def _bootstrap_status_labels(github: GitHubClient, repos: list[str] | None
 
 
 async def _resolve_active_repos(
-    github: GitHubClient, desired_repos: list[str],
+    github: GitHubClient, desired_repos: list[str], config: Config | None = None,
 ) -> list[str]:
-    """Resolve ACTIVE_REPOS = desired ∩ installation repositories.
+    """Resolve watch and official-policy authorization from one snapshot.
 
-    The first configured repository is required; the others are optional.
-    Installation permissions never expand the configured allowlist.
+    Installation permissions never expand the PR watch allowlist. The full
+    snapshot is separately intersected with official repositories for policy
+    reads, even when only user-owned forks are watched.
     """
     authorized_names = await github.list_installation_repositories()
-    active = resolve_authorized_repos(desired_repos, authorized_names)
+    authorized = {
+        name.lower() for name in validate_repository_names(
+            authorized_names,
+            label="installation repositories",
+            allow_empty=True,
+        )
+    }
+    desired = validate_repository_names(desired_repos)
+    active = [repo for repo in desired if repo in authorized]
+    policy_active = [
+        repo for repo in DEFAULT_GITHUB_REPOS if repo.lower() in authorized
+    ]
+    target_config = config or getattr(github, "config", None)
+    if target_config is not None:
+        target_config.policy_active_repos = policy_active
     inactive = [repo for repo in desired_repos if repo.lower() not in active]
     logger.info("github desired repos: %s", desired_repos)
     logger.info("github authorized desired repos: %s", active)
+    logger.info("official policy repositories authorized: %s", policy_active)
     if inactive:
         logger.info("github inactive desired repos: %s", inactive)
     return active
@@ -289,24 +305,9 @@ def create_app(config: Config | None = None):
     config = config or load_config()
     config.github_repos = validate_repository_names(config.github_repos)
     policy = Policy(config)
-    if set(config.github_repos).isdisjoint(DEFAULT_GITHUB_REPOS):
-        try:
-            # Keep the legacy no-repo Policy API available for deployments
-            # outside the controlled repository-scoped policy flow.
-            policy.load_machines()
-        except Exception as exc:
-            policy.machines = {}
-            logger.warning(
-                "legacy global machine owners file is unavailable (%s); "
-                "legacy machine policy remains fail-closed",
-                type(exc).__name__,
-            )
-    else:
-        # A single local owner list must never become a fallback shared by the
-        # controlled repositories. Their policies load independently from main.
-        logger.info(
-            "using repository-scoped machine policy; legacy global machine owners are not loaded",
-        )
+    # Repository authorization is loaded independently from each official
+    # repository's main branch. Never seed Policy's legacy global list from the
+    # shared local machines.yaml mount when PRs come from user-owned forks.
 
     # Create shared GitHub App auth provider first
     github_auth = github_app_auth.create_github_app_auth()
@@ -352,10 +353,17 @@ def create_app(config: Config | None = None):
         # Resolve ACTIVE_REPOS at startup (fresh from installation) — must be inside
         # lifespan so we can properly await the async function.
         desired_repos = list(config.github_repos)
+        config.auth_valid = False
+        config.active_repos = []
+        config.policy_active_repos = []
         try:
-            active_repos = await _resolve_active_repos(github, desired_repos)
+            active_repos = await _resolve_active_repos(
+                github, desired_repos, config=config,
+            )
             # Keep the configured allowlist separate from runtime authorization.
             config.active_repos = active_repos
+            # _resolve_active_repos stores the formal-policy intersection from
+            # that same complete Installation snapshot in policy_active_repos.
             config.auth_valid = True
             watcher.mark_repos_pending_baseline(active_repos)
             try:
