@@ -6,6 +6,7 @@ Single writer: only GitHubCommandWatcher mutates deploy state.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -19,6 +20,7 @@ from agents import github_app_auth
 from .github_state_proxy import GitHubStateProxy
 from .github_command_watcher import GitHubCommandWatcher
 from .policy import Policy
+from .repo_policy import POLICY_REFRESH_TICK_SECONDS, RepositoryPolicyProvider
 from .router_webhook import router as webhook_router
 from .service import DeployController
 from .evidence_api import router as evidence_router
@@ -67,6 +69,11 @@ _STATUS_LABEL_SPECS = (
         "status: deploy-requested",
         "FBCA04",
         "Deploy Approval: Machine Owner action required",
+    ),
+    (
+        "status: deploying",
+        "1D76DB",
+        "Deploy Approval: deployment in progress",
     ),
     (
         "status: testing",
@@ -118,6 +125,7 @@ _LABEL_SPECS: dict[str, tuple[str, str]] = {
     "status: reviewing": ("5319E7", "Deploy Approval: current HEAD is being reviewed"),
     "status: deploy-ready": ("0E8A16", "Deploy Approval: reviewed HEAD is ready for deploy request"),
     "status: deploy-requested": ("FBCA04", "Deploy Approval: Machine Owner action required"),
+    "status: deploying": ("1D76DB", "Deploy Approval: deployment in progress"),
     "status: testing": ("1D76DB", "Deploy Approval: deployment complete; human testing required"),
     "status: acceptance-required": ("FBCA04", "Deploy Approval: testing complete; independent acceptance required"),
     "status: succeeded": ("0E8A16", "Deploy Approval: human validation passed"),
@@ -221,18 +229,40 @@ async def _bootstrap_status_labels(github: GitHubClient, repos: list[str] | None
 
 
 async def _resolve_active_repos(
-    github: GitHubClient, desired_repos: list[str],
+    github: GitHubClient, desired_repos: list[str], config: Config | None = None,
 ) -> list[str]:
     """Resolve ACTIVE_REPOS = desired ∩ installation repositories.
 
     The first configured repository is required; the others are optional.
     Installation permissions never expand the configured allowlist.
+
+    The same complete snapshot also yields ``policy_active_repos``: the
+    intersection with the official policy repositories, independent of which
+    (possibly fork-owned) repositories are watched for PRs.
     """
     authorized_names = await github.list_installation_repositories()
     active = resolve_authorized_repos(desired_repos, authorized_names)
+    try:
+        authorized = {
+            name.lower() for name in validate_repository_names(
+                authorized_names,
+                label="installation repositories",
+                allow_empty=True,
+            )
+        }
+    except ValueError:
+        policy_active = []
+    else:
+        policy_active = [
+            repo for repo in DEFAULT_GITHUB_REPOS if repo.lower() in authorized
+        ]
+    target_config = config or getattr(github, "config", None)
+    if target_config is not None:
+        target_config.policy_active_repos = policy_active
     inactive = [repo for repo in desired_repos if repo.lower() not in active]
     logger.info("github desired repos: %s", desired_repos)
     logger.info("github authorized desired repos: %s", active)
+    logger.info("official policy repositories authorized: %s", policy_active)
     if inactive:
         logger.info("github inactive desired repos: %s", inactive)
     return active
@@ -283,6 +313,10 @@ def create_app(config: Config | None = None):
     config = config or load_config()
     config.github_repos = validate_repository_names(config.github_repos)
     policy = Policy(config)
+    # V152's controller/watcher call sites still resolve machines without a
+    # repository argument, so the legacy fail-closed local mount is retained
+    # unchanged for backwards compatibility. Repository-scoped policy is served
+    # independently by the shared RepositoryPolicyProvider below.
     policy.load_machines()
 
     # Create shared GitHub App auth provider first
@@ -294,6 +328,11 @@ def create_app(config: Config | None = None):
         token_provider=github_auth.get_installation_token,
     )
 
+    # One provider instance is shared so machines, reviewers, and reported
+    # status always describe the same validated snapshot, and only one refresh
+    # loop exists per repository (enforced by the provider's per-repo lock).
+    repo_policy = RepositoryPolicyProvider(config, github)
+
     # GitHubStateProxy receives github_app_id for lazy provenance check
     proxy = GitHubStateProxy(
         config, github, github_app_id=github_auth.app_id,
@@ -303,6 +342,8 @@ def create_app(config: Config | None = None):
         config, proxy, policy, github,
         agent_core_factory=None,
     )
+    policy.repo_policy = repo_policy
+    controller.repo_policy = repo_policy
 
     store = CosAttachmentStore(config)
     evidence_service = None
@@ -313,6 +354,7 @@ def create_app(config: Config | None = None):
             config=config, github=github, proxy=proxy, policy=policy,
             controller=controller, store=store,
         )
+        evidence_service.repo_policy = repo_policy
         # A's existing serial watcher calls controller.project_evidence().
         controller.evidence_service = evidence_service
     else:
@@ -323,18 +365,63 @@ def create_app(config: Config | None = None):
 
     # Single serial command watcher
     watcher = GitHubCommandWatcher(config, proxy, controller, github=github, github_auth=github_auth)
+    watcher.repo_policy = repo_policy
+    controller.watcher = watcher
+
+    async def _refresh_repo_policies() -> None:
+        """Refresh each authorized official policy source, independently."""
+        for repo in list(DEFAULT_GITHUB_REPOS):
+            try:
+                await repo_policy.refresh_if_due(repo)
+            except Exception as exc:
+                # One repository's failure must not affect the other's policy.
+                logger.warning(
+                    "repository policy refresh failed for %s: %s",
+                    repo, type(exc).__name__,
+                )
+
+    async def _repo_policy_refresh_loop() -> None:
+        """Re-check each official ``main`` on the provider's 30-minute schedule.
+
+        Each repository is refreshed on its own schedule through the provider's
+        per-repository lock, so a slow or failing repository cannot delay or
+        invalidate the other's policy. The loop wakes every
+        POLICY_REFRESH_TICK_SECONDS and ``refresh_if_due`` decides whether a
+        repository is actually due. The loop is cancelled on shutdown.
+        """
+        try:
+            while True:
+                await asyncio.sleep(POLICY_REFRESH_TICK_SECONDS)
+                await _refresh_repo_policies()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive loop guard
+            logger.warning("repository policy refresh loop stopped: %s", type(exc).__name__)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Resolve ACTIVE_REPOS at startup (fresh from installation) — must be inside
         # lifespan so we can properly await the async function.
         desired_repos = list(config.github_repos)
+        config.auth_valid = False
+        config.active_repos = []
+        config.policy_active_repos = []
+        policy_refresh_task: asyncio.Task | None = None
         try:
-            active_repos = await _resolve_active_repos(github, desired_repos)
+            active_repos = await _resolve_active_repos(
+                github, desired_repos, config=config,
+            )
             # Keep the configured allowlist separate from runtime authorization.
             config.active_repos = active_repos
+            # _resolve_active_repos stored the official-policy intersection from
+            # the same complete Installation snapshot in policy_active_repos.
             config.auth_valid = True
             watcher.mark_repos_pending_baseline(active_repos)
+            # Policy refresh is fail-closed and independent of startup: a failed
+            # or missing policy source leaves approvals blocked, but never blocks
+            # the watcher from starting or observing PRs.
+            await _refresh_repo_policies()
+            policy_refresh_task = asyncio.create_task(_repo_policy_refresh_loop())
             try:
                 await _bootstrap_status_labels(github, repos=active_repos)
             except Exception as exc:
@@ -347,6 +434,12 @@ def create_app(config: Config | None = None):
             watcher.start()
             yield
         finally:
+            if policy_refresh_task is not None:
+                policy_refresh_task.cancel()
+                try:
+                    await policy_refresh_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             await _lifespan_cleanup(
                 watcher,
                 controller,

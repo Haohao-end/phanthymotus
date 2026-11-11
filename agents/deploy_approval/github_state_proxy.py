@@ -52,6 +52,7 @@ _ALLOWED_STATUS_LABELS = frozenset({
     "status: reviewing",
     "status: deploy-ready",
     "status: deploy-requested",
+    "status: deploying",
     "status: testing",
     "status: acceptance-required",
     "status: succeeded",
