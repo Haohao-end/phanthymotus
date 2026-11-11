@@ -20,10 +20,11 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 from .evidence_auth import (
     DOWNLOAD_PURPOSE, PURPOSE, UPLOAD_MAX_BYTES, UPLOAD_MAX_FILES, UPLOAD_PURPOSE,
+    issue_capability, public_https_ingress_ready,
 )
 from .evidence_models import (
     EvidenceError, round_id_for_state, trusted_round_numbers, utc_now, validate_context,
@@ -31,6 +32,9 @@ from .evidence_models import (
 
 UPLOAD_MAX_NOTES = 20
 _CURRENT_CONTEXT_HISTORY_TIMEOUT_SECONDS = 8
+_EVIDENCE_COMMENT_MARKER = '<!-- deploy-approval-evidence-comment:'
+_EVIDENCE_IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+_EVIDENCE_VIDEO_SUFFIXES = {'.mp4', '.webm'}
 
 
 class _NoopAsyncContext:
@@ -138,6 +142,99 @@ class EvidenceService:
         operation.clear()
         operation.update(canonical)
         return record
+
+    @staticmethod
+    def _comment_media_kind(filename):
+        suffix = PurePosixPath(str(filename or '')).suffix.lower()
+        if suffix in _EVIDENCE_VIDEO_SUFFIXES:
+            return 'video'
+        if suffix in _EVIDENCE_IMAGE_SUFFIXES:
+            return 'image'
+        return ''
+
+    def _evidence_comment_body(self, repo, pr_number, operation, *, error=''):
+        """Build one visible bot comment for a verified or failed upload."""
+        head_sha, round_id = operation.get('head_sha'), operation.get('round_id')
+        attachment_id = operation.get('attachment_id')
+        if operation.get('evidence_kind') not in (None, 'file'):
+            return ''
+        if (not isinstance(head_sha, str) or not re.fullmatch(r'[0-9a-f]{40}', head_sha)
+                or not isinstance(round_id, str)
+                or not re.fullmatch(re.escape(head_sha) + r'-[0-9]+', round_id)
+                or not isinstance(attachment_id, str) or not attachment_id):
+            return ''
+        marker = (f'{_EVIDENCE_COMMENT_MARKER}{head_sha}:{round_id}:'
+                  f'{attachment_id} -->')
+        filename = str(operation.get('filename') or '附件文件')
+        safe_name = re.sub(r'[\r\n<>|`\[\]]', '_', filename)[:160] or '附件文件'
+        lines = [marker, '### 测试证据已上传' if not error else '### 测试证据上传失败', '']
+        lines.append(f'- **文件：** {safe_name}')
+        size = operation.get('size')
+        if type(size) is int and size > 0:
+            lines.append(f'- **大小：** {size} 字节')
+        if isinstance(operation.get('completed_at'), str):
+            lines.append(f'- **归档时间：** {operation["completed_at"]}')
+        if error:
+            lines.append(f'- **失败原因：** {error}')
+            return '\n'.join(lines)
+        sha256 = operation.get('sha256')
+        if isinstance(sha256, str) and re.fullmatch(r'[0-9a-f]{64}', sha256):
+            lines.append(f'- **SHA256：** `{sha256}`')
+        lines.extend(['', f'**本轮：** `{round_id}`'])
+        base = getattr(self.config, 'evidence_public_base_url', '')
+        if not public_https_ingress_ready(self.config):
+            lines.extend(['', '预览链接暂不可用；请从 PR Summary 的附件页查看。'])
+            return '\n'.join(lines)
+        from .comments import _evidence_path
+        api = _evidence_path(repo, pr_number)
+        if not api:
+            return '\n'.join(lines)
+        kind = self._comment_media_kind(filename)
+        capability = issue_capability(
+            self.config, repo, pr_number, head_sha, round_id,
+            purpose=DOWNLOAD_PURPOSE, resource='attachment:' + attachment_id,
+        )
+        url = (base + api + '/attachments/' + quote(attachment_id, safe='') +
+               '/preview?cap=' + quote(capability, safe=''))
+        lines.append('')
+        if kind == 'image':
+            lines.append(f'![{safe_name}](<{url}>)')
+        elif kind == 'video':
+            lines.append(f'[▶ 打开视频预览：{safe_name}](<{url}>)')
+        else:
+            lines.append(f'[打开附件：{safe_name}](<{url}>)')
+        return '\n'.join(lines)
+
+    async def _publish_evidence_comment(self, repo, pr_number, operation, *, error=''):
+        """Post or update one marker-keyed bot comment; never fail the upload."""
+        try:
+            body = self._evidence_comment_body(repo, pr_number, operation, error=error)
+            if not body:
+                return
+            marker = body.split('\n', 1)[0]
+            expected_url = (
+                f'{self.config.github_api_url.rstrip("/")}/repos/{repo}/issues/{pr_number}')
+            comments = await self.proxy.get_issue_comments(repo, pr_number)
+            existing = [
+                item for item in comments
+                if isinstance(item, dict)
+                and item.get('issue_url') == expected_url
+                and self.proxy.is_bot_comment(item)
+                and isinstance(item.get('body'), str)
+                and item['body'].startswith(marker)
+            ]
+            if existing:
+                comment_id = existing[0].get('id')
+                if type(comment_id) is int and comment_id > 0:
+                    if existing[0]['body'] == body:
+                        return
+                    await self.proxy.update_comment(repo, comment_id, body)
+                return
+            await self.proxy.post_issue_comment(repo, pr_number, body)
+        except Exception:
+            # A comment is a convenience projection of the trusted record; the
+            # owner of the upload must not see a failure because GitHub is slow.
+            return
 
     async def _store(self, action, operation, payload):
         if self.store is None or not callable(getattr(self.store, 'dispatch', None)):
@@ -1707,6 +1804,7 @@ class EvidenceService:
                 if source['status'] == 'ready':
                     await current()
                     await self._save(repo, pr_number, 'attachment', source, 'ready')
+                    await self._publish_evidence_comment(repo, pr_number, source)
                     return public(source)
                 await current()
                 result = await self._store('resume', source, {})
@@ -1741,6 +1839,7 @@ class EvidenceService:
                                      completed_at=utc_now())
                     await self._save(repo, pr_number, 'operation', recovered, 'ready')
                     await self._save(repo, pr_number, 'attachment', recovered, 'ready')
+                    await self._publish_evidence_comment(repo, pr_number, recovered)
                 else:
                     if not recovered.get('object_key') or not recovered.get('upload_id'):
                         raise EvidenceError('upload_not_recoverable', 502)
@@ -1753,6 +1852,8 @@ class EvidenceService:
                     raise EvidenceError('round_changed', 409)
                 await current()
                 await self._save(repo, pr_number, 'attachment', existing, existing['status'])
+                if existing['status'] == 'ready':
+                    await self._publish_evidence_comment(repo, pr_number, existing)
                 return public(existing)
             if action in {'init', 'note'}:
                 text = payload.get('text') or payload.get('note', '')
@@ -1909,11 +2010,16 @@ class EvidenceService:
                         or result['size'] != operation['size'] or not isinstance(actual_sha, str)
                         or not re.fullmatch('[0-9a-f]{64}', actual_sha)
                         or (operation.get('sha256') and actual_sha != operation['sha256'])):
+                    await self._publish_evidence_comment(
+                        repo, pr_number, operation,
+                        error='服务端未能校验归档内容，未记录为可用证据。',
+                    )
                     raise EvidenceError('object_not_verified', 409)
                 operation.update(status='ready', sha256=actual_sha, cos_content_verified=True,
                                  completed_at=utc_now())
                 await self._save(repo, pr_number, 'operation', operation, 'ready')
                 await self._save(repo, pr_number, 'attachment', operation, 'ready')
+                await self._publish_evidence_comment(repo, pr_number, operation)
             else:
                 if not operation.get('upload_id') or not operation.get('object_key'):
                     raise EvidenceError('upload_not_recoverable', 502)

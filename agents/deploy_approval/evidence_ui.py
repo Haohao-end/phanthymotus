@@ -23,93 +23,46 @@ def render_upload_page(repo, pr_number, head_sha, round_id, *, read_only=False) 
 *{{box-sizing:border-box}}
 body{{margin:0;background:#f5f5f7;color:#1d1d1f;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}}
 main{{width:min(100% - 32px,780px);margin:48px auto 72px}}
-.page-header{{display:flex;align-items:center;justify-content:space-between;gap:20px;margin:0 0 26px}}
+.page-header{{margin:0 0 26px}}
 .eyebrow{{margin:0 0 4px;color:#6e6e73;font-size:13px;font-weight:600;letter-spacing:.02em}}
 h1{{margin:0;font-size:clamp(28px,5vw,36px);line-height:1.15;letter-spacing:-.035em}}
 .subtitle{{margin:8px 0 0;color:#6e6e73}}
-.header-actions{{display:flex;align-items:center;gap:12px;flex-shrink:0}}
-.status-pill{{display:inline-flex;align-items:center;min-height:30px;padding:4px 11px;border-radius:999px;background:#e8e8ed;color:#424245;font-size:14px;font-weight:600;white-space:nowrap}}
-.status-pill[data-state="testing"]{{background:#e8f2ff;color:#0758b7}}
-.status-pill[data-state="succeeded"]{{background:#e7f6ec;color:#147333}}
-.status-pill[data-state="failed"]{{background:#fff0ef;color:#b42318}}
 section.panel{{margin:16px 0;padding:24px;background:#fff;border:1px solid #e5e5ea;border-radius:16px}}
-.section-heading{{margin-bottom:18px}}
-h2{{margin:0;font-size:20px;letter-spacing:-.02em}}
-.muted{{margin:5px 0 0;color:#6e6e73;font-size:14px}}
-button,input,textarea,select{{font:inherit}}
+button,input{{font:inherit}}
 button{{min-height:44px;padding:9px 16px;border:1px solid #d2d2d7;border-radius:10px;background:#fff;color:#1d1d1f;cursor:pointer}}
 button:hover{{background:#f5f5f7}}
 button:disabled{{cursor:not-allowed;opacity:.55}}
-button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,summary:focus-visible{{outline:3px solid #77aaff;outline-offset:2px}}
+button:focus-visible,a:focus-visible,input:focus-visible{{outline:3px solid #77aaff;outline-offset:2px}}
 .primary{{border-color:#0071e3;background:#0071e3;color:#fff;font-weight:600}}
 .primary:hover{{border-color:#0077ed;background:#0077ed}}
-.header-actions button{{min-width:76px}}
 #message{{margin:0 0 16px;color:#b42318;white-space:pre-wrap}}
 #message:empty{{display:none}}
+.muted{{margin:0 0 16px;color:#6e6e73}}
 fieldset{{min-width:0;margin:0;padding:0;border:0}}
 #dropzone{{display:flex;min-height:132px;align-items:center;justify-content:center;flex-direction:column;gap:8px;padding:20px;border:1px dashed #a1a1a6;border-radius:13px;color:#1d1d1f;text-align:center;cursor:pointer}}
 #dropzone.dragging{{border-color:#0071e3;background:#f0f7ff}}
 #dropzone input{{max-width:100%;font-size:14px}}
 .file-hint{{color:#6e6e73;font-size:13px}}
-.secondary{{margin-top:14px;border-top:1px solid #e5e5ea;padding-top:12px}}
-.secondary summary,.history-record summary,.attachment-details summary{{cursor:pointer;color:#424245;font-weight:600}}
-.secondary-fields{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}}
-label.control{{display:block;color:#424245;font-size:14px;font-weight:600}}
-textarea,select{{display:block;width:100%;margin-top:6px;padding:10px 12px;border:1px solid #d2d2d7;border-radius:9px;background:#fff;color:#1d1d1f}}
-textarea{{min-height:88px;resize:vertical}}
-.secondary-actions{{display:flex;justify-content:flex-end;margin-top:12px}}
 .primary-row{{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}}
 .list-heading{{margin:24px 0 8px;font-size:16px}}
-.queue,.attachments{{list-style:none;margin:0;padding:0}}
-.queue:empty,.attachments:empty{{display:none}}
-.job,.attachment{{margin:10px 0;padding:15px;border:1px solid #e5e5ea;border-radius:12px;background:#fff}}
-.job-heading,.attachment-heading{{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}}
-.job-title,.attachment-title{{min-width:0;overflow-wrap:anywhere;font-weight:600}}
+.queue{{list-style:none;margin:0;padding:0}}
+.queue:empty{{display:none}}
+.job{{margin:10px 0;padding:15px;border:1px solid #e5e5ea;border-radius:12px;background:#fff}}
+.job-heading{{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}}
+.job-title{{min-width:0;overflow-wrap:anywhere;font-weight:600}}
 .file-size{{flex-shrink:0;color:#6e6e73;font-size:14px;white-space:nowrap}}
 progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#0071e3}}
 .job-footer{{display:flex;align-items:center;justify-content:space-between;gap:12px}}
 .job-state{{color:#424245;font-size:14px;font-weight:600}}
 .job-detail{{color:#6e6e73;font-size:13px;overflow-wrap:anywhere}}
-.job-footer button,.attachment-actions button,.attachment-actions a{{min-height:40px}}
-.attachment-actions{{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}}
-.attachment-actions a{{display:inline-flex;align-items:center;padding:7px 12px;border:1px solid #d2d2d7;border-radius:9px;color:#06c;text-decoration:none}}
-.attachment-actions a:hover{{background:#f5f5f7}}
-.attachment-details{{margin-top:9px;font-size:14px}}
-.attachment-meta{{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:10px 0 0;color:#6e6e73}}
-.attachment-meta dt{{color:#86868b}}
-.attachment-meta dd{{margin:0;color:#424245;overflow-wrap:anywhere}}
-.media-preview{{margin-top:12px}}
-.media-preview video,.media-preview img{{display:block;width:100%;max-height:520px;border-radius:10px;background:#111}}
-.attachment-meta-inline{{margin:5px 0 0;color:#6e6e73;font-size:13px}}
-.attachment-note{{margin-top:10px;padding:10px 12px;border-radius:10px;background:#f5f5f7;overflow-wrap:anywhere}}
-.attachment-note p{{margin:0 0 8px}}.attachment-note p:last-child{{margin-bottom:0}}
-.attachment-note pre,.attachment-note code{{white-space:pre-wrap;overflow-wrap:anywhere}}
-.media-hint,.empty-state{{color:#6e6e73;font-size:14px}}
-.media-hint{{margin:7px 0 0}}
-.media-hint:empty{{display:none}}
-.history-record{{margin:10px 0;padding:14px;border:1px solid #e5e5ea;border-radius:12px}}
-.history-record summary{{overflow-wrap:anywhere}}
-.history-record ul{{list-style:none;margin:12px 0 0;padding:0}}
-.history-section-summary{{cursor:pointer;font-size:20px;font-weight:600}}
-.round-facts{{margin:8px 0 16px;color:#424245}}
-.round-facts p{{margin:3px 0;overflow-wrap:anywhere}}
-.deployment-table-wrap{{margin:12px 0;overflow-x:auto;border:1px solid #e5e5ea;border-radius:10px}}
-.deployment-table{{width:100%;border-collapse:collapse;font-size:13px}}
-.deployment-table th,.deployment-table td{{padding:8px 10px;border-bottom:1px solid #e5e5ea;text-align:left;vertical-align:top;overflow-wrap:anywhere}}
-.deployment-table th{{background:#f5f5f7;color:#424245;white-space:nowrap}}
-.deployment-table tr:last-child td{{border-bottom:0}}
-.history-links{{margin-top:12px}}
-.history-links a{{color:#06c}}
+.job-footer button{{min-height:40px}}
 [hidden]{{display:none!important}}
 @media (max-width:560px){{
   main{{width:min(100% - 24px,780px);margin:28px auto 48px}}
-  .page-header{{align-items:flex-start;flex-direction:column;gap:12px}}
-  .header-actions{{width:100%;justify-content:space-between}}
   section.panel{{padding:18px;border-radius:14px}}
-  .secondary-fields{{grid-template-columns:1fr}}
   .primary-row{{flex-direction:column}}
   .primary-row button{{width:100%}}
-  .job-heading,.attachment-heading{{gap:6px;flex-direction:column}}
+  .job-heading{{gap:6px;flex-direction:column}}
   .file-size{{white-space:normal}}
   .job-footer{{align-items:flex-start;flex-direction:column}}
   .job-footer button{{width:100%}}
@@ -120,20 +73,14 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 <header class="page-header"><div><p class="eyebrow">部署验证</p><h1>附件</h1>
 <p class="subtitle">{esc(repo)} · PR #{esc(pr_number)}</p></div></header>
 <p id="message" role="status" aria-live="polite"></p>
-<section id="current-section" class="panel" hidden><div class="section-heading"><h2 id="round-title">附件</h2><p id="summary" class="muted">当前轮附件与说明。</p></div>
-<div class="round-facts"><p id="round-head"></p><p id="round-status"></p><p id="round-time"></p></div><div id="current-deployments"></div>
-<fieldset id="writes" disabled hidden><legend>上传附件</legend>
-<label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><span class="file-hint">最多 20 个文件 · 单个文件最大 512 MiB · 总计最大 10 GiB</span><input id="file" type="file" multiple></label>
-<div class="secondary"><div class="secondary-fields">
-<label class="control" for="note">文件说明或独立备注<textarea id="note" aria-describedby="note-help"></textarea><span id="note-help" class="file-hint">最多 5000 字，支持 Markdown；短备注可随文件保存或单独保存。超出后，点击“单独保存备注”或“上传文件”都会将原文完整转为 UTF-8 TXT 附件。图片可作为独立附件上传。</span></label>
-<label class="control" for="replace">附件操作<select id="replace"><option value="">新增附件（保留已有附件）</option><optgroup id="replace-targets" label="替换指定附件（旧记录保留历史）"></optgroup></select></label>
-</div></div>
-<div class="primary-row"><button id="save-note" type="button">单独保存备注</button><button id="upload" class="primary" type="button">上传所选文件</button></div>
+<p id="mode-hint" class="muted" hidden>当前为查看模式。如需上传证据，请从 PR Summary 的「打开附件页」进入。</p>
+<section id="current-section" class="panel" hidden>
+<fieldset id="writes" disabled hidden><legend>上传测试证据</legend>
+<label id="dropzone" for="file"><strong>选择视频或图片，或拖放到这里</strong><span class="file-hint">最多 20 个文件 · 单个文件最大 512 MiB · 总计最大 10 GiB</span><input id="file" type="file" multiple></label>
+<div class="primary-row"><button id="upload" class="primary" type="button">上传所选文件</button></div>
 </fieldset>
 <h3 class="list-heading" id="queue-heading" hidden>上传进度</h3><ul id="queue" class="queue" aria-labelledby="queue-heading" aria-live="polite"></ul>
-<h3 class="list-heading" id="attachments-heading">附件</h3><ul id="attachments" class="attachments" aria-labelledby="attachments-heading"></ul>
 </section>
-<details id="history-section" class="panel" hidden><summary class="history-section-summary">历史轮次</summary><div id="history"></div></details>
 </main></body></html>'''
 
 
@@ -151,12 +98,11 @@ _JAVASCRIPT = r'''"use strict";
   const storageKey = "evidence:" + api + ":" + bound.head_sha + ":" + bound.round_id;
   const proofKey = "evidence-proof:" + api + ":" + bound.head_sha + ":" + bound.round_id;
   const clientKeyStorage = "evidence-client-key:" + api + ":" + bound.head_sha + ":" + bound.round_id;
-  const PART_BYTES = 8 * 1024 * 1024, MAX_BYTES = 512 * 1024 * 1024, MAX_NOTE_CHARS = 5000;
+  const PART_BYTES = 8 * 1024 * 1024, MAX_BYTES = 512 * 1024 * 1024;
   const MAX_FILES = 20, MAX_TOTAL_BYTES = 10 * 1024 * 1024 * 1024;
   const active = new Set(), jobs = [];
   let context = null, stopped = false, pageLeaving = false, busy = false, proofSecret = "", clientKey = "", savedUploads = {};
   let contextAuthorized = false;
-  let noteOperation = null;
   const fragment = new URLSearchParams(window.location.hash.slice(1));
   const incomingProof = fragment.get("proof");
   if (window.location.hash) history.replaceState(history.state, "", window.location.pathname + window.location.search);
@@ -200,13 +146,6 @@ _JAVASCRIPT = r'''"use strict";
   }
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
   const roundMatches = value => value && value.head_sha === bound.head_sha && value.round_id === bound.round_id;
-  const lifecycleLabels = {
-    testing: "测试中", succeeded: "已通过", failed: "未通过", "deploy-ready": "待部署",
-    "deploy-requested": "等待部署审批", deploying: "正在部署", deployed: "已部署",
-    reviewing: "代码审查中", pending: "等待更新", text: "备注已保存"
-  };
-  const lifecycleLabel = value => Object.prototype.hasOwnProperty.call(lifecycleLabels, value)
-    ? lifecycleLabels[value] : "状态暂不可用";
   function formatBytes(value) {
     if (value === null || value === undefined || value === "") return "";
     const bytes = Number(value);
@@ -216,16 +155,6 @@ _JAVASCRIPT = r'''"use strict";
     let size = bytes, unit = "B";
     for (const next of units) { size /= 1024; unit = next; if (size < 1024 || next === "TB") break; }
     return size.toFixed(1).replace(/\.0$/, "") + " " + unit;
-  }
-  function formatDate(value, includeTime = false) {
-    if (typeof value !== "string" || !value) return "时间未知";
-    const date = new Date(value);
-    if (!Number.isFinite(date.getTime())) return "时间未知";
-    const options = includeTime
-      ? {timeZone: "Asia/Shanghai", year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23"}
-      : {timeZone: "Asia/Shanghai", year: "numeric", month: "long", day: "numeric"};
-    const formatted = new Intl.DateTimeFormat("zh-CN", options).format(date);
-    return includeTime ? formatted + "（北京时间）" : formatted;
   }
   const jobStatusLabel = status => ({
     排队中: "等待上传", 核对中: "校验中", running: "文件发送中", verifying: "正在归档附件",
@@ -261,11 +190,8 @@ _JAVASCRIPT = r'''"use strict";
     const canWrite = writable();
     $("writes").hidden = !canWrite; $("writes").disabled = !canWrite;
     $("upload").disabled = busy || !canWrite; $("file").disabled = busy || !canWrite;
-    $("note").disabled = busy || !canWrite; $("save-note").disabled = busy || !canWrite;
-    $("replace").disabled = busy || !canWrite;
     for (const button of document.querySelectorAll("button[data-job-action]"))
       button.disabled = !canWrite || (busy && button.dataset.jobAction !== "pause");
-    for (const button of document.querySelectorAll("button[data-delete]")) button.disabled = busy || !canWrite;
   }
   function abortRequest(request, reason = "stopped") {
     try {
@@ -478,374 +404,23 @@ _JAVASCRIPT = r'''"use strict";
       xhr.send(blob);
     });
   }
-  function anchor(label, path) {
-    const target = new URL(api + path, window.location.href);
-    if (target.origin !== window.location.origin) throw new Error("拒绝跨站下载地址。");
-    const a = document.createElement("a"); a.textContent = label; a.href = target.href;
-    a.setAttribute("download", ""); a.rel = "noopener"; return a;
-  }
-  function attachmentDownloadUrl(item) {
-    if (!item || item.status !== "ready" || item.deleted_at) return "";
-    const attachmentId = item.attachment_id || item.id;
-    if (!attachmentId || typeof item.download_capability !== "string" || !item.download_capability) return "";
-    try {
-      const path = "/attachments/" + id(attachmentId) + "/download?cap=" + encodeURIComponent(item.download_capability);
-      const target = new URL(api + path, window.location.href);
-      return target.origin === window.location.origin ? target.href : "";
-    } catch (_) { return ""; }
-  }
-  function attachmentPreviewUrl(item) {
-    if (!item || item.status !== "ready" || item.deleted_at) return "";
-    const attachmentId = item.attachment_id || item.id;
-    if (!attachmentId || typeof item.download_capability !== "string" || !item.download_capability) return "";
-    try {
-      const path = "/attachments/" + id(attachmentId) + "/preview?cap=" + encodeURIComponent(item.download_capability);
-      const target = new URL(api + path, window.location.href);
-      return target.origin === window.location.origin ? target.href : "";
-    } catch (_) { return ""; }
-  }
-  function mediaType(item) {
-    const type = String(item.media_type || item.content_type || "").toLowerCase().split(";")[0];
-    const name = String(item.filename || "").toLowerCase();
-    if (/^image\/(png|jpeg|gif|webp)$/.test(type)) return "image";
-    if (/^video\/(mp4|webm)$/.test(type)) return "video";
-    if (type && type !== "application/octet-stream") return "";
-    if (/\.(png|jpe?g|gif|webp)$/.test(name)) return "image";
-    if (/\.(mp4|webm)$/.test(name)) return "video";
-    return "";
-  }
-  function appendMeta(list, label, value) {
-    if (value === undefined || value === null || value === "") return;
-    const term = document.createElement("dt"), description = document.createElement("dd");
-    term.textContent = label; description.textContent = String(value);
-    list.append(term, description);
-  }
-  function itemTimestamp(item) {
-    const value = Date.parse(item && (item.created_at || item.uploaded_at || item.updated_at) || "");
-    return Number.isFinite(value) ? value : 0;
-  }
   function isDeletedAttachment(item) {
     return !!(item && (item.status === "deleted" || item.deleted_at));
   }
   function isTextRecord(item) {
     return !!(item && (item.status === "text" || item.evidence_kind === "note" || item.kind === "note"));
   }
-  function displayNote(item) {
-    if (!item || item.evidence_kind !== "note" || typeof item.display_note !== "string") return "";
-    return item.display_note.trim();
-  }
-  function displayFilename(item) {
-    const value = String(item && item.filename || "").trim();
-    if (!value || /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value))
-      return item && item.status === "text" ? "附件说明" : "附件文件";
-    return value;
-  }
-  function appendInlineMarkdown(parent, text) {
-    const tick = String.fromCharCode(96);
-    const tokenPattern = new RegExp("(\\*\\*[^*]+\\*\\*|\\*[^*]+\\*|" + tick + "[^" + tick + "]+" + tick + "|\\[[^\\]]+\\]\\([^)]+\\))", "g");
-    let offset = 0, match;
-    while ((match = tokenPattern.exec(text))) {
-      if (match.index > offset) parent.append(document.createTextNode(text.slice(offset, match.index)));
-      const token = match[0];
-      let node = null;
-      if (token.startsWith("**") && token.endsWith("**")) {
-        node = document.createElement("strong"); node.textContent = token.slice(2, -2);
-      } else if (token.startsWith("*") && token.endsWith("*")) {
-        node = document.createElement("em"); node.textContent = token.slice(1, -1);
-      } else if (token.startsWith(tick) && token.endsWith(tick)) {
-        node = document.createElement("code"); node.textContent = token.slice(1, -1);
-      } else {
-        const linkMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-        if (linkMatch) {
-          try {
-            const target = new URL(linkMatch[2], window.location.href);
-            if (target.protocol === "https:" && !target.username && !target.password) {
-              node = document.createElement("a"); node.textContent = linkMatch[1];
-              node.href = target.href; node.rel = "noopener noreferrer";
-            }
-          } catch (_) {}
-        }
-      }
-      parent.append(node || document.createTextNode(token));
-      offset = tokenPattern.lastIndex;
-    }
-    if (offset < text.length) parent.append(document.createTextNode(text.slice(offset)));
-  }
-  function renderMarkdown(container, source) {
-    const lines = String(source || "").split(/\r?\n/);
-    let list = null;
-    for (const line of lines) {
-      if (!line.trim()) { list = null; continue; }
-      const heading = line.match(/^(#{1,3})\s+(.+)$/);
-      if (heading) {
-        list = null;
-        const node = document.createElement(heading[1].length === 1 ? "h3" : "h4");
-        appendInlineMarkdown(node, heading[2]); container.append(node); continue;
-      }
-      const bullet = line.match(/^\s*[-*]\s+(.+)$/);
-      if (bullet) {
-        if (!list) { list = document.createElement("ul"); container.append(list); }
-        const item = document.createElement("li"); appendInlineMarkdown(item, bullet[1]); list.append(item); continue;
-      }
-      list = null;
-      const paragraph = document.createElement("p");
-      appendInlineMarkdown(paragraph, line); container.append(paragraph);
-    }
-  }
-  function syntheticBotNote(item, note) {
-    if (!item || item.internal_bot_note !== true) return false;
-    const normalized = String(note || "").trim().replace(/\s+/g, " ").toLowerCase();
-    return [
-      "server-side cos multipart acceptance",
-      "server-side 20mb h.264 cos transport acceptance"
-    ].some(template => normalized === template ||
-      normalized.startsWith(template) && /^[ :;,.!?…-]/.test(normalized.slice(template.length)));
-  }
-  function attachmentList(rows, parent, current) {
-    const ordered = [...(rows || [])].filter(item => item && typeof item === "object")
-      .sort((a, b) => itemTimestamp(b) - itemTimestamp(a));
-    const latestVideo = current ? ordered.find(item => !item.deleted_at && item.status === "ready" &&
-      mediaType(item) === "video" && attachmentPreviewUrl(item)) : null;
-    if (latestVideo) ordered.unshift(ordered.splice(ordered.indexOf(latestVideo), 1)[0]);
-    for (const item of ordered) {
-      const deleted = isDeletedAttachment(item);
-      const li = document.createElement("li");
-      li.className = "attachment";
-      const heading = document.createElement("div"), title = document.createElement("strong"), size = document.createElement("span");
-      heading.className = "attachment-heading"; title.className = "attachment-title"; size.className = "file-size";
-      const attachmentId = item.attachment_id || item.id;
-      const independentNote = isTextRecord(item);
-      title.textContent = independentNote ? "独立备注" : displayFilename(item);
-      size.textContent = formatBytes(item.size);
-      heading.append(title); if (size.textContent) heading.append(size);
-      li.append(heading);
-      const meta = document.createElement("p");
-      meta.className = "attachment-meta-inline";
-      meta.textContent = formatDate(item.created_at || item.uploaded_at, true);
-      li.append(meta);
-      if (deleted) {
-        const badge = document.createElement("p"); badge.className = "muted";
-        badge.textContent = "已删除，历史记录保留";
-        li.append(badge);
-      }
-      const previewUrl = deleted ? "" : attachmentPreviewUrl(item);
-      const kind = previewUrl ? mediaType(item) : "";
-      if (kind) {
-        const preview = document.createElement("div");
-        const media = document.createElement(kind === "video" ? "video" : "img");
-        preview.className = "media-preview";
-        if (kind === "video") {
-          media.controls = true; media.playsInline = true;
-          media.preload = item === latestVideo ? "auto" : "metadata";
-          if (item === latestVideo) { media.muted = true; media.autoplay = true; }
-        } else {
-          media.alt = displayFilename(item); media.loading = "lazy";
-        }
-        const hint = document.createElement("p"); hint.className = "media-hint";
-        media.addEventListener("error", () => { hint.textContent = "暂时无法预览；请重新打开附件页面。"; });
-        preview.append(media, hint); media.src = previewUrl; li.append(preview);
-      }
-      const note = independentNote ? displayNote(item) : String(item.note || "").trim();
-      if (note && !syntheticBotNote(item, note)) {
-        const noteBlock = document.createElement("div");
-        noteBlock.className = "attachment-note";
-        renderMarkdown(noteBlock, note);
-        li.append(noteBlock);
-      }
-      const actions = document.createElement("div");
-      actions.className = "attachment-actions";
-      const url = deleted ? "" : attachmentDownloadUrl(item);
-      if (url) {
-        actions.append(anchor("下载", "/attachments/" + id(item.attachment_id || item.id) +
-          "/download?cap=" + encodeURIComponent(item.download_capability)));
-      }
-      const same = current && (!item.head_sha || item.head_sha === bound.head_sha) &&
-        (!item.round_id || item.round_id === bound.round_id);
-      if (!deleted && same && writable() && item.can_delete === true && attachmentId) {
-        const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "删除";
-        remove.dataset.delete = attachmentId;
-        remove.addEventListener("click", () => deleteAttachment(item)); actions.append(remove);
-        if (item.status === "ready" && item.can_delete === true && !independentNote) {
-          const option = document.createElement("option"); option.value = attachmentId;
-          option.textContent = displayFilename(item); $("replace-targets").append(option);
-        }
-      }
-      if (actions.childNodes.length) li.append(actions);
-      parent.append(li);
-    }
-  }
-  function deploymentList(rows, parent) {
-    parent.replaceChildren();
-    if (!Array.isArray(rows) || !rows.length) return;
-    const heading = document.createElement("h3"); heading.className = "list-heading";
-    heading.textContent = "部署记录";
-    parent.append(heading);
-    const wrap = document.createElement("div"), table = document.createElement("table");
-    wrap.className = "deployment-table-wrap"; table.className = "deployment-table";
-    const labels = ["Machine", "IP", "Component", "Variant/Path", "Image", "Result"];
-    const thead = document.createElement("thead"), headerRow = document.createElement("tr");
-    for (const label of labels) {
-      const cell = document.createElement("th"); cell.scope = "col";
-      cell.textContent = label; headerRow.append(cell);
-    }
-    thead.append(headerRow); table.append(thead);
-    const body = document.createElement("tbody");
-    for (const row of rows) {
-      if (!row || typeof row !== "object") continue;
-      const tr = document.createElement("tr");
-      for (const value of [row.machine, row.ip, row.component, row.variant_path, row.image, row.result]) {
-        const cell = document.createElement("td");
-        cell.textContent = typeof value === "string" && value ? value : "—";
-        tr.append(cell);
-      }
-      body.append(tr);
-    }
-    table.append(body); wrap.append(table); parent.append(wrap);
-  }
-  function machineLogList(logs, roundId, parent) {
-    if (!logs || typeof logs !== "object" || !roundId) return;
-    const section = document.createElement("div"); section.className = "history-links";
-    const heading = document.createElement("h4"); heading.textContent = "机器部署日志"; section.append(heading);
-    for (const [alias, log] of Object.entries(logs)) {
-      const row = document.createElement("p"); row.textContent = alias + "：";
-      if (log && log.status === "ready" && typeof log.capability === "string" && log.capability) {
-        row.append(anchor("下载日志", "/rounds/" + id(roundId) + "/machines/" + encodeURIComponent(alias) +
-          "/log/download?cap=" + encodeURIComponent(log.capability)));
-      } else row.append(document.createTextNode(log && log.status === "pending" ? "保存中" : "日志不可获取"));
-      section.append(row);
-    }
-    if (Object.keys(logs).length) parent.append(section);
-  }
   function render() {
-    const degraded = context && context.evidence_degraded === true;
     const state = typeof context.status === "string" ? context.status : "";
-    const pageAvailable = !!context && (typeof state === "string" && !!state ||
-      roundMatches(context) || Array.isArray(context.rounds) || Array.isArray(context.history));
-    // Lifecycle labels control writes; trusted current and archived evidence
-    // remain readable throughout every supported phase.
-    const stageAvailable = pageAvailable;
-    if (degraded) {
-      message("");
-      const label = document.createTextNode("历史附件暂未加载；当前轮信息仍来自已验证的 Lifecycle。 ");
-      const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "重试";
-      retry.addEventListener("click", () => refresh().catch(refreshFailure));
-      $("message").append(label, retry);
-    } else message("");
-    $("current-section").hidden = !stageAvailable;
-    $("history-section").hidden = true;
-    $("attachments").replaceChildren(); $("history").replaceChildren();
-    $("current-deployments").replaceChildren();
+    const pageAvailable = !!context && (!!state || roundMatches(context));
+    message("");
+    $("current-section").hidden = !pageAvailable;
+    $("mode-hint").hidden = !pageAvailable || writable();
     if (!pageAvailable) {
       $("writes").hidden = true; $("writes").disabled = true;
-      $("current-section").hidden = true;
       controls();
       return;
     }
-    const testStatuses = new Set(["testing", "succeeded", "failed"]);
-    const oldRounds = (context.rounds || context.history || []).filter(round =>
-      !roundMatches(round) && round && testStatuses.has(round.status));
-    oldRounds.sort((a, b) => {
-      const aNumber = Number.isSafeInteger(a.round_number) && a.round_number > 0 ? a.round_number : null;
-      const bNumber = Number.isSafeInteger(b.round_number) && b.round_number > 0 ? b.round_number : null;
-      if (aNumber !== null && bNumber !== null && aNumber !== bNumber) return bNumber - aNumber;
-      if (aNumber !== bNumber) return aNumber === null ? 1 : -1;
-      const getTime = round => {
-        const value = Date.parse(round && (round.archived_at || round.ended_at || round.round_started_at || round.started_at || round.created_at) || "");
-        return Number.isFinite(value) ? value : 0;
-      };
-      return getTime(b) - getTime(a);
-    });
-    const roundNumber = Number.isSafeInteger(context.round_number) && context.round_number > 0
-      ? context.round_number : null;
-    const latestRoundNumber = Math.max(roundNumber || 0, ...oldRounds.map(round =>
-      Number.isSafeInteger(round.round_number) && round.round_number > 0 ? round.round_number : 0));
-    const selectedIsLatestRound = roundNumber === null || roundNumber === latestRoundNumber;
-    if (stageAvailable) {
-      $("round-title").textContent = roundNumber
-        ? "第 " + roundNumber + " 轮" + (selectedIsLatestRound ? "（当前轮次）" : "")
-        : (selectedIsLatestRound ? "当前轮（当前轮次）" : "当前轮");
-      $("summary").textContent = degraded
-        ? "历史附件暂未加载，写入已禁用，请重试并等待完整可信状态恢复。"
-        : state === "testing" && !writable()
-        ? "当前为查看模式。如需上传，请从 PR Summary 的「打开附件页」进入。"
-        : "本轮附件与说明。";
-      $("round-head").textContent = "Commit：" + String(context.head_sha || "—");
-      $("round-status").textContent = "状态：" +
-        (context.acceptance_pending ? "测试完成 · 待验收" : lifecycleLabel(state));
-      $("round-time").textContent = "测试时间：" + formatDate(context.round_started_at, true);
-      deploymentList(context.display_deployments, $("current-deployments"));
-      machineLogList(context.deployment_logs, context.round_id, $("current-deployments"));
-    } else {
-      $("writes").hidden = true; $("writes").disabled = true;
-    }
-    const replacement = $("replace").value;
-    const replacementGroup = document.createElement("optgroup");
-    replacementGroup.id = "replace-targets";
-    replacementGroup.label = "替换指定附件（旧记录保留历史）";
-    $("replace").replaceChildren(new Option("新增附件（保留已有附件）", ""), replacementGroup);
-    if (stageAvailable && Array.isArray(context.attachments))
-      attachmentList(context.attachments, $("attachments"), true);
-    if (stageAvailable && !degraded && Array.isArray(context.attachments) && !$("attachments").childNodes.length) {
-      const empty = document.createElement("li"); empty.className = "empty-state";
-      empty.textContent = "本轮暂无附件；上传完成后会显示在这里。"; $("attachments").append(empty);
-    }
-    for (let index = 0; !degraded && index < oldRounds.length; index++) {
-      const round = oldRounds[index];
-      const details = document.createElement("details"), summary = document.createElement("summary"), content = document.createElement("div");
-      const rawRoundDate = round.round_started_at || round.started_at || round.created_at || round.archived_at || round.ended_at;
-      const roundDate = rawRoundDate && Number.isFinite(Date.parse(rawRoundDate)) ? formatDate(rawRoundDate) : "";
-      const hasAttachmentDetails = Array.isArray(round.attachments);
-      const count = hasAttachmentDetails ? round.attachments.filter(item => item && !isDeletedAttachment(item)).length : null;
-      const number = Number.isSafeInteger(round.round_number) && round.round_number > 0
-        ? round.round_number : null;
-      details.className = "history-record";
-      const summaryParts = [number ? "第 " + number + " 轮" : "历史轮次"];
-      if (roundDate) summaryParts.push(roundDate);
-      const historyAttachmentLabel = !hasAttachmentDetails ? "附件明细请查看历史归档" :
-        round.attachments.length === 0 ? "该轮未保存附件" :
-        count ? count + " 个附件" : round.attachments.length + " 条历史附件记录（已删除）";
-      summaryParts.push(historyAttachmentLabel);
-      summary.textContent = summaryParts.join(" · ");
-      details.append(summary);
-      content.className = "history-content";
-      const facts = document.createElement("div"); facts.className = "round-facts";
-      for (const [label, value] of [
-        ["Commit", String(round.head_sha || "—")],
-        ["状态", round.acceptance_pending ? "测试完成 · 待验收" : lifecycleLabel(round.status)],
-        ["测试时间", formatDate(rawRoundDate, true)]
-      ]) {
-        const fact = document.createElement("p"); fact.textContent = label + "：" + value; facts.append(fact);
-      }
-      content.append(facts);
-      const deploymentRows = document.createElement("div");
-      deploymentList(round.display_deployments, deploymentRows); content.append(deploymentRows);
-      machineLogList(round.deployment_logs, round.round_id, content);
-      if (hasAttachmentDetails) {
-        const ul = document.createElement("ul"); attachmentList(round.attachments, ul, false); content.append(ul);
-      } else {
-        const missing = document.createElement("p"); missing.className = "muted";
-        missing.textContent = "附件明细请查看历史归档。"; content.append(missing);
-      }
-      details.append(content);
-      if (round.round_id && (round.cos_object_key || round.cos && round.cos.object_key || round.log_available || round.log_ready) &&
-          context.enabled !== false && context.evidence_enabled !== false)
-        details.append(anchor("下载本轮日志", "/rounds/" + id(round.round_id) + "/log/download?cap=" + encodeURIComponent(round.capability || "")));
-      $("history").append(details);
-    }
-    let archiveCount = 0;
-    for (const archive of context.archive_links || []) {
-      try {
-        const url = new URL(archive.url), prefix = "/" + app.dataset.repo;
-        if (url.origin !== "https://github.com" || url.username || url.password || url.search ||
-            ![prefix + "/issues/" + app.dataset.pr, prefix + "/pull/" + app.dataset.pr].includes(url.pathname) ||
-            !/^#issuecomment-[0-9]+$/.test(url.hash)) continue;
-        const a = document.createElement("a"), p = document.createElement("p");
-        a.textContent = "查看完整历史记录"; a.href = url.href; a.rel = "noopener";
-        p.append(a); p.className = "history-links"; $("history").append(p); archiveCount++;
-      } catch (_) {}
-    }
-    $("history-section").hidden = degraded || oldRounds.length === 0 && archiveCount === 0;
-    if ([...$("replace").options].some(o => o.value === replacement)) $("replace").value = replacement;
     controls();
   }
   async function refresh(job, timeoutMs = 20000) {
@@ -981,14 +556,7 @@ _JAVASCRIPT = r'''"use strict";
       completeUnknown: false, replacesId, note};
     jobs.push(job); updateJob(job); return job;
   }
-  function convertLongNoteToTextAttachment(note) {
-    const file = new File([note], "附件说明-" + Date.now() + ".txt", {
-      type: "text/plain;charset=utf-8", lastModified: Date.now()
-    });
-    if (file.size > MAX_BYTES) throw new Error("说明转换后的 TXT 超过 512 MiB，未上传；请缩短说明后重试。");
-    return file;
-  }
-  function currentRoundFileQuota(replacementId) {
+  function currentRoundFileQuota() {
     if (!context || !Array.isArray(context.attachments) || !Array.isArray(context.operations)) return null;
     const records = new Map();
     for (const row of [...context.operations, ...context.attachments]) {
@@ -1020,16 +588,9 @@ _JAVASCRIPT = r'''"use strict";
       pendingFiles.push({id: "local:" + job.fingerprint + ":" + (job.replacesId || "new"), size: job.file.size, row: job});
     }
     const activeFiles = [...completedFiles, ...pendingFiles];
-    let fileCount = activeFiles.length;
-    let totalBytes = activeFiles.reduce((sum, row) => sum + row.size, 0);
+    const fileCount = activeFiles.length;
+    const totalBytes = activeFiles.reduce((sum, row) => sum + row.size, 0);
     if (!Number.isSafeInteger(totalBytes)) return null;
-    if (replacementId) {
-      const target = activeFiles.find(row => row.id === replacementId);
-      if (!target || target.row.status !== "ready" || target.row.can_delete !== true)
-        return {error: "替换目标已删除、不可替换或状态已变化；请刷新附件页面后重选。"};
-      fileCount -= 1;
-      totalBytes -= target.size;
-    }
     const configuredFiles = context.upload_max_files;
     const configuredBytes = context.upload_max_bytes;
     const invite = context.auth_method === "signed_invite" || context.upload_invite === true;
@@ -1045,10 +606,10 @@ _JAVASCRIPT = r'''"use strict";
         ? Math.min(MAX_TOTAL_BYTES, configuredBytes) : MAX_TOTAL_BYTES
     };
   }
-  function validateSelectedFiles(files, replacementId = "") {
+  function validateSelectedFiles(files) {
     const selected = Array.from(files || []);
-    if (!selected.length) return "请选择文件，或填写超过 5000 字的说明以生成 TXT 附件。";
-    if (selected.length > MAX_FILES) return "一次最多上传 20 个文件（自动生成的 TXT 也计入数量）。";
+    if (!selected.length) return "请选择要上传的视频或图片。";
+    if (selected.length > MAX_FILES) return "一次最多上传 20 个文件。";
     let totalBytes = 0;
     for (let index = 0; index < selected.length; index++) {
       const file = selected[index], size = Number(file && file.size);
@@ -1059,9 +620,8 @@ _JAVASCRIPT = r'''"use strict";
       totalBytes += size;
       if (totalBytes > MAX_TOTAL_BYTES) return "所选文件总大小超过 10 GiB 上限。";
     }
-    const quota = currentRoundFileQuota(replacementId);
+    const quota = currentRoundFileQuota();
     if (!quota) return "无法确认当前轮附件及剩余配额，请刷新页面后重试。";
-    if (quota.error) return quota.error;
     const maxFiles = Math.min(MAX_FILES, quota.maxFiles);
     const maxBytes = Math.min(MAX_TOTAL_BYTES, quota.maxBytes);
     if (quota.fileCount + selected.length > maxFiles)
@@ -1069,39 +629,6 @@ _JAVASCRIPT = r'''"use strict";
     if (quota.totalBytes + totalBytes > maxBytes)
       return "加上当前轮已有文件后将超过 " + formatBytes(maxBytes) + " 的总大小上限。";
     return "";
-  }
-  async function saveStandaloneNote() {
-    if (busy || !writable()) return;
-    const text = $("note").value;
-    if (!text.trim()) { message("请输入要单独保存的备注。"); return; }
-    if ([...text].length > MAX_NOTE_CHARS) {
-      message("备注超过 5000 字，正在将原文完整转为 UTF-8 TXT 附件。");
-      await runUpload({longNoteOnly: true});
-      return;
-    }
-    busy = true; controls();
-    try {
-      if (!noteOperation || noteOperation.text !== text) {
-        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(
-          JSON.stringify([bound.head_sha, bound.round_id, text])));
-        const hash = [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, "0")).join("");
-        noteOperation = {text, key: "note-" + hash, saved: false};
-      }
-      if (!noteOperation.saved) {
-        const result = await request("/notes", {method: "POST", key: noteOperation.key, body: {text}});
-        if (result.status !== "ready" || result.cos_content_verified !== true)
-          throw new Error("服务端尚未确认备注内容已校验保存；可再次尝试，操作会保持幂等。");
-        noteOperation.saved = true;
-      }
-      try { await refresh(); }
-      catch (_) {
-        message("备注已保存并通过内容校验；页面暂未刷新，请稍后重试查看。");
-        return;
-      }
-      message(context.summary_updated === true ? "备注已保存，页面已更新。" : "备注已安全保存，Summary 正在等待自动更新。");
-    } catch (error) {
-      message(error.message || "备注保存失败；可重试，操作会保持幂等。");
-    } finally { busy = false; controls(); }
   }
   function progressJob(job, parts, inflight, partBytes) {
     let bytes = 0;
@@ -1325,30 +852,13 @@ _JAVASCRIPT = r'''"use strict";
     if (busy || stopped) return;
     busy = true; controls(); await processJob(job); busy = false; controls();
   }
-  async function runUpload({longNoteOnly = false} = {}) {
+  async function runUpload() {
     if (busy || !writable()) return;
-    const note = $("note").value;
-    let files = longNoteOnly ? [] : Array.from($("file").files || []);
-    const longNote = [...note].length > MAX_NOTE_CHARS;
-    const replacementId = longNoteOnly ? "" : $("replace").value || "";
-    if (longNote) {
-      try { files.push(convertLongNoteToTextAttachment(note)); }
-      catch (error) { message(error.message || "说明无法转换为附件。"); return; }
-    }
-    if (replacementId && (longNote || files.length !== 1)) {
-      message("替换模式每次只能选择一个文件；不能与多文件或自动生成的 TXT 同时使用。请选择“新增附件”或调整选择。");
-      return;
-    }
-    if (replacementId && jobs.some(job => job.replacesId === replacementId && job.status !== "succeeded")) {
-      message("该附件已有替换任务；请在上传队列中继续或重试，避免重复替换同一附件。");
-      return;
-    }
-    const validationError = validateSelectedFiles(files, replacementId);
+    const files = Array.from($("file").files || []);
+    const validationError = validateSelectedFiles(files);
     if (validationError) { message(validationError); return; }
-    if (!longNoteOnly) $("file").value = "";
-    for (const file of files) {
-      const job = makeJob(file, replacementId, longNote ? "" : note);
-    }
+    $("file").value = "";
+    for (const file of files) makeJob(file);
     busy = true; controls();
     for (const job of jobs) {
       if (job.status !== "排队中" || stopped) continue;
@@ -1356,17 +866,6 @@ _JAVASCRIPT = r'''"use strict";
     }
     busy = false; controls(); if (!stopped) message("队列已处理；各文件状态与恢复进度分别显示在队列中。");
   }
-  async function deleteAttachment(item) {
-    if (busy || !writable()) return;
-    if (!window.confirm("确认删除当前轮附件“" + (item.filename || "附件") +
-        "”？删除将保留审计记录，历史轮次不会自动删除。")) return;
-    busy = true; controls();
-    const key = bound.round_id + ":delete:" + (item.attachment_id || item.id);
-    try { await request("/attachments/" + id(item.attachment_id || item.id), {method: "DELETE", key, body: {}}); await refresh(); message("删除结果已刷新，审计记录保留。"); }
-    catch (error) { message(error.message); try { await refresh(); } catch (_) {} }
-    finally { busy = false; controls(); }
-  }
-  $("save-note").addEventListener("click", saveStandaloneNote);
   $("upload").addEventListener("click", runUpload);
   const dropzone = $("dropzone");
   for (const eventName of ["dragenter", "dragover"]) dropzone.addEventListener(eventName, event => {

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import ipaddress
 import re
 import html
 import json
@@ -138,6 +139,137 @@ def _build_table(builds: list[BuildInfo]) -> str:
     return "\n".join(lines)
 
 
+def _real_ip(value):
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    value = value.strip()
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return ""
+
+
+def _machine_commands(machine_groups, components=None, *, fully_compatible=False):
+    required = {
+        component.get("component_id") for component in components or []
+        if isinstance(component, dict) and isinstance(component.get("component_id"), str)
+        and component.get("component_id")
+    }
+    commands = []
+    seen = set()
+    for group in machine_groups or []:
+        if not isinstance(group, dict):
+            continue
+        component_ids = group.get("component_ids")
+        covered = {value for value in component_ids if isinstance(value, str)} if isinstance(component_ids, list) else set()
+        if fully_compatible:
+            if required and not required.issubset(covered):
+                continue
+            if not required and group.get("fully_compatible") is not True:
+                continue
+        elif not covered:
+            continue
+        ip = _real_ip(group.get("ip"))
+        if not ip or ip in seen:
+            continue
+        seen.add(ip)
+        commands.append({"ip": ip, "command": f"/approve_deploy machine={ip}"})
+    return commands
+
+
+def _component_label(component):
+    if not isinstance(component, dict):
+        return "组件"
+    target = component.get("target") or component.get("component_id") or "组件"
+    if target == "driver" and component.get("driver_path"):
+        return f"driver {component['driver_path']}"
+    if component.get("variant"):
+        return f"{target} {component['variant']}"
+    return str(target)
+
+
+def _runtime_check_lines(runtime_checks, components=None, machine_groups=None):
+    if isinstance(runtime_checks, dict):
+        rows = list(runtime_checks.values())
+    elif isinstance(runtime_checks, (list, tuple, set)):
+        rows = runtime_checks
+    else:
+        return []
+    component_map = {
+        component.get("component_id"): component for component in components or []
+        if isinstance(component, dict) and isinstance(component.get("component_id"), str)
+    }
+    machine_map = {
+        group.get("alias"): group for group in machine_groups or []
+        if isinstance(group, dict) and isinstance(group.get("alias"), str)
+    }
+    statuses = {
+        "match": "match",
+        "mismatch": "mismatch",
+        "unavailable": "unavailable",
+        "not_running": "unavailable",
+        "identity_changed": "unavailable",
+    }
+    lines = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        status = statuses.get(row.get("status"))
+        if status is None:
+            continue
+        component_id = row.get("component_id")
+        component = component_map.get(component_id, {})
+        machine_alias = row.get("machine") or row.get("machine_alias") or row.get("alias")
+        machine = machine_map.get(machine_alias, {}) if isinstance(machine_alias, str) else {}
+        ip = _real_ip(row.get("ip") or machine.get("ip"))
+        target_image = (row.get("target_image") or row.get("target_image_ref")
+                        or row.get("expected_image_ref") or component.get("image_ref")
+                        or row.get("image_ref"))
+        actual_image = (row.get("running_image") or row.get("observed_image")
+                        or row.get("actual_image") or row.get("actual_image_ref"))
+        label = _component_label(component) if component else (component_id or "组件")
+        machine_label = f"`{_escape(machine_alias)}`" if isinstance(machine_alias, str) and machine_alias else "机器"
+        if ip:
+            machine_label += f"（`{_escape(ip)}`）"
+        if status == "match":
+            lines.append(f"- MATCH：{machine_label} 的 `{_escape(label)}` 运行镜像与目标一致。")
+        elif status == "mismatch":
+            target = f"`{_escape(target_image)}`" if isinstance(target_image, str) and target_image else "未提供"
+            actual = f"`{_escape(actual_image)}`" if isinstance(actual_image, str) and actual_image else "未获取到"
+            line = (f"- MISMATCH：{machine_label} 的 `{_escape(label)}`；目标镜像 {target}，"
+                    f"实际镜像 {actual}。不会自动部署。")
+            approval_target = ip
+            if not approval_target and isinstance(machine_alias, str) and re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", machine_alias):
+                approval_target = machine_alias
+            if approval_target:
+                line += f" 检查处理后可直接重新审批：`/approve_deploy machine={_escape(approval_target)}`。"
+            lines.append(line)
+        else:
+            lines.append(f"- UNAVAILABLE：无法确认 {machine_label} 的 `{_escape(label)}` 运行镜像；不会据此自动部署。")
+    return lines
+
+
+def _safe_upload_url(repo, pr_number, value):
+    if not isinstance(value, str) or len(value) > 4096 or any(c in value for c in '\r\n<>"\\'):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+        expected_path = _evidence_path(repo, pr_number).replace("/api/evidence/", "/evidence/", 1)
+        from .config import is_evidence_ingress_url
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if (parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password
+                or parsed.port not in (None, 443) or parsed.path != expected_path
+                or parsed.fragment or set(query) != {"cap"} or len(query["cap"]) != 1
+                or not 1 <= len(query["cap"][0]) <= 2048
+                or not is_evidence_ingress_url(origin)):
+            return ""
+        return value
+    except (TypeError, ValueError):
+        return ""
+
+
 def _cos_evidence_block(
     object_key: str = "",
     sha256: str = "",
@@ -217,12 +349,21 @@ def _workflow_lines(
     return "\n".join(lines)
 
 
-def _testing_next_action(evidence_complete: bool) -> str:
-    if evidence_complete:
-        return ("**Machine Owner**\n\n测试完成后，请执行 `/request_acceptance`，"
-                "之后由 `test_reviewers.yaml` 白名单中的验收人记录最终结果。")
-    return ("**PR developer and deployed Machine Owner**\n\n"
-            "完成本轮验证后，由 Machine Owner 执行 `/request_acceptance` 请求验收。")
+def _testing_next_action(evidence_complete: bool, evidence_url: str = "") -> str:
+    lines = [
+        "请完成本轮实际验证，并上传能展示开发效果的视频或图片；这些证据用于验收开发效果，"
+        "并辅助判断是否可以合并。",
+    ]
+    if evidence_url:
+        lines.extend(["", f"[打开本轮测试证据上传页](<{evidence_url}>)"])
+    else:
+        lines.extend(["", "本轮测试证据上传链接暂不可用；请从当前 PR Summary 打开已绑定本轮的附件页。"])
+    lines.extend([
+        "",
+        ("证据已上传。测试完成后可执行 `/request_acceptance` 请求独立验收。"
+         if evidence_complete else "测试完成并上传证据后，可执行 `/request_acceptance` 请求独立验收。"),
+    ])
+    return "\n".join(lines)
 
 
 # ── History helpers ──────────────────────────────────────────────
@@ -305,7 +446,33 @@ def deploy_ready(
     repo: str, pr_number: int, head_sha: str,
     builds: list[BuildInfo], last_lifecycle_event: str = "",
     review_evidence: dict | None = None,
+    machine_groups: list[dict] | None = None,
+    components: list[dict] | None = None,
+    runtime_checks: list[dict] | dict | None = None,
+    evidence_url: str = "",
+    acceptance_reviewers: list[str] | None = None,
+    test_only: bool = False,
 ) -> str:
+    machines = _machine_commands(machine_groups, components, fully_compatible=True)
+    next_action = [
+        "如需在真实机器上验证，`/request_deploy` 是可选操作：未提交时控制器不会通知任何机器负责人，"
+        "提交后由控制器通知对应机器负责人。",
+    ]
+    if machines:
+        next_action.extend(["", "完全兼容机器的审批命令（逐台使用真实 IP）："])
+        for machine in machines:
+            next_action.append(f"- `{machine['command']}`")
+        if len(machines) == 1:
+            next_action.extend([
+                "", "当前仅有一台完全兼容机器，也可直接使用：`/approve_deploy`。",
+            ])
+    else:
+        next_action.extend([
+            "", "当前没有可核实真实 IP 的完全兼容机器，因此不显示机器审批命令。",
+        ])
+    runtime_lines = _runtime_check_lines(runtime_checks, components, machine_groups)
+    if runtime_lines:
+        next_action.extend(["", *runtime_lines])
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
@@ -321,9 +488,7 @@ def deploy_ready(
         "",
         "### Next action",
         "",
-        "**Developer**",
-        "",
-        "`/request_deploy`",
+        *next_action,
         "",
         "### Review evidence",
         "",
@@ -364,6 +529,10 @@ def deploy_requested(
     all_components: list[dict] | None = None,
     component_snapshot: list[dict] | None = None,
     attempt: dict | None = None,
+    runtime_checks: list[dict] | dict | None = None,
+    evidence_url: str = "",
+    acceptance_reviewers: list[str] | None = None,
+    test_only: bool = False,
 ) -> str:
     """status: deploy-requested with IP table, workflow, deployment, history."""
     # Build component labels
@@ -433,6 +602,17 @@ def deploy_requested(
         f"**Bound HEAD:** `{_short(head_sha)}`",
         f"**Repository:** `{repo}`",
     ]
+    approval_commands = _machine_commands(machine_groups, components)
+    next_action = [
+        "部署请求已提交，控制器会通知对应机器负责人。请在兼容机器上逐台执行审批命令：",
+    ]
+    if approval_commands:
+        next_action.extend(f"- `{row['command']}`" for row in approval_commands)
+    else:
+        next_action.extend(["", "当前没有可核实真实 IP 的兼容机器，因此不显示审批命令。"])
+    runtime_lines = _runtime_check_lines(runtime_checks, components, machine_groups)
+    if runtime_lines:
+        next_action.extend(["", *runtime_lines])
     lines.extend([
         "",
         "### Workflow",
@@ -441,11 +621,7 @@ def deploy_requested(
         "",
         "### Next action",
         "",
-        "**Machine Owner**",
-        "",
-        "`/approve_deploy machine=<alias-or-ip>`",
-        "",
-        "Machine Owner may use either the machine alias or the listed IP address.",
+        *next_action,
         "",
         "### Compatible machines for remaining components",
         "",
@@ -483,20 +659,30 @@ def testing(
     acceptance_pending: bool = False,
     acceptance_reviewers_configured: bool = True,
     acceptance_reviewers: list[str] | None = None,
+    evidence_url: str = "",
+    runtime_checks: list[dict] | dict | None = None,
+    test_only: bool = False,
 ) -> str:
+    evidence_url = _safe_upload_url(repo, pr_number, evidence_url)
     if acceptance_pending:
-        reviewers = [name for name in acceptance_reviewers or []
-                     if isinstance(name, str) and name.strip()]
-        next_action = ["### 验收人", ""]
+        reviewers = [name.strip() for name in acceptance_reviewers or []
+                     if isinstance(name, str)
+                     and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", name.strip())]
+        if test_only:
+            reviewers = ["Haohao-end"]
+        next_action = []
         if reviewers:
             next_action.extend([
-                "本轮可验收的 GitHub 用户："
-                + "、".join(f"`@{_escape(name.strip())}`" for name in reviewers),
+                "当前仓库本轮可验收账号："
+                + "、".join(f"@{_escape(name.strip())}" for name in reviewers),
+                "",
+                "请名单中的验收账号在当前 PR Conversation 复制并发布其中一条命令：",
+                "",
+                "- 验收通过：`/record_test result=pass`",
+                "- 验收未通过：`/record_test result=fail`",
+                "",
+                "命令必须作为评论正文单独发布；GitHub Review 的 Approve 按钮不能替代此命令。",
             ])
-            acceptance_instruction = (
-                "请名单中的任意一位验收人，在当前 PR 的 Conversation 新建一条评论，"
-                "以下两条命令二选一。"
-            )
         else:
             if not acceptance_reviewers_configured:
                 reason = (
@@ -507,34 +693,13 @@ def testing(
                 reason = (
                     "现有 `test_reviewers.yaml` 中没有可用的有效验收人。请管理员检查现有名单配置。"
                 )
-            next_action.extend([reason])
-            acceptance_instruction = (
-                "名单恢复可用前，暂不能执行验收命令。之后请名单中的任意一位验收人，"
-                "在当前 PR 的 Conversation 新建一条评论，以下两条命令二选一。"
-            )
-        next_action.extend([
-            "",
-            "### 验收操作",
-            "",
-            acceptance_instruction,
-            "",
-            "只有现有 `test_reviewers.yaml` 白名单决定谁可以执行 `/record_test`。",
-            "",
-            "- 验收成功：`/record_test result=pass`",
-            "- 验收失败：`/record_test result=fail`",
-            "",
-            "只需执行其中一条。`summary` 是可选参数，用于补充验收说明。"
-            "将命令作为评论正文从第一列开始输入；不要加引用前缀，也不要放进 Markdown 代码块。",
-            "GitHub Review 的 Approve 按钮不能替代此业务命令。",
-            "",
-            "### 结果说明",
-            "",
-            "- `pass`：本轮状态变为 `succeeded`，验收通过。",
-            "- `fail`：本轮状态变为 `failed`，验收失败。",
-        ])
+            next_action.extend([reason, "", "当前没有可执行的验收账号，暂不显示 `/record_test` 命令。"])
         next_action = "\n".join(next_action)
     else:
-        next_action = _testing_next_action(evidence_complete)
+        next_action = _testing_next_action(evidence_complete, evidence_url)
+    runtime_lines = _runtime_check_lines(runtime_checks, components, machine_groups)
+    if runtime_lines:
+        next_action += "\n\n" + "\n".join(runtime_lines)
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
@@ -674,6 +839,16 @@ def uncertain_comment(
     machine_groups: list[dict] | None = None,
     attempt: dict | None = None,
 ) -> str:
+    approval_commands = _machine_commands(machine_groups, components)
+    next_action = ["**Machine Owner**", ""]
+    if approval_commands:
+        next_action.extend(f"- `{row['command']}`" for row in approval_commands)
+    else:
+        next_action.append(
+            "请在兼容机器上重新发布 `/approve_deploy`，并指定该机器的真实 IP；"
+            "当前可信状态未提供具体机器命令。"
+        )
+    next_action.extend(["", "Only a NEW `/approve_deploy` starts recovery validation."])
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
@@ -690,11 +865,7 @@ def uncertain_comment(
         "",
         "### Next action",
         "",
-        "**Machine Owner**",
-        "",
-        "`/approve_deploy machine=<alias-or-ip>`",
-        "",
-        "Only a NEW `/approve_deploy` starts recovery validation.",
+        *next_action,
     ]
     lines.extend(_attempt_lines(attempt))
     if deployments:
@@ -711,6 +882,7 @@ def deploy_status_comment(
     last_lifecycle_event: str = "",
     machine_groups: list[dict] | None = None,
     attempt: dict | None = None,
+    next_action: str = "",
 ) -> str:
     lines = [
         BOT_MARKER,
@@ -726,6 +898,8 @@ def deploy_status_comment(
         _workflow_lines(status),
         "",
     ]
+    if next_action:
+        lines.extend(["### Next action", "", next_action, ""])
     if components:
         lines.append("Components:")
         for c in components:
@@ -747,15 +921,22 @@ def deploying_comment(
     machine_groups: list[dict] | None = None,
     attempt: dict | None = None,
     last_lifecycle_event: str = "",
+    runtime_checks: list[dict] | dict | None = None,
+    test_only: bool = False,
 ) -> str:
     """Full lifecycle body for the service's transient executing phase."""
     details = dict(attempt or {})
     details.setdefault("phase", "executing")
+    runtime_lines = _runtime_check_lines(runtime_checks, components, machine_groups)
+    next_action = "部署操作正在处理中；控制器会先核对目标镜像与机器实际运行镜像。"
+    if runtime_lines:
+        next_action += "\n\n" + "\n".join(runtime_lines)
     return deploy_status_comment(
         "deploy-requested", head_sha, repo, pr_number,
         components=components, deployments=deployments,
         machine_groups=machine_groups, attempt=details,
         last_lifecycle_event=last_lifecycle_event,
+        next_action=next_action,
     )
 
 
@@ -795,9 +976,9 @@ def deploy_help_text(topic: str = "") -> str:
             "阶段：PR 状态为 deploy-requested，且机器与剩余组件兼容。",
             "",
             "命令：",
-            "`/approve_deploy machine=<alias-or-ip>`",
+            "在 `/approve_deploy machine=` 后填写兼容机器的真实 IP。",
             "",
-            "`machine` 可填写兼容机器的别名或 IP 地址。",
+            "PR Summary 的机器列表会列出当前可用的真实 IP；只有一台完全兼容机器时也可直接发送 `/approve_deploy`。",
         ])
     if topic == "record_test":
         return "\n".join([
@@ -828,7 +1009,7 @@ def deploy_help_text(topic: str = "") -> str:
         "命令用途、执行人和阶段：",
         "- `/request_bot_review`：触发当前 HEAD 代码审查；PR 作者在开放 PR 的 review-required 阶段执行。",
         "- `/request_deploy`：PR 作者在开放 PR 的 deploy-ready 阶段发起部署请求。",
-        "- `/approve_deploy machine=<alias-or-ip>`：对应 Machine Owner 或有 write/maintain/admin 权限的协作者，在 deploy-requested 阶段审批指定机器。",
+        "- `/approve_deploy`：对应 Machine Owner 或有 write/maintain/admin 权限的协作者，在 deploy-requested 阶段按 Summary 中兼容机器的真实 IP 审批（`machine=` 后填写真实 IP）。",
         "- `/request_acceptance`：本轮实际部署机器的 Machine Owner 在 testing 阶段请求验收；仅更新待验收标记，不结束 testing。",
         "- `/record_test result=pass summary=\"视频播放和附件校验通过\"`：`test_reviewers.yaml` 白名单中的用户在待验收阶段记录成功。",
         "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`：`test_reviewers.yaml` 白名单中的用户在待验收阶段记录失败。",
@@ -970,10 +1151,11 @@ def render_evidence_section(
     """Render current evidence and archived rounds without mutating history.
 
     Records may be attachment rows, round bundles, or archive_snapshot entries.
-    Archive links must come from trusted server-side discovery. COS download
-    links are rendered only after the projection and URL signature checks pass.
-    The caller supplies evidence_enabled=True in the render state only when
-    the configured feature is enabled; absent flags fail closed for API links.
+    Archive links must come from trusted server-side discovery. Attachment rows
+    link only to the validated capability download endpoint; short-lived COS
+    signed URLs are never projected here. The caller supplies
+    evidence_enabled=True in the render state only when the configured feature
+    is enabled; absent flags fail closed for API links.
     """
     from .evidence_models import round_id_for_state
 
@@ -1171,53 +1353,6 @@ def render_evidence_section(
             return ""
         path = api + "/attachments/" + urllib.parse.quote(attachment_id, safe="") + "/download"
         return origin + path + "?" + urllib.parse.urlencode({"cap": capability})
-
-    def trusted_cos_download_url(item, key):
-        verified_content = (
-            item.get("cos_content_verified") is True
-            or item.get("actor_verified") is True
-            and item.get("upload_method") != "signed_invite"
-        ) if isinstance(item, dict) else False
-        if (not isinstance(item, dict) or item.get("status") != "ready"
-                or item.get("deleted_at") or not verified_content
-                or item.get("cos_projection_verified") is not True
-                or item.get("head_sha") != key[0] or item.get("round_id") != key[1]
-                or not isinstance(item.get("sha256"), str)
-                or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None):
-            return ""
-        attachment_id = item.get("attachment_id")
-        filename = item.get("filename")
-        uploaded_at = first_valid_time(item.get("created_at"), item.get("uploaded_at"))
-        object_key = item.get("object_key")
-        size = item.get("size")
-        if (not isinstance(attachment_id, str) or not isinstance(filename, str)
-                or not isinstance(uploaded_at, str) or not isinstance(object_key, str)
-                or isinstance(size, bool) or not isinstance(size, int)
-                or not 1 <= size <= 512 * 1024 * 1024
-                or not callable(cos_download_url_expiry)):
-            return ""
-        try:
-            from .evidence_store import build_attachment_key
-            if object_key != build_attachment_key(
-                    repo, pr_number, key[0], key[1], attachment_id, uploaded_at, filename):
-                return ""
-            value = item.get("cos_download_url")
-            if (not isinstance(value, str) or len(value) > 8192
-                    or any(char in value for char in "\r\n<>\\\"")):
-                return ""
-            parsed = urllib.parse.urlsplit(value)
-            if (parsed.scheme != "https" or parsed.username is not None
-                    or parsed.password is not None or parsed.port is not None
-                    or parsed.fragment
-                    or urllib.parse.unquote(parsed.path.lstrip("/")) != object_key):
-                return ""
-            if cos_download_url_expiry(
-                    value, key=object_key, filename=filename,
-                    attachment_id=attachment_id) is None:
-                return ""
-            return value
-        except (AttributeError, TypeError, ValueError, OverflowError):
-            return ""
 
     def latest_attachments(group, key):
         latest_items = {}
@@ -1437,8 +1572,6 @@ def render_evidence_section(
                 filename = filename + "（已删除）"
             download_url = ("" if deleted else
                             stable_attachment_download_url(item, key, base or upload_base))
-            if not download_url and not deleted:
-                download_url = trusted_cos_download_url(item, key)
             filename_cell = _escape(filename)
             if download_url:
                 filename_cell = f"[{filename_cell}](<{download_url}>)"

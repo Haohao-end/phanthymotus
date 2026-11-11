@@ -27,7 +27,8 @@ _PURPOSES = {PURPOSE, DOWNLOAD_PURPOSE, UPLOAD_PURPOSE}
 UPLOAD_COOKIE = 'evidence-upload-capability'
 UPLOAD_MAX_FILES = 20
 UPLOAD_MAX_BYTES = 10 * 1024 * 1024 * 1024
-UPLOAD_MAX_LIFETIME_SECONDS = 30 * 24 * 60 * 60
+UPLOAD_MAX_LIFETIME_SECONDS = 365 * 24 * 60 * 60
+_LEGACY_UPLOAD_MAX_LIFETIME_SECONDS = 30 * 24 * 60 * 60
 PROOF_HEADER = 'x-evidence-secret'
 NONCE_HEADER = 'x-evidence-nonce'
 PROOF_SECONDS = 24 * 60 * 60
@@ -189,7 +190,7 @@ def issue_capability(config, repo, pr_number, head_sha, round_id, purpose=PURPOS
     claims = {'repo': repo, 'pr': pr_number, 'head': head_sha,
               'round': round_id, 'purpose': purpose}
     if purpose == UPLOAD_PURPOSE:
-        claims.update(expires_at=expires_at, status='testing')
+        claims.update(issued_at=now, expires_at=expires_at, status='testing')
     if purpose == DOWNLOAD_PURPOSE:
         if not isinstance(resource, str) or not 1 <= len(resource) <= 160 or any(ord(c) < 33 for c in resource):
             raise ValueError('download capability resource required')
@@ -225,9 +226,16 @@ def verify_capability(config, token, repo, pr_number, *, purpose=None, resource=
                 or (claims.get('purpose') in {PURPOSE, UPLOAD_PURPOSE} and 'resource' in claims)
                 or (claims.get('purpose') == UPLOAD_PURPOSE
                     and (type(claims.get('expires_at')) is not int
-                         or not int(time.time()) < claims['expires_at'] <=
-                         int(time.time()) + UPLOAD_MAX_LIFETIME_SECONDS
-                         or claims.get('status') != 'testing'))
+                         or not int(time.time()) < claims['expires_at']
+                         or claims.get('status') != 'testing'
+                         or ('issued_at' in claims and (
+                             type(claims.get('issued_at')) is not int
+                             or claims['issued_at'] > int(time.time())
+                             or claims['expires_at'] <= claims['issued_at']
+                             or claims['expires_at'] > claims['issued_at'] + UPLOAD_MAX_LIFETIME_SECONDS
+                         ))
+                         or ('issued_at' not in claims and
+                             claims['expires_at'] > int(time.time()) + _LEGACY_UPLOAD_MAX_LIFETIME_SECONDS)))
                 or (claims.get('purpose') != UPLOAD_PURPOSE and 'expires_at' in claims)
                 or not re.fullmatch(r'[0-9a-f]{40}', str(claims.get('head', '')))
                 or not re.fullmatch(r'[0-9a-f]{40}-[0-9]+', str(claims.get('round', '')))
