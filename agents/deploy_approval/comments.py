@@ -149,8 +149,10 @@ def _deployment_table(deployments=None, components=None, machine_groups=None) ->
             "No deployment has been performed yet.")
 
 
-_RUNTIME_CHECKS_START = "<!-- deploy-approval-runtime-checks:start -->"
-_RUNTIME_CHECKS_END = "<!-- deploy-approval-runtime-checks:end -->"
+_RUNTIME_CHECKS_START = "<!-- deploy-approval-runtime-action:start -->"
+_RUNTIME_CHECKS_END = "<!-- deploy-approval-runtime-action:end -->"
+_LEGACY_RUNTIME_CHECKS_START = "<!-- deploy-approval-runtime-checks:start -->"
+_LEGACY_RUNTIME_CHECKS_END = "<!-- deploy-approval-runtime-checks:end -->"
 
 
 def _runtime_component_label(component: dict) -> str:
@@ -165,15 +167,15 @@ def runtime_image_checks_block(
     runtime_checks, components, *, lifecycle_status: str = "",
     machine_groups=None, machine_inventory=None, machine_diagnostics=None,
     machine_context=None, test_only: bool | None = None,
+    existing_commands: set[str] | None = None,
 ) -> str:
-    """Render bounded, verified runtime image observations for the Lifecycle Summary."""
+    """Render verified runtime findings as Next action text, never a new section."""
     if not isinstance(runtime_checks, list) or not runtime_checks:
         return ""
     component_map = {
         item.get("component_id"): item for item in components or []
         if isinstance(item, dict) and isinstance(item.get("component_id"), str)
     }
-    rows = []
     context = machine_context if isinstance(machine_context, dict) else {}
     groups = _record_rows(machine_groups)
     inventory = _machine_inventory_records(machine_inventory)
@@ -199,18 +201,87 @@ def runtime_image_checks_block(
         node_host = _canonical_ip(_record_value(row, "node_host"))
         if alias and node_host:
             policy_aliases_by_ip.setdefault(node_host, set()).add(alias.casefold())
-    status_text = {
-        "match": "MATCH",
-        "mismatch": "MISMATCH",
-        "not_running": "UNAVAILABLE",
-        "unavailable": "UNAVAILABLE",
-        "identity_changed": "IDENTITY_CHANGED",
-    }
+
+    def ipv4(value):
+        return _canonical_ip(value)
+
+    def safe_selector_for(check, diagnostic, group, physical, key, ip_value,
+                          group_node_host, duplicate_ip, identity_confirmed,
+                          repo_authorization, binding_matches):
+        selector = str(check.get("command_selector", "") or "").strip()
+        if not selector:
+            return ""
+        selector_ip = ipv4(selector)
+        approval_flags = [
+            value for value in (
+                _field_flag(record, "approval_available", "safe_to_approve", "safe_to_deploy")
+                for record in (check, diagnostic, group)
+            ) if value is not None
+        ]
+        compatibility_flags = [
+            value for value in (
+                _field_flag(record, "component_compatible", "components_compatible")
+                for record in (check, diagnostic, group)
+            ) if value is not None
+        ]
+        explicit_check_selector = (
+            "command_selector" in check
+            and isinstance(check.get("command_selector"), str)
+            and bool(check.get("command_selector").strip())
+        )
+        approval_confirmed = (
+            False if False in approval_flags else
+            True if True in approval_flags else explicit_check_selector
+        )
+        compatibility_confirmed = (
+            False if False in compatibility_flags else
+            True if True in compatibility_flags else explicit_check_selector
+        )
+        if (not approval_confirmed or not compatibility_confirmed
+                or identity_confirmed is not True
+                or repo_authorization is not True or not binding_matches):
+            return ""
+        if selector_ip:
+            return selector_ip if (
+                selector_ip == ip_value
+                and selector_ip == group_node_host
+                and not duplicate_ip
+            ) else ""
+        alias = _machine_alias(physical)
+        physical_primary_ip = ipv4(_machine_ip(physical))
+        physical_identity_matches = bool(
+            physical_primary_ip == ip_value
+            and physical_alias_counts.get(key, 0) == 1
+            and alias.casefold() == key
+        )
+        alias_is_verified = bool(
+            selector == alias
+            and alias.casefold() == key
+            and physical_identity_matches
+            and (not group_node_host or group_node_host == ip_value)
+        )
+        if not alias_is_verified:
+            return ""
+        ip_command_flags = [
+            _field_flag(record, "ip_command_safe")
+            for record in (check, diagnostic, group)
+        ]
+        ip_is_safe = (
+            False if False in ip_command_flags else
+            True if True in ip_command_flags else not duplicate_ip
+        )
+        if ip_is_safe and not duplicate_ip and group_node_host == ip_value:
+            return ip_value
+        return selector
+
+    grouped: dict[str, dict] = {}
+    seen_checks = set()
     for check in runtime_checks:
         if not isinstance(check, dict):
             continue
-        component = component_map.get(check.get("component_id"), {})
-        machine = str(check.get("machine", "") or "")
+        machine = str(check.get("machine", "") or "").strip()
+        if not machine:
+            continue
         key = machine.casefold()
         group = group_by_alias.get(key, {})
         physical = inventory_by_alias.get(key, {})
@@ -219,23 +290,13 @@ def runtime_image_checks_block(
         if not isinstance(supplied_context, dict):
             supplied_context = {}
         ip_value = (
-            _canonical_ip(_record_value(check, "primary_ip"))
-            or _canonical_ip(_record_value(check, "main_ip"))
-            or _canonical_ip(_machine_ip(physical))
-            or _canonical_ip(_record_value(supplied_context, "primary_ip"))
-            or _canonical_ip(_record_value(supplied_context, "main_ip"))
-            or _canonical_ip(_record_value(check, "ip"))
-            or "未记录"
+            ipv4(_record_value(check, "primary_ip"))
+            or ipv4(_record_value(check, "main_ip"))
+            or ipv4(_machine_ip(physical))
+            or ipv4(_record_value(supplied_context, "primary_ip"))
+            or ipv4(_record_value(supplied_context, "main_ip"))
+            or ipv4(_record_value(check, "ip"))
         )
-        # An explicit empty value means the current controller has revoked the
-        # selector. Only use a live machine group when the check omitted it;
-        # never revive a command parsed from Lifecycle Markdown history.
-        raw_selector = (
-            check.get("command_selector") if "command_selector" in check
-            else _record_value(group, "command_selector", default="")
-        )
-        command_selector = str(raw_selector or "").strip()
-        selected_ip = _canonical_ip(command_selector)
         identity_values = [value for value in (
             _field_flag(record, "identity_confirmed", "machine_identity_confirmed")
             for record in (check, diagnostic, group)
@@ -245,16 +306,16 @@ def runtime_image_checks_block(
             True if True in identity_values else None
         )
         group_node_host = next((value for value in (
-            _canonical_ip(_record_value(group, "node_host")),
-            _canonical_ip(_record_value(group, "policy_node_host")),
-            _canonical_ip(_record_value(diagnostic, "node_host")),
-            _canonical_ip(_record_value(diagnostic, "policy_node_host")),
-            _canonical_ip(_record_value(check, "node_host")),
-            _canonical_ip(_record_value(check, "policy_node_host")),
-            _canonical_ip(_record_value(group, "primary_ip")),
+            ipv4(_record_value(group, "node_host")),
+            ipv4(_record_value(group, "policy_node_host")),
+            ipv4(_record_value(diagnostic, "node_host")),
+            ipv4(_record_value(diagnostic, "policy_node_host")),
+            ipv4(_record_value(check, "node_host")),
+            ipv4(_record_value(check, "policy_node_host")),
+            ipv4(_record_value(group, "primary_ip")),
         ) if value), "")
         duplicate_ip = bool(
-            physical_ip_counts.get(ip_value, 0) > 1
+            (ip_value and physical_ip_counts.get(ip_value, 0) > 1)
             or _field_flag(check, "duplicate_ip") is True
             or _field_flag(diagnostic, "duplicate_ip") is True
             or _field_flag(group, "duplicate_ip") is True
@@ -263,13 +324,17 @@ def runtime_image_checks_block(
             )
             or len(policy_aliases_by_ip.get(group_node_host, set())) > 1
         )
-        repo_authorization = next((value for value in (
+        repo_authorization_values = [value for value in (
             _field_flag(record, "repository_authorized", "repo_authorized")
             for record in (check, diagnostic, group)
-        ) if value is not None), None)
-        physical_primary_ip = _canonical_ip(_machine_ip(physical))
+        ) if value is not None]
+        repo_authorization = (
+            False if False in repo_authorization_values else
+            True if True in repo_authorization_values else None
+        )
+        physical_primary_ip = ipv4(_machine_ip(physical))
         physical_identity_matches = bool(
-            physical_primary_ip == ip_value
+            ip_value and physical_primary_ip == ip_value
             and physical_alias_counts.get(key, 0) == 1
             and _machine_alias(physical).casefold() == key
         )
@@ -279,97 +344,250 @@ def runtime_image_checks_block(
                 if group_node_host else physical_identity_matches
             )
         )
-        selector_is_safe = bool(
-            selected_ip == ip_value and not duplicate_ip
-            and binding_matches
-            and identity_confirmed is True
-            and repo_authorization is True
+        command_selector = safe_selector_for(
+            check, diagnostic, group, physical, key, ip_value,
+            group_node_host, duplicate_ip, identity_confirmed,
+            repo_authorization, binding_matches,
         )
-        alias_selector_is_safe = bool(
-            command_selector
-            and not selected_ip
-            and duplicate_ip
-            and command_selector == _machine_alias(physical)
-            and _machine_alias(physical).casefold() == key
-            and physical_alias_counts.get(key, 0) == 1
-            and physical_identity_matches
-            and binding_matches
-            and identity_confirmed is True
-            and repo_authorization is True
-            and _field_flag(group, "approval_available") is True
-        )
-        if (not (selector_is_safe or alias_selector_is_safe)
-                or _field_flag(group, "approval_available") is False
-                or repo_authorization is not True
-                or (group and group_node_host and group_node_host != ip_value)
-                or identity_confirmed is False):
-            command_selector = ""
-        target_image, observed_image = _runtime_image_values(check, component)
+        component = component_map.get(check.get("component_id"), {})
+        component_id = str(check.get("component_id", "") or "组件未提供")
         component_label = (
-            _runtime_component_label(component)
-            or str(check.get("component_id") or "未提供")
+            _runtime_component_label(component) or component_id
         )
-        checked_at = str(check.get("checked_at", "") or "未扫描")
+        target_image, observed_image = _runtime_image_values(check, component)
+        images_confirmed = target_image != "未取得" and observed_image != "未取得"
+        if not images_confirmed:
+            command_selector = ""
         status = str(check.get("status", "unavailable") or "unavailable").casefold()
-        if status not in status_text:
+        if status not in {"match", "mismatch", "not_running", "unavailable", "identity_changed"}:
             status = "unavailable"
-        next_step = "等待下次状态检查"
-        if lifecycle_status == "deploying":
-            status_label = status_text[status]
-            status_text_value = f"部署进行中；上次只读检查：{status_label}"
-            next_step = "正在部署，请等待结果；不要重复审批"
-        elif status == "match":
-            next_step = "MATCH：运行镜像与审批目标一致，无需重新部署。"
-        elif status == "mismatch":
-            difference = (
-                f"审批目标 {target_image} 与当前运行镜像 {observed_image} 不同"
-            )
-            if command_selector:
-                next_step = (
-                    f"MISMATCH：{difference}，需要重新部署。直接重新审批："
-                    f"`/approve_deploy machine={_escape(command_selector)}`。"
-                    "/request_deploy 可选，不是前提。"
+        check_key = (
+            key, ip_value, component_id, status, target_image, observed_image,
+        )
+        if check_key in seen_checks:
+            continue
+        seen_checks.add(check_key)
+        item = {
+            "component": component_label,
+            "target": target_image,
+            "observed": observed_image,
+            "status": status,
+            "selector": command_selector,
+            "images_confirmed": images_confirmed,
+            "identity_confirmed": identity_confirmed,
+            "repo_authorization": repo_authorization,
+            "ip": ip_value if identity_confirmed is True else "",
+        }
+        machine_row = grouped.setdefault(key, {"alias": machine, "ips": set(), "checks": []})
+        if item["ip"]:
+            machine_row["ips"].add(item["ip"])
+        machine_row["checks"].append(item)
+
+    if not grouped:
+        return ""
+    if lifecycle_status == "deploying":
+        return ""
+
+    existing_commands = existing_commands or set()
+    lines = []
+    emitted_commands = set()
+    for key in sorted(grouped):
+        row = grouped[key]
+        ips = row["ips"]
+        ip_text = next(iter(ips)) if len(ips) == 1 else "IP 未确认"
+        lines.append(f"- {row['alias']}（{ip_text}）")
+        selectors = set()
+        for item in row["checks"]:
+            component = _escape(item["component"])
+            status = item["status"]
+            if status == "match":
+                if item["repo_authorization"] is not True:
+                    message = "当前仓库尚未确认授权该机器，无法确认当前部署状态。"
+                elif item["identity_confirmed"] is not True:
+                    message = "机器身份未能确认，无法确认当前运行状态。"
+                elif not item["images_confirmed"]:
+                    message = "审批目标或当前运行镜像无法确认，不能判断是否一致；不生成审批命令。"
+                else:
+                    message = ""
+                if message:
+                    lines.append(f"  - {component}：{message}")
+                    continue
+                lines.extend([
+                    f"  - {component}",
+                    f"    审批目标：<code>{_escape(item['target'])}</code>",
+                    f"    当前运行：<code>{_escape(item['observed'])}</code>",
+                    "    运行镜像与审批目标一致，无需重新部署。",
+                ])
+                continue
+            if status == "mismatch":
+                lines.extend([
+                    f"  - {component}",
+                    f"    审批目标：<code>{_escape(item['target'])}</code>",
+                    f"    当前运行：<code>{_escape(item['observed'])}</code>",
+                ])
+                if not item["images_confirmed"]:
+                    lines.append(
+                        "    审批目标或当前运行镜像无法确认，不生成审批命令。"
+                        "/request_deploy 可选，不是前置条件。"
+                    )
+                else:
+                    lines.append("    当前镜像与审批目标不一致，需要重新部署。")
+                if item["selector"] and item["images_confirmed"]:
+                    selectors.add(item["selector"])
+                elif item["images_confirmed"]:
+                    reason = (
+                        "当前仓库尚未确认授权该机器"
+                        if item["repo_authorization"] is not True else
+                        "机器身份未能确认"
+                        if item["identity_confirmed"] is not True else
+                        "机器身份和仓库授权已确认，但组件兼容性或审批条件未确认；"
+                        "机器已识别，但当前不能安全生成审批命令"
+                    )
+                    lines.append(
+                        f"    {reason}，不生成审批命令。"
+                        if (item["repo_authorization"] is not True
+                            or item["identity_confirmed"] is not True)
+                        else f"    {reason}。"
+                    )
+                    lines.append("    /request_deploy 可选，不是前置条件。")
+                continue
+            if status == "identity_changed":
+                lines.append(
+                    f"  - {component}：机器身份绑定发生变化，无法确认审批目标或当前运行镜像；不生成审批命令。"
+                )
+            elif status == "not_running":
+                lines.append(
+                    f"  - {component}：组件当前未运行，无法确认当前镜像；不生成审批命令。"
                 )
             else:
-                next_step = (
-                    f"MISMATCH：{difference}，需要重新部署；当前身份、仓库授权或主 IP "
-                    "未全部确认，暂不生成审批命令。"
+                lines.append(
+                    f"  - {component}：运行状态无法确认，不能判断当前镜像；不生成审批命令。"
                 )
-        elif status == "unavailable":
-            next_step = "机器连接或状态不可用，无法确认当前镜像；暂不生成重新部署命令。"
-        elif status == "identity_changed":
-            next_step = "身份绑定变化，等待重新确认；当前不生成审批命令。"
-        elif status == "not_running":
-            next_step = "组件当前未运行，无法比较镜像；先确认机器状态，不生成重新部署命令。"
-        owners = _owner_names(diagnostic, physical, group, supplied_context)
-        owner_label = _owner_label(
-            owners, test_only=bool(test_only), mention=not bool(test_only),
-        )
-        rows.append("| " + " | ".join((
-            f"`{_escape(machine)}`",
-            f"`{_escape(ip_value)}`",
-            owner_label,
-            _escape(component_label),
-            f"`{_escape(target_image)}`",
-            f"`{_escape(observed_image)}`" if observed_image else "未取得",
-            _escape(checked_at),
-            _escape(status_text_value if lifecycle_status == "deploying"
-                    else status_text.get(status, "无法确认机器状态")),
-            next_step,
-        )) + " |")
-    if not rows:
+        for selector in sorted(selectors):
+            command = f"/approve_deploy machine={selector}"
+            if command in existing_commands:
+                lines.append("    此机器的可执行审批命令已在上方列出。")
+                lines.append("    /request_deploy 可选，不是前置条件。")
+                continue
+            if command in emitted_commands:
+                continue
+            emitted_commands.add(command)
+            lines.append(f"  - 重新部署命令：<code>{_escape(command)}</code>")
+            lines.append("    /request_deploy 可选，不是前置条件。")
+    if not lines:
         return ""
-    return "\n".join([
-        _RUNTIME_CHECKS_START,
-        "### 已部署组件镜像检查",
-        "",
-        "| 机器 | IP | 负责人 | 组件 | 审批目标镜像 | 当前运行镜像 | 最后检查时间 | 状态 | 下一步 |",
-        "|---|---|---|---|---|---|---|---|---|",
-        *rows,
-        "",
-        "MISMATCH 行给出的直接审批命令可以单独使用；`/request_deploy` 可选。",
-        _RUNTIME_CHECKS_END,
-    ])
+    return "\n".join((_RUNTIME_CHECKS_START, *lines, _RUNTIME_CHECKS_END))
+
+
+def _next_action_body_bounds(markdown: str) -> tuple[int, int] | None:
+    """Return the exact body span of the one existing Next action section."""
+    headings = list(re.finditer(r"(?m)^### Next action[ \t]*\r?$", markdown))
+    if len(headings) != 1:
+        return None
+    heading = headings[0]
+    newline_at = markdown.find("\n", heading.end())
+    body_start = newline_at + 1 if newline_at >= 0 else heading.end()
+
+    boundaries = []
+    for marker in (
+        "<!-- evidence-projection:start -->",
+        "<!-- deploy-approval-visible-history:start -->",
+    ):
+        position = markdown.find(marker, body_start)
+        if position >= 0:
+            boundaries.append(position)
+
+    fence_char = ""
+    fence_length = 0
+    offset = body_start
+    for line in markdown[body_start:].splitlines(keepends=True):
+        line_text = line.rstrip("\r\n")
+        if fence_char:
+            closing = re.match(r"^[ \t]{0,3}(`+|~+)[ \t]*$", line_text)
+            if (closing is not None and closing.group(1)[0] == fence_char
+                    and len(closing.group(1)) >= fence_length):
+                fence_char = ""
+                fence_length = 0
+        else:
+            fence = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})", line_text)
+            if fence is not None:
+                fence_char = fence.group(1)[0]
+                fence_length = len(fence.group(1))
+            elif re.match(r"^[ \t]{0,3}###[ \t]+[^\r\n]*$", line_text):
+                boundaries.append(offset)
+                break
+        offset += len(line)
+
+    body_end = min(boundaries) if boundaries else len(markdown)
+    return (body_start, body_end) if body_end >= body_start else None
+
+
+def _runtime_marker_span(body: str) -> tuple[bool, tuple[int, int] | None]:
+    """Validate a single current or legacy runtime marker pair in one body."""
+    pairs = (
+        (_RUNTIME_CHECKS_START, _RUNTIME_CHECKS_END),
+        (_LEGACY_RUNTIME_CHECKS_START, _LEGACY_RUNTIME_CHECKS_END),
+    )
+    found = []
+    for start_marker, end_marker in pairs:
+        start_count = body.count(start_marker)
+        end_count = body.count(end_marker)
+        if start_count == 0 and end_count == 0:
+            continue
+        if start_count != 1 or end_count != 1:
+            return False, None
+        start = body.find(start_marker)
+        end = body.find(end_marker, start + len(start_marker))
+        if end < 0:
+            return False, None
+        found.append((start, end + len(end_marker)))
+    if len(found) > 1:
+        return False, None
+    return True, found[0] if found else None
+
+
+def _replace_runtime_next_action(markdown: str, runtime_action: str) -> str:
+    bounds = _next_action_body_bounds(markdown)
+    if bounds is None:
+        return markdown
+    body_start, body_end = bounds
+    runtime_markers = (
+        _RUNTIME_CHECKS_START, _RUNTIME_CHECKS_END,
+        _LEGACY_RUNTIME_CHECKS_START, _LEGACY_RUNTIME_CHECKS_END,
+    )
+    outside = (markdown[:body_start], markdown[body_end:])
+    if any(marker in part for marker in runtime_markers for part in outside):
+        return markdown
+    body = markdown[body_start:body_end]
+    markers_valid, marker_span = _runtime_marker_span(body)
+    if not markers_valid:
+        return markdown
+    if marker_span is None and not runtime_action:
+        return markdown
+
+    newline = "\r\n" if "\r\n" in markdown else "\n"
+    if marker_span is not None:
+        start, end = marker_span
+        if runtime_action:
+            updated_body = body[:start] + runtime_action + body[end:]
+        else:
+            # Remove only the marker span. Everything before and after it is
+            # kept verbatim, including any Next action text that follows the
+            # runtime block.
+            updated_body = body[:start] + body[end:]
+    elif body.rstrip():
+        # Keep a blank line between the existing text and the runtime action,
+        # and another one before the next section marker so the marker keeps
+        # its own line.
+        updated_body = (
+            body.rstrip() + newline + newline + runtime_action + newline + newline
+        )
+    else:
+        prefix = markdown[:body_start]
+        separator = newline if prefix.endswith("\n") else newline + newline
+        updated_body = separator + runtime_action + newline + newline
+
+    return markdown[:body_start] + updated_body + markdown[body_end:]
 
 
 def update_runtime_image_checks(
@@ -377,37 +595,46 @@ def update_runtime_image_checks(
     machine_groups=None, machine_inventory=None, machine_diagnostics=None,
     test_only: bool | None = None,
 ) -> str:
-    """Replace only the runtime-check section, keeping the rest of the summary intact."""
+    """Update only the existing Next action while preserving other summary sections."""
     if not isinstance(markdown, str):
         return markdown
-    start_count = markdown.count(_RUNTIME_CHECKS_START)
-    end_count = markdown.count(_RUNTIME_CHECKS_END)
-    if start_count != end_count or start_count > 1:
+    bounds = _next_action_body_bounds(markdown)
+    if bounds is None:
         return markdown
-    updated = markdown
-    if start_count:
-        start = updated.index(_RUNTIME_CHECKS_START)
-        end = updated.index(_RUNTIME_CHECKS_END, start) + len(_RUNTIME_CHECKS_END)
-        updated = updated[:start].rstrip() + updated[end:]
-    if test_only is None and "[test only]" in updated.casefold():
+    body_start, body_end = bounds
+    body = markdown[body_start:body_end]
+    markers_valid, marker_span = _runtime_marker_span(body)
+    if not markers_valid:
+        return markdown
+
+    body_without_runtime = (
+        body if marker_span is None else
+        body[:marker_span[0]] + body[marker_span[1]:]
+    )
+    context_markdown = (
+        markdown[:body_start] + body_without_runtime + markdown[body_end:]
+    )
+    if test_only is None and "[test only]" in markdown.casefold():
         test_only = True
-    machine_context = _lifecycle_machine_display_context(updated)
+    machine_context = _lifecycle_machine_display_context(context_markdown)
+    # The Summary renders commands through _escape(), so ``_`` appears as
+    # ``&#95;``. Unescape before collecting commands, otherwise an existing
+    # command is not recognised and gets emitted twice.
+    existing_command_text = html.unescape(body_without_runtime)
+    existing_commands = {
+        f"/approve_deploy machine={match.group(1)}"
+        for match in re.finditer(
+            r"/approve_deploy[ \t]+machine=([A-Za-z0-9_.-]{1,128})",
+            existing_command_text,
+        )
+    }
     block = runtime_image_checks_block(
         runtime_checks, components, lifecycle_status=lifecycle_status,
         machine_groups=machine_groups, machine_inventory=machine_inventory,
         machine_diagnostics=machine_diagnostics, machine_context=machine_context,
-        test_only=test_only,
+        test_only=test_only, existing_commands=existing_commands,
     )
-    if not block:
-        return updated.rstrip()
-    insert_at = updated.find("<!-- deploy-approval-visible-history:start -->")
-    if insert_at < 0:
-        history_heading = re.search(r"(?m)^### History\s*$", updated)
-        insert_at = history_heading.start() if history_heading else len(updated)
-    prefix = updated[:insert_at].rstrip()
-    suffix = updated[insert_at:].lstrip()
-    return "\n\n".join(part for part in (prefix, block, suffix) if part)
-
+    return _replace_runtime_next_action(markdown, block)
 
 def _build_table(builds: list[BuildInfo], components: list[dict] | None = None) -> str:
     """Render the build results table for deploy-ready comment."""
@@ -458,7 +685,11 @@ def evidence_upload_comment(
     attachment_id: str, filename: str, *, download_url: str,
     preview_url: str = "", note: str = "", public_base_url: str = "",
 ) -> str:
-    """Build one safe, idempotently identifiable notification for a ready file."""
+    """Build a safe notification for a ready media file.
+
+    Text evidence remains in the trusted evidence record; public upload
+    comments show only the media preview and its download link.
+    """
     if (not _evidence_path(repo, pr_number)
             or not isinstance(head_sha, str)
             or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
@@ -500,6 +731,10 @@ def evidence_upload_comment(
     suffix = clean_filename.rsplit(".", 1)[-1].lower() if "." in clean_filename else ""
     image_suffixes = {"png", "jpg", "jpeg", "gif", "webp"}
     video_suffixes = {"mp4", "webm"}
+    if suffix not in image_suffixes | video_suffixes:
+        return ""
+    if not preview_url:
+        return ""
     lines = [
         "### 测试证据已上传",
         "",
@@ -508,19 +743,8 @@ def evidence_upload_comment(
     if suffix in image_suffixes and preview_url:
         lines.extend(["", f"![{label}](<{preview_url}>)", "", f"[下载图片](<{download_url}>)"])
     elif suffix in video_suffixes:
-        lines[-1] = f"已保存：[{label}](<{preview_url or download_url}>)"
-        if preview_url:
-            lines.extend(["", f"[下载视频](<{download_url}>)"])
-    if isinstance(note, str) and note.strip():
-        from .evidence_builder import _redact_secrets
-
-        safe_note = _redact_secrets(note.strip())
-        safe_note = re.sub(
-            r"(?i)((?:x-evidence-secret|x-evidence-client-key|evidence-capability|capability|cap|token)\s*[=:]\s*)[^\s&;]+",
-            r"\1[已隐藏]", safe_note)
-        safe_note = re.sub(r"https?://[^\s<>()]+", "[链接已隐藏]", safe_note)
-        escaped_note = _escape(safe_note)
-        lines.extend(["", "备注：", "", *("> " + line for line in escaped_note.splitlines())])
+        lines[-1] = f"已保存：[▶ 预览视频：{label}](<{preview_url}>)"
+        lines.extend(["", f"[下载视频](<{download_url}>)"])
     notification_key = hashlib.sha256(
         f"{repo}:{pr_number}:{head_sha}:{round_id}:{attachment_id}".encode("utf-8")
     ).hexdigest()
@@ -602,21 +826,22 @@ def _testing_next_action(
     repo: str = "", pr_number: int = 0,
 ) -> str:
     evidence_url = _trusted_upload_page_url(evidence_url, repo, pr_number)
+    lines = ["部署已经完成，现在可以开始测试。"]
     if evidence_complete:
-        lines = [
-            "测试证据已收到。审批人会据此核对本轮实际效果，并判断是否通过验收、是否可以合并。",
+        lines.extend([
+            "本轮测试证据已收到。审批人会据此核对实现效果，并判断是否通过验收、是否可以合并。",
             "如需补充视频或图片，可继续上传：",
-        ]
+        ])
     else:
-        lines = [
+        lines.extend([
             "请把本轮开发的实际效果、视频或截图上传到这里，供审批人检查实现效果，",
             "并作为是否通过验收、是否可以合并的依据：",
-        ]
+        ])
     if evidence_url:
         lines.extend(["", f"[上传测试证据](<{evidence_url}>)"])
     else:
         lines.extend(["", "[上传测试证据][deploy-approval-upload]"])
-    lines.extend(["", "测试完成后，请由部署本轮的机器负责人在 PR 评论中输入 `/request_acceptance`。"])
+    lines.extend(["", "测试完成后，请执行 `/request_acceptance`。"])
     return "\n".join(lines)
 
 
@@ -755,8 +980,8 @@ def deploy_ready(
         node_host = ipv4(group.get("node_host"))
         if primary_ip:
             primary_ip_counts[primary_ip] = primary_ip_counts.get(primary_ip, 0) + 1
-        if isinstance(alias, str) and alias and node_host:
-            aliases_by_node_host.setdefault(node_host, set()).add(alias.casefold())
+        if isinstance(alias, str) and alias.strip() and node_host:
+            aliases_by_node_host.setdefault(node_host, set()).add(alias.strip().casefold())
 
     if approval_evidence_ready:
         seen_commands = set()
@@ -793,7 +1018,7 @@ def deploy_ready(
                 or len(aliases_by_node_host.get(node_host, set())) > 1
             )
             # A present selector is authoritative, including an empty value.
-            # Only legacy groups with no selector field may use a verified IP.
+            # A verified alias may resolve to its unique primary IP below.
             if "command_selector" in group:
                 raw_selector = group.get("command_selector")
             else:
@@ -813,19 +1038,48 @@ def deploy_ready(
                     continue
                 command_selector = selector_ip
             else:
-                if (selector != alias or not ambiguous_ip
-                        or group.get("ip_command_safe") is not False
-                        or (not aliases_by_node_host.get(node_host)
-                            or alias.casefold() not in aliases_by_node_host[node_host])):
+                if selector != alias:
                     continue
-                command_selector = alias
+                if (group.get("ip_command_safe") is not False and not ambiguous_ip
+                        and aliases_by_node_host.get(node_host, set())
+                        == {alias.strip().casefold()}):
+                    command_selector = primary_ip
+                else:
+                    # Keep the verified alias fallback when the IP selector is
+                    # unsafe. The alias must be unique and bound to this exact
+                    # authorized machine and compatible component set.
+                    alias_fallback_allowed = bool(
+                        group.get("ip_command_safe") is False or ambiguous_ip
+                    )
+                    if (not alias_fallback_allowed
+                            or aliases_by_node_host.get(node_host, set())
+                            != {alias.strip().casefold()}):
+                        continue
+                    command_selector = alias
 
             command = f"/approve_deploy machine={command_selector}"
             if command in seen_commands:
                 continue
             seen_commands.add(command)
-            label = f"{_escape(alias)}（主 IP：`{primary_ip}`）"
-            commands.append(f"- {label}：`{command}`")
+            component_by_id = {
+                item.get("component_id"): item for item in components or []
+                if isinstance(item, dict)
+                and isinstance(item.get("component_id"), str)
+            }
+            machine_component_ids = deployable_ids.intersection(compatible_ids)
+            component_labels = [
+                _runtime_component_label(component_by_id[component_id])
+                if component_id in component_by_id else component_id
+                for component_id in sorted(machine_component_ids)
+            ]
+            component_text = "、".join(
+                _escape(label) for label in component_labels if label
+            )
+            commands.append(
+                f"- `{_escape(alias)}`（{primary_ip}）\n"
+                f"  兼容组件：{component_text or '当前部署组件'}\n"
+                f"  `{command}`"
+            )
             if deployable_ids.issubset(compatible_ids):
                 full_machine_aliases.add(alias.casefold())
 
@@ -838,26 +1092,32 @@ def deploy_ready(
         f"**Bound HEAD:** `{_short(head_sha)}`",
         f"**Repository:** `{repo}`",
         "",
-        ("代码审查和镜像构建已完成，当前 HEAD 未变化，当前版本已经可以部署。"
+        "### Workflow",
+        "",
+        _workflow_lines("deploy-ready"),
+        "",
+        "### Next action",
+        "",
+        ("当前版本已经通过代码审查和镜像构建，可以部署。"
          if approval_evidence_ready else
-         "当前 HEAD 的审核和镜像构建结果尚未确认完成，暂时不能部署。"),
+         "当前 HEAD 的代码审查或镜像构建尚未确认通过，暂时不能部署。"),
     ]
     if commands:
-        lines.extend(["", "你可以直接执行下面对应机器的审批命令：", "", *commands])
+        lines.extend(["", "以下机器已通过身份、授权和兼容性检查，可直接执行对应审批命令：", "", *commands])
     elif approval_evidence_ready:
         lines.extend([
             "",
-            "当前没有通过仓库授权、机器身份和组件兼容校验的可执行审批命令。",
+            "当前没有通过兼容性、仓库授权和机器身份校验的可执行审批命令。",
         ])
     else:
         lines.extend([
             "",
-            "审查或构建结果尚未确认通过，暂不显示可执行部署审批方式。",
+            "审查或构建结果尚未确认通过，暂不显示可执行部署审批命令。",
         ])
     if approval_evidence_ready and len(full_machine_aliases) == 1:
         lines.extend(["", "当前只有一台完整适配机器，也可以直接使用简写 `/approve_deploy`。"])
     if approval_evidence_ready:
-        lines.extend(["", "`/request_deploy` 也可以选择使用，但不是部署审批的前置步骤。"])
+        lines.extend(["", "`/request_deploy` 是可选操作，不是部署审批的前置步骤。"])
     lines.extend(["", "### 构建结果", "", _build_table(builds, components)])
     return _lifecycle_body(lines)
 
@@ -1560,6 +1820,14 @@ def deploy_requested(
         if isinstance(item, dict) and isinstance(item.get("component_id"), str)
         and item.get("component_id")
     }
+    deployed_component_ids = {
+        component_id
+        for deployment in deployments or []
+        if isinstance(deployment, dict) and deployment.get("phase") == "deployed"
+        for component_id in deployment.get("component_ids", [])
+        if isinstance(component_id, str) and component_id
+    }
+    remaining_component_ids = component_ids - deployed_component_ids
     known_aliases_by_ip = {}
     inventory_ip_counts = {}
     inventory_alias_counts = {}
@@ -1799,9 +2067,13 @@ def deploy_requested(
             and not duplicate_ip
         )
         if identity_confirmed and authorized and group_approval_flag is not False:
-            if physical_ip_unique and provided_selector in {"", physical_ip}:
+            if (physical_ip_unique
+                    and _field_flag(group, "ip_command_safe") is not False
+                    and provided_selector in {"", physical_ip, alias}):
                 command_selector = physical_ip
-            elif (duplicate_ip and alias_identity_matches
+            elif (alias_identity_matches
+                  and (duplicate_ip
+                       or _field_flag(group, "ip_command_safe") is False)
                   and provided_selector in {"", alias}):
                 command_selector = alias
             else:
@@ -1812,7 +2084,10 @@ def deploy_requested(
             group_approval_flag is True
         )
         safe_flag_allows = safe_flag is not False or bool(
-            duplicate_ip and command_selector == alias and group_approval_available
+            command_selector == alias
+            and (duplicate_ip
+                 or _field_flag(group, "ip_command_safe") is False)
+            and group_approval_available
             and component_coverage_confirmed
         )
         safe = bool(
@@ -1864,7 +2139,10 @@ def deploy_requested(
                 if component_flag is False else "当前 PR 组件匹配结果尚未确认。"
             )
         if safe_flag is False and not (
-                duplicate_ip and command_selector == alias and group_approval_available):
+                command_selector == alias
+                and (duplicate_ip
+                     or _field_flag(group, "ip_command_safe") is False)
+                and group_approval_available):
             reasons.append("机器诊断未允许安全审批。")
         return {
             "alias": alias,
@@ -1889,266 +2167,114 @@ def deploy_requested(
         }
 
     machine_states = [machine_flags(row) for row in inventory_rows]
-    safe_machines = {
-        item["alias"].casefold(): item for item in machine_states
-        if item["safe"] and item["alias"]
+    compatible_states = sorted(
+        (item for item in machine_states if item["safe"] and item["alias"]),
+        key=lambda item: item["alias"].casefold(),
+    )
+    component_by_id = {
+        item.get("component_id"): item for item in components
+        if isinstance(item, dict) and isinstance(item.get("component_id"), str)
     }
-    machine_state_by_alias = {
-        item["alias"].casefold(): item for item in machine_states if item["alias"]
-    }
-    physical_machine_count = len(inventory_rows)
-    inventory_lines = [
-        "### 已登记机器", "",
-        "| 编号 | 品牌 | 型号 | 别名 | 主 IP | 辅助 IP | 负责人 | 仓库授权 | Agent Core | 平台 | 当前 PR 组件兼容性 | 原因 |",
-        "|---:|---|---|---|---|---|---|---|---|---|---|---|",
-    ]
-    for ordinal, (machine, state) in enumerate(zip(inventory_rows, machine_states), 1):
-        index = _record_value(machine, "index", "number", "id", default=ordinal)
-        brand = _record_value(machine, "brand", "manufacturer", default="未提供")
-        model = _record_value(machine, "model", "model_name", default="未提供")
-        alias = state["alias"] or "未提供"
-        main_ip = _machine_ip(machine) or "未提供"
-        auxiliary_ips = _display_values(_record_value(
-            machine, "auxiliary_ip", "auxiliary_ips", "aux_ips", "secondary_ips",
-        ))
-        owner_text = _owner_label(state["owners"], test_only=test_only, mention=not test_only)
-        auth_text = "已授权" if state["authorized"] else "未授权或未确认"
-        agent_text = (
-            "凭据可用" if state["credentials_available"] else
-            "不可用" if state["credentials_flag"] is False else "未确认"
-        )
-        platform_value = _record_value(
-            state["diagnostic"], "platform", "platform_name", "platforms",
-            default=_record_value(machine, "platform", "platform_name", "platforms"),
-        )
-        platform_text = "、".join(_display_values(platform_value)) or "未确认"
-        compatibility = (
-            "兼容" if state["component_compatible"] else
-            "不兼容" if state["component_flag"] is False else
-            "部分兼容" if component_ids.intersection(
-                set(_record_value(state["group"], "component_ids", default=[]) or [])
-                | set(_record_value(state["diagnostic"], "component_ids", default=[]) or [])
-            ) else "未确认"
-        )
-        reasons = "；".join(state["reasons"]) or "所有审批条件已确认。"
-        inventory_lines.append("| " + " | ".join(_escape(value) for value in (
-            index, brand, model, alias, main_ip,
-            "、".join(auxiliary_ips) if auxiliary_ips else "—",
-            owner_text, auth_text, agent_text, platform_text, compatibility, reasons,
-        )) + " |")
-    if not inventory_rows:
-        inventory_lines.extend([
-            "| — | — | — | 未提供 | — | — | — | 未确认 | 未确认 | 未确认 | 未确认 | 未收到物理机器清单，不能据此推断机器不存在。 |",
-        ])
-
-    compatible_lines = [
-        "### 可以审批的机器", "",
-    ]
-    compatible_states = [item for item in machine_states if item["safe"]]
-    if display_status == "deploying":
-        compatible_lines.append("当前部署正在执行，请等待结果；此阶段不重复审批。")
-    elif compatible_states:
-        compatible_lines.extend([
-            "| 机器 | 主 IP | 负责人 | 审批命令 |",
-            "|---|---|---|---|",
-        ])
-        for state in compatible_states:
-            owner = _owner_label(state["owners"], test_only=test_only, mention=not test_only)
-            command = f"/approve_deploy machine={state['command_selector']}"
-            compatible_lines.append(
-                "| " + " | ".join(_escape(value) for value in (
-                    state["alias"], state["ip"], owner,
-                )) + f" | `{_escape(command)}` |"
-            )
-    else:
-        compatible_lines.append("尚无通过仓库授权、身份、Agent Core、平台、组件及安全审批检查的机器。")
-
-    pending_lines = [
-        "### 暂不能审批的机器", "",
-    ]
-    pending_states = [item for item in machine_states if not item["safe"]]
-    known_no_authorization = policy["known_no_authorization"]
-    authorization_unknown = policy["authorization_unknown"]
-    if (known_no_authorization or authorization_unknown) and inventory_rows:
-        if known_no_authorization and physical_machine_count == 21:
-            pending_lines.extend([
-                "物理机器已登记，但当前仓库尚未授权。",
-                "所有21台仍正常展示。没有授权的机器不生成可执行审批命令。",
-                "",
-            ])
-        elif known_no_authorization:
-            pending_lines.extend([
-                f"物理机器已登记，但当前仓库尚未授权；清单中的 {physical_machine_count} 台设备仍正常展示。",
-                "没有授权的机器不生成可执行审批命令。",
-                "",
-            ])
-        else:
-            pending_lines.extend([
-                "物理机器已登记，但当前仓库授权状态未确认。",
-                "所有物理机器仍正常展示；未确认授权的机器不生成可执行审批命令。",
-                "",
-            ])
-    if pending_states:
-        for state in pending_states:
-            reasons = "；".join(state["reasons"]) or "兼容性或安全审批条件未确认。"
-            pending_lines.extend([
-                f"- 机器 `{_escape(state['alias'] or '未提供')}`",
-                f"  - 负责人：{_owner_label(state['owners'], test_only=test_only, mention=not test_only)}",
-                f"  - 主 IP：`{_escape(state['ip'] or '未提供')}`",
-                f"  - 状态：{_escape('重复 IP' if state['duplicate_ip'] else '待确认 / 不兼容')}",
-                f"  - 原因：{_escape(reasons)}",
-            ])
-    elif inventory_rows:
-        pending_lines.append("所有已登记机器均通过当前审批条件。")
-
-    runtime_rows = _record_rows(runtime_checks, ("checks", "runtime_checks", "items"))
-    runtime_lines = ["### 运行镜像状态", ""]
-    if runtime_rows:
-        runtime_lines.extend([
-            "| 机器 | IP | 负责人 | 组件 | 审批目标镜像 | 当前运行镜像 | 最后检查时间 | 状态 | 下一步 |",
-            "|---|---|---|---|---|---|---|---|---|",
-        ])
-        runtime_status_labels = {
-            "match": "MATCH",
-            "mismatch": "MISMATCH",
-            "not_running": "UNAVAILABLE",
-            "unavailable": "UNAVAILABLE",
-            "identity_changed": "IDENTITY_CHANGED",
-        }
-        for check in runtime_rows:
-            alias = _machine_alias(check)
-            alias_key_value = alias.casefold()
-            machine_state = machine_state_by_alias.get(alias_key_value, {})
-            physical = (
-                inventory_by_alias.get(alias_key_value)
-                or machine_state.get("physical")
-                or inventory_by_ip.get(_canonical_ip(_machine_ip(check)), {})
-            )
-            ip_value = (
-                _canonical_ip(_record_value(check, "primary_ip"))
-                or _canonical_ip(_record_value(check, "main_ip"))
-                or _canonical_ip(_machine_ip(physical))
-                or _canonical_ip(machine_state.get("ip"))
-                or _canonical_ip(_machine_ip(check))
-            )
-            status = str(_record_value(check, "status", default="unavailable")).casefold()
-            if status not in runtime_status_labels:
-                status = "unavailable"
-            component = component_by_id.get(
-                _record_value(check, "component_id"), {},
-            )
-            target_image, observed_image = _runtime_image_values(check, component)
-            if display_status == "deploying":
-                next_step = "正在部署，请等待结果；不要重复审批。"
-            elif status == "match":
-                next_step = "运行镜像与审批目标一致，无需重新部署。"
-            elif status == "unavailable":
-                next_step = "机器连接或状态不可用，无法确认当前镜像；暂不生成重新部署命令。"
-            elif status == "identity_changed":
-                next_step = "身份绑定变化，等待重新确认；当前不生成审批命令。"
-            elif status == "not_running":
-                next_step = "组件当前未运行，无法比较镜像；先确认机器状态，不生成重新部署命令。"
-            else:
-                safe_state = safe_machines.get(alias_key_value)
-                selector = str(
-                    safe_state.get("command_selector", "") or ""
-                ).strip() if safe_state else ""
-                selected_ip = _canonical_ip(selector)
-                safe_ip_selector = bool(
-                    selected_ip and selected_ip == ip_value
-                    and safe_state.get("ip") == ip_value
-                    and safe_state.get("identity_confirmed") is True
-                    and safe_state.get("authorized") is True
-                    and not safe_state.get("duplicate_ip")
-                ) if safe_state else False
-                safe_alias_selector = bool(
-                    selector and not selected_ip and selector == alias
-                    and safe_state.get("duplicate_ip") is True
-                    and safe_state.get("ip") == ip_value
-                    and safe_state.get("identity_confirmed") is True
-                    and safe_state.get("authorized") is True
-                ) if safe_state else False
-                if safe_ip_selector or safe_alias_selector:
-                    difference = (
-                        f"审批目标 {target_image} 与当前运行镜像 {observed_image} 不同，"
-                        "需要重新部署。"
-                    )
-                    next_step = (
-                        f"{difference}直接重新审批：`/approve_deploy machine={selector}`；"
-                        "`/request_deploy` 可选。"
-                    )
-                else:
-                    next_step = (
-                        "运行镜像与审批目标不一致，需要重新部署；但当前身份、仓库授权或主 IP "
-                        "未全部确认，暂不生成审批命令。"
-                    )
-            component_label = (
-                _runtime_component_label(component)
-                or str(_record_value(check, "component_id") or "未提供")
-            )
-            checked_at = (
-                _record_value(check, "checked_at", "last_scanned_at", default="未扫描")
-                or "未扫描"
-            )
-            status_label = runtime_status_labels[status]
-            if display_status == "deploying":
-                status_label = f"部署进行中；上次只读检查：{status_label}"
-            owner_text = _owner_label(
-                machine_state.get("owners", []),
-                test_only=test_only,
-                mention=not test_only,
-            )
-            runtime_lines.append("| " + " | ".join(_escape(value) for value in (
-                alias or _record_value(check, "machine", default="未提供"),
-                ip_value or "未提供",
-                owner_text,
-                component_label,
-                target_image, observed_image, checked_at, status_label, next_step,
-            )) + " |")
-    else:
-        runtime_lines.append("尚无可展示的机器镜像检查结果。")
-
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
         "### Deploy Approval — Lifecycle",
         "",
-        f"**Status:** `{display_status}`",
-        f"**Bound HEAD:** `{_short(head_sha)}`",
-        f"**Repository:** `{_escape(repo)}`",
+        f"**Status:** <code>{display_status}</code>",
+        f"**Bound HEAD:** <code>{_short(head_sha)}</code>",
+        f"**Repository:** <code>{_escape(repo)}</code>",
         "",
-        *inventory_lines,
+        "### Workflow",
         "",
-        *compatible_lines,
+        _workflow_lines(display_status),
         "",
-        *pending_lines,
-        "",
-        *runtime_lines,
+        "### Next action",
         "",
     ]
+    seen_commands = set()
+    full_machine_aliases = set()
     if display_status == "deploying":
         lines.extend([
-            "", "部署正在执行，请等待结果。完成后系统会核对运行镜像；所有组件确认完成后即可开始测试。",
-        ])
-    elif compatible_states:
-        lines.extend([
-            "", "当前已经收到部署申请。请对应机器负责人在上表中执行本机审批命令。",
-            "审批通过后系统会执行部署并核对运行镜像；所有组件确认完成后会进入测试。",
+            "部署申请已收到，当前正在部署。请等待部署结果，不要重复提交审批。",
         ])
     else:
-        lines.extend([
-            "", "当前已经收到部署申请，但暂时没有通过安全检查的可部署机器。",
-            "请先处理上方列出的授权、身份或兼容问题；条件满足后，机器负责人的审批命令会显示在这里。",
-        ])
+        lines.append("部署申请已收到。请对应机器负责人批准明确列出的机器和组件：")
+        for state in compatible_states:
+            alias = state["alias"]
+            selector = state["command_selector"]
+            if (not isinstance(selector, str)
+                    or not (ipv4(selector)
+                            or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", selector))):
+                continue
+            command = f"/approve_deploy machine={selector}"
+            if command in seen_commands:
+                continue
+            seen_commands.add(command)
+            group = state["group"] if isinstance(state["group"], dict) else {}
+            ids = _record_value(group, "component_ids", default=[])
+            if not isinstance(ids, (list, tuple, set)):
+                ids = []
+            ids = sorted({
+                component_id for component_id in ids
+                if isinstance(component_id, str) and component_id
+            })
+            if remaining_component_ids and remaining_component_ids.issubset(set(ids)):
+                full_machine_aliases.add(alias.casefold())
+            component_labels = [
+                _runtime_component_label(component_by_id[component_id])
+                if component_id in component_by_id else component_id
+                for component_id in ids
+            ]
+            component_text = "、".join(
+                _escape(label) for label in component_labels if label
+            ) or "当前适配组件"
+            owner_text = _owner_label(
+                state["owners"], test_only=test_only, mention=not test_only,
+            )
+            lines.append(
+                f"- {owner_text}：请批准 {_escape(alias)}（{_escape(state['ip'] or 'IP 未确认')}）"
+                f"的 {component_text}。命令：<code>{_escape(command)}</code>"
+            )
+        if not seen_commands:
+            lines.append(
+                "当前没有通过机器身份、仓库授权、连接状态和组件适配确认的可执行审批命令；"
+                "请等待配置或状态同步后刷新 Summary。"
+            )
+        if len(full_machine_aliases) == 1:
+            lines.append("当前只有一台完整适配剩余组件的机器，也可以执行简写命令：<code>/approve_deploy</code>。")
 
-    if gate_note:
-        lines.extend(["", *[_safe_display_text(note) for note in gate_note
-                             if isinstance(note, str)]])
-    lines.extend(["", "### 部署进度", ""])
-    lines.append(_deployment_table(
-        deployments, all_components or component_snapshot or components, group_rows,
-    ))
-    lines.extend(_attempt_lines(attempt))
+    notes = []
+    for note in gate_note or []:
+        if not isinstance(note, str):
+            continue
+        value = note.strip()
+        if not value or value.startswith("/approve_deploy machine="):
+            continue
+        if value.startswith("### "):
+            value = value[4:].strip()
+        if value and value not in notes:
+            notes.append(_safe_display_text(value))
+    if notes:
+        lines.extend(["", *notes])
+
+    runtime_action = runtime_image_checks_block(
+        runtime_rows, components, lifecycle_status=display_status,
+        machine_groups=group_rows, machine_inventory=inventory_rows,
+        machine_diagnostics=diagnostic_rows,
+        existing_commands=seen_commands,
+    )
+    if runtime_action:
+        lines.extend(["", runtime_action])
+
+    lines.extend([
+        "",
+        "### 部署进度",
+        "",
+        _deployment_table(
+            deployments, all_components or component_snapshot or components, group_rows,
+        ),
+        *_attempt_lines(attempt),
+    ])
     body = _lifecycle_body(lines)
     return body.replace("@", "＠") if test_only else body
 
@@ -2177,7 +2303,8 @@ def testing(
             waiting_for = "、".join(f"@{_escape(name)}" for name in reviewers)
             next_action = [
                 f"已申请验收，正在等待 {waiting_for} 确认。",
-                "验收人确认后，会在 PR 评论中记录结果。",
+                "请验收人检查本轮测试证据和部署效果，然后执行 "
+                "`/record_test result=pass` 或 `/record_test result=fail`。",
             ]
         else:
             if not acceptance_reviewers_configured:
@@ -2202,6 +2329,14 @@ def testing(
         "",
         ("**Status:** `testing` · 测试完成 · 待验收"
          if acceptance_pending else "**Status:** `testing`"),
+        "",
+        f"**Repository:** <code>{_escape(repo)}</code>",
+        "",
+        "### Workflow",
+        "",
+        _workflow_lines("testing"),
+        "",
+        "### Next action",
         "",
         *next_action,
     ]

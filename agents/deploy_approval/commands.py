@@ -5,11 +5,12 @@ Parsing is strict: unknown flags, a duplicated required arg or a stray argument
 are rejected as ``unknown``.
 
 Commands are public:
-  - ``/request_deploy`` — PR Author requests a deployment (ZERO parameters)
-  - ``/approve_deploy`` — Machine Owner approves a deployment
+  - ``/request_deploy`` — optional PR Author request for current HEAD
+  - ``/approve_deploy`` — Machine Owner approves; selects by alias or IPv4
+    when needed and may omit ``machine=`` for one fully compatible machine
   - ``/record_test`` — Machine Owner records test result (no machine=)
   - ``/request_acceptance`` — Machine Owner requests independent acceptance
-  - ``/evidence_link`` — Read-only short-lived evidence download link
+  - ``/evidence_link`` — Deprecated; consumed with a deprecation notice
   - ``/deploy_status`` — Read-only status query
   - ``/deploy_help`` — Help for commands
   - ``/submit_evidence`` — Persist native PR attachments and notes
@@ -93,7 +94,8 @@ def _parse_args(tokens: list[str]) -> tuple[list[str], dict[str, str]]:
 
 # Allowed key=value arguments for each command.
 _ALLOWED_KV = {
-    "request_deploy": frozenset(),        # ZERO parameters
+    "request_deploy": frozenset(),        # Optional command, ZERO parameters
+    # The controller resolves machine= as an exact alias or literal IPv4.
     "approve_deploy": frozenset({"machine"}),
     "record_test": frozenset({"result", "summary"}),
     "request_acceptance": frozenset(),

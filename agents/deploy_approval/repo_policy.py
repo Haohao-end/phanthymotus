@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import errno
 import hashlib
 import logging
 import os
@@ -34,7 +33,7 @@ _LOCAL_POLICY_DIRECTORY_BY_REPO = {
     "4paradigm/phanthymotus": "core",
     "4paradigm/phanthymotus-driver": "driver",
 }
-_LOCAL_POLICY_ROOT = "/run/deploy-approval/policy-candidates"
+_LOCAL_POLICY_ROOT_PARTS = ("run", "deploy-approval", "policy-candidates")
 BLOCKED_REPOSITORY_POLICY_NOT_CONFIGURED = "BLOCKED_REPOSITORY_POLICY_NOT_CONFIGURED"
 
 
@@ -199,6 +198,11 @@ class RepositoryPolicyStore:
             raise _LocalPolicyValidationError("unsupported local policy candidate")
         if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
             raise _LocalPolicyValidationError("safe local file opening is unavailable")
+        root_parts = _LOCAL_POLICY_ROOT_PARTS
+        if (not isinstance(root_parts, (tuple, list)) or not root_parts
+                or any(not isinstance(part, str) or not part or part in {".", ".."}
+                       or "/" in part for part in root_parts)):
+            raise _LocalPolicyValidationError("local policy root is invalid")
 
         directory_flags = (
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -211,7 +215,7 @@ class RepositoryPolicyStore:
         directory_fd = os.open("/", directory_flags)
         file_fd = None
         try:
-            for component in (*_LOCAL_POLICY_ROOT.strip("/").split("/"), directory):
+            for component in (*root_parts, directory):
                 next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
                 os.close(directory_fd)
                 directory_fd = next_fd
@@ -219,17 +223,9 @@ class RepositoryPolicyStore:
                 if (not stat.S_ISDIR(directory_stat.st_mode)
                         or directory_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
                     raise _LocalPolicyValidationError(
-                        "local policy directory is not safely protected",
+                        "local policy directory permissions are unsafe",
                     )
 
-            path_stat = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
-            if (not stat.S_ISREG(path_stat.st_mode)
-                    or path_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                    or path_stat.st_size < 0
-                    or path_stat.st_size > MAX_REPO_POLICY_FILE_BYTES):
-                raise _LocalPolicyValidationError(
-                    "local policy candidate failed file validation",
-                )
             file_fd = os.open(filename, file_flags, dir_fd=directory_fd)
             before = os.fstat(file_fd)
             if (not stat.S_ISREG(before.st_mode)
@@ -237,7 +233,7 @@ class RepositoryPolicyStore:
                     or before.st_size < 0
                     or before.st_size > MAX_REPO_POLICY_FILE_BYTES):
                 raise _LocalPolicyValidationError(
-                    "local policy candidate failed file validation",
+                    "local policy candidate permissions are unsafe or file is invalid",
                 )
 
             chunks = []
@@ -285,24 +281,28 @@ class RepositoryPolicyStore:
                     "local policy candidate changed while being read",
                 )
             return b"".join(chunks)
-        except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-                raise _LocalPolicyValidationError(
-                    "local policy path contains a symbolic link or non-directory component",
-                ) from None
-            raise
         finally:
             if file_fd is not None:
                 os.close(file_fd)
             os.close(directory_fd)
 
+    @staticmethod
+    def _local_candidate_bytes(canonical_repo: str, filename: str) -> bytes:
+        """Read one protected candidate from this repository's local directory."""
+        return RepositoryPolicyStore._read_local_candidate(canonical_repo, filename)
+
     def _load_local_fallback(
         self, canonical_repo: str, filename: str, state: _RepositoryPolicy,
     ) -> str:
         try:
-            content = self._read_local_candidate(canonical_repo, filename)
+            content = self._local_candidate_bytes(canonical_repo, filename)
+            if content is None:
+                raise FileNotFoundError(filename)
+            if not isinstance(content, bytes):
+                raise _LocalPolicyValidationError(
+                    "local policy candidate must be bytes",
+                )
         except FileNotFoundError:
-            self._clear_file_snapshot(state, filename)
             self._set_file_status(state, filename, "missing_local")
             self._record_attempt(
                 state, filename, "missing_local", source="local_fallback",
@@ -312,15 +312,17 @@ class RepositoryPolicyStore:
             )
             return "missing_local"
         except _LocalPolicyValidationError:
-            self._clear_file_snapshot(state, filename)
-            self._set_file_status(state, filename, "invalid_local")
+            retained = self._retain_snapshot_after_candidate_error(
+                state, filename, "invalid_local", source="local_fallback",
+            )
             self._record_attempt(
                 state, filename, "invalid_local", source="local_fallback",
                 reason="repository-specific local candidate failed security validation",
             )
             logger.warning(
-                "local repository policy candidate failed security validation for %s/%s",
+                "local repository policy candidate failed security validation for %s/%s%s",
                 canonical_repo, filename,
+                "; prior trusted local policy retained" if retained else "",
             )
             return "invalid_local"
         except OSError as exc:
@@ -332,7 +334,6 @@ class RepositoryPolicyStore:
             if retained:
                 self._set_file_status(state, filename, "valid")
             else:
-                self._clear_file_snapshot(state, filename)
                 self._set_file_status(state, filename, "unavailable")
             self._record_attempt(
                 state, filename, "local_read_error", source="local_fallback",
@@ -357,9 +358,10 @@ class RepositoryPolicyStore:
             self._reported_unconfigured.discard((canonical_repo, filename))
             return "unchanged_local_fallback"
         if state.rejected_local_sha256.get(filename) == digest:
-            self._clear_file_snapshot(state, filename)
             state.rejected_local_sha256[filename] = digest
-            self._set_file_status(state, filename, "invalid_local")
+            self._retain_snapshot_after_candidate_error(
+                state, filename, "invalid_local", source="local_fallback",
+            )
             self._record_attempt(
                 state, filename, "invalid_local", source="local_fallback",
                 reason="local YAML/schema validation failed",
@@ -369,16 +371,18 @@ class RepositoryPolicyStore:
         try:
             candidate = self._parse_candidate(filename, content)
         except Exception as exc:
-            self._clear_file_snapshot(state, filename)
             state.rejected_local_sha256[filename] = digest
-            self._set_file_status(state, filename, "invalid_local")
+            retained = self._retain_snapshot_after_candidate_error(
+                state, filename, "invalid_local", source="local_fallback",
+            )
             self._record_attempt(
                 state, filename, "invalid_local", source="local_fallback",
                 reason="local YAML/schema validation failed",
             )
             logger.warning(
-                "local repository policy candidate failed schema validation for %s/%s (%s)",
+                "local repository policy candidate failed schema validation for %s/%s (%s)%s",
                 canonical_repo, filename, type(exc).__name__,
+                "; prior trusted local policy retained" if retained else "",
             )
             return "invalid_local"
 
@@ -452,16 +456,44 @@ class RepositoryPolicyStore:
     def _reject_invalid_update(
         cls, state: _RepositoryPolicy, filename: str,
     ) -> bool:
-        # A changed official file that fails validation can no longer authorize
-        # operations. Keep only rejection diagnostics; never serve the older
-        # policy as if it still reflected the official main branch.
+        """Keep the last trusted snapshot when a new official file is invalid.
+
+        A candidate is parsed completely before this function is reached, so a
+        failed update never partially replaces a trusted snapshot. A previous
+        trusted policy remains usable; first-time invalid policy stays blocked.
+        """
+        return cls._retain_snapshot_after_candidate_error(
+            state, filename, "invalid_schema",
+        )
+
+    @classmethod
+    def _retain_snapshot_after_candidate_error(
+        cls, state: _RepositoryPolicy, filename: str, error_status: str, *,
+        source: str | None = None,
+    ) -> bool:
+        trusted = cls._has_trusted_snapshot(state, filename)
+        if source is not None:
+            trusted = trusted and state.file_source.get(filename) == source
+        if trusted:
+            # Keep serving the last successfully parsed configuration. The
+            # failed candidate is visible through last_attempt_* diagnostics.
+            cls._set_file_status(state, filename, "valid")
+            return True
+
         cls._set_candidate(state, filename, None)
         for mapping in (
             state.source_sha, state.local_sha256, state.file_source, state.etag,
         ):
             mapping.pop(filename, None)
-        cls._set_file_status(state, filename, "invalid_schema")
+        cls._set_file_status(state, filename, error_status)
         return False
+
+    @classmethod
+    def _mark_candidate_response_error(
+        cls, state: _RepositoryPolicy, filename: str, status: str = "invalid_response",
+    ) -> None:
+        """Retain a verified snapshot when the latest API response is unusable."""
+        cls._retain_snapshot_after_candidate_error(state, filename, status)
 
     @staticmethod
     def _sync_status(state: _RepositoryPolicy | None) -> str:
@@ -845,11 +877,11 @@ class RepositoryPolicyStore:
                         file_results[filename] = "network_error"
                         continue
                     else:
-                        self._set_file_status(state, filename, "invalid_response")
                         self._record_attempt(
                             state, filename, "invalid_response", source="main",
                             reason="official policy read returned an unexpected error",
                         )
+                        self._mark_candidate_response_error(state, filename)
                         logger.warning(
                             "official policy read returned an unexpected error for %s/%s (%s)",
                             canonical,
@@ -877,11 +909,11 @@ class RepositoryPolicyStore:
 
                 if not isinstance(remote_result, dict):
                     state.last_attempt_source[filename] = "main"
-                    self._set_file_status(state, filename, "invalid_response")
                     self._record_attempt(
                         state, filename, "invalid_response", source="main",
                         reason="official policy response is not an object",
                     )
+                    self._mark_candidate_response_error(state, filename)
                     state.etag.pop(filename, None)
                     logger.warning(
                         "repository policy file response for %s/%s is invalid",
@@ -916,7 +948,8 @@ class RepositoryPolicyStore:
                             state, filename, "invalid_response", source="main",
                             reason="unexpected not-modified response without a trusted main snapshot",
                         )
-                        self._set_file_status(state, filename, "invalid_response")
+                        self._mark_candidate_response_error(state, filename)
+                        state.etag.pop(filename, None)
                         logger.warning(
                             "repository policy file response for %s/%s was unexpectedly not modified",
                             canonical, filename,
@@ -943,7 +976,7 @@ class RepositoryPolicyStore:
                              and re.fullmatch(r"[0-9a-fA-F]{40}", source_sha)
                              else ""),
                     )
-                    self._set_file_status(state, filename, "invalid_response")
+                    self._mark_candidate_response_error(state, filename)
                     state.etag.pop(filename, None)
                     logger.warning(
                         "repository policy file response for %s/%s failed validation",
@@ -1002,10 +1035,8 @@ class RepositoryPolicyStore:
                     self._reject_invalid_update(state, filename)
                     state.etag.pop(filename, None)
                     logger.warning(
-                        "repository policy file %s/%s failed schema validation (%s); authorization for this file was withdrawn",
-                        canonical,
-                        filename,
-                        type(exc).__name__,
+                        "repository policy file %s/%s failed schema validation (%s); prior trusted policy retained when available",
+                        canonical, filename, type(exc).__name__,
                     )
                     file_results[filename] = "invalid_schema"
                     continue

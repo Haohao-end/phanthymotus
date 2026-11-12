@@ -26,10 +26,10 @@ main{{width:min(100% - 32px,680px);margin:48px auto 72px}}
 h1{{margin:0;font-size:clamp(28px,5vw,36px);line-height:1.15;letter-spacing:-.035em}}
 .subtitle{{margin:10px 0 26px;color:#6e6e73}}
 section.panel{{padding:24px;background:#fff;border:1px solid #e5e5ea;border-radius:16px}}
-button,input,textarea{{font:inherit}}
+button,input{{font:inherit}}
 button{{min-height:44px;padding:9px 16px;border:1px solid #0071e3;border-radius:10px;background:#0071e3;color:#fff;font-weight:600;cursor:pointer}}
 button:disabled{{cursor:not-allowed;opacity:.55}}
-button:focus-visible,input:focus-visible,textarea:focus-visible{{outline:3px solid #77aaff;outline-offset:2px}}
+button:focus-visible,input:focus-visible{{outline:3px solid #77aaff;outline-offset:2px}}
 #message{{margin:0 0 16px;color:#b42318;white-space:pre-wrap}}
 #message:empty{{display:none}}
 fieldset{{min-width:0;margin:0;padding:0;border:0}}
@@ -37,8 +37,6 @@ fieldset{{min-width:0;margin:0;padding:0;border:0}}
 #dropzone.dragging{{border-color:#0071e3;background:#f0f7ff}}
 #dropzone input{{max-width:100%;font-size:14px}}
 .file-hint{{margin:5px 0 0;color:#6e6e73;font-size:13px}}
-label.control{{display:block;margin-top:18px;color:#424245;font-size:14px;font-weight:600}}
-textarea{{display:block;width:100%;min-height:78px;margin-top:6px;padding:10px 12px;border:1px solid #d2d2d7;border-radius:9px;background:#fff;color:#1d1d1f;resize:vertical}}
 .primary-row{{display:flex;justify-content:flex-end;margin-top:14px}}
 .list-heading{{margin:24px 0 8px;font-size:16px}}
 .queue{{list-style:none;margin:0;padding:0}}
@@ -69,7 +67,6 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 <section id="upload-section" class="panel">
 <fieldset id="writes" disabled hidden>
 <label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><span class="file-hint">最多 20 个文件 · 单个文件最大 512 MiB · 总计最大 10 GiB</span><input id="file" type="file" multiple></label>
-<label class="control" for="note">文件说明（可选）<textarea id="note" maxlength="5000" aria-describedby="note-help"></textarea><span id="note-help" class="file-hint">说明会随本次选择的文件一起提供给验收人。</span></label>
 <div class="primary-row"><button id="upload" type="button">上传测试证据</button></div>
 </fieldset>
 <h2 class="list-heading" id="queue-heading" hidden>上传进度</h2><ul id="queue" class="queue" aria-labelledby="queue-heading" aria-live="polite"></ul>
@@ -91,7 +88,7 @@ _JAVASCRIPT = r'''"use strict";
   const storageKey = "evidence:" + api + ":" + bound.head_sha + ":" + bound.round_id;
   const proofKey = "evidence-proof:" + api + ":" + bound.head_sha + ":" + bound.round_id;
   const clientKeyStorage = "evidence-client-key:" + api + ":" + bound.head_sha + ":" + bound.round_id;
-  const PART_BYTES = 8 * 1024 * 1024, MAX_BYTES = 512 * 1024 * 1024, MAX_NOTE_CHARS = 5000;
+  const PART_BYTES = 8 * 1024 * 1024, MAX_BYTES = 512 * 1024 * 1024;
   const MAX_FILES = 20, MAX_TOTAL_BYTES = 10 * 1024 * 1024 * 1024;
   const active = new Set(), jobs = [];
   let context = null, stopped = false, pageLeaving = false, busy = false, proofSecret = "", clientKey = "", savedUploads = {};
@@ -183,7 +180,6 @@ _JAVASCRIPT = r'''"use strict";
     const canWrite = writable();
     $("writes").hidden = !canWrite; $("writes").disabled = !canWrite;
     $("upload").disabled = busy || !canWrite; $("file").disabled = busy || !canWrite;
-    $("note").disabled = busy || !canWrite;
     for (const button of document.querySelectorAll("button[data-job-action]"))
       button.disabled = !canWrite || (busy && button.dataset.jobAction !== "pause");
   }
@@ -539,7 +535,7 @@ _JAVASCRIPT = r'''"use strict";
       } else if (!busy && job.status !== "succeeded") runSingle(job);
     };
   }
-  function makeJob(file, replacesId = "", note = "") {
+  function makeJob(file, replacesId = "") {
     const row = document.createElement("li"), heading = document.createElement("div"), title = document.createElement("strong");
     const size = document.createElement("span"), progress = document.createElement("progress");
     const footer = document.createElement("div"), status = document.createElement("span"), detail = document.createElement("span");
@@ -553,7 +549,7 @@ _JAVASCRIPT = r'''"use strict";
     $("queue").append(row); $("queue-heading").hidden = false;
     const job = {file, row, progress, statusNode: status, detailNode: detail, actionButton: action,
       requests: new Set(), parts: new Map(), paused: false, running: false, status: "排队中",
-      completeUnknown: false, replacesId, note};
+      completeUnknown: false, replacesId, noteDigest: ""};
     jobs.push(job); updateJob(job); return job;
   }
   function currentRoundFileQuota(replacementId) {
@@ -680,15 +676,24 @@ _JAVASCRIPT = r'''"use strict";
   async function startOrRestore(job) {
     job.status = "核对中"; updateJob(job, "正在检查文件并准备上传。");
     job.fingerprint = await fileFingerprint(job.file, job);
-    job.noteDigest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(job.note)))]
-      .map(v => v.toString(16).padStart(2, "0")).join("");
     const resumeKey = job.fingerprint + ":" + (job.replacesId || "new") + ":" + job.noteDigest;
     const legacyKey = job.fingerprint + ":" + (job.replacesId || "new") + ":";
-    const saved = savedUploads[resumeKey] || savedUploads[legacyKey];
+    let saved = savedUploads[resumeKey] || savedUploads[legacyKey];
+    if (!saved) {
+      const prefix = legacyKey;
+      const prior = Object.entries(savedUploads).find(([key, value]) =>
+        key.startsWith(prefix) && value && value.fingerprint === job.fingerprint &&
+        value.filename === job.file.name && Number(value.size) === job.file.size &&
+        typeof value.note_digest === "string" && /^[0-9a-f]{64}$/.test(value.note_digest));
+      if (prior) {
+        saved = prior[1];
+        job.noteDigest = saved.note_digest;
+      }
+    }
     if (saved) {
       if (saved.filename && saved.filename !== job.file.name || saved.size && Number(saved.size) !== job.file.size ||
-          saved.replaces_id && saved.replaces_id !== job.replacesId || saved.note_digest && saved.note_digest !== job.noteDigest)
-        throw new Error("保存的上传记录与所选文件或备注不匹配，拒绝混用。");
+          saved.replaces_id && saved.replaces_id !== job.replacesId)
+        throw new Error("保存的上传记录与所选文件不匹配，拒绝混用。");
       job.uploadId = saved.upload_id || ""; job.initKey = saved.init_key || uid();
       job.completeUnknown = saved.complete_unknown === true;
     } else job.initKey = uid();
@@ -697,7 +702,7 @@ _JAVASCRIPT = r'''"use strict";
     if (!job.uploadId) {
       const initialized = await request("/uploads", {method: "POST", key: job.initKey,
         body: {filename: job.file.name, size: job.file.size, content_type: job.file.type || "application/octet-stream",
-          note: job.note, replaces_id: job.replacesId || null}, job});
+          replaces_id: job.replacesId || null}, job});
       if (initialized.head_sha !== bound.head_sha || initialized.round_id !== bound.round_id) {
         halt("上传属于其他 HEAD/round，已停止。请刷新后重试。");
         throw new Error("轮次不匹配");
@@ -869,14 +874,11 @@ _JAVASCRIPT = r'''"use strict";
   }
   async function runUpload() {
     if (busy || !writable()) return;
-    const note = $("note").value;
     const files = Array.from($("file").files || []);
-    if ([...note].length > MAX_NOTE_CHARS) { message("文件说明最多 5000 字，请缩短后重试。"); return; }
     const validationError = validateSelectedFiles(files);
     if (validationError) { message(validationError); return; }
     $("file").value = "";
-    for (const file of files) makeJob(file, "", note);
-    $("note").value = "";
+    for (const file of files) makeJob(file);
     busy = true; controls();
     for (const job of jobs) {
       if (job.status !== "排队中" || stopped) continue;

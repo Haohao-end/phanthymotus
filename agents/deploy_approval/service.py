@@ -5301,7 +5301,12 @@ class DeployController:
     async def handle_evidence_link(
         self, repo: str, pr_number: int, comment_id: int, actor: str, actor_id: str,
     ) -> bool:
-        """Consume deprecated requests without signing or replying with links."""
+        """Consume deprecated requests without creating or returning a link."""
+        await self._post_command_reply(
+            repo, pr_number, comment_id,
+            "`/evidence_link` 已停用，本次没有生成下载链接。请查看当前 Lifecycle Summary 中的有效证据入口；需要查询部署状态时可使用 `/deploy_status`。",
+            topic="evidence-link-deprecated",
+        )
         return True
 
     async def handle_deploy_status(
@@ -6044,16 +6049,46 @@ class DeployController:
             if isinstance(check, dict) and isinstance(check.get("machine"), str):
                 checks_by_alias.setdefault(check["machine"], []).append(check)
 
-        identities: dict[str, tuple[str, str, list[str], bool, str]] = {}
+        try:
+            policy_status = self.policy.repo_policy_status(repo)
+        except Exception as exc:
+            logger.warning(
+                "runtime display repository policy unavailable repo=%s reason=%s",
+                repo, type(exc).__name__,
+            )
+            policy_status = None
+        repository_authorized = (
+            isinstance(policy_status, dict)
+            and policy_status.get("authorized") is True
+            and policy_status.get("machines_configured") is True
+        )
+        try:
+            policy_machines = (
+                self.policy.get_machines(repo=repo) if repository_authorized else []
+            )
+            if not isinstance(policy_machines, list):
+                policy_machines = []
+        except Exception as exc:
+            logger.warning(
+                "runtime display machine policy unavailable repo=%s reason=%s",
+                repo, type(exc).__name__,
+            )
+            policy_machines = []
+
+        identities: dict[str, tuple[str, list[str], bool, str]] = {}
         diagnostics = []
         for alias, machine_checks in checks_by_alias.items():
             primary_ip, selector, owners = self._runtime_display_identity(alias, repo)
+            machine_repository_authorized = (
+                repository_authorized
+                and sum(getattr(item, "alias", None) == alias for item in policy_machines) == 1
+            )
             owners = sorted({
                 owner.strip() for owner in owners
                 if isinstance(owner, str) and _LOGIN_RE.fullmatch(owner.strip())
                 and not owner.strip().casefold().endswith("[bot]")
             }, key=str.casefold)
-            identity_confirmed = bool(primary_ip and selector)
+            machine_identity_confirmed = bool(primary_ip)
             mismatch_ids = {
                 item.get("component_id") for item in machine_checks
                 if item.get("status") == "mismatch"
@@ -6062,7 +6097,8 @@ class DeployController:
             mismatch_components = [component_by_id[item] for item in mismatch_ids
                                    if item in component_by_id]
             safe_selector = ""
-            if (identity_confirmed and mismatch_ids
+            if (machine_repository_authorized and machine_identity_confirmed and selector
+                    and mismatch_ids
                     and len(mismatch_components) == len(mismatch_ids)):
                 eligible_group = next((group for group in self._get_machine_groups_for_components(
                     mismatch_components, repo,
@@ -6075,27 +6111,20 @@ class DeployController:
                     if group_selector == selector:
                         safe_selector = selector
 
-            # The renderer can read legacy machine commands from the existing
-            # summary. Mark a row unconfirmed unless its current command context
-            # is verified, so those legacy selectors cannot be reused.
-            command_context_confirmed = identity_confirmed and (
-                not mismatch_ids or bool(safe_selector)
-            )
             identities[alias] = (
-                primary_ip if identity_confirmed else "",
-                selector if identity_confirmed else "",
-                owners if identity_confirmed else [],
-                identity_confirmed,
+                primary_ip if machine_identity_confirmed else "",
+                owners if machine_identity_confirmed and machine_repository_authorized else [],
+                machine_identity_confirmed,
                 safe_selector,
             )
             diagnostics.append({
                 "alias": alias,
-                "primary_ip": primary_ip if identity_confirmed else "",
-                "node_host": primary_ip if identity_confirmed else "",
-                "owners": owners if identity_confirmed else [],
-                "duplicate_ip": bool(identity_confirmed and selector == alias),
-                "repository_authorized": identity_confirmed,
-                "identity_confirmed": command_context_confirmed,
+                "primary_ip": primary_ip if machine_identity_confirmed else "",
+                "node_host": primary_ip if machine_identity_confirmed else "",
+                "owners": owners if machine_identity_confirmed and machine_repository_authorized else [],
+                "duplicate_ip": bool(machine_identity_confirmed and selector == alias),
+                "repository_authorized": machine_repository_authorized,
+                "identity_confirmed": machine_identity_confirmed,
             })
 
         display_checks = []
@@ -6104,16 +6133,13 @@ class DeployController:
                 continue
             item = copy.deepcopy(check)
             alias = str(item.get("machine", "") or "")
-            primary_ip, selector, owners, identity_confirmed, safe_selector = identities.get(
-                alias, ("", "", [], False, ""),
+            primary_ip, owners, machine_identity_confirmed, safe_selector = identities.get(
+                alias, ("", [], False, ""),
             )
             item["primary_ip"] = primary_ip
-            item["command_selector"] = (
-                safe_selector if item.get("status") == "mismatch"
-                else selector if identity_confirmed else ""
-            )
+            item["command_selector"] = safe_selector
             item["owners"] = owners if owners else ["负责人待配置"]
-            item["ip"] = primary_ip if identity_confirmed else ""
+            item["ip"] = primary_ip if machine_identity_confirmed else ""
             display_checks.append(item)
         updated = comments_mod.update_runtime_image_checks(
             markdown, display_checks, components,
@@ -6123,10 +6149,10 @@ class DeployController:
             test_only=test_only,
         )
         unverified_aliases = {
-            alias for alias, values in identities.items() if not values[3]
+            alias for alias, values in identities.items() if not values[2]
         }
         unverified_owner_aliases = {
-            alias for alias, values in identities.items() if not values[2]
+            alias for alias, values in identities.items() if not values[1]
         }
         if unverified_aliases or unverified_owner_aliases:
             start_marker = "<!-- deploy-approval-runtime-checks:start -->"
@@ -8762,7 +8788,7 @@ class DeployController:
         def projection_body(rendered_section):
             projection = start + "\n" + rendered_section + "\n" + end
             result = visible.rstrip() + "\n\n" + projection
-            if history and state.get("status") != "testing":
+            if history:
                 result += "\n\n" + history
             return result
 
@@ -8911,12 +8937,18 @@ class DeployController:
         expected_lifecycle_state: dict | None = None,
         write_guard: Any | None = None,
         archive_reason: str = "Lifecycle snapshot replaced",
+        runtime_projection_only: bool = False,
     ) -> bool:
         """Write lifecycle comment with automatic history management.
 
         If event is provided, it is appended to the visible History section.
         Legacy v1 migration is handled automatically on first meaningful event.
         Preserves existing History events across lifecycle rewrites.
+
+        runtime_projection_only persists refreshed runtime scan results by
+        replacing only the existing Next action inside the current Summary.
+        It does not rebuild the Summary, recreate the Evidence Projection or
+        normalize History, and it never appends a lifecycle event.
         """
         runtime_checks = state.get("runtime_checks", [])
         display_pr = None
@@ -8925,6 +8957,92 @@ class DeployController:
                 display_pr = await self.proxy.get_pr(repo, pr_number)
             except Exception:
                 display_pr = None
+        if runtime_projection_only:
+            from .github_state_proxy import HIDDEN_STATE_MARKER
+            source_comment = await self.proxy.find_trusted_lifecycle_comment(
+                repo, pr_number,
+            )
+            if (not isinstance(source_comment, dict)
+                    or not isinstance(source_comment.get("id"), int)
+                    or not isinstance(source_comment.get("body"), str)):
+                return False
+            source_body = source_comment["body"]
+            hidden_index = source_body.find(HIDDEN_STATE_MARKER)
+            if hidden_index < 0:
+                return False
+            source_visible = source_body[:hidden_index].rstrip("\n")
+            # Replacing only the Next action keeps every other byte of the
+            # current Summary (Status, Workflow, Evidence, History) intact.
+            projected_visible = self._render_runtime_checks_for_display(
+                source_visible,
+                runtime_checks if isinstance(runtime_checks, list) else [],
+                state.get("components", []), repo, state.get("status", ""), display_pr,
+            )
+            before_bounds = comments_mod._next_action_body_bounds(source_visible)
+            outside_changed = True
+            if before_bounds is None:
+                # No locatable Next action: the renderer must not have touched
+                # anything at all, otherwise the write would rewrite sections
+                # this path is not allowed to rebuild.
+                outside_changed = projected_visible != source_visible
+            else:
+                source_prefix = source_visible[:before_bounds[0]]
+                next_action_body = source_visible[before_bounds[0]:before_bounds[1]]
+                source_suffix = source_visible[before_bounds[1]:]
+                trailing = next_action_body[len(next_action_body.rstrip("\n")):]
+                if projected_visible.startswith(source_prefix):
+                    rest = projected_visible[len(source_prefix):]
+                    rendered_body = None
+                    if source_suffix and rest.endswith(source_suffix):
+                        rendered_body = rest[:-len(source_suffix)]
+                    elif source_suffix and rest.endswith(source_suffix.lstrip("\n")):
+                        # First runtime insertion into a Summary that had no
+                        # runtime marker consumes the blank line that keeps the
+                        # next section on its own line. The suffix itself is
+                        # otherwise untouched.
+                        rendered_body = rest[:-len(source_suffix.lstrip("\n"))]
+                    elif not source_suffix:
+                        rendered_body = rest
+                    if rendered_body is not None:
+                        # Rebuild as original prefix + rendered Next action
+                        # body + original trailing separator + original
+                        # suffix. Every byte outside Next action is reused
+                        # from the current Summary, never re-rendered.
+                        if trailing and not rendered_body.endswith(trailing):
+                            rendered_body = rendered_body.rstrip("\n") + trailing
+                        projected_visible = (
+                            source_prefix + rendered_body + source_suffix
+                        )
+                        outside_changed = False
+            if outside_changed:
+                # The renderer touched bytes outside Next action. Never persist
+                # that; the next scan retries against a well-formed Summary.
+                logger.warning(
+                    "runtime image projection skipped: rendering would change "
+                    "content outside Next action repo=%s pr=%s",
+                    repo, pr_number,
+                )
+                return False
+            async with self._evidence_lock:
+                if expected_lifecycle_state is not None:
+                    fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
+                    if fresh_state != expected_lifecycle_state:
+                        return False
+                current_pr = await self.proxy.get_pr(repo, pr_number)
+                if (not isinstance(current_pr, dict)
+                        or current_pr.get("state") != "open"
+                        or current_pr.get("merged") or current_pr.get("draft")
+                        or current_pr.get("head", {}).get("sha") != state.get("head_sha")):
+                    return False
+                written = await self.proxy.write_hidden_state(
+                    repo, pr_number, projected_visible, state,
+                    expected_comment=(source_comment["id"], source_body),
+                )
+                if not isinstance(written, dict):
+                    raise GitHubStateProxyError(
+                        "Lifecycle state write was not confirmed",
+                    )
+                return True
         new_visible_markdown = self._render_runtime_checks_for_display(
             new_visible_markdown,
             runtime_checks if isinstance(runtime_checks, list) else [],
@@ -11128,8 +11246,8 @@ class DeployController:
                 return state
             from .github_state_proxy import HIDDEN_STATE_MARKER
             visible = lifecycle["body"].split(HIDDEN_STATE_MARKER, 1)[0].rstrip()
-            if (state.get("status") != new_state.get("status")
-                    and new_state.get("status") == "testing"):
+            lifecycle_transition = state.get("status") != new_state.get("status")
+            if lifecycle_transition and new_state.get("status") == "testing":
                 updated_visible = comments_mod.testing(
                     repo, pr_number, new_state["head_sha"],
                     deployments=self._enrich_deployments_for_render(
@@ -11140,12 +11258,6 @@ class DeployController:
                 )
             else:
                 updated_visible = visible
-            updated_visible = comments_mod.update_runtime_image_checks(
-                updated_visible, new_state.get("runtime_checks", []),
-                new_state.get("components", []),
-                lifecycle_status=new_state.get("status", ""),
-                test_only=test_only,
-            )
             transitions: dict[tuple[str, str, str, str], list[tuple[dict, str]]] = {}
             for key, check in selected_results.items():
                 old = old_by_key.get(key)
@@ -11168,6 +11280,7 @@ class DeployController:
             written = await self._write_lifecycle_with_history(
                 repo, pr_number, new_state, updated_visible,
                 expected_lifecycle_state=state,
+                runtime_projection_only=not lifecycle_transition,
             )
             if not written:
                 return state

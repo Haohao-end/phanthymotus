@@ -3311,6 +3311,21 @@ class GitHubCommandWatcher:
                         repo, pr_number, comment_id,
                         failure_reason="command_handler_returned_unfinished",
                     )
+                    post_reply = getattr(self.controller, "_post_command_reply", None)
+                    if callable(post_reply):
+                        try:
+                            await post_reply(
+                                repo, pr_number, comment_id,
+                                f"`/{cmd.kind}` 尚未完成，Controller 未确认执行结果，因此本次不会标记为成功。"
+                                "请查看 Lifecycle Summary；若状态为 `deploying` 或结果仍在确认中，请等待只读恢复检查完成后再提交新命令。",
+                                topic=f"command-unfinished-{cmd.kind}",
+                            )
+                        except Exception as reply_error:
+                            logger.warning(
+                                "unfinished command notice failed repo=%s pr=%s comment_id=%s reason=%s",
+                                repo, pr_number, comment_id,
+                                _github_failure_reason(reply_error),
+                            )
                 # False means unfinished work (including COS failure). Never
                 # consume a later comment past it; retry from fresh state next poll.
                 return
@@ -3328,6 +3343,20 @@ class GitHubCommandWatcher:
                                     else "cursor_persist_not_confirmed"),
                     retryable=not consumed,
                 )
+                post_reply = getattr(self.controller, "_post_command_reply", None)
+                if callable(post_reply):
+                    try:
+                        await post_reply(
+                            repo, pr_number, comment_id,
+                            f"`/{cmd.kind}` 未执行：命令无法处理。请检查 Lifecycle Summary 和当前命令格式后，再发送新的命令。",
+                            topic=f"command-rejected-{cmd.kind}",
+                        )
+                    except Exception as reply_error:
+                        logger.warning(
+                            "command rejection notice failed repo=%s pr=%s comment_id=%s reason=%s",
+                            repo, pr_number, comment_id,
+                            _github_failure_reason(reply_error),
+                        )
                 return
             except Exception as e:
                 self._finish_recent_command(
@@ -3338,6 +3367,25 @@ class GitHubCommandWatcher:
                     "command handler outcome unknown command=%s comment_id=%s repo=%s pr=%s error=%s; automatic replay suppressed",
                     cmd.kind, comment_id, repo, pr_number, _github_failure_reason(e),
                 )
+                # A handler may persist an in-progress deployment before
+                # failing. Keep automatic replay suppressed and give the user
+                # an idempotent status note without claiming success or failure.
+                post_reply = getattr(self.controller, "_post_command_reply", None)
+                if callable(post_reply):
+                    try:
+                        await post_reply(
+                            repo, pr_number, comment_id,
+                            f"`/{cmd.kind}` 的执行结果暂时无法确认。当前命令不会自动重放；"
+                            "请检查 Lifecycle Summary。若状态为 `deploying` 或结果仍在确认中，"
+                            "请等待只读恢复检查完成后再提交新的审批命令。",
+                            topic=f"command-outcome-unknown-{cmd.kind}",
+                        )
+                    except Exception as reply_error:
+                        logger.warning(
+                            "command outcome notice failed repo=%s pr=%s comment_id=%s reason=%s",
+                            repo, pr_number, comment_id,
+                            _github_failure_reason(reply_error),
+                        )
                 # Transient error — do NOT advance cursor, stop processing this PR
                 return
 

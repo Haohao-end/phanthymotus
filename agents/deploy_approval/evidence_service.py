@@ -31,6 +31,7 @@ from .evidence_models import (
 )
 
 UPLOAD_MAX_NOTES = 20
+_COMMENTABLE_MEDIA_SUFFIXES = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4', '.webm'}
 _CURRENT_CONTEXT_HISTORY_TIMEOUT_SECONDS = 8
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,8 @@ class EvidenceService:
                 or operation.get('pr_number') != pr_number
                 or operation.get('status') != 'ready'
                 or operation.get('cos_content_verified') is not True
+                or operation.get('evidence_kind') == 'note'
+                or operation.get('internal_bot_note') is True
                 or not isinstance(operation.get('object_key'), str)
                 or not operation['object_key']
                 or type(operation.get('size')) is not int or operation['size'] <= 0
@@ -195,6 +198,21 @@ class EvidenceService:
                 or re.fullmatch(r'[A-Za-z0-9_-]{1,128}', attachment_id) is None
                 or not isinstance(filename, str) or not filename.strip()):
             return False
+        if PurePosixPath(filename).suffix.lower() not in _COMMENTABLE_MEDIA_SUFFIXES:
+            return False
+
+        actor_login = operation.get('actor_login') or operation.get('actor')
+        note_text = operation.get('note')
+        if isinstance(actor_login, str) and actor_login.casefold() == '4pd-pr-assistant[bot]' \
+                and isinstance(note_text, str):
+            normalized_note = ' '.join(note_text.split()).casefold()
+            internal_notes = (
+                'server-side cos multipart acceptance',
+                'server-side 20mb h.264 cos transport acceptance',
+            )
+            if any(normalized_note == template or normalized_note.startswith(template + ' ')
+                   for template in internal_notes):
+                return False
 
         from . import comments as comments_mod, evidence_auth
         public_base = getattr(self.config, 'evidence_public_base_url', '')
@@ -209,17 +227,14 @@ class EvidenceService:
                 repo, pr_number, attachment_id, capability,
                 action='download', public_base_url=public_base,
             )
-            suffix = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-            preview_url = ''
-            if suffix in {'png', 'jpg', 'jpeg', 'gif', 'webp'}:
-                preview_url = comments_mod.stable_attachment_url(
-                    repo, pr_number, attachment_id, capability,
-                    action='preview', public_base_url=public_base,
-                )
+            preview_url = comments_mod.stable_attachment_url(
+                repo, pr_number, attachment_id, capability,
+                action='preview', public_base_url=public_base,
+            )
             body = comments_mod.evidence_upload_comment(
                 repo, pr_number, head_sha, round_id, attachment_id, filename,
                 download_url=download_url, preview_url=preview_url,
-                note=operation.get('note', ''), public_base_url=public_base,
+                public_base_url=public_base,
             )
         except Exception as exc:
             logger.warning(
