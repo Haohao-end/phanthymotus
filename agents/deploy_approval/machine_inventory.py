@@ -4,8 +4,18 @@ This file contains identity and verified descriptive metadata only. The supplied
 driver-directory snapshot reference is 814b3ca953d33eba0aca9a61dcefa773f5da483b.
 This file must not be used to authorize deployments or hold credentials. The former
 ``p200pro-011`` record was removed and is intentionally not assigned to a
-current machine; the old ``x2-012`` and ``rm75-014`` identities map to their
-current physical-machine aliases below.
+current machine; the old ``x2-012`` identity maps to ``x2-011``.
+
+``4paradigm/phanthymotus-driver#473`` is kept as historical evidence only: it
+records a deployment of ``rm75-014`` at ``10.110.8.244`` with
+``driver_path=realman/rm75_6f_v``. That record is NOT an authorization source.
+The historical address is deliberately absent from this file, and neither
+``rm75-014`` nor that address is used to claim, or to bind, any current
+physical identity — a similar legacy alias alone never proves the same machine.
+``machines.yaml`` on the official repository main branch is the only
+authorization source, and identity must be re-verified there. ``tron2-019`` has
+no verified primary address; none is inferred for it, and one primary IP never
+binds two physical identities.
 """
 
 from __future__ import annotations
@@ -21,11 +31,9 @@ _PLATFORM_LINUX_ARM64 = "linux/arm64"
 _PLATFORM_SOURCE_EXPLICIT = (
     "PHANTHYMOTUS_V44U explicit machine platform verification evidence"
 )
-_PLATFORM_SOURCE_RM75 = (
-    f"{_OWNER_SOURCE_V16}: rm75-014 platform=linux/arm64; migrated to rm75-013 "
-    "through the retained legacy_aliases mapping and matching driver_path="
-    "realman/rm75_6f_v"
-)
+# Historical evidence only; it never authorizes or binds a current identity.
+_RM75_HISTORICAL_ALIAS = "rm75-014"
+_RM75_HISTORICAL_IP = "10.110.8.244"
 
 
 def _record(
@@ -113,12 +121,9 @@ _INVENTORY = (
     _record("012", "adam-pro-012", "柏奥尼克", "Adam Pro", "10.100.128.154",
             secondary_ips=("10.10.20.126",),
             driver_path="pndbotics/adam", driver_path_verified=True),
-    _record("013", "rm75-013", "睿尔曼", "RM75-6f-v", "10.100.130.37",
+    _record("013", "rm75-013", "睿尔曼", "RM75-6f-v", "",
             owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
-            legacy_aliases=("rm75-014",),
-            driver_path="realman/rm75_6f_v", driver_path_verified=True,
-            platforms=(_PLATFORM_LINUX_ARM64,), platform_status="verified",
-            platform_source=_PLATFORM_SOURCE_RM75),
+            driver_path="realman/rm75_6f_v", driver_path_verified=True),
     _record("014", "as2w-014", "宇树", "As2 W", "10.100.129.146",
             secondary_ips=("10.100.128.245",),
             driver_path="unitree/as2w", driver_path_verified=True),
@@ -131,7 +136,7 @@ _INVENTORY = (
             driver_path="ubtrobot/u1_pro", driver_path_verified=True),
     _record("018", "piper-018", "松灵AgileX", "Piper上海", "10.110.10.46",
             driver_path="agilex/piper", driver_path_verified=True),
-    _record("019", "tron2-019", "逐际动力", "Tron2上海", "10.110.8.244",
+    _record("019", "tron2-019", "逐际动力", "Tron2上海", "",
             driver_path="limx/tron2", driver_path_verified=True),
     _record("020", "s10pro-020", "云深处", "山猫S10-pro", "10.100.128.127",
             driver_path="deep_robotics/s10_pro", driver_path_verified=True),
@@ -158,7 +163,7 @@ def _validate_static_inventory() -> None:
         if machine["platform_status"] == "verified"
     }
     if verified_platforms != {
-        "beijing-g1-001", "tianyi2-005", "q5-010", "rm75-013",
+        "beijing-g1-001", "tianyi2-005", "q5-010",
     }:
         raise RuntimeError("only evidence-backed physical machines may have verified platforms")
     if sum(machine["owner_status"] == "verified" for machine in _INVENTORY) != 12:
@@ -167,6 +172,7 @@ def _validate_static_inventory() -> None:
         raise RuntimeError("the nine newly added machine owners must remain pending")
     numbers: set[str] = set()
     aliases: set[str] = set()
+    primary_ips: set[str] = set()
     for expected_number, machine in enumerate(_INVENTORY, start=1):
         if set(machine) != _REQUIRED_FIELDS:
             raise RuntimeError("physical machine inventory record has invalid fields")
@@ -177,7 +183,15 @@ def _validate_static_inventory() -> None:
         numbers.add(machine["number"])
         aliases.add(machine["alias"])
         addresses = [machine["primary_ip"], *machine["secondary_ips"]]
+        # An empty primary IP means "no verified address". It is permitted but
+        # must never be inferred from another record, and secondary addresses
+        # must always be real.
+        if not machine["primary_ip"] and machine["secondary_ips"]:
+            raise RuntimeError("physical machine without a verified primary IP "
+                               "must not claim secondary addresses")
         for address in addresses:
+            if not address:
+                continue
             try:
                 parsed = _ipaddress.ip_address(address)
             except ValueError as exc:
@@ -186,6 +200,12 @@ def _validate_static_inventory() -> None:
                 raise RuntimeError("physical machine inventory IPs must be IPv4")
         if len(addresses) != len(set(addresses)):
             raise RuntimeError("one machine record must not repeat an IP")
+        primary_ip = machine["primary_ip"]
+        if primary_ip:
+            if primary_ip in primary_ips:
+                raise RuntimeError(
+                    "one primary IP must not bind two physical machine identities")
+            primary_ips.add(primary_ip)
         if machine["owner_status"] not in {"verified", "pending"}:
             raise RuntimeError("physical machine owner status is invalid")
         if machine["platform_status"] not in {"verified", "unverified"}:
@@ -221,10 +241,20 @@ def _validate_static_inventory() -> None:
     by_alias = {machine["alias"]: machine for machine in _INVENTORY}
     if by_alias["x2-011"]["legacy_aliases"] != ["x2-012"]:
         raise RuntimeError("X2 historical alias must remain linked to x2-011")
-    if (by_alias["rm75-013"]["legacy_aliases"] != ["rm75-014"]
-            or by_alias["rm75-013"]["driver_path"] != "realman/rm75_6f_v"
-            or by_alias["rm75-013"]["platform_source"] != _PLATFORM_SOURCE_RM75):
-        raise RuntimeError("RM75 platform migration must stay bound to its verified legacy identity")
+    # Historical evidence never binds a current physical identity. A similar
+    # legacy alias must not promote rm75-014 to rm75-013, and the historical
+    # address must not appear anywhere in the descriptive inventory.
+    if by_alias["rm75-013"]["legacy_aliases"] or any(
+            by_alias["rm75-013"][name] in {_RM75_HISTORICAL_ALIAS, _RM75_HISTORICAL_IP}
+            for name in ("alias", "primary_ip", "driver_path")):
+        raise RuntimeError("RM75 identity must not be bound from historical alias evidence")
+    if by_alias["tron2-019"]["primary_ip"] != "":
+        raise RuntimeError("tron2-019 has no verified primary address")
+    for machine in _INVENTORY:
+        if _RM75_HISTORICAL_IP in [
+                machine["primary_ip"], *machine["secondary_ips"],
+        ]:
+            raise RuntimeError("historical PR #473 address must not be written to the inventory")
     if (by_alias["c23-021"]["driver_path"] is not None
             or by_alias["c23-021"]["driver_path_verified"] is not False):
         raise RuntimeError("C23 driver path must remain unverified")

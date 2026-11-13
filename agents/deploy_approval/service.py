@@ -1872,7 +1872,7 @@ class DeployController:
             groups = []
         command_lines = self._machine_notice_lines(
             groups, repo, mention_owners=False,
-            test_only=self._is_test_only_pr(pr),
+            test_only=self._is_test_only_pr(pr), components=remaining,
         )
         next_step = (
             "Use a current complete machine command below to submit a new approval after checking the Summary."
@@ -1962,12 +1962,24 @@ class DeployController:
                     return True
                 if state.get("runtime_redeploy"):
                     commands = self._runtime_drift_command_lines(state, repo)
+                    if commands:
+                        drift_reply = [
+                            "当前漂移轮次已经创建。请机器负责人直接使用对应机器的审批命令；"
+                            "`/request_deploy` 不是前提：",
+                            *(f"`{line}`" for line in commands),
+                        ]
+                    else:
+                        unreadable = self._runtime_unreadable_lines(
+                            state.get("runtime_checks", []),
+                        )
+                        drift_reply = [
+                            "当前漂移轮次已创建，但没有可安全生成的重新审批命令。",
+                            *unreadable,
+                            "请恢复机器连接与仓库策略，等待下一次状态检查。",
+                        ]
                     await self._post_command_reply(
                         repo, pr_number, comment_id,
-                        "当前漂移轮次已经创建。请机器负责人直接使用对应机器的审批命令；"
-                        "`/request_deploy` 不是前提：\n"
-                        + ("\n".join(f"`{line}`" for line in commands)
-                           if commands else "当前状态无法确认漂移机器，请检查本仓库机器策略。"),
+                        "\n".join(drift_reply),
                         topic="runtime-redeploy-request-already-pending",
                     )
                     return True
@@ -1976,13 +1988,13 @@ class DeployController:
                     runtime_redeploy_request = True
                 else:
                     checks = state.get("runtime_checks", [])
-                    if any(isinstance(check, dict)
-                           and check.get("status") in {"unavailable", "identity_changed"}
-                           for check in checks):
-                        message = (
-                            "当前机器状态无法确认，不能创建漂移重新部署轮次。请检查机器连接和本仓库策略，"
-                            "等待状态检查确认后再试；ZERO deploy POST。"
-                        )
+                    unreadable = self._runtime_unreadable_lines(checks)
+                    if unreadable:
+                        message = "\n".join([
+                            "当前机器运行状态不可读，不能创建漂移重新部署轮次；ZERO deploy POST。",
+                            *unreadable,
+                            "请恢复机器连接和本仓库策略，等待状态检查确认后再试。",
+                        ])
                         topic = "runtime-redeploy-request-state-unavailable"
                     elif (_current_status in {"testing", "succeeded", "failed"}
                           and checks
@@ -2180,7 +2192,12 @@ class DeployController:
                         message = "重新检查确认运行镜像已与审批目标一致，无需重新部署；ZERO deploy POST。"
                         topic = "runtime-redeploy-request-already-matches"
                     else:
-                        message = "重新检查无法确认镜像漂移。请检查机器连接与仓库策略，等待状态可读后再申请；ZERO deploy POST。"
+                        unreadable = self._runtime_unreadable_lines(fresh_checks)
+                        message = "\n".join([
+                            "重新检查未确认镜像漂移；ZERO deploy POST。",
+                            *unreadable,
+                            "请恢复机器连接与仓库策略，等待状态可读后再申请。",
+                        ])
                         topic = "runtime-redeploy-request-state-unavailable"
                     await self._post_command_reply(
                         repo, pr_number, comment_id, message, topic=topic,
@@ -2285,6 +2302,7 @@ class DeployController:
                 command_lines = self._machine_notice_lines(
                     machine_groups, repo, mention_owners=True,
                     test_only=self._is_test_only_pr(fresh_pr),
+                    components=working_state.get("components", []),
                 )
                 await self._post_bound_notice(
                     repo, pr_number, head_sha=pr_head,
@@ -2293,8 +2311,15 @@ class DeployController:
                     expected_command_kind="request_deploy",
                     message="\n".join([
                         f"已为 HEAD `{_short(pr_head)}` 的本轮 `{round_id_for_state(working_state)}` 创建镜像漂移部署请求。",
-                        "下一步：机器负责人可直接使用以下对应机器命令审批；`/request_deploy` 仍是可选申请。",
-                        *command_lines,
+                        *(
+                            [
+                                "下一步：机器负责人可直接使用以下对应机器命令审批；"
+                                "`/request_deploy` 仍是可选申请。",
+                                *command_lines,
+                            ]
+                            if command_lines else
+                            self._machine_blocking_summary(machine_groups)
+                        ),
                     ]),
                 )
                 return True
@@ -2364,13 +2389,16 @@ class DeployController:
             await self._project_status_best_effort(repo, pr_number, "deploy-requested")
             command_lines = self._machine_notice_lines(
                 machine_groups, repo, mention_owners=True,
-                test_only=self._is_test_only_pr(pr_data),
+                test_only=self._is_test_only_pr(pr_data), components=components,
             )
-            if not command_lines:
-                command_lines = [
-                    "当前没有适配且可访问的机器，无法生成可执行的审批命令。"
-                    "请检查当前仓库机器配置和 Agent Core 访问。"
+            if command_lines:
+                next_step_lines = [
+                    "下一步：请对应机器负责人使用以下完整命令审批；"
+                    "只有执行 `/request_deploy` 后才会发送负责人提醒。",
+                    *command_lines,
                 ]
+            else:
+                next_step_lines = self._machine_blocking_summary(machine_groups)
             await self._post_bound_notice(
                 repo, pr_number, head_sha=pr_head,
                 round_id=round_id_for_state(state), comment_id=comment_id,
@@ -2378,8 +2406,7 @@ class DeployController:
                 expected_command_kind="request_deploy",
                 message="\n".join([
                     f"已为 HEAD `{_short(pr_head)}` 的本轮 `{round_id_for_state(state)}` 请求部署审批。",
-                    "下一步：请对应机器负责人使用以下完整命令审批；只有执行 `/request_deploy` 后才会发送负责人提醒。",
-                    *command_lines,
+                    *next_step_lines,
                 ]),
             )
             return True
@@ -2707,13 +2734,25 @@ class DeployController:
                 message = "重新检查确认运行镜像已与审批目标一致，无需重新部署，ZERO deploy POST。"
                 topic = "runtime-redeploy-already-matches"
             elif any(check.get("status") == "identity_changed" for check in current_checks):
-                message = "机器 alias/IP 绑定已变化，无法确认当前运行镜像。请管理员核对本仓库机器策略后等待重新检查；ZERO deploy POST。"
+                message = "\n".join([
+                    "机器 alias/IP 绑定已变化，无法确认当前运行镜像；ZERO deploy POST。",
+                    *self._runtime_unreadable_lines(current_checks),
+                    "请管理员核对本仓库机器策略后等待重新检查。",
+                ])
                 topic = "runtime-redeploy-identity-changed"
             elif any(check.get("status") == "not_running" for check in current_checks):
-                message = "指定机器的目标运行时未处于 running 状态，无法确认镜像漂移。恢复运行时并等待重新检查；ZERO deploy POST。"
+                message = "\n".join([
+                    "指定机器的目标运行时未处于 running 状态，无法确认镜像漂移；ZERO deploy POST。",
+                    *self._runtime_unreadable_lines(current_checks),
+                    "恢复运行时并等待重新检查。",
+                ])
                 topic = "runtime-redeploy-not-running"
             elif any(check.get("status") == "unavailable" for check in current_checks):
-                message = "无法连接机器或读取运行状态，不能确认是否需要重新部署。恢复机器访问后等待下一次检查；ZERO deploy POST。"
+                message = "\n".join([
+                    "无法连接机器或读取运行状态，不能确认是否需要重新部署；ZERO deploy POST。",
+                    *self._runtime_unreadable_lines(current_checks),
+                    "恢复机器访问后等待下一次检查。",
+                ])
                 topic = "runtime-redeploy-unavailable"
             else:
                 message = "当前没有可确认的镜像漂移，请等待机器状态重新检查；ZERO deploy POST。"
@@ -3060,25 +3099,27 @@ class DeployController:
                     command_lines = self._machine_notice_lines(
                         options, repo, mention_owners=False,
                         test_only=self._is_test_only_pr(pr_data),
+                        components=remaining_for_selection,
                     )
                     if not command_lines:
-                        explanation = (
-                            "No deployable machine matches the remaining components' target, platform, "
-                            "variant, and driver path, or its Agent Core access is unavailable. "
-                            "Check this repository's machine policy and machine access configuration."
-                        )
-                    elif full_groups:
-                        explanation = "Several fully compatible machines are available. Choose one explicitly:"
+                        reply = "\n".join(self._machine_blocking_summary(options))
                     else:
-                        explanation = (
-                            "No single machine covers every remaining component. Choose an adapted "
-                            "machine explicitly for partial deployment:"
-                        )
-                    reply = "\n".join([
-                        explanation,
-                        *command_lines,
-                        "Use one of the complete machine commands above; no machine was selected automatically.",
-                    ])
+                        if full_groups:
+                            explanation = (
+                                "Several fully compatible machines are available. "
+                                "Choose one explicitly:"
+                            )
+                        else:
+                            explanation = (
+                                "No single machine covers every remaining component. Choose an adapted "
+                                "machine explicitly for partial deployment:"
+                            )
+                        reply = "\n".join([
+                            explanation,
+                            *command_lines,
+                            "Use one of the complete machine commands above; "
+                            "no machine was selected automatically.",
+                        ])
                     await self._post_command_reply(
                         repo, pr_number, comment_id, reply,
                         topic="approve-deploy-machine-selection",
@@ -3097,18 +3138,23 @@ class DeployController:
                     and component.get("component_id") not in deployed_ids
                 ]
                 try:
+                    remaining_groups = self._get_machine_groups_for_components(
+                        remaining_components, repo,
+                    )
                     available_commands = self._machine_notice_lines(
-                        self._get_machine_groups_for_components(remaining_components, repo),
-                        repo, mention_owners=False,
+                        remaining_groups, repo, mention_owners=False,
                         test_only=self._is_test_only_pr(pr_data),
+                        components=remaining_components,
                     )
                 except Exception as exc:
                     logger.warning("compatible machine list unavailable %s#%s exception=%s",
                                    repo, pr_number, type(exc).__name__)
+                    remaining_groups = []
                     available_commands = []
                 suggestion = (
                     "\nAvailable compatible commands:\n" + "\n".join(available_commands)
-                    if available_commands else "\nNo compatible deployable machine is currently available; check repository machine policy and machine access."
+                    if available_commands else
+                    "\n" + "\n".join(self._machine_blocking_summary(remaining_groups))
                 )
                 await self._post_error(
                     repo, pr_number,
@@ -3236,6 +3282,7 @@ class DeployController:
                 command_lines = self._machine_notice_lines(
                     compatible_groups, repo, mention_owners=False,
                     test_only=self._is_test_only_pr(pr_data),
+                    components=undeployed_components,
                 )
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
@@ -3511,6 +3558,8 @@ class DeployController:
 
             new_deployments = []
             deploy_error = None
+            failed_component_id = ""
+            failed_component_target = ""
             deploy_outcome_uncertain = False
             deploy_preflight_unavailable = False
             runtime_unconfirmed_components = []
@@ -3523,6 +3572,8 @@ class DeployController:
                 runtime_id = str(comp.get("runtime_id") or "")
                 component_id = comp.get("component_id", "")
                 comp_target = comp.get("target", "")
+                failed_component_id = str(component_id)
+                failed_component_target = str(comp_target)
                 if not runtime_id:
                     deploy_error = f"missing runtime id for {comp_target}"
                     break
@@ -4204,11 +4255,20 @@ class DeployController:
                 state["last_processed_comment_id"] = comment_id
 
                 failure_next_step = (
-                    "先根据 Error 修复部署原因并确认目标机器恢复可读。随后由 PR 作者执行 `/request_deploy` 建立新的重试轮次，"
+                    "先根据 Error 修复失败原因并确认目标机器恢复可读。随后由 PR 作者执行 `/request_deploy` 建立新的重试轮次，"
                     "并按 Lifecycle Summary 给出的机器命令审批；如果后续只读检查明确确认 `MISMATCH`，机器 Owner 也可直接执行对应 `/approve_deploy`，无需 `/request_deploy`。"
                 )
+                failure_component = (
+                    f"`{failed_component_id}`"
+                    + (f"（target `{failed_component_target}`）" if failed_component_target else "")
+                    if failed_component_id else "未知组件"
+                )
+                failure_detail = (
+                    f"机器 `{machine_alias}`（IP `{machine.node_host}`），"
+                    f"失败组件 {failure_component}，原因：{deploy_error}"
+                )
                 markdown = comments_mod.failed_comment(
-                    repo, pr_number, pr_head, error=deploy_error,
+                    repo, pr_number, pr_head, error=failure_detail,
                 ) + f"\n\n**下一步：** {failure_next_step}"
                 approve_attempt["outcome"] = "failed"
                 self._record_approve_attempt(state, approve_attempt)
@@ -4238,8 +4298,9 @@ class DeployController:
                     round_id=round_id_for_state(state), comment_id=comment_id,
                     topic="deployment-failed", expected_command_kind="approve_deploy",
                     message=(f"Deployment failed for HEAD `{_short(pr_head)}` in round "
-                             f"`{round_id_for_state(state)}`. Check the Lifecycle Summary Error field for the cause. "
-                             f"{failure_next_step}"),
+                             f"`{round_id_for_state(state)}` on machine `{machine_alias}` "
+                             f"({machine.node_host}), component {failure_component}. "
+                             f"Reason: {deploy_error}. {failure_next_step}"),
                 )
 
                 # One-shot runtime log snapshot for failed path
@@ -4369,6 +4430,7 @@ class DeployController:
                 remaining_commands = self._machine_notice_lines(
                     remaining_groups, repo, mention_owners=False,
                     test_only=self._is_test_only_pr(pr_data),
+                    components=remaining,
                 )
                 markdown = self._deploy_requested_markdown(
                     repo, pr_number, pr_head,
@@ -4409,6 +4471,7 @@ class DeployController:
                 notice_lines = self._machine_notice_lines(
                     remaining_groups, repo, mention_owners=True,
                     test_only=self._is_test_only_pr(pr_data),
+                    components=remaining,
                 )
                 await self._post_bound_notice(
                     repo, pr_number, head_sha=pr_head,
@@ -4417,8 +4480,11 @@ class DeployController:
                     expected_command_kind="approve_deploy",
                     message="\n".join([
                         "Partial deployment completed. The remaining components need another machine approval.",
-                        "下一步：请按以下完整命令审批剩余组件。",
-                        *notice_lines,
+                        *(
+                            ["下一步：请按以下完整命令审批剩余组件。", *notice_lines]
+                            if notice_lines else
+                            self._machine_blocking_summary(remaining_groups)
+                        ),
                     ]),
                 )
                 if redeploy_mode:
@@ -5486,32 +5552,53 @@ class DeployController:
 
     def _machine_identity_matches(
         self, alias: str, policy_machine, inventory: list[dict] | None = None,
+        policy_machines: list | None = None,
     ) -> tuple[dict | None, bool]:
-        """Bind one repo machine to exactly one physical alias and primary IP."""
+        """Resolve one repo machine to exactly one physical identity.
+
+        The official repository policy row is the authorization source. When the
+        descriptive physical inventory also has that alias, it must agree on the
+        alias, node_id and primary address. When it does not, the identity is
+        still confirmed from the policy row, but only if that row is globally
+        unambiguous (one alias, one node_id, one literal IPv4).
+        """
         if not isinstance(alias, str) or not alias or policy_machine is None:
             return None, False
         rows = inventory if isinstance(inventory, list) else self._physical_machine_inventory()
         matches = [item for item in rows if item.get("alias") == alias]
-        if len(matches) != 1:
+        if len(matches) > 1:
             return None, False
-        physical = matches[0]
+        physical = matches[0] if matches else None
         policy_alias = getattr(policy_machine, "alias", "")
         policy_node_id = str(getattr(policy_machine, "node_id", "") or "").strip()
-        physical_node_id = str(physical.get("node_id", "") or "").strip()
-        primary_ip = self._canonical_primary_ipv4(physical.get("primary_ip", ""))
         policy_ip = self._canonical_primary_ipv4(
             getattr(policy_machine, "node_host", ""),
         )
-        matches_identity = bool(
-            physical.get("alias") == alias
-            and policy_alias == alias
-            and policy_node_id
-            and primary_ip
-            and policy_ip
-            and primary_ip == policy_ip
-            and (not physical_node_id or physical_node_id == policy_node_id)
+        if policy_alias != alias or not policy_node_id or not policy_ip:
+            return physical, False
+        peers = (
+            policy_machines if isinstance(policy_machines, list)
+            else [policy_machine]
         )
-        return physical, matches_identity
+        policy_unambiguous = bool(
+            sum(getattr(item, "alias", None) == alias for item in peers) == 1
+            and sum(
+                self._canonical_primary_ipv4(getattr(item, "node_host", "")) == policy_ip
+                for item in peers
+            ) == 1
+        )
+        if physical is None:
+            return None, policy_unambiguous
+        physical_node_id = str(physical.get("node_id", "") or "").strip()
+        if physical_node_id and physical_node_id != policy_node_id:
+            return physical, False
+        primary_ip = self._canonical_primary_ipv4(physical.get("primary_ip", ""))
+        if not primary_ip:
+            # The descriptive inventory records no verified address for this
+            # machine. That is not evidence of a conflict, so the policy row
+            # decides — but only when that row is globally unambiguous.
+            return physical, policy_unambiguous
+        return physical, primary_ip == policy_ip
 
     def _record_agent_core_health(self, repo: str, machine, status: str) -> None:
         alias = str(getattr(machine, "alias", "") or "")
@@ -5564,7 +5651,7 @@ class DeployController:
                 != self._machine_connection_fingerprint(machine)):
             return False
         _, identity_matches = self._machine_identity_matches(
-            alias, current_machine,
+            alias, current_machine, None, machines,
         )
         if not identity_matches:
             return False
@@ -5628,9 +5715,23 @@ class DeployController:
             if machine_ip and machine_alias:
                 policy_aliases_by_ip.setdefault(machine_ip, []).append(machine_alias)
         groups = []
-        for physical in inventory:
-            alias = physical["alias"]
-            primary_ip = physical["primary_ip"]
+        # The official repository policy is the authorization source, so every
+        # authorized alias must be evaluated even when the descriptive physical
+        # inventory has no matching record. Such a machine stays blocked with an
+        # explicit identity reason instead of silently disappearing.
+        inventory_aliases = {
+            str(item.get("alias", "") or "") for item in inventory
+        }
+        entries: list[tuple[dict | None, str]] = [
+            (item, str(item.get("alias", "") or "")) for item in inventory
+        ]
+        for machine in authorized_machines:
+            policy_only_alias = str(getattr(machine, "alias", "") or "")
+            if policy_only_alias and policy_only_alias not in inventory_aliases:
+                entries.append((None, policy_only_alias))
+        for physical, alias in entries:
+            physical = physical or {}
+            primary_ip = str(physical.get("primary_ip", "") or "")
             policy_matches = authorized_by_alias.get(alias, [])
             policy_machine = policy_matches[0] if len(policy_matches) == 1 else None
             node_id = str(getattr(policy_machine, "node_id", "") or "")
@@ -5638,12 +5739,16 @@ class DeployController:
                 getattr(policy_machine, "node_host", ""),
             )
             _, identity_matches = self._machine_identity_matches(
-                alias, policy_machine, inventory,
+                alias, policy_machine, inventory, authorized_machines,
             )
+            if not primary_ip:
+                # The descriptive inventory has no verified address for this
+                # identity; the authorized policy row supplies the only address.
+                primary_ip = node_host
             repo_authorized = bool(
                 policy_configured and policy_machine is not None
                 and node_id and identity_matches
-                and alias_counts.get(alias, 0) == 1
+                and alias_counts.get(alias, 0) <= 1
                 and len(policy_matches) == 1
             )
             if not policy_configured:
@@ -5693,6 +5798,12 @@ class DeployController:
             variants = list(getattr(policy_machine, "variants", []) or [])
             driver_paths = list(getattr(policy_machine, "driver_paths", []) or [])
             targets = list(getattr(policy_machine, "targets", []) or [])
+            # Platform evidence: when the descriptive inventory has a record for
+            # this alias, its explicit verification status is authoritative. When
+            # it has none, the official policy row is the only source, and its
+            # declared platforms are matched against the component platform by
+            # the compatibility check below.
+            has_inventory_record = bool(physical.get("alias"))
             platform_verified = (
                 physical.get("platform_verified") is True
                 or bool(str(physical.get("platform") or "").strip())
@@ -5702,6 +5813,8 @@ class DeployController:
                 platform_verified = False
             elif inventory_platform_status in {"verified", "compatible", "ok"}:
                 platform_verified = True
+            elif not has_inventory_record:
+                platform_verified = bool(policy_machine is not None and platform_values)
             if (policy_configured and policy_machine is not None and components
                     and any(not comp.get("resolved_platform")
                             for comp in components if isinstance(comp, dict))):
@@ -5896,11 +6009,14 @@ class DeployController:
             return ""
         inventory = self._physical_machine_inventory()
         physical, identity_matches = self._machine_identity_matches(
-            alias, machine, inventory,
+            alias, machine, inventory, machines,
         )
-        if physical is None or not identity_matches:
+        if not identity_matches:
             return ""
-        primary_ip = physical["primary_ip"]
+        primary_ip = (
+            physical.get("primary_ip", "") if physical is not None
+            else self._canonical_primary_ipv4(getattr(machine, "node_host", ""))
+        )
         physical_ip_count = sum(
             item.get("primary_ip") == primary_ip for item in inventory
         )
@@ -5908,7 +6024,21 @@ class DeployController:
             self._canonical_primary_ipv4(getattr(item, "node_host", "")) == primary_ip
             for item in machines
         )
-        if physical_ip_count == 1 and policy_ip_count == 1:
+        # One IP must never address two physical identities. When this alias has
+        # its own verified inventory address, exactly that row may claim the IP.
+        # When the inventory holds no address for the alias, no inventory row at
+        # all may claim it — the policy row alone still supplies the address.
+        alias_has_inventory_ip = bool(
+            physical is not None
+            and self._canonical_primary_ipv4(physical.get("primary_ip", ""))
+        )
+        inventory_binding_ok = (
+            physical_ip_count == 1 if alias_has_inventory_ip
+            else physical_ip_count == 0
+        )
+        if (inventory_binding_ok and policy_ip_count == 1
+                and self._canonical_primary_ipv4(
+                    getattr(machine, "node_host", "")) == primary_ip):
             return primary_ip
         # Alias is safe only after exact primary-IP identity and repo-policy checks.
         return alias
@@ -5929,10 +6059,13 @@ class DeployController:
                 and sum(getattr(item, "alias", None) == alias for item in machines) == 1
                 and machine is not None):
             physical, identity_matches = self._machine_identity_matches(
-                alias, machine,
+                alias, machine, None, machines,
             )
-            if identity_matches and physical is not None:
-                primary_ip = physical.get("primary_ip", "")
+            if identity_matches:
+                primary_ip = (
+                    physical.get("primary_ip", "") if physical is not None
+                    else self._canonical_primary_ipv4(getattr(machine, "node_host", ""))
+                )
                 owners = list(getattr(machine, "owners", []) or [])
         else:
             machine = None
@@ -9895,10 +10028,10 @@ class DeployController:
             display_pr = None
         test_only = self._is_test_only_pr(display_pr)
         groups = self._get_machine_groups_for_components(components, repo)
-        diagnostics = self._machine_inventory_diagnostic_lines(
+        command_lines = self._machine_notice_lines(
             groups, repo, mention_owners=False, test_only=test_only,
+            components=components,
         )
-        has_command_lines = any("；命令：" in line for line in diagnostics)
         required_ids = {
             component.get("component_id") for component in components
             if isinstance(component, dict) and isinstance(component.get("component_id"), str)
@@ -9910,26 +10043,18 @@ class DeployController:
         message_lines = [
             f"当前 Commit `{_short(head_sha)}` 的构建和审核已完成，Lifecycle 已进入 `deploy-ready`。",
         ]
-        if diagnostics:
-            message_lines.extend([
-                f"当前物理机器诊断共 {len(diagnostics)} 台；仅获当前仓库授权且兼容的机器显示审批命令：",
-                *diagnostics,
-            ])
-        else:
-            message_lines.append("当前无法读取物理机器清单；不会生成机器审批命令。")
-        if has_command_lines:
+        if command_lines:
+            message_lines.extend(["可执行的机器审批命令：", *command_lines])
             if len(full_groups) == 1:
-                message_lines.extend([
+                message_lines.append(
                     "只有一台机器完整适配全部组件，也可以直接执行 `/approve_deploy`。",
-                ])
+                )
             elif len(full_groups) > 1:
                 message_lines.append("有多台机器完整适配，请从上方的审批命令中明确选择一台。")
             elif required_ids:
                 message_lines.append("没有单台机器覆盖全部组件；可按上面的命令分批审批适配机器。")
         else:
-            message_lines.append(
-                "审核和构建已完成，但当前没有可执行的审批命令。请检查当前仓库 main 的 machines.yaml 和 Agent Core 配置。"
-            )
+            message_lines.extend(self._machine_blocking_summary(groups))
         message_lines.append("无需先执行 `/request_deploy`；该命令仍可用于显式申请部署。")
         body = "\n".join((comments_mod.BOT_MARKER, marker, "", *message_lines))
         if not await context_is_current():
@@ -10090,9 +10215,90 @@ class DeployController:
             )
         return f"当前仓库 `{repo}` 的验收白名单中没有可用的 GitHub 账号。"
 
+    _MACHINE_BLOCKING_GUIDANCE = (
+        ("REPOSITORY_POLICY_MISSING",
+         "当前仓库 main 没有已验证的 machines.yaml：请在该仓库 main 提交有效的 "
+         "machines.yaml（node_id、node_host、owners、targets、platforms、driver_paths），"
+         "等待策略刷新后重试。"),
+        ("MACHINE_NOT_AUTHORIZED",
+         "物理机器未获当前仓库授权：请在该仓库 main 的 machines.yaml 中登记该机器，"
+         "alias、node_id 与主 IP 必须与机器身份一致。"),
+        ("MACHINE_IDENTITY_MISMATCH",
+         "仓库策略与物理机器身份不一致：请核对 machines.yaml 的 alias、node_host "
+         "与该机器实际主 IP。"),
+        ("OWNER_NOT_CONFIGURED",
+         "兼容机器没有有效负责人：请在 machines.yaml 的 owners 中填写 GitHub 账号。"),
+        ("AGENT_CORE_CREDENTIAL_MISSING",
+         "兼容机器缺少 Agent Core 凭证：请为该机器配置 Agent Core token。"),
+        ("AGENT_CORE_UNAVAILABLE",
+         "兼容机器的 Agent Core 当前无法连接：请检查机器与 Agent Core 服务。"),
+        ("AGENT_CORE_UNKNOWN",
+         "兼容机器的 Agent Core 尚未确认：审批会先执行只读预检。"),
+        ("TARGET_UNSUPPORTED",
+         "机器未声明当前组件目标：请在 machines.yaml 的 targets 中加入该目标。"),
+        ("PLATFORM_MISMATCH",
+         "构建平台与机器配置不匹配：请核对 machines.yaml 的 platforms 与本次构建平台。"),
+        ("PLATFORM_UNVERIFIED",
+         "构建平台或机器平台未验证：请确认本次构建平台和 machines.yaml 的 platforms。"),
+        ("VARIANT_MISMATCH",
+         "组件 variant 不在机器 variants 中：请核对 machines.yaml 的 variants。"),
+        ("DRIVER_PATH_MISMATCH",
+         "组件 driver_path 不在机器 driver_paths 中：请核对 machines.yaml 的 driver_paths。"),
+        ("PRIMARY_IP_AMBIGUOUS",
+         "主 IP 存在歧义：请确保一个主 IP 只绑定一台物理机器。"),
+    )
+
+    def _machine_blocking_summary(self, groups: list[dict]) -> list[str]:
+        """Explain why no approval command exists without dumping every machine."""
+        if not groups:
+            return ["当前无法读取物理机器清单，因此不会生成审批命令。"]
+        present: set[str] = set()
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            for reason in group.get("blocking_reasons", []) or []:
+                if isinstance(reason, str):
+                    present.add(reason)
+        if not present:
+            return ["当前没有兼容的机器可提交审批：请检查该仓库 main 的 machines.yaml 和 "
+                    "Agent Core 配置。"]
+        lines = ["当前没有可执行的审批命令。阻断原因和需要检查的配置："]
+        for reason, guidance in self._MACHINE_BLOCKING_GUIDANCE:
+            if reason in present:
+                lines.append(f"- {guidance}")
+        return lines
+
+    @staticmethod
+    def _component_summary_labels(
+        component_ids: list, components: list[dict] | None,
+    ) -> str:
+        """Describe compatible components as ``target variant``; never dump ids."""
+        by_id = {
+            item.get("component_id"): item for item in components or []
+            if isinstance(item, dict) and isinstance(item.get("component_id"), str)
+        }
+        labels: list[str] = []
+        for component_id in component_ids if isinstance(component_ids, list) else []:
+            component = by_id.get(component_id)
+            if isinstance(component, dict):
+                target = str(component.get("target", "") or "").strip()
+                variant = str(component.get("variant", "") or "").strip()
+                driver_path = str(component.get("driver_path", "") or "").strip()
+                if target == "driver" and driver_path:
+                    label = f"{target} {driver_path}"
+                elif target and variant:
+                    label = f"{target} {variant}"
+                else:
+                    label = target or component_id[:8]
+            else:
+                label = str(component_id)[:8]
+            if label and label not in labels:
+                labels.append(label)
+        return "、".join(labels)
+
     def _machine_notice_lines(
         self, groups: list[dict], repo: str, *, mention_owners: bool,
-        test_only: bool = False,
+        test_only: bool = False, components: list[dict] | None = None,
     ) -> list[str]:
         lines: list[str] = []
         for group in groups:
@@ -10135,79 +10341,15 @@ class DeployController:
                 and "PRIMARY_IP_AMBIGUOUS" in group.get("blocking_reasons", [])
                 else "；使用 alias" if selector == alias else ""
             )
-            lines.append(f"机器 `{alias}`（主 IP：`{primary_ip}`），Owner：{owner_label}{selection_note}")
+            component_label = self._component_summary_labels(
+                group.get("component_ids", []), components,
+            )
+            components_note = f"，兼容组件：{component_label}" if component_label else ""
+            lines.append(
+                f"机器 `{alias}`（主 IP：`{primary_ip}`），Owner：{owner_label}"
+                f"{components_note}{selection_note}"
+            )
             lines.append(f"`/approve_deploy machine={selector}`")
-        return lines
-
-    def _machine_inventory_diagnostic_lines(
-        self, groups: list[dict], repo: str, *, mention_owners: bool,
-        test_only: bool = False,
-    ) -> list[str]:
-        reason_labels = {
-            "REPOSITORY_POLICY_MISSING": "当前仓库未配置 machines.yaml",
-            "MACHINE_NOT_AUTHORIZED": "未获当前仓库授权",
-            "MACHINE_IDENTITY_MISMATCH": "物理机器身份与仓库策略不匹配",
-            "OWNER_NOT_CONFIGURED": "负责人待配置",
-            "AGENT_CORE_CREDENTIAL_MISSING": "Agent Core 凭证未配置",
-            "AGENT_CORE_UNAVAILABLE": "Agent Core 当前无法连接",
-            "AGENT_CORE_UNKNOWN": "Agent Core 尚未确认，审批时先执行只读预检",
-            "PLATFORM_UNVERIFIED": "构建平台未验证",
-            "PLATFORM_MISMATCH": "构建平台与机器配置不匹配",
-            "TARGET_UNSUPPORTED": "目标不受支持",
-            "VARIANT_MISMATCH": "variant 不匹配",
-            "DRIVER_PATH_MISMATCH": "driver_path 不匹配",
-            "PRIMARY_IP_AMBIGUOUS": "主 IP 有歧义，审批命令使用 alias",
-        }
-        lines = []
-        for group in groups:
-            if not isinstance(group, dict):
-                continue
-            alias = str(group.get("alias", "") or "未知别名")
-            primary_ip = str(group.get("primary_ip", "") or "主 IP 未记录")
-            owners = group.get("owners", [])
-            valid_owners = sorted({
-                owner.strip() for owner in owners
-                if isinstance(owner, str) and _LOGIN_RE.fullmatch(owner.strip())
-                and not owner.strip().casefold().endswith("[bot]")
-            }, key=str.casefold)
-            can_mention_owners = (
-                mention_owners and not test_only
-                and group.get("repo_authorized") is True
-                and group.get("approval_available") is True
-                and bool(group.get("component_ids"))
-            )
-            owner_labels = [
-                f"@{owner}" if can_mention_owners else owner
-                for owner in valid_owners
-            ]
-            owner_text = " ".join(owner_labels) if owner_labels else "负责人待配置"
-            reasons = [reason_labels.get(reason, reason)
-                       for reason in group.get("blocking_reasons", [])]
-            status_text = (
-                "可提交审批（部署前只读预检）"
-                if group.get("approval_available") is True
-                and group.get("agent_core_status") == "unknown" else
-                "可审批" if group.get("approval_available") else "暂不可审批"
-            )
-            line = f"机器 `{alias}`（主 IP：`{primary_ip}`），Owner：{owner_text}；{status_text}"
-            if reasons:
-                line += "；" + "、".join(dict.fromkeys(reasons))
-            try:
-                current_machine = self.policy.get_machine(alias, repo=repo)
-            except Exception:
-                current_machine = None
-            selector = self._machine_command_selector(alias, repo)
-            command_available = bool(
-                current_machine is not None
-                and self._machine_is_deployable(current_machine, repo)
-                and group.get("approval_available") is True
-                and group.get("component_ids")
-                and selector
-                and selector == group.get("command_selector")
-            )
-            if command_available:
-                line += f"；命令：`/approve_deploy machine={selector}`"
-            lines.append(line)
         return lines
 
     async def _approval_command_guidance(self, repo: str, pr_number: int) -> str:
@@ -10242,14 +10384,26 @@ class DeployController:
                         f"`{command}`" for command in drift_commands
                     )
                 checks = state.get("runtime_checks", [])
-                if any(isinstance(check, dict)
-                       and check.get("status") in {"unavailable", "identity_changed"}
-                       for check in checks):
-                    return "当前机器状态无法确认。检查机器连接和本仓库策略，等待下一次状态检查；此时不能重新部署。"
+                unreadable = self._runtime_unreadable_lines(checks)
+                if unreadable:
+                    return "\n".join([
+                        "当前机器运行状态不可读，无法判断是否需要重新部署。",
+                        *unreadable,
+                        "请恢复机器连接和本仓库策略后等待下一次状态检查；此时不生成审批命令。",
+                    ])
                 return "当前没有已确认的镜像漂移，若运行镜像已一致则无需重新部署；等待状态检查更新。"
             if status == "deploy-requested" and state.get("runtime_redeploy"):
                 drift_commands = self._runtime_drift_command_lines(state, repo)
                 if not drift_commands:
+                    unreadable = self._runtime_unreadable_lines(
+                        state.get("runtime_checks", []),
+                    )
+                    if unreadable:
+                        return "\n".join([
+                            "当前漂移机器运行状态不可读，无法生成重新审批命令。",
+                            *unreadable,
+                            "请恢复机器连接与仓库策略，等待下一次状态检查。",
+                        ])
                     return "当前漂移机器状态无法确认。检查机器连接与仓库策略，等待下一次状态检查。"
                 return "当前部署请求绑定了漂移机器，请直接使用对应机器审批命令；`/request_deploy` 可选：\n" + "\n".join(
                     f"`{command}`" for command in drift_commands
@@ -10263,16 +10417,13 @@ class DeployController:
                 and component.get("component_id") not in deployed_ids
             ]
             groups = self._get_machine_groups_for_components(remaining, repo)
-            diagnostics = self._machine_inventory_diagnostic_lines(
+            command_lines = self._machine_notice_lines(
                 groups, repo, mention_owners=False,
-                test_only=self._is_test_only_pr(pr),
+                test_only=self._is_test_only_pr(pr), components=remaining,
             )
-            lines = ["当前物理机器诊断（含仓库授权、兼容性和负责人）：", *diagnostics]
-            if not any("；命令：" in line for line in diagnostics):
-                return "\n".join([
-                    *lines,
-                    "当前没有可执行的审批命令。请检查当前仓库 main 的 machines.yaml 和 Agent Core 配置。",
-                ])
+            if not command_lines:
+                return "\n".join(self._machine_blocking_summary(groups))
+            lines = ["可执行的机器审批命令：", *command_lines]
             required_ids = {
                 component.get("component_id") for component in remaining
                 if isinstance(component, dict) and isinstance(component.get("component_id"), str)
@@ -10366,13 +10517,13 @@ class DeployController:
         await self._project_status_best_effort(repo, pr_number, "deploy-requested")
         command_lines = self._machine_notice_lines(
             machine_groups, repo, mention_owners=False,
-            test_only=self._is_test_only_pr(pr),
+            test_only=self._is_test_only_pr(pr), components=remaining,
         )
         message_lines = [reason, "No deploy POST was sent for the pending component."]
         if command_lines:
             message_lines.extend(["Current compatible commands:", *command_lines])
         else:
-            message_lines.append("No compatible deployable machine is currently available.")
+            message_lines.extend(self._machine_blocking_summary(machine_groups))
         await self._post_bound_notice(
             repo, pr_number, head_sha=blocked_state["head_sha"],
             round_id=round_id_for_state(blocked_state), comment_id=comment_id,
@@ -10434,6 +10585,35 @@ class DeployController:
             str(check.get("machine", "")), str(check.get("ip", "")),
             str(check.get("component_id", "")),
         )
+
+    @staticmethod
+    def _runtime_unreadable_lines(checks: list[dict]) -> list[str]:
+        """Name exactly which machine/components could not be read."""
+        lines: list[str] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for check in checks if isinstance(checks, list) else []:
+            if (not isinstance(check, dict)
+                    or check.get("status") not in {"unavailable", "identity_changed", "not_running"}):
+                continue
+            alias = str(check.get("machine", "") or "")
+            component_id = str(check.get("component_id", "") or "")
+            status = str(check.get("status", ""))
+            key = (alias, str(check.get("ip", "")), component_id, status)
+            if not alias or key in seen:
+                continue
+            seen.add(key)
+            ip_text = str(check.get("ip", "") or "主 IP 未记录")
+            component_text = f"`{component_id}`" if component_id else "未知组件"
+            reason = {
+                "identity_changed": "机器身份或运行时绑定无法确认",
+                "not_running": "组件当前未运行，运行镜像不可读",
+                "unavailable": "Agent Core 或运行状态不可读",
+            }[status]
+            lines.append(
+                f"- 机器 `{alias}`（{ip_text}），组件 {component_text}：{reason}；状态不可读，"
+                "未生成审批命令。"
+            )
+        return lines
 
     @staticmethod
     def _runtime_check_is_due(check: dict | None, now: datetime) -> bool:
@@ -12315,6 +12495,7 @@ class DeployController:
                 lines = self._machine_notice_lines(
                     remaining_groups, repo,
                     mention_owners=True, test_only=self._is_test_only_pr(pr_data),
+                    components=remaining,
                 )
                 await self._post_bound_notice(
                     repo, pr_number, head_sha=refreshed["head_sha"],
@@ -12322,7 +12503,13 @@ class DeployController:
                     comment_id=int(command.get("comment_id", 0) or 0),
                     topic="deployment-recovered-partial",
                     expected_command_kind="approve_deploy",
-                    message="\n".join(["A partial deployment was confirmed. The remaining components need another approval.", *lines]),
+                    message="\n".join([
+                        "A partial deployment was confirmed. The remaining components need another approval.",
+                        *(
+                            lines if lines else
+                            self._machine_blocking_summary(remaining_groups)
+                        ),
+                    ]),
                 )
 
     async def _refresh_uncertain_state(

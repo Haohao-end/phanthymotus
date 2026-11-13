@@ -2,7 +2,24 @@
 
 Commands must start a line. Only the PR's main-conversation comments are read.
 Parsing is strict: unknown flags, a duplicated required arg or a stray argument
-are rejected as ``unknown``.
+are rejected and classified with a stable ``ParsedCommand.error`` code so the
+watcher/controller can explain *what* failed, *why*, and *which command* to use
+next.  Parse-level codes:
+
+  - ``unknown_argument:<keys>``  — unsupported ``key=value`` for this command
+  - ``extra_parameter``          — stray positional or parameters on a
+                                   parameterless form of a supported command
+  - ``missing_machine_value``    — ``machine=`` present but empty
+  - ``invalid_ip_format``        — ``machine=`` is IP-shaped but not valid IPv4
+  - ``missing_parameter:<key>``  — a required ``key=value`` was not supplied
+  - ``invalid_parameter:<key>``  — value is syntactically invalid (e.g. result)
+  - ``duplicate_argument:<key>`` — the same ``key=value`` was repeated
+  - ``invalid_arguments``        — unbalanced quoting / unparseable arguments
+
+Execution-time classifications (machine not found/ambiguous, actor not
+authorized, machine incompatible, HEAD changed, PR closed, state does not allow
+execution) are produced by the controller, which must still answer with the
+same what/why/which-command structure.
 
 Commands are public:
   - ``/request_deploy`` — optional PR Author request for current HEAD
@@ -20,6 +37,7 @@ Commands are public:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import shlex
 import re
 from difflib import SequenceMatcher
@@ -87,9 +105,31 @@ def _parse_args(tokens: list[str]) -> tuple[list[str], dict[str, str]]:
             positional.append(str(v))
         else:
             if k in kv:
-                raise ValueError(f"duplicate argument {k}")
+                raise ValueError(f"duplicate_argument:{k}")
             kv[k] = v
     return positional, kv
+
+
+_DIGITS_AND_DOTS = re.compile(r"^[\d.]+$")
+
+
+def _machine_selector_error(value: str) -> str:
+    """Classify an unusable ``machine=`` value before any lifecycle work.
+
+    An alias is accepted verbatim; only values that are shaped like an IP
+    address are validated here so the controller can still resolve aliases and
+    report machine-not-found / ambiguous-IP failures with the compatible list.
+    """
+    if not value:
+        return "missing_machine_value"
+    if ":" in value or _DIGITS_AND_DOTS.fullmatch(value):
+        try:
+            parsed = ipaddress.ip_address(value)
+        except ValueError:
+            return "invalid_ip_format"
+        if parsed.version != 4:
+            return "invalid_ip_format"
+    return ""
 
 
 # Allowed key=value arguments for each command.
@@ -264,11 +304,11 @@ def parse_command(comment_text: str) -> ParsedCommand:
         # request_deploy: reject any positional args or key=value args
         if name == "request_deploy":
             if positional:
-                return ParsedCommand(kind=name, raw=raw_line.strip(), error="unexpected_argument")
+                return ParsedCommand(kind=name, raw=raw_line.strip(), error="extra_parameter")
             return ParsedCommand(kind="request_deploy", raw=raw_line.strip())
         if name == "request_acceptance":
             if positional or kv:
-                return ParsedCommand(kind=name, raw=raw_line.strip(), error="unexpected_argument")
+                return ParsedCommand(kind=name, raw=raw_line.strip(), error="extra_parameter")
             return ParsedCommand(kind="request_acceptance", raw=raw_line.strip())
         parsed = _build_command(name, positional, kv, tokens[1:])
         if parsed.kind == "unknown":
@@ -349,38 +389,42 @@ def _build_command(name: str, positional: list[str], kv: dict[str, str],
         return ParsedCommand(kind="request_deploy", raw=raw)
     if name == "approve_deploy":
         if positional:
-            return ParsedCommand(kind="unknown", raw="", error="unexpected_argument")
+            return ParsedCommand(kind="unknown", raw="", error="extra_parameter")
         machine_alias = kv.get("machine", "")
-        if "machine" in kv and not machine_alias:
-            return ParsedCommand(kind="unknown", raw="", error="missing_machine_value")
+        if "machine" in kv:
+            selector_error = _machine_selector_error(machine_alias)
+            if selector_error:
+                return ParsedCommand(kind="unknown", raw="", error=selector_error)
         return ParsedCommand(
             kind="approve_deploy", machine_alias=machine_alias, raw=raw
         )
     if name == "record_test":
         if positional:
-            return ParsedCommand(kind="unknown", raw="")
+            return ParsedCommand(kind="unknown", raw="", error="extra_parameter")
+        # machine= is not a record_test parameter.
+        if "machine" in kv:
+            return ParsedCommand(kind="unknown", raw="", error="unknown_argument:machine")
+        if "result" not in kv:
+            return ParsedCommand(kind="unknown", raw="", error="missing_parameter:result")
         result = kv.get("result", "")
         if result not in ("pass", "fail"):
-            return ParsedCommand(kind="unknown", raw="")
-        # Reject machine= parameter
-        if "machine" in kv:
-            return ParsedCommand(kind="unknown", raw="")
+            return ParsedCommand(kind="unknown", raw="", error="invalid_parameter:result")
         summary = kv.get("summary", "")
         return ParsedCommand(
             kind="record_test", result=result, summary=summary, raw=raw
         )
     if name == "evidence_link":
         if positional:
-            return ParsedCommand(kind="unknown", raw="")
+            return ParsedCommand(kind="unknown", raw="", error="extra_parameter")
         attachment_id = kv.get("id", "")
         if kv and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id):
-            return ParsedCommand(kind="unknown", raw="")
+            return ParsedCommand(kind="unknown", raw="", error="invalid_parameter:id")
         return ParsedCommand(
             kind="evidence_link", evidence_args={"id": attachment_id} if attachment_id else {}, raw=raw,
         )
     if name == "deploy_status":
         if positional:
-            return ParsedCommand(kind="unknown", raw="")
+            return ParsedCommand(kind="unknown", raw="", error="extra_parameter")
         return ParsedCommand(kind="deploy_status", raw=raw)
     if name == "deploy_help":
         topic = " ".join(positional) if positional else ""
@@ -389,13 +433,14 @@ def _build_command(name: str, positional: list[str], kv: dict[str, str],
         )
     if name in {"submit_evidence", "remove_evidence"}:
         if positional:
-            return ParsedCommand(kind="unknown", raw="")
+            return ParsedCommand(kind="unknown", raw="", error="extra_parameter")
         head = kv.get("head", "")
         round_id = kv.get("round", "")
-        if (not re.fullmatch(r"[0-9a-fA-F]{40}", head)
-                or not re.fullmatch(r"[0-9a-fA-F]{40}-[0-9]+", round_id)
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", head):
+            return ParsedCommand(kind="unknown", raw="", error="invalid_parameter:head")
+        if (not re.fullmatch(r"[0-9a-fA-F]{40}-[0-9]+", round_id)
                 or not round_id.lower().startswith(head.lower() + "-")):
-            return ParsedCommand(kind="unknown", raw="")
+            return ParsedCommand(kind="unknown", raw="", error="invalid_parameter:round")
         if name == "submit_evidence":
             return ParsedCommand(kind=name, evidence_args={
                 "head": head.lower(), "round": round_id.lower(),
@@ -403,8 +448,10 @@ def _build_command(name: str, positional: list[str], kv: dict[str, str],
                 "note": kv.get("note", ""), "replaces": kv.get("replaces", ""),
             }, raw=raw)
         attachment_id = kv.get("id", "")
-        if not attachment_id or any(k in kv for k in ("machine", "note", "replaces")):
-            return ParsedCommand(kind="unknown", raw="")
+        if not attachment_id:
+            return ParsedCommand(kind="unknown", raw="", error="missing_parameter:id")
+        if any(k in kv for k in ("machine", "note", "replaces")):
+            return ParsedCommand(kind="unknown", raw="", error="unknown_argument:machine,note,replaces")
         return ParsedCommand(kind=name, evidence_args={
             "head": head.lower(), "round": round_id.lower(), "id": attachment_id,
         }, raw=raw)

@@ -171,6 +171,7 @@ def _load_machines_data(raw: Any) -> dict[str, MachineInfo]:
         raise MachineLoadError("machines mapping must not be empty")
     machines: dict[str, MachineInfo] = {}
     node_ids_seen: set[str] = set()
+    node_hosts_seen: dict[str, str] = {}
     for alias, entry in machines_raw.items():
         if not isinstance(alias, str) or not alias.strip():
             raise MachineLoadError("machine alias must be a non-empty string")
@@ -203,6 +204,13 @@ def _load_machines_data(raw: Any) -> dict[str, MachineInfo]:
                 f"machine {alias!r}: node_host is required and must be non-empty"
             )
         node_host = _validate_literal_ip(node_host, alias)
+        previous_alias = node_hosts_seen.get(node_host)
+        if previous_alias is not None:
+            raise MachineLoadError(
+                f"duplicate node_host {node_host!r}: machines {previous_alias!r} and "
+                f"{alias!r} cannot share one physical IP address"
+            )
+        node_hosts_seen[node_host] = alias
         targets_raw = entry.get("targets")
         if not isinstance(targets_raw, list) or not targets_raw:
             raise MachineLoadError(

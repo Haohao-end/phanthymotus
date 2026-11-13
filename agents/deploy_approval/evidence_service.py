@@ -346,35 +346,6 @@ class EvidenceService:
                 output[alias] = row
         return output
 
-    def _display_deployments(self, snapshot, *, historical=False):
-        components = {
-            component.get('component_id'): component
-            for component in snapshot.get('components', [])
-            if isinstance(component, dict) and isinstance(component.get('component_id'), str)
-        }
-        deployment_rows = snapshot.get('deployments', [])
-        enriched = self.controller._enrich_deployments_for_render(
-            deployment_rows if isinstance(deployment_rows, list) else [],
-            historical=historical,
-            historical_machine_groups=(snapshot.get('machine_groups') if historical else None),
-        )
-        output = []
-        for deployment in enriched:
-            if not isinstance(deployment, dict):
-                continue
-            component_ids = deployment.get('component_ids') or [None]
-            for component_id in component_ids:
-                component = components.get(component_id, {})
-                output.append({
-                    'machine': str(deployment.get('machine', '') or ''),
-                    'ip': str(deployment.get('ip', '') or ''),
-                    'component': str(component.get('target', '') or '组件信息不可用'),
-                    'variant_path': str(component.get('variant') or component.get('driver_path') or '—'),
-                    'image': str(component.get('image_ref') or deployment.get('image_ref') or '—'),
-                    'result': str(deployment.get('phase') or deployment.get('result') or '状态未知'),
-                })
-        return output
-
     async def _degraded_current_context(self, repo, pr_number, principal, pr, state, payload, active_round):
         """Return a read-only current snapshot after the bounded history read times out."""
         expected_head = state.get('head_sha')
@@ -451,9 +422,6 @@ class EvidenceService:
                               and pr.get('head', {}).get('sha') == expected_head
                               and not pr.get('merged') and not pr.get('draft')),
             'evidence_degraded': True,
-            'display_deployments': self._display_deployments(state),
-            'deployment_logs': self._trusted_deployment_logs(
-                state, repo, pr_number, expected_head, active_round),
             'upload_invite': invite_allowed,
             'auth_method': principal.get('auth_method', 'github_comment_proof'),
             'actor_verified': principal.get('actor_verified') is True,
@@ -1525,7 +1493,7 @@ class EvidenceService:
                 return {'uploaded': True, 'part_number': part, 'size': length}
             if action == 'context':
                 note_display_cache = {}
-                async def context_attachment(row, *, historical=False):
+                async def context_attachment(row):
                     public_fields = {
                         'attachment_id', 'filename', 'size', 'sha256', 'note', 'evidence_kind',
                         'round_id', 'head_sha', 'status', 'created_at', 'updated_at',
@@ -1555,20 +1523,15 @@ class EvidenceService:
                     if note_row:
                         value['evidence_kind'] = 'note'
                         attachment_id = row.get('attachment_id')
-                        if historical:
-                            value['display_note'] = '[历史备注可在历史归档中查看]'
-                            value['note'] = value['display_note']
-                            value['display_note_complete'] = False
-                        else:
-                            if attachment_id not in note_display_cache:
-                                note_source = {**row, 'evidence_kind': 'note'}
-                                note_display_cache[attachment_id] = await self._verified_note_display(
-                                    note_source, repo, pr_number, principal)
-                            display_note, complete = note_display_cache[attachment_id]
-                            value.update(display_note=display_note,
-                                         # Older page clients render `note`; retain that safe display alias.
-                                         note=display_note)
-                            value['display_note_complete'] = bool(complete)
+                        if attachment_id not in note_display_cache:
+                            note_source = {**row, 'evidence_kind': 'note'}
+                            note_display_cache[attachment_id] = await self._verified_note_display(
+                                note_source, repo, pr_number, principal)
+                        display_note, complete = note_display_cache[attachment_id]
+                        value.update(display_note=display_note,
+                                     # Older page clients render `note`; retain that safe display alias.
+                                     note=display_note)
+                        value['display_note_complete'] = bool(complete)
                     value['can_delete'] = bool(
                         write_context_allowed
                         and (authorized_writer or invite_allowed
@@ -1583,20 +1546,11 @@ class EvidenceService:
                                 and row_round == round_id]
                 current_attachments = await asyncio.gather(
                     *(context_attachment(row) for row in current_rows))
-                round_attachments = {}
-                for row in records:
-                    if row['kind'] != 'round' or row['data'].get('round_id') not in round_numbers:
-                        continue
-                    row_head = row['data'].get('head_sha')
-                    row_round = row['data']['round_id']
-                    round_attachments[row_round] = [
-                        await context_attachment(attachment, historical=True)
-                        for (attachment_repo, attachment_pr, attachment_head,
-                             attachment_round, _), attachment
-                        in latest_by_identity.items()
-                        if attachment_repo == repo and attachment_pr == pr_number
-                        and attachment_head == row_head and attachment_round == row_round]
 
+                # The upload page keeps only the current round's upload state.
+                # Historical rounds, deployment records, machine logs and
+                # attachment explanation tables are intentionally not projected
+                # here; the Lifecycle Summary keeps the full trusted history.
                 return {'repo': repo, 'pr_number': pr_number, 'head_sha': selected['head_sha'], 'round_id': round_id,
                         'round_number': round_numbers.get(round_id),
                         'round_started_at': selected.get('round_started_at'),
@@ -1613,11 +1567,6 @@ class EvidenceService:
                             and selected['acceptance_request'].get('status') == 'pending'
                             and selected['acceptance_request'].get('head_sha') == selected.get('head_sha')
                             and selected['acceptance_request'].get('round_id') == round_id),
-                        'display_deployments': self._display_deployments(
-                            selected, historical=(round_id != active_round),
-                        ),
-                        'deployment_logs': self._trusted_deployment_logs(
-                            selected, repo, pr_number, selected['head_sha'], round_id),
                         'upload_invite': bool(invite_allowed),
                         'auth_method': principal.get('auth_method', 'github_comment_proof'),
                         'actor_verified': principal.get('actor_verified') is True,
@@ -1625,32 +1574,12 @@ class EvidenceService:
                         'upload_max_files': (UPLOAD_MAX_FILES if invite_allowed else None),
                         'upload_max_bytes': (UPLOAD_MAX_BYTES if invite_allowed else None),
                         'attachments': current_attachments,
-                        'rounds': [{**r['data']['snapshot'], 'round_id': r['data']['round_id'],
-                                    'round_number': round_numbers.get(r['data']['round_id']),
-                                    'acceptance_pending': bool(
-                                        isinstance(r['data']['snapshot'].get('acceptance_request'), dict)
-                                        and r['data']['snapshot']['acceptance_request'].get('status') == 'pending'
-                                        and r['data']['snapshot']['acceptance_request'].get('round_id') == r['data']['round_id']),
-                                    'display_deployments': self._display_deployments(
-                                        r['data']['snapshot'], historical=True,
-                                    ),
-                                    'deployment_logs': self._trusted_deployment_logs(
-                                        r['data']['snapshot'], repo, pr_number,
-                                        r['data']['snapshot'].get('head_sha'), r['data']['round_id']),
-                                    'attachments': round_attachments.get(r['data']['round_id'], [])}
-                                   for r in records if r['kind'] == 'round'
-                                   and r['data'].get('round_id') in round_numbers],
                         'operations': [{k: v for k, v in r.items() if k != 'upload_id'}
                                        for r in operations.values() if not r.get('auth_nonce_marker')
                                        and not r.get('native_attachment')
                                        and r.get('head_sha') == selected.get('head_sha')
                                        and r.get('round_id') == round_id
                                        and r.get('actor_id') == principal['id']],
-                        'records': [row for (row_repo, row_pr, row_head, row_round, _), row
-                                    in latest_by_identity.items()
-                                    if row_repo == repo and row_pr == pr_number
-                                    and row_head == selected.get('head_sha')
-                                    and row_round == round_id],
                         # Evidence history is projected from verified round data;
                         # storage comment URLs/IDs are intentionally not exposed.
                         'archive_links': []}

@@ -74,6 +74,138 @@ def _github_failure_reason(exc: Exception) -> str:
     return type(exc).__name__
 
 
+# Exact next command for each supported command kind. Used only in rejection
+# replies so every failure states what failed, why, and which command to run.
+_NEXT_COMMAND = {
+    "request_deploy": "`/request_deploy`（无需任何参数）",
+    "approve_deploy": "`/approve_deploy machine=<机器别名或唯一 IPv4>`"
+                      "（仅当只有一台完整兼容机器时可省略 machine=）",
+    "record_test": "`/record_test result=pass` 或 `/record_test result=fail`",
+    "request_acceptance": "`/request_acceptance`（无需任何参数）",
+    "deploy_status": "`/deploy_status`（无需任何参数）",
+    "deploy_help": "`/deploy_help`",
+    "evidence_link": "PR Summary 中的稳定附件链接（该命令已弃用）",
+    "submit_evidence": "按 PR Summary 生成的完整 `head=`、`round=` 参数重新提交",
+    "remove_evidence": "按 PR Summary 生成的完整 `head=`、`round=`、`id=` 参数重新提交",
+}
+
+
+def _command_kind(cmd) -> str:
+    """Public command name for a parsed/queued command (never empty)."""
+    kind = getattr(cmd, "kind", "") or ""
+    if kind and kind != "unknown":
+        return kind
+    return getattr(cmd, "intent", "") or "unknown"
+
+
+def _command_error_explanation(cmd) -> tuple[str, str]:
+    """Return (what_failed, why) for a parsed command's rejection.
+
+    Codes come from ``commands.parse_command``; execution-time rejections
+    (machine not found/ambiguous, not authorized, incompatible, HEAD changed,
+    PR closed, state not ready) are phrased by the controller, so the fallback
+    here stays deliberately generic without swallowing the command.
+    """
+    kind = _command_kind(cmd)
+    error = getattr(cmd, "error", "") or ""
+    if getattr(cmd, "intent", ""):
+        return (
+            f"未识别的命令，已按 `/{kind}` 处理。",
+            "该行不是当前支持的部署命令，可能是拼写错误或旧命令。",
+        )
+    if error.startswith("unknown_argument:"):
+        keys = error.partition(":")[2] or "?"
+        return (
+            f"`/{kind}` 不接受参数 `{keys}`。",
+            "该参数不属于此命令允许的参数集合，因此没有执行任何部署或状态变更。",
+        )
+    if error == "extra_parameter":
+        return (
+            f"`/{kind}` 收到了多余的位置参数。",
+            "命令只接受规定的 `key=value` 形式，多余内容无法安全解析。",
+        )
+    if error == "missing_machine_value":
+        return (
+            "`machine=` 的值为空。",
+            "空的机器选择器无法定位唯一的当前机器，因此没有执行。",
+        )
+    if error == "invalid_ip_format":
+        return (
+            "`machine=` 不是有效的 IPv4 地址，也不是已知别名的格式。",
+            "机器选择器必须使用配置中的机器别名或设备主 IPv4 地址。",
+        )
+    if error.startswith("missing_parameter:"):
+        key = error.partition(":")[2] or "?"
+        return (
+            f"`/{kind}` 缺少必需参数 `{key}=`。",
+            "缺少该参数无法确定要处理的对象，因此没有执行。",
+        )
+    if error.startswith("invalid_parameter:"):
+        key = error.partition(":")[2] or "?"
+        return (
+            f"`/{kind}` 的参数 `{key}=` 格式或取值无效。",
+            "参数值不符合命令要求，因此没有执行。",
+        )
+    if error.startswith("duplicate_argument:"):
+        key = error.partition(":")[2] or "?"
+        return (
+            f"`/{kind}` 重复提供了参数 `{key}=`。",
+            "同一个参数只允许出现一次，重复时无法确定意图。",
+        )
+    if error == "invalid_arguments":
+        return (
+            f"`/{kind}` 的参数无法解析。",
+            "引号未闭合或参数格式不完整，因此没有执行。",
+        )
+    return (
+        f"`/{kind}` 的当前状态或参数无法处理。",
+        "命令未能通过执行前检查，因此没有产生任何部署或状态变更。",
+    )
+
+
+def _command_rejection_message(cmd) -> str:
+    """Build the public rejection reply for a command the watcher rejected."""
+    kind = _command_kind(cmd)
+    what, why = _command_error_explanation(cmd)
+    next_command = _NEXT_COMMAND.get(kind, "`/deploy_help` 查看命令说明")
+    return "\n".join([
+        f"`/{kind}` 未执行。",
+        f"- 错误：{what}",
+        f"- 原因：{why}",
+        f"- 下一步：{next_command}",
+    ])
+
+
+# Terminal rejections discovered at the dispatch boundary (after the command
+# was parsed, queued and its comment/PR identity re-verified, before any
+# controller work). Each entry states what failed, why, and the next step,
+# mirroring parse-level rejections.
+#
+# Only reasons that can still be bound to the command comment are listed.
+# Edited comments, unreadable timestamps, closed/merged/draft PRs and revoked
+# installation authorization are refused earlier: the bot can no longer prove
+# or reach the comment/installation, so a reply cannot be delivered there.
+_BOUNDARY_REJECTIONS = {
+    "head_changed": (
+        "PR HEAD 在审批执行前发生了变化。",
+        "审批只对提交命令时的 HEAD 有效；HEAD 变化后旧的 Review 与审批失效。",
+        "请在最新 HEAD 重新等待 Review 结果后再发送：",
+    ),
+}
+
+
+def _boundary_rejection_message(kind: str, reason: str) -> str:
+    """Build the public 错误/原因/下一步 reply for a dispatch-boundary rejection."""
+    what, why, next_step = _BOUNDARY_REJECTIONS[reason]
+    next_command = _NEXT_COMMAND.get(kind, "`/deploy_help` 查看命令说明")
+    return "\n".join([
+        f"`/{kind}` 未执行。",
+        f"- 错误：{what}",
+        f"- 原因：{why}",
+        f"- 下一步：{next_step}{next_command}",
+    ])
+
+
 def _needs_initial_comment_baseline(state: dict | None) -> bool:
     """Determine if a PR needs an initial comment baseline cycle.
 
@@ -929,6 +1061,50 @@ class GitHubCommandWatcher:
             discovery_to_completion_seconds=None,
             processing_duration_seconds=None,
         )
+
+    def _recent_command_notice_posted(self, repo, pr_number, comment_id, topic) -> bool:
+        record = self._recent_command_records.get((repo, pr_number, comment_id))
+        if not isinstance(record, dict):
+            return False
+        return topic in set(record.get("posted_notices") or ())
+
+    def _mark_recent_command_notice_posted(self, repo, pr_number, comment_id, topic):
+        record = self._recent_command_records.get((repo, pr_number, comment_id))
+        if not isinstance(record, dict):
+            return
+        notices = set(record.get("posted_notices") or ())
+        notices.add(topic)
+        record["posted_notices"] = sorted(notices)
+
+    async def _post_boundary_rejection(
+        self, repo: str, pr_number: int, comment_id: int, *,
+        kind: str, reason: str,
+    ) -> None:
+        """Post one public rejection notice for a dispatch-boundary decision.
+
+        The notice states what failed, why, and the next command to use. It is
+        idempotent per (command comment, reason) and never re-raises: a failed
+        notice must not change the terminal outcome of the command.
+        """
+        topic = f"command-rejected-{reason}-{kind}"
+        if self._recent_command_notice_posted(repo, pr_number, comment_id, topic):
+            return
+        post_reply = getattr(self.controller, "_post_command_reply", None)
+        if not callable(post_reply):
+            return
+        try:
+            await post_reply(
+                repo, pr_number, comment_id,
+                _boundary_rejection_message(kind, reason),
+                topic=topic,
+            )
+        except Exception as exc:
+            logger.warning(
+                "watcher boundary rejection notice failed repo=%s pr=%s comment_id=%s reason=%s",
+                repo, pr_number, comment_id, _github_failure_reason(exc),
+            )
+            return
+        self._mark_recent_command_notice_posted(repo, pr_number, comment_id, topic)
 
     def _fail_recent_commands_for_pr(self, repo, pr_number, reason, *, retryable=True):
         for (observed_repo, observed_pr, comment_id), record in list(
@@ -3257,17 +3433,49 @@ class GitHubCommandWatcher:
             if (not isinstance(dispatch_pr, dict)
                     or type(dispatch_pr.get("number")) is not int
                     or dispatch_pr.get("number") != pr_number
-                    or dispatch_pr.get("state") != "open"
-                    or dispatch_pr.get("merged")
-                    or dispatch_pr.get("draft")
-                    or not isinstance(dispatch_head, str)
-                    or not re.fullmatch(r"[0-9a-f]{40}", dispatch_head)
-                    or dispatch_head != state.get("head_sha")
                     or not isinstance(base_name, str)
-                    or base_name.casefold() != repo.casefold()):
+                    or base_name.casefold() != repo.casefold()
+                    or not isinstance(dispatch_head, str)
+                    or not re.fullmatch(r"[0-9a-f]{40}", dispatch_head)):
+                # PR identity is unreadable, so no reply can be bound to it.
                 self._finish_recent_command(
                     repo, pr_number, comment_id,
                     failure_reason="dispatch_pr_identity_or_head_mismatch",
+                )
+                return
+            if (dispatch_pr.get("state") != "open"
+                    or dispatch_pr.get("merged")
+                    or dispatch_pr.get("draft")):
+                # Closed/merged/draft PRs cannot receive a bound reply; the
+                # Lifecycle Summary already reports the terminal state.
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason="dispatch_pr_not_open",
+                )
+                return
+            if dispatch_head != state.get("head_sha"):
+                state_head = state.get("head_sha")
+                if not isinstance(state_head, str) or not re.fullmatch(
+                        r"[0-9a-f]{40}", state_head):
+                    # Lifecycle HEAD is unreadable — treat like identity loss.
+                    self._finish_recent_command(
+                        repo, pr_number, comment_id,
+                        failure_reason="dispatch_pr_identity_or_head_mismatch",
+                    )
+                    return
+                # HEAD moved between reconcile and dispatch: this command was
+                # issued for a different round. Consume it so it can never be
+                # replayed against the new HEAD, and say so publicly.
+                consumed = await self._consume_comment_cursor(repo, pr_number, comment_id)
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason=("dispatch_pr_head_changed" if consumed
+                                    else "dispatch_pr_head_changed_cursor_persist_not_confirmed"),
+                    retryable=not consumed,
+                )
+                await self._post_boundary_rejection(
+                    repo, pr_number, comment_id,
+                    kind=_command_kind(cmd), reason="head_changed",
                 )
                 return
 
@@ -3316,8 +3524,11 @@ class GitHubCommandWatcher:
                         try:
                             await post_reply(
                                 repo, pr_number, comment_id,
-                                f"`/{cmd.kind}` 尚未完成，Controller 未确认执行结果，因此本次不会标记为成功。"
-                                "请查看 Lifecycle Summary；若状态为 `deploying` 或结果仍在确认中，请等待只读恢复检查完成后再提交新命令。",
+                                f"`/{cmd.kind}` 尚未完成。\n"
+                                "- 错误：Controller 未确认执行结果，本次不会标记为成功。\n"
+                                "- 原因：命令已进入处理但结果未返回，自动重放可能造成重复部署。\n"
+                                "- 下一步：查看 Lifecycle Summary；若状态为 `deploying` 或结果确认中，"
+                                "请等待只读恢复检查完成后再提交新命令。",
                                 topic=f"command-unfinished-{cmd.kind}",
                             )
                         except Exception as reply_error:
@@ -3348,7 +3559,7 @@ class GitHubCommandWatcher:
                     try:
                         await post_reply(
                             repo, pr_number, comment_id,
-                            f"`/{cmd.kind}` 未执行：命令无法处理。请检查 Lifecycle Summary 和当前命令格式后，再发送新的命令。",
+                            _command_rejection_message(cmd),
                             topic=f"command-rejected-{cmd.kind}",
                         )
                     except Exception as reply_error:
@@ -3375,8 +3586,10 @@ class GitHubCommandWatcher:
                     try:
                         await post_reply(
                             repo, pr_number, comment_id,
-                            f"`/{cmd.kind}` 的执行结果暂时无法确认。当前命令不会自动重放；"
-                            "请检查 Lifecycle Summary。若状态为 `deploying` 或结果仍在确认中，"
+                            f"`/{cmd.kind}` 的执行结果暂时无法确认。\n"
+                            "- 错误：处理过程中出现异常，无法判断部署是否已经开始。\n"
+                            "- 原因：自动重放可能造成重复部署，因此当前命令不会自动重放。\n"
+                            "- 下一步：检查 Lifecycle Summary；若状态为 `deploying` 或结果确认中，"
                             "请等待只读恢复检查完成后再提交新的审批命令。",
                             topic=f"command-outcome-unknown-{cmd.kind}",
                         )

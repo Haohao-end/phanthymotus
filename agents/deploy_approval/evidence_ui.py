@@ -18,7 +18,7 @@ def render_upload_page(repo, pr_number, head_sha, round_id, *, read_only=False) 
     return f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="referrer" content="no-referrer"><title>上传测试证据</title>
+<meta name="referrer" content="no-referrer"><title>测试证据上传</title>
 <style>
 *{{box-sizing:border-box}}
 body{{margin:0;background:#f5f5f7;color:#1d1d1f;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}}
@@ -62,9 +62,10 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 </style><script src="/evidence/assets/app.js" defer></script></head>
 <body>
 <main id="app" data-api="{esc(api)}" data-repo="{esc(repo)}" data-pr="{esc(pr_number)}" data-head="{esc(head_sha)}" data-round="{esc(round_id)}" data-read-only="{str(bool(read_only)).lower()}">
-<header><h1>上传测试证据</h1><p class="subtitle">这里上传供验收人查看的测试效果视频、截图等证据。</p></header>
+<header><h1>测试证据上传</h1><p class="subtitle">这里上传供验收人查看的测试效果视频、截图等证据。</p></header>
 <p id="message" role="status" aria-live="polite"></p>
-<section id="upload-section" class="panel">
+<h2 class="list-heading" id="next-action-heading">下一步：上传测试证据</h2>
+<section id="upload-section" class="panel" aria-labelledby="next-action-heading">
 <fieldset id="writes" disabled hidden>
 <label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><span class="file-hint">最多 20 个文件 · 单个文件最大 512 MiB · 总计最大 10 GiB</span><input id="file" type="file" multiple></label>
 <div class="primary-row"><button id="upload" type="button">上传测试证据</button></div>
@@ -285,7 +286,7 @@ _JAVASCRIPT = r'''"use strict";
           if (!(path === "/context" && authMode === "invite")) halt(expired);
           throw new ApiError(401, expired, detail);
         }
-        if (response.status === 403) throw new ApiError(403, "当前链接没有此操作权限。请从 PR Summary 获取有效上传邀请；历史轮次仅支持查看。", detail);
+        if (response.status === 403) throw new ApiError(403, "当前链接没有上传权限。请刷新 PR Summary 并打开最新上传链接。", detail);
         if (response.status === 503) throw new ApiError(503, "附件或 GitHub 服务暂时无法读取；当前操作未确认完成。请稍后重试，或重新打开 PR Summary 中的附件页面。", detail);
         if (response.status === 409 && ["round_changed", "context_not_writable", "pr_closed",
           "pr_closed_or_mismatched", "pr_draft", "state_unavailable"].includes(detail))

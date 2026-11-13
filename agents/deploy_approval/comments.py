@@ -566,26 +566,33 @@ def _replace_runtime_next_action(markdown: str, runtime_action: str) -> str:
         return markdown
 
     newline = "\r\n" if "\r\n" in markdown else "\n"
+    separator = newline + newline
     if marker_span is not None:
         start, end = marker_span
         if runtime_action:
             updated_body = body[:start] + runtime_action + body[end:]
         else:
-            # Remove only the marker span. Everything before and after it is
-            # kept verbatim, including any Next action text that follows the
-            # runtime block.
-            updated_body = body[:start] + body[end:]
-    elif body.rstrip():
-        # Keep a blank line between the existing text and the runtime action,
-        # and another one before the next section marker so the marker keeps
-        # its own line.
-        updated_body = (
-            body.rstrip() + newline + newline + runtime_action + newline + newline
-        )
+            # Remove the marker span plus the blank-line separator the
+            # projection inserted. The trailing whitespace that used to follow
+            # the Next action text is kept verbatim, so clearing the block
+            # restores the original bytes inside the section.
+            before_raw = body[:start]
+            before = (
+                before_raw[:-len(separator)]
+                if before_raw.endswith(separator) else
+                before_raw.rstrip("\r\n")
+            )
+            updated_body = before + body[end:]
+    elif body.strip():
+        # Keep the original trailing newlines after the runtime block so the
+        # next section marker keeps its own line and removal stays reversible.
+        text = body.rstrip("\r\n")
+        trailing = body[len(text):]
+        updated_body = text + separator + runtime_action + trailing
     else:
-        prefix = markdown[:body_start]
-        separator = newline if prefix.endswith("\n") else newline + newline
-        updated_body = separator + runtime_action + newline + newline
+        # Whitespace-only body: keep that whitespace after the block so the
+        # next section marker stays on its own line and removal stays exact.
+        updated_body = newline + runtime_action + body
 
     return markdown[:body_start] + updated_body + markdown[body_end:]
 
@@ -777,25 +784,68 @@ def _workflow_lines(
     status: str, evidence_complete: bool = False,
     deployments_complete: bool | None = None,
     record_test_complete: bool = False,
+    failed_stage: str = "",
 ) -> str:
-    """Keep the progress note short and separate from the next action."""
-    if status == "review-required":
-        return "当前 HEAD 尚无可信代码审查结果。"
-    if status == "reviewing":
-        return "Review Agent 正在检查当前 HEAD。"
-    if status == "deploy-ready":
-        return "当前 HEAD 的构建和审核已通过。"
-    if status == "deploy-requested":
-        return "本轮部署申请已收到。"
-    if status == "deploying":
-        return "部署命令已提交，结果正在确认。"
-    if status == "testing":
-        return "本轮部署已完成，可开始测试。"
-    if status == "succeeded":
-        return "本轮验收已通过。"
-    if status == "failed":
-        return "本轮流程失败，请查看具体部署或验收记录。"
-    return "等待更新。"
+    """Return the fixed 8-step workflow as markdown.
+
+    Always forward order. [x] for complete, [ ] for pending.
+    First unchecked step marked with \u2190 **Next**.
+    If all steps are checked, no Next marker is emitted.
+    ``failed_stage`` decides how far a failed run may claim progress.
+    """
+    step_defs = [
+        ("1. Request Review", 0, "review"),
+        ("2. Review Agent completed", 1, "reviewed"),
+        ("3. Request deployment", 2, "request"),
+        ("4. Machine Owner approval(s)", 3, "approval"),
+        ("5. All required components deployed", 4, "deployment"),
+        ("6. Machine Owner uploads evidence", 4, "evidence"),
+        ("7. Record validation result", 5, "result"),
+        ("8. Deployment accepted", 6, "accepted"),
+    ]
+
+    status_levels = {
+        "review-required": 0,
+        "reviewing": 1,
+        "deploy-ready": 2,
+        "deploy-requested": 3,
+        "deploying": 4,
+        "testing": 5,
+        "succeeded": 7,
+    }
+    # A failed run must never claim steps it cannot prove: ``failed`` marks the
+    # first step that did not complete as Next and leaves everything after it
+    # unchecked. An unknown stage falls back to the most conservative
+    # progression — nothing is reported as completed.
+    failed_first_pending = {
+        "deployment": 4,
+        "evidence": 5,
+        "validation": 7,
+    }.get(failed_stage or "", 0)
+    current_level = status_levels.get(status, 0)
+
+    lines = []
+    next_marked = False
+    for index, (label, required_level, step) in enumerate(step_defs):
+        if status == "failed":
+            checked = index < failed_first_pending
+        else:
+            checked = current_level > required_level
+            if status == "testing" and step == "deployment":
+                # An unset flag means the caller did not assert incompleteness.
+                checked = deployments_complete is not False
+            if status == "testing" and step == "evidence":
+                checked = bool(evidence_complete)
+            if status == "testing" and step == "result":
+                checked = bool(record_test_complete)
+        mark = "[x]" if checked else "[ ]"
+        line = f"- {mark} {label}"
+        if not checked and not next_marked:
+            line += " \u2190 **Next**"
+            next_marked = True
+        lines.append(line)
+
+    return "\n".join(lines)
 
 
 def _trusted_upload_page_url(value: str, repo: str, pr_number: int) -> str:
@@ -1788,6 +1838,7 @@ def deploy_requested(
     inventory_rows = _machine_inventory_records(machine_inventory)
     diagnostic_rows = _machine_diagnostic_rows(machine_diagnostics)
     group_rows = _record_rows(machine_groups)
+    runtime_rows = _record_rows(runtime_checks, ("checks", "runtime_checks", "items"))
     policy = _repo_policy_display_status(repo, repository_policy_status, machine_diagnostics)
     test_only = _test_only_status(
         repository_policy_status, machine_diagnostics, group_rows, components,
@@ -2203,7 +2254,7 @@ def deploy_requested(
             alias = state["alias"]
             selector = state["command_selector"]
             if (not isinstance(selector, str)
-                    or not (ipv4(selector)
+                    or not (_canonical_ip(selector)
                             or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", selector))):
                 continue
             command = f"/approve_deploy machine={selector}"
@@ -2334,7 +2385,11 @@ def testing(
         "",
         "### Workflow",
         "",
-        _workflow_lines("testing"),
+        _workflow_lines(
+            "testing", evidence_complete=evidence_complete,
+            deployments_complete=deployments_complete,
+            record_test_complete=record_test_complete,
+        ),
         "",
         "### Next action",
         "",
@@ -2382,6 +2437,7 @@ def failed_comment(
     components: list[dict] | None = None,
     machine_groups: list[dict] | None = None,
     attempt: dict | None = None,
+    failed_stage: str = "",
 ) -> str:
     lines = [
         BOT_MARKER,
@@ -2393,7 +2449,7 @@ def failed_comment(
         "",
         "### Workflow",
         "",
-        _workflow_lines("failed"),
+        _workflow_lines("failed", failed_stage=failed_stage),
         "",
         "### Next action",
         "",
