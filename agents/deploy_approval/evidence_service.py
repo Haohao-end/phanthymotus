@@ -19,6 +19,7 @@ import re
 import socket
 import tempfile
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urljoin, urlsplit
@@ -45,6 +46,29 @@ class _NoopAsyncContext:
 
 
 class EvidenceService:
+    @staticmethod
+    def _is_internal_bot_note(row):
+        if not isinstance(row, dict) or row.get('actor_verified') is not True:
+            return False
+        actor = row.get('actor_login') or row.get('actor')
+        note = row.get('note')
+        if not (isinstance(actor, str) and actor.casefold() == '4pd-pr-assistant[bot]'
+                and isinstance(note, str)):
+            return False
+        normalized = ' '.join(
+            unicodedata.normalize('NFKC', note).replace('\u200b', '').split(),
+        ).casefold()
+        templates = (
+            'server-side cos multipart acceptance',
+            'server-side 20mb h.264 cos transport acceptance',
+            '自动保存的内部证据记录（无需操作）',
+        )
+        return any(normalized == template or
+                   normalized.startswith(template) and
+                   normalized[len(template):len(template) + 1] in
+                   {' ', ':', ';', ',', '.', '!', '?', '(', '（', '-', '—'}
+                   for template in templates)
+
     def __init__(self, *, config, github, proxy, policy, controller, store):
         self.config, self.github, self.proxy = config, github, proxy
         self.policy, self.controller, self.store = policy, controller, store
@@ -181,6 +205,7 @@ class EvidenceService:
                 or operation.get('cos_content_verified') is not True
                 or operation.get('evidence_kind') == 'note'
                 or operation.get('internal_bot_note') is True
+                or self._is_internal_bot_note(operation)
                 or not isinstance(operation.get('object_key'), str)
                 or not operation['object_key']
                 or type(operation.get('size')) is not int or operation['size'] <= 0
@@ -200,19 +225,6 @@ class EvidenceService:
             return False
         if PurePosixPath(filename).suffix.lower() not in _COMMENTABLE_MEDIA_SUFFIXES:
             return False
-
-        actor_login = operation.get('actor_login') or operation.get('actor')
-        note_text = operation.get('note')
-        if isinstance(actor_login, str) and actor_login.casefold() == '4pd-pr-assistant[bot]' \
-                and isinstance(note_text, str):
-            normalized_note = ' '.join(note_text.split()).casefold()
-            internal_notes = (
-                'server-side cos multipart acceptance',
-                'server-side 20mb h.264 cos transport acceptance',
-            )
-            if any(normalized_note == template or normalized_note.startswith(template + ' ')
-                   for template in internal_notes):
-                return False
 
         from . import comments as comments_mod, evidence_auth
         public_base = getattr(self.config, 'evidence_public_base_url', '')
@@ -1494,6 +1506,11 @@ class EvidenceService:
             if action == 'context':
                 note_display_cache = {}
                 async def context_attachment(row):
+                    # Internally generated bot notes remain in the trusted
+                    # evidence store, but are never projected to this page.
+                    if (row.get('internal_bot_note') is True
+                            or self._is_internal_bot_note(row)):
+                        return None
                     public_fields = {
                         'attachment_id', 'filename', 'size', 'sha256', 'note', 'evidence_kind',
                         'round_id', 'head_sha', 'status', 'created_at', 'updated_at',
@@ -1546,6 +1563,7 @@ class EvidenceService:
                                 and row_round == round_id]
                 current_attachments = await asyncio.gather(
                     *(context_attachment(row) for row in current_rows))
+                current_attachments = [row for row in current_attachments if row is not None]
 
                 # The upload page keeps only the current round's upload state.
                 # Historical rounds, deployment records, machine logs and
@@ -1575,7 +1593,10 @@ class EvidenceService:
                         'upload_max_bytes': (UPLOAD_MAX_BYTES if invite_allowed else None),
                         'attachments': current_attachments,
                         'operations': [{k: v for k, v in r.items() if k != 'upload_id'}
-                                       for r in operations.values() if not r.get('auth_nonce_marker')
+                                       for r in operations.values()
+                                       if r.get('internal_bot_note') is not True
+                                       and not self._is_internal_bot_note(r)
+                                       and not r.get('auth_nonce_marker')
                                        and not r.get('native_attachment')
                                        and r.get('head_sha') == selected.get('head_sha')
                                        and r.get('round_id') == round_id
@@ -1762,7 +1783,10 @@ class EvidenceService:
                             and sum(invite_rows.values()) + requested_size > UPLOAD_MAX_BYTES):
                         raise EvidenceError('upload_invitation_note_byte_quota_exceeded', 413)
 
-            def public(operation, result=None, *, attachment_persisted=False):
+            def public(
+                operation, result=None, *, attachment_persisted=False,
+                github_comment_synced=None,
+            ):
                 value = copy.deepcopy(operation)
                 # HTTP upload_id is a stable operation reference, never a key
                 # supplied by a browser. COS UploadId remains a recovery fact.
@@ -1788,6 +1812,8 @@ class EvidenceService:
                     value['github_record_persisted'] = True
                 if attachment_persisted and ((result or {}).get('verified') is True or persisted_ready):
                     value['verified'] = True
+                if isinstance(github_comment_synced, bool):
+                    value['github_comment_synced'] = github_comment_synced
                 return value
 
             nonce_consumed = False
@@ -1817,8 +1843,13 @@ class EvidenceService:
                 if saved and saved['status'] == 'deleted':
                     raise EvidenceError('attachment_deleted', 410)
                 if saved and saved['status'] == 'ready' and saved.get('cos_content_verified') is True:
-                    await self._notify_ready_attachment(repo, pr_number, saved)
-                    return public(saved, attachment_persisted=True)
+                    github_comment_synced = await self._notify_ready_attachment(
+                        repo, pr_number, saved,
+                    )
+                    return public(
+                        saved, attachment_persisted=True,
+                        github_comment_synced=github_comment_synced,
+                    )
                 if source['status'] == 'ready':
                     await current()
                     recovered = copy.deepcopy(source)
@@ -1837,8 +1868,13 @@ class EvidenceService:
                         recovered.update(sha256=sha, cos_content_verified=True)
                         await self._save(repo, pr_number, 'operation', recovered, 'ready')
                     await self._save(repo, pr_number, 'attachment', recovered, 'ready')
-                    await self._notify_ready_attachment(repo, pr_number, recovered)
-                    return public(recovered, attachment_persisted=True)
+                    github_comment_synced = await self._notify_ready_attachment(
+                        repo, pr_number, recovered,
+                    )
+                    return public(
+                        recovered, attachment_persisted=True,
+                        github_comment_synced=github_comment_synced,
+                    )
                 await current()
                 result = await self._store('resume', source, {})
                 try:
@@ -1861,6 +1897,7 @@ class EvidenceService:
                                 or (source.get(field) and source[field] != value)):
                             raise EvidenceError('store_recovery_conflict', 409)
                         recovered[field] = value
+                github_comment_synced = None
                 if result.get('verified') is True:
                     sha = result.get('sha256')
                     if (not recovered.get('object_key') or type(result.get('size')) is not int
@@ -1872,22 +1909,34 @@ class EvidenceService:
                                      completed_at=utc_now())
                     await self._save(repo, pr_number, 'operation', recovered, 'ready')
                     await self._save(repo, pr_number, 'attachment', recovered, 'ready')
-                    await self._notify_ready_attachment(repo, pr_number, recovered)
+                    github_comment_synced = await self._notify_ready_attachment(
+                        repo, pr_number, recovered,
+                    )
                 else:
                     if not recovered.get('object_key') or not recovered.get('upload_id'):
                         raise EvidenceError('upload_not_recoverable', 502)
                     recovered['status'] = 'uploading'
                     await self._save(repo, pr_number, 'operation', recovered, 'uploading')
-                return public(recovered, result, attachment_persisted=result.get('verified') is True)
+                return public(
+                    recovered, result,
+                    attachment_persisted=result.get('verified') is True,
+                    github_comment_synced=github_comment_synced,
+                )
 
             if existing and existing['status'] in {'ready', 'deleted', 'invalid'}:
                 if existing['status'] == 'invalid':
                     raise EvidenceError('round_changed', 409)
                 await current()
                 await self._save(repo, pr_number, 'attachment', existing, existing['status'])
+                github_comment_synced = None
                 if existing.get('status') == 'ready':
-                    await self._notify_ready_attachment(repo, pr_number, existing)
-                return public(existing, attachment_persisted=existing.get('status') == 'ready')
+                    github_comment_synced = await self._notify_ready_attachment(
+                        repo, pr_number, existing,
+                    )
+                return public(
+                    existing, attachment_persisted=existing.get('status') == 'ready',
+                    github_comment_synced=github_comment_synced,
+                )
             if action in {'init', 'note'}:
                 text = payload.get('text') or payload.get('note', '')
                 if action == 'note':
@@ -1965,11 +2014,15 @@ class EvidenceService:
                     raise EvidenceError('upload_owner_mismatch', 403)
                 if (action != 'delete' and current_attachment
                         and current_attachment.get('status') == 'ready'):
+                    github_comment_synced = None
                     if action in {'complete', 'resume'}:
-                        await self._notify_ready_attachment(repo, pr_number, current_attachment)
+                        github_comment_synced = await self._notify_ready_attachment(
+                            repo, pr_number, current_attachment,
+                        )
                     return public(
                         current_attachment,
                         attachment_persisted=True,
+                        github_comment_synced=github_comment_synced,
                     )
                 operation = existing or {**source, 'operation_id': opid,
                                          'source_operation_id': source['operation_id'], 'request_sha256': request_hash}
@@ -2043,6 +2096,7 @@ class EvidenceService:
                         raise EvidenceError('store_object_conflict', 409)
                     operation[key] = value
             ready = result.get('verified') is True
+            github_comment_synced = None
             if action in {'complete', 'note'} or ready:
                 actual_sha = result.get('sha256')
                 if (not ready or not operation.get('object_key') or type(result.get('size')) is not int
@@ -2054,10 +2108,15 @@ class EvidenceService:
                                  completed_at=utc_now())
                 await self._save(repo, pr_number, 'operation', operation, 'ready')
                 await self._save(repo, pr_number, 'attachment', operation, 'ready')
-                await self._notify_ready_attachment(repo, pr_number, operation)
+                github_comment_synced = await self._notify_ready_attachment(
+                    repo, pr_number, operation,
+                )
             else:
                 if not operation.get('upload_id') or not operation.get('object_key'):
                     raise EvidenceError('upload_not_recoverable', 502)
                 operation['status'] = 'uploading'
                 await self._save(repo, pr_number, 'operation', operation, 'uploading')
-            return public(operation, result, attachment_persisted=ready)
+            return public(
+                operation, result, attachment_persisted=ready,
+                github_comment_synced=github_comment_synced,
+            )

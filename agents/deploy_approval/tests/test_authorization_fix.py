@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
+import hmac
 import json
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -57,44 +60,80 @@ def _fake_install_repo_response(repos, page=1, per_page=100):
 
 @pytest.mark.asyncio
 async def test_resolve_active_repos_main_only():
-    config = _make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config = _make_config(github_repos=["test-owner/phanthymotus", "test-owner/phanthymotus-driver"])
     gh = _make_github(config)
     gh.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus"]
+        return_value=["test-owner/phanthymotus"]
     )
     active = await _resolve_active_repos(gh, config.github_repos)
-    assert active == ["4paradigm/phanthymotus"]
+    assert active == ["test-owner/phanthymotus"]
 
 
 @pytest.mark.asyncio
 async def test_resolve_active_repos_main_and_driver():
-    config = _make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config = _make_config(github_repos=["test-owner/phanthymotus", "test-owner/phanthymotus-driver"])
     gh = _make_github(config)
     gh.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+        return_value=["test-owner/phanthymotus", "test-owner/phanthymotus-driver"]
     )
     active = await _resolve_active_repos(gh, config.github_repos)
-    assert active == ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    assert active == ["test-owner/phanthymotus", "test-owner/phanthymotus-driver"]
 
 
 @pytest.mark.asyncio
-async def test_resolve_active_repos_missing_main_fails():
-    config = _make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+async def test_resolve_active_repos_is_the_exact_intersection():
+    config = _make_config(github_repos=["test-owner/phanthymotus", "test-owner/phanthymotus-driver"])
     gh = _make_github(config)
-    gh.list_installation_repositories = AsyncMock(return_value=["4paradigm/phanthymotus-driver"])
-    with pytest.raises(RuntimeError, match="required repo.*not authorized"):
-        await _resolve_active_repos(gh, config.github_repos)
+    gh.list_installation_repositories = AsyncMock(return_value=["test-owner/phanthymotus-driver"])
+    assert await _resolve_active_repos(gh, config.github_repos) == [
+        "test-owner/phanthymotus-driver",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_installation_snapshot_separates_watch_and_policy_authorization():
+    config = _make_config(
+        github_repos=["test-owner/phanthymotus"],
+        active_repos=[],
+        policy_active_repos=[],
+        auth_valid=True,
+    )
+
+    class FakeGitHub:
+        def __init__(self):
+            self.config = config
+            self.calls = 0
+
+        async def list_installation_repositories(self):
+            self.calls += 1
+            return [
+                "test-owner/phanthymotus",
+                "4paradigm/phanthymotus",
+                "4paradigm/phanthymotus-driver",
+            ]
+
+    github = FakeGitHub()
+    active = await _resolve_active_repos(github, config.github_repos, config=config)
+    config.active_repos = active
+
+    assert active == ["test-owner/phanthymotus"]
+    assert config.active_repos == ["test-owner/phanthymotus"]
+    assert config.policy_active_repos == [
+        "4paradigm/phanthymotus",
+        "4paradigm/phanthymotus-driver",
+    ]
+    assert github.calls == 1
 
 
 @pytest.mark.asyncio
 async def test_resolve_active_repos_unknown_ignored():
-    config = _make_config(github_repos=["4paradigm/phanthymotus"])
+    config = _make_config(github_repos=["test-owner/phanthymotus"])
     gh = _make_github(config)
     gh.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "some/other-repo"]
+        return_value=["test-owner/phanthymotus", "some/other-repo"]
     )
     active = await _resolve_active_repos(gh, config.github_repos)
-    assert active == ["4paradigm/phanthymotus"]
+    assert active == ["test-owner/phanthymotus"]
 
 
 # ------------------------------------------------------------------
@@ -105,8 +144,8 @@ async def test_resolve_active_repos_unknown_ignored():
 async def test_list_installation_repositories_pagination():
     config = _make_config()
 
-    repos1 = [{"full_name": f"repo-{i}"} for i in range(100)]
-    repos2 = [{"full_name": f"repo-{i}"} for i in range(100, 110)]
+    repos1 = [{"full_name": f"org/repo-{i}"} for i in range(100)]
+    repos2 = [{"full_name": f"org/repo-{i}"} for i in range(100, 110)]
 
     class MockTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request):
@@ -279,7 +318,7 @@ def test_webhook_driver_blocked_when_inactive():
     from ..router_webhook import router as webhook_router
 
     config = Config(
-        github_repos=["4paradigm/phanthymotus"],
+        github_repos=["test-owner/phanthymotus"],
         webhook_enabled=True,
         github_webhook_secret="secret",
         poll_enabled=True,
@@ -287,7 +326,7 @@ def test_webhook_driver_blocked_when_inactive():
         machine_owners_file="/dev/null",
         secrets_file="/dev/null",
     )
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["test-owner/phanthymotus"]
     config.auth_valid = True
 
     app = FastAPI()
@@ -298,17 +337,19 @@ def test_webhook_driver_blocked_when_inactive():
 
     payload = json.dumps({
         "action": "created",
-        "repository": {"full_name": "4paradigm/phanthymotus-driver"},
+        "repository": {"full_name": "test-owner/phanthymotus-driver"},
         "issue": {"number": 1, "pull_request": {}},
         "comment": {"id": 99},
     }).encode()
 
+    signature = hmac.new(b"secret", payload, hashlib.sha256).hexdigest()
     response = client.post(
         "/webhook",
         content=payload,
         headers={
             "X-GitHub-Event": "issue_comment",
-            "X-Hub-Signature-256": "sha256=94b5df81103e3a1a6c2e6f7a9d0a429131d732bfca34d2e3d5b63d56cff457da",
+            "X-Hub-Signature-256": f"sha256={signature}",
+            "X-GitHub-Delivery": "test-driver-blocked",
             "Content-Type": "application/json",
         },
     )
@@ -323,7 +364,7 @@ def test_webhook_driver_allowed_when_active():
     from ..router_webhook import router as webhook_router
 
     config = Config(
-        github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+        github_repos=["test-owner/phanthymotus", "test-owner/phanthymotus-driver"],
         webhook_enabled=True,
         github_webhook_secret="secret",
         poll_enabled=True,
@@ -331,7 +372,7 @@ def test_webhook_driver_allowed_when_active():
         machine_owners_file="/dev/null",
         secrets_file="/dev/null",
     )
-    config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    config.active_repos = ["test-owner/phanthymotus", "test-owner/phanthymotus-driver"]
     config.auth_valid = True
 
     proxy = AsyncMock()
@@ -344,28 +385,32 @@ def test_webhook_driver_allowed_when_active():
     app = FastAPI()
     app.state.config = config
     app.state.proxy = proxy
+    app.state.watcher = MagicMock()
+    app.state.watcher.enqueue_pr.return_value = True
     app.include_router(webhook_router)
 
     client = TestClient(app)
 
     payload = json.dumps({
         "action": "created",
-        "repository": {"full_name": "4paradigm/phanthymotus-driver"},
+        "repository": {"full_name": "test-owner/phanthymotus-driver"},
         "issue": {"number": 1, "pull_request": {}},
         "comment": {"id": 99},
     }).encode()
 
+    signature = hmac.new(b"secret", payload, hashlib.sha256).hexdigest()
     response = client.post(
         "/webhook",
         content=payload,
         headers={
             "X-GitHub-Event": "issue_comment",
-            "X-Hub-Signature-256": "sha256=94b5df81103e3a1a6c2e6f7a9d0a429131d732bfca34d2e3d5b63d56cff457da",
+            "X-Hub-Signature-256": f"sha256={signature}",
+            "X-GitHub-Delivery": "test-driver-allowed",
             "Content-Type": "application/json",
         },
     )
     assert response.status_code == 200
-    assert response.json()["status"] == "deferred"
+    assert response.json()["status"] == "queued"
 
 
 # ------------------------------------------------------------------
@@ -415,7 +460,7 @@ async def test_first_observation_baseline_blocks_historical_commands():
 
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
 
     # Historical commands must NOT be dispatched.
     controller.on_command.assert_not_called()
@@ -437,7 +482,7 @@ async def test_first_observation_baseline_new_command_after_still_executes():
       -> on_command called exactly once for id=20
     """
     config = _make_config()
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["test-owner/phanthymotus"]
     config.auth_valid = True
     proxy = MagicMock()
 
@@ -472,7 +517,7 @@ async def test_first_observation_baseline_new_command_after_still_executes():
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
     # Cycle 1: no state, historical comment only
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
     controller.on_command.assert_not_called()
     proxy.persist_cursor.assert_called()
     assert hidden_state[0]["last_processed_comment_id"] == 10
@@ -481,16 +526,139 @@ async def test_first_observation_baseline_new_command_after_still_executes():
     hidden_state[0] = {"last_processed_comment_id": 10, "head_sha": "a" * 40}
     historical_comments.append({"id": 20, "body": "/request_deploy"})
     controller.on_command.reset_mock()
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
 
     # on_command called exactly once for the new comment (id=20)
     controller.on_command.assert_called_once()
 
 
 @pytest.mark.asyncio
+async def test_command_rejection_posts_comment_before_cursor_consumption():
+    repo = "test-owner/phanthymotus"
+    config = _make_config(github_repos=[repo], active_repos=[repo])
+    state = {
+        "head_sha": "a" * 40,
+        "status": "deploy-ready",
+        "last_processed_comment_id": 10,
+        "round_id": f"{'a' * 40}-10",
+        "command": {
+            "comment_id": 10, "kind": "", "phase": "completed", "args": {},
+        },
+    }
+    events = []
+    comment = {
+        "id": 20,
+        "body": "/approve_deploy machine=999.999",
+        "created_at": "2026-11-14T00:00:00Z",
+        "updated_at": "2026-11-14T00:00:00Z",
+        "issue_url": f"https://api.github.com/repos/{repo}/issues/1",
+        "user": {"id": 123, "login": "test-actor"},
+    }
+    proxy = MagicMock()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.get_pr = AsyncMock(return_value={
+        "number": 1, "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40},
+        "base": {"repo": {"full_name": repo}},
+    })
+    proxy.get_issue_comments = AsyncMock(return_value=[comment])
+    proxy.get_comment = AsyncMock(return_value=comment)
+    proxy.is_bot_comment = MagicMock(return_value=False)
+    proxy.comment_identity = AsyncMock(return_value=("123", "test-actor"))
+
+    async def post_reply(*_args, **_kwargs):
+        events.append("comment")
+        return True
+
+    async def persist_cursor(_repo, _pr, comment_id):
+        events.append("cursor")
+        state["last_processed_comment_id"] = comment_id
+        return state
+
+    proxy.persist_cursor = AsyncMock(side_effect=persist_cursor)
+    controller = MagicMock()
+    controller.reconcile_pr = AsyncMock()
+    controller._post_command_reply = AsyncMock(side_effect=post_reply)
+    controller._approval_command_guidance = AsyncMock(
+        return_value="`/approve_deploy machine=192.0.2.10`",
+    )
+    controller.policy = None
+    controller.github = None
+
+    watcher = GitHubCommandWatcher(config, proxy, controller)
+    watcher._repo_baseline_cutoff_utc[repo] = datetime(
+        2026, 11, 13, tzinfo=timezone.utc,
+    )
+
+    await watcher._process_pr(repo, 1)
+
+    assert events == ["comment", "cursor"]
+    assert state["last_processed_comment_id"] == 20
+    assert proxy.persist_cursor.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_command_rejection_comment_leaves_cursor_retryable():
+    repo = "test-owner/phanthymotus"
+    config = _make_config(github_repos=[repo], active_repos=[repo])
+    state = {
+        "head_sha": "a" * 40,
+        "status": "deploy-ready",
+        "last_processed_comment_id": 10,
+        "round_id": f"{'a' * 40}-10",
+        "command": {
+            "comment_id": 10, "kind": "", "phase": "completed", "args": {},
+        },
+    }
+    events = []
+    comment = {
+        "id": 20,
+        "body": "/approve_deploy machine=999.999",
+        "created_at": "2026-11-14T00:00:00Z",
+        "updated_at": "2026-11-14T00:00:00Z",
+        "issue_url": f"https://api.github.com/repos/{repo}/issues/1",
+        "user": {"id": 123, "login": "test-actor"},
+    }
+    proxy = MagicMock()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.get_pr = AsyncMock(return_value={
+        "number": 1, "state": "open", "merged": False, "draft": False,
+        "head": {"sha": "a" * 40},
+        "base": {"repo": {"full_name": repo}},
+    })
+    proxy.get_issue_comments = AsyncMock(return_value=[comment])
+    proxy.get_comment = AsyncMock(return_value=comment)
+    proxy.is_bot_comment = MagicMock(return_value=False)
+    proxy.comment_identity = AsyncMock(return_value=("123", "test-actor"))
+    proxy.persist_cursor = AsyncMock(side_effect=lambda *_args: events.append("cursor"))
+
+    async def failed_reply(*_args, **_kwargs):
+        events.append("comment")
+        return False
+
+    controller = MagicMock()
+    controller.reconcile_pr = AsyncMock()
+    controller._post_command_reply = AsyncMock(side_effect=failed_reply)
+    controller._approval_command_guidance = AsyncMock(return_value="policy unavailable")
+    controller.policy = None
+    controller.github = None
+
+    watcher = GitHubCommandWatcher(config, proxy, controller)
+    watcher._repo_baseline_cutoff_utc[repo] = datetime(
+        2026, 11, 13, tzinfo=timezone.utc,
+    )
+
+    await watcher._process_pr(repo, 1)
+
+    assert events == ["comment"]
+    assert state["last_processed_comment_id"] == 10
+    assert proxy.persist_cursor.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_existing_state_cursor_behavior_unchanged():
     config = _make_config()
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["test-owner/phanthymotus"]
     config.auth_valid = True
     proxy = MagicMock()
     proxy.read_hidden_state = AsyncMock(return_value={
@@ -511,7 +679,7 @@ async def test_existing_state_cursor_behavior_unchanged():
 
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
 
     controller.on_command.assert_called()
 
@@ -537,7 +705,7 @@ async def test_bot_comment_no_cursor_regression():
 
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
 
     controller.on_command.assert_not_called()
 
@@ -560,15 +728,15 @@ def test_supported_github_repos_contains_both():
 async def test_resolve_active_repos_logs_no_secrets(caplog):
     import logging
     caplog.set_level(logging.INFO)
-    config = _make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config = _make_config(github_repos=["test-owner/phanthymotus", "test-owner/phanthymotus-driver"])
     gh = _make_github(config)
     gh.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus"]
+        return_value=["test-owner/phanthymotus"]
     )
     await _resolve_active_repos(gh, config.github_repos)
     logged = caplog.text
-    assert "4paradigm/phanthymotus" in logged
-    assert "4paradigm/phanthymotus-driver" in logged
+    assert "test-owner/phanthymotus" in logged
+    assert "test-owner/phanthymotus-driver" in logged
 
 
 # ------------------------------------------------------------------
@@ -606,7 +774,7 @@ async def test_startup_main_only_active_repos():
         machine_yaml_path = f.name
 
     cfg = Config(
-        github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+        github_repos=["test-owner/phanthymotus", "test-owner/phanthymotus-driver"],
         github_api_url="https://api.github.com",
         poll_enabled=True,
         poll_interval_seconds=30,
@@ -621,7 +789,7 @@ async def test_startup_main_only_active_repos():
             return {"id": 222, "login": "bot"}
 
         async def list_installation_repositories(self):
-            return ["4paradigm/phanthymotus"]
+            return ["test-owner/phanthymotus"]
 
         async def list_repository_labels(self, repo):
             return []
@@ -670,13 +838,13 @@ async def test_startup_main_only_active_repos():
         server_mod.GitHubCommandWatcher = orig_watcher
 
     assert watcher_started == [True]
-    assert cfg.github_repos == ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
-    assert cfg.active_repos == ["4paradigm/phanthymotus"]
+    assert cfg.github_repos == ["test-owner/phanthymotus", "test-owner/phanthymotus-driver"]
+    assert cfg.active_repos == ["test-owner/phanthymotus"]
 
 
 @pytest.mark.asyncio
-async def test_startup_missing_main_watcher_not_started():
-    """Lifespan integration: main missing from installation -> startup FAILS, watcher does NOT start."""
+async def test_startup_uses_only_the_authorized_watch_intersection():
+    """An absent first watch repo does not turn an authorized repo into a policy source."""
     from fastapi.testclient import TestClient
     from ..server import create_app
 
@@ -698,7 +866,7 @@ async def test_startup_missing_main_watcher_not_started():
         machine_yaml_path = f.name
 
     cfg = Config(
-        github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+        github_repos=["test-owner/phanthymotus", "test-owner/phanthymotus-driver"],
         github_api_url="https://api.github.com",
         poll_enabled=True,
         poll_interval_seconds=30,
@@ -714,7 +882,7 @@ async def test_startup_missing_main_watcher_not_started():
 
         async def list_installation_repositories(self):
             # Only driver authorized; main is missing
-            return ["4paradigm/phanthymotus-driver"]
+            return ["test-owner/phanthymotus-driver"]
 
         async def list_repository_labels(self, repo):
             return []
@@ -753,15 +921,16 @@ async def test_startup_missing_main_watcher_not_started():
 
     try:
         app = create_app(cfg)
-        with pytest.raises(RuntimeError, match="required repo.*not authorized"):
-            with TestClient(app):
-                pass
+        with TestClient(app):
+            pass
     finally:
         server_mod.github_app_auth.create_github_app_auth = orig_auth
         server_mod.GitHubClient = orig_ghc
         server_mod.GitHubCommandWatcher = orig_watcher
 
-    assert watcher_started == []
+    assert watcher_started == [True]
+    assert cfg.active_repos == ["test-owner/phanthymotus-driver"]
+    assert cfg.policy_active_repos == []
 
 
 # ------------------------------------------------------------------
@@ -808,7 +977,7 @@ async def test_baseline_persist_failure_cycle1_zero_dispatch():
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
     # Cycle 1: persist fails, no dispatch
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
     controller.on_command.assert_not_called()
     # State now has cursor=0 from reconcile
     assert hidden_state[0]["last_processed_comment_id"] == 0
@@ -857,7 +1026,7 @@ async def test_baseline_persist_failure_cycle2_still_zero_dispatch():
     persist_call_count[0] = 1  # First attempt already failed
 
     # Cycle 2: persist succeeds, still no dispatch (baseline only)
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
     controller.on_command.assert_not_called()
     # Cursor should now be >= 10
     assert hidden_state[0]["last_processed_comment_id"] >= 10
@@ -867,7 +1036,7 @@ async def test_baseline_persist_failure_cycle2_still_zero_dispatch():
 async def test_new_command_after_recovered_baseline_executes():
     """Test B: After baseline recovered, new comment id=20 is dispatched."""
     config = _make_config()
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["test-owner/phanthymotus"]
     config.auth_valid = True
     proxy = MagicMock()
 
@@ -912,7 +1081,7 @@ async def test_new_command_after_recovered_baseline_executes():
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
     # Cycle 1: baseline succeeds on first try
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
     controller.on_command.assert_not_called()
     assert hidden_state[0]["last_processed_comment_id"] >= 10
 
@@ -921,7 +1090,7 @@ async def test_new_command_after_recovered_baseline_executes():
     comments_list.append({"id": 20, "body": "/request_deploy"})
     controller.on_command.reset_mock()
 
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
     controller.on_command.assert_called_once()
     call_args = controller.on_command.call_args
     # args: (cmd, repo, pr_number, comment_id) -> args[3] is comment_id
@@ -964,11 +1133,11 @@ async def test_baseline_persist_consecutive_failures_zero_dispatch():
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
     # Cycle 1
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
     controller.on_command.assert_not_called()
 
     # Cycle 2: state still has cursor=0, baseline incomplete
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
     controller.on_command.assert_not_called()
 
 
@@ -1006,7 +1175,7 @@ async def test_baseline_persist_returns_low_cursor_zero_dispatch():
 
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
     controller.on_command.assert_not_called()
     # Cursor should NOT have advanced to 10
     assert hidden_state[0]["last_processed_comment_id"] == 0
@@ -1016,7 +1185,7 @@ async def test_baseline_persist_returns_low_cursor_zero_dispatch():
 async def test_zero_comments_first_observation_reconcile_creates_bot_comment():
     """Test E: initial comments empty, reconcile creates lifecycle bot comment id=100."""
     config = _make_config()
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["test-owner/phanthymotus"]
     config.auth_valid = True
     proxy = MagicMock()
 
@@ -1050,7 +1219,7 @@ async def test_zero_comments_first_observation_reconcile_creates_bot_comment():
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
     # Cycle 1: baseline at 100 (from post-reconcile snapshot)
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
     controller.on_command.assert_not_called()
     assert hidden_state[0]["last_processed_comment_id"] >= 100
 
@@ -1059,7 +1228,7 @@ async def test_zero_comments_first_observation_reconcile_creates_bot_comment():
     comments_list.append({"id": 101, "body": "/request_deploy"})
     controller.on_command.reset_mock()
 
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
     controller.on_command.assert_called_once()
     call_args = controller.on_command.call_args
     assert call_args.args[3] == 101
@@ -1111,7 +1280,7 @@ async def test_existing_state_disappears_after_reconcile_fails_closed():
 
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("test-owner/phanthymotus", 1)
 
     controller.on_command.assert_not_called()
     proxy.get_comment.assert_not_called()
@@ -1146,7 +1315,7 @@ async def test_startup_authorization_failure_closes_resources():
         machine_yaml_path = f.name
 
     cfg = Config(
-        github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+        github_repos=["test-owner/phanthymotus", "test-owner/phanthymotus-driver"],
         github_api_url="https://api.github.com",
         poll_enabled=True,
         poll_interval_seconds=30,
@@ -1269,7 +1438,7 @@ async def test_startup_cleanup_failure_does_not_mask_authorization_error():
         machine_yaml_path = f.name
 
     cfg = Config(
-        github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+        github_repos=["test-owner/phanthymotus", "test-owner/phanthymotus-driver"],
         github_api_url="https://api.github.com",
         poll_enabled=True,
         poll_interval_seconds=30,
@@ -1423,7 +1592,7 @@ async def test_lifespan_body_exception_cleanup_runs_once():
             self.http = FakeGitHubHTTP()
 
         async def list_installation_repositories(self):
-            return ['4paradigm/phanthymotus']
+            return ['test-owner/phanthymotus']
 
         async def aclose(self):
             cleanup_counts['gh_close'] += 1
@@ -1457,7 +1626,7 @@ async def test_lifespan_body_exception_cleanup_runs_once():
         machine_yaml_path = mf.name
 
     cfg = Config(
-        github_repos=['4paradigm/phanthymotus', '4paradigm/phanthymotus-driver'],
+        github_repos=['test-owner/phanthymotus', 'test-owner/phanthymotus-driver'],
         github_api_url='https://api.github.com',
         poll_enabled=True,
         poll_interval_seconds=30,
@@ -1488,8 +1657,8 @@ async def test_lifespan_body_exception_cleanup_runs_once():
 
 
 @pytest.mark.asyncio
-async def test_primary_repo_requires_installation_authorization():
-    """Use the real installation API reader and primary intersection, offline."""
+async def test_watch_repos_are_intersected_with_installation_snapshot():
+    """Use the real installation API reader and exact watch intersection, offline."""
     cfg = _make_config(github_repos=["team/main", "team/drivers"], active_repos=[], auth_valid=False)
     installed = ["team/drivers", "outside/authorized"]
     requests = []
@@ -1504,8 +1673,7 @@ async def test_primary_repo_requires_installation_authorization():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         gh = GitHubClient(cfg, http=http, token_provider=AsyncMock(return_value="OFFLINE_INSTALLATION_TOKEN"))
-        with pytest.raises(RuntimeError, match="required repo.*team/main.*not authorized"):
-            await _resolve_active_repos(gh, cfg.github_repos)
+        assert await _resolve_active_repos(gh, cfg.github_repos) == ["team/drivers"]
         assert cfg.active_repos == [] and cfg.auth_valid is False
         installed[:] = ["TEAM/Main", "team/drivers", "outside/authorized"]
         assert await _resolve_active_repos(gh, cfg.github_repos) == ["team/main", "team/drivers"]
@@ -1566,6 +1734,7 @@ async def test_watcher_dynamic_repo_refresh_no_expansion():
     calls_before = proxy.get_open_prs.await_count
     await watcher._poll_once()
     assert proxy.get_open_prs.await_count == calls_before
+
     transport_calls = []
 
     async def transport(request):
@@ -1583,8 +1752,8 @@ async def test_watcher_dynamic_repo_refresh_no_expansion():
         await watcher._refresh_active_repos()
         assert watcher._pending_baseline_repos == {"team/main", "team/drivers"}
         proxy.get_issue_comments.return_value.append(
-                {"id": 30, "body": "/approve_deploy machine=test-machine",
-                 "created_at": "2026-01-01T00:00:00Z"})
+            {"id": 30, "body": "/approve_deploy machine=test-machine",
+             "created_at": "2026-01-01T00:00:00Z"})
         await watcher._poll_once()
         assert state["last_processed_comment_id"] == 30
         controller.on_command.assert_not_awaited()
@@ -1600,8 +1769,37 @@ async def test_watcher_dynamic_repo_refresh_no_expansion():
         assert transport_calls == []
     github.list_installation_repositories.return_value = ["team/drivers", "outside/authorized"]
     await watcher._refresh_active_repos()
-    assert cfg.active_repos == [] and cfg.auth_valid is False
+    assert cfg.active_repos == ["team/drivers"] and cfg.auth_valid is True
     controller.on_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_watcher_refreshes_policy_authorization_from_the_same_installation_snapshot():
+    cfg = _make_config(
+        github_repos=["team/main"], active_repos=["team/main"],
+        policy_active_repos=list(DEFAULT_GITHUB_REPOS), auth_valid=True,
+    )
+    github = MagicMock()
+    github.list_installation_repositories = AsyncMock(return_value=[
+        "team/main", "4paradigm/phanthymotus",
+    ])
+    auth = MagicMock()
+    auth.refresh_installation_token = AsyncMock(return_value="OFFLINE_TOKEN")
+    watcher = GitHubCommandWatcher(
+        cfg, MagicMock(), MagicMock(), github=github, github_auth=auth,
+    )
+
+    await watcher._refresh_active_repos()
+
+    assert github.list_installation_repositories.await_count == 1
+    assert cfg.active_repos == ["team/main"]
+    assert cfg.policy_active_repos == ["4paradigm/phanthymotus"]
+
+    github.list_installation_repositories = AsyncMock(return_value=["team/main"])
+    await watcher._refresh_active_repos()
+
+    assert cfg.active_repos == ["team/main"]
+    assert cfg.policy_active_repos == []
 
 
 
@@ -1655,7 +1853,7 @@ async def test_normal_shutdown_cleanup_exactly_once():
             self.http = FakeGitHubHTTP()
 
         async def list_installation_repositories(self):
-            return ['4paradigm/phanthymotus']
+            return ['test-owner/phanthymotus']
 
         async def aclose(self):
             cleanup_counts['gh_close'] += 1
@@ -1687,7 +1885,7 @@ async def test_normal_shutdown_cleanup_exactly_once():
         machine_yaml_path = mf.name
 
     cfg = Config(
-        github_repos=['4paradigm/phanthymotus', '4paradigm/phanthymotus-driver'],
+        github_repos=['test-owner/phanthymotus', 'test-owner/phanthymotus-driver'],
         github_api_url='https://api.github.com',
         poll_enabled=True,
         poll_interval_seconds=30,

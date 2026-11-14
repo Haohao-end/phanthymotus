@@ -311,10 +311,10 @@ async def test_request_deploy_uses_canonical_component_snapshot_helper():
     proxy.project_status_label = AsyncMock()
     github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
 
-    await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
+    await controller.handle_request_deploy("Haohao-end/phanthymotus", 1, 101)
 
     controller._build_component_snapshot.assert_awaited_once_with(
-        "4paradigm/phanthymotus", 1, "a" * 40, builds
+        "Haohao-end/phanthymotus", 1, "a" * 40, builds
     )
     written_state = proxy.write_hidden_state.call_args.args[3]
     assert written_state["components"][0]["component_id"] == "comp-123"
@@ -368,7 +368,7 @@ async def test_uncertain_recovery_rebuilds_fresh_component_snapshot():
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
 
-    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state)
+    result = await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state)
 
     assert result == "deploy-requested"
     written_state = proxy.write_hidden_state.call_args.args[3]
@@ -422,7 +422,7 @@ async def test_uncertain_recovery_new_job_never_keeps_old_components():
         proxy.write_hidden_state = AsyncMock()
         proxy.project_status_label = AsyncMock()
 
-        await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state)
+        await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state)
 
         written_state = proxy.write_hidden_state.call_args.args[3]
         assert [c["component_id"] for c in written_state["components"]] == ["comp-new"]
@@ -477,7 +477,7 @@ async def test_uncertain_recovery_snapshot_change_resets_deployments():
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
 
-    await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state)
+    await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state)
 
     written_state = proxy.write_hidden_state.call_args.args[3]
     assert written_state["deployments"] == []
@@ -548,7 +548,7 @@ async def test_uncertain_recovery_same_snapshot_preserves_known_successful_deplo
         proxy.write_hidden_state = AsyncMock()
         proxy.project_status_label = AsyncMock()
 
-        await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state)
+        await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state)
 
         written_state = proxy.write_hidden_state.call_args.args[3]
         assert written_state["deployments"] == state["deployments"]
@@ -613,7 +613,7 @@ async def test_uncertain_recovery_clears_runtime_id_for_ambiguous_component():
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
 
-    await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state)
+    await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state)
 
     written_state = proxy.write_hidden_state.call_args.args[3]
     assert written_state["components"][0].get("runtime_id") is None
@@ -666,7 +666,7 @@ async def test_uncertain_recovery_snapshot_rebuild_failure_stays_uncertain():
         proxy.write_hidden_state = AsyncMock()
         proxy.project_status_label = AsyncMock()
 
-        result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state)
+        result = await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state)
 
         assert result == "uncertain"
         written_state = proxy.write_hidden_state.call_args.args[3]
@@ -746,7 +746,7 @@ async def test_watcher_uncertain_without_new_approve_does_not_refresh_review():
 
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("Haohao-end/phanthymotus", 1)
 
     assert state["command"]["phase"] == "uncertain"
     assert controller.on_command.await_count == 0
@@ -758,7 +758,7 @@ async def test_watcher_uncertain_without_new_approve_does_not_refresh_review():
 @pytest.mark.asyncio
 async def test_watcher_uncertain_new_approve_refreshes_review_before_final_pre_deploy_validation():
     controller, proxy, policy, github, config = _controller()
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
     config.auth_valid = True
     state = _state()
     state["command"]["phase"] = "uncertain"
@@ -863,7 +863,7 @@ async def test_watcher_uncertain_new_approve_refreshes_review_before_final_pre_d
 
     watcher = GitHubCommandWatcher(config, proxy, controller)
 
-    await watcher._process_pr("4paradigm/phanthymotus", 1)
+    await watcher._process_pr("Haohao-end/phanthymotus", 1)
 
     assert controller.on_command.await_count == 1
     assert controller.on_command.call_args.args[3] == 99
@@ -942,7 +942,7 @@ async def test_uncertain_post_stops_later_components():
     """
     controller, proxy, policy, github, config = _controller()
     real_comps = await controller._build_component_snapshot(
-        "4paradigm/phanthymotus", 1, "a" * 40,
+        "Haohao-end/phanthymotus", 1, "a" * 40,
         [_build(), _build(target="actucore"), _build(target="driver", driver_path="custom/driver")],
     )
     assert real_comps is not None
@@ -993,7 +993,7 @@ async def test_uncertain_post_stops_later_components():
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
 
-    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 17, "test-machine", "owner1", "111")
+    await controller.handle_approve_deploy("Haohao-end/phanthymotus", 1, 17, "test-machine", "owner1", "111")
 
     # 1-4: A once, B once, C zero, total 2
     assert deploy_calls.get("perception", 0) == 1, f"perception deployed {deploy_calls.get('perception', 0)} times"
@@ -1065,7 +1065,7 @@ def test_poll_disabled_webhook_enabled_fails_config():
         validate_config(
             Config(
                 github_repos=[
-                    "4paradigm/phanthymotus",
+                    "Haohao-end/phanthymotus",
                 ],
                 poll_enabled=False,
                 webhook_enabled=True,
@@ -1078,11 +1078,11 @@ def test_poll_disabled_webhook_enabled_fails_config():
 async def test_webhook_remains_supplementary_zero_dispatch():
     controller, proxy, policy, github, config = _controller()
     config.webhook_enabled = True
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
     config.auth_valid = True
     payload = {
         "action": "created",
-        "repository": {"full_name": "4paradigm/phanthymotus"},
+        "repository": {"full_name": "Haohao-end/phanthymotus"},
         "issue": {"number": 1, "pull_request": {}},
         "comment": {"id": 99},
     }
@@ -1223,7 +1223,7 @@ async def test_new_approve_deploys_only_remaining_components():
     import hashlib
 
     controller, proxy, policy, github, config = _controller()
-    REPO = "4paradigm/phanthymotus"
+    REPO = "Haohao-end/phanthymotus"
     events: list[str] = []
     write_log: list[tuple[str, dict]] = []
 
@@ -1511,7 +1511,7 @@ async def test_legacy_digest_undeployed_component_migrates_to_tag_preserving_com
     state_copy = copy.deepcopy(old_state)
     from ..github_state_proxy import _validate_hidden_state as _validate_hidden_state_fn
     _validate_hidden_state_fn(state_copy)
-    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+    result = await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state_copy)
 
     assert result == "deploy-requested"
 
@@ -1600,7 +1600,7 @@ async def test_legacy_digest_deployed_component_preserves_deployment_and_histori
     state_copy = copy.deepcopy(old_state)
     from ..github_state_proxy import _validate_hidden_state as _validate_hidden_state_fn
     _validate_hidden_state_fn(state_copy)
-    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+    result = await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state_copy)
 
     assert result == "deploy-requested"
 
@@ -1681,7 +1681,7 @@ async def test_legacy_deployed_component_missing_runtime_id_fails_closed(config,
 
     import copy
     state_copy = copy.deepcopy(old_state)
-    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+    result = await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state_copy)
 
     # Should reset to fresh snapshot (semantic_changed=True, evidence_changed=True)
     assert result == "deploy-requested"
@@ -1767,7 +1767,7 @@ async def test_real_review_tag_change_resets_snapshot(config, monkeypatch):
 
     import copy
     state_copy = copy.deepcopy(old_state)
-    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+    result = await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state_copy)
 
     assert result == "deploy-requested"
 
@@ -1855,7 +1855,7 @@ async def test_removed_component_resets_snapshot(config, monkeypatch):
 
     import copy
     state_copy = copy.deepcopy(old_state)
-    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+    result = await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state_copy)
 
     assert result == "deploy-requested"
 
@@ -1939,7 +1939,7 @@ async def test_added_component_resets_snapshot(config, monkeypatch):
 
     import copy
     state_copy = copy.deepcopy(old_state)
-    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+    result = await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state_copy)
 
     assert result == "deploy-requested"
 
@@ -2018,7 +2018,7 @@ async def test_duplicate_old_semantic_component_resets_snapshot(config, monkeypa
 
     import copy
     state_copy = copy.deepcopy(old_state)
-    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+    result = await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state_copy)
 
     assert result == "deploy-requested"
 
@@ -2058,7 +2058,7 @@ async def test_duplicate_fresh_semantic_component_fails_closed(config, monkeypat
                        success=True, deployable=True, image_tag=TAG_A, version="v1")
 
     snapshot = await controller._build_component_snapshot(
-        "4paradigm/phanthymotus", 1, "a" * 40, [build1, build2]
+        "Haohao-end/phanthymotus", 1, "a" * 40, [build1, build2]
     )
     assert snapshot is None, "duplicate semantic key must produce None snapshot"
 
@@ -2099,7 +2099,7 @@ async def test_duplicate_fresh_semantic_component_fails_closed(config, monkeypat
 
     import copy
     state_copy = copy.deepcopy(old_state)
-    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+    result = await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state_copy)
 
     # duplicate semantic key -> _build_component_snapshot returns None -> uncertain
     assert result == "uncertain"
@@ -2168,7 +2168,7 @@ async def test_legacy_migration_zero_registry_http(config, monkeypatch):
 
     import copy
     state_copy = copy.deepcopy(old_state)
-    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+    result = await controller._refresh_uncertain_state("Haohao-end/phanthymotus", 1, state_copy)
 
     assert result == "deploy-requested"
 
@@ -2520,7 +2520,7 @@ async def test_terminal_cos_metadata_rebind_preserves_visible_history():
         cos_bundle_size=1024,
     )
     rebound = await controller._rebind_terminal_cos_if_current(
-        "4paradigm/phanthymotus", 1,
+        "Haohao-end/phanthymotus", 1,
         expected_head="a" * 40,
         expected_terminal_status="succeeded",
         expected_comment_id=17,
@@ -2588,7 +2588,7 @@ async def test_terminal_cos_presigned_url_rebind_preserves_visible_history():
         cos_object_key=object_key, cos_bundle_sha256="cd" * 32, cos_bundle_size=2048,
     )
     ok1 = await controller._rebind_terminal_cos_if_current(
-        "4paradigm/phanthymotus", 1,
+        "Haohao-end/phanthymotus", 1,
         expected_head="a" * 40, expected_terminal_status="succeeded",
         expected_comment_id=17, expected_command_kind="record_test",
         expected_test_result="pass", cos_metadata=cos_metadata, markdown=md_no_url,
@@ -2602,7 +2602,7 @@ async def test_terminal_cos_presigned_url_rebind_preserves_visible_history():
         cos_download_url="https://bucket.cos.ap-beijing.myqcloud.com/signed?token=x",
     )
     ok2 = await controller._rebind_terminal_cos_if_current(
-        "4paradigm/phanthymotus", 1,
+        "Haohao-end/phanthymotus", 1,
         expected_head="a" * 40, expected_terminal_status="succeeded",
         expected_comment_id=17, expected_command_kind="record_test",
         expected_test_result="pass", cos_metadata=cos_metadata, markdown=md_with_url,
@@ -3557,7 +3557,7 @@ async def test_two_machine_full_lifecycle_history_survives_record_test_and_cos_r
         "size": 2048,
     })
 
-    await controller.handle_record_test("4paradigm/phanthymotus", 1, 70, "pass", "all good", "owner1", "111")
+    await controller.handle_record_test("Haohao-end/phanthymotus", 1, 70, "pass", "all good", "owner1", "111")
 
     # Re-bind mocks after record_test
     proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
@@ -3568,13 +3568,13 @@ async def test_two_machine_full_lifecycle_history_survives_record_test_and_cos_r
     # ── Stage 5: Simulate COS metadata rebind (event=None) ──
     cos_meta = {"object_key": "phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz", "sha256": "d4" + "a" * 62, "size": 2048}
     markdown_meta = comments_mod.succeeded_comment(
-        "4paradigm/phanthymotus", 1, "a" * 40,
+        "Haohao-end/phanthymotus", 1, "a" * 40,
         cos_object_key=cos_meta["object_key"],
         cos_bundle_sha256=cos_meta["sha256"],
         cos_bundle_size=cos_meta["size"],
     )
     await controller._rebind_terminal_cos_if_current(
-        "4paradigm/phanthymotus", 1,
+        "Haohao-end/phanthymotus", 1,
         expected_head="a" * 40,
         expected_terminal_status="succeeded",
         expected_comment_id=70,
@@ -3599,7 +3599,7 @@ async def test_two_machine_full_lifecycle_history_survives_record_test_and_cos_r
         cos_download_url="https://cos.example.com/download/phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz",
     )
     await controller._rebind_terminal_cos_if_current(
-        "4paradigm/phanthymotus", 1,
+        "Haohao-end/phanthymotus", 1,
         expected_head="a" * 40,
         expected_terminal_status="succeeded",
         expected_comment_id=70,
@@ -5020,8 +5020,8 @@ async def test_driver_repo_added_after_start_is_activated_without_restart():
     from ..config import DESIRED_REPOS
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]  # driver not yet active
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]  # driver not yet active
 
     proxy = MagicMock()
     proxy.get_open_prs = AsyncMock(return_value=[])
@@ -5031,7 +5031,7 @@ async def test_driver_repo_added_after_start_is_activated_without_restart():
     github = MagicMock(spec=GitHubClient)
     # Initially only phanthymotus
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus"]
+        return_value=["Haohao-end/phanthymotus"]
     )
 
     github_auth = MagicMock()
@@ -5043,12 +5043,12 @@ async def test_driver_repo_added_after_start_is_activated_without_restart():
 
     # Simulate auth refresh: grant driver repo
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
     )
 
     await watcher._refresh_active_repos()
 
-    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" in config.active_repos
     github_auth.refresh_installation_token.assert_called_once()
 
 
@@ -5060,10 +5060,10 @@ async def test_driver_repo_removed_after_start_is_deactivated():
     from ..config import DESIRED_REPOS
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
     config.active_repos = [
-        "4paradigm/phanthymotus",
-        "4paradigm/phanthymotus-driver",
+        "Haohao-end/phanthymotus",
+        "Haohao-end/phanthymotus-driver",
     ]
 
     proxy = MagicMock()
@@ -5072,7 +5072,7 @@ async def test_driver_repo_removed_after_start_is_deactivated():
     github = MagicMock(spec=GitHubClient)
     # Driver repo no longer authorized
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus"]
+        return_value=["Haohao-end/phanthymotus"]
     )
 
     github_auth = MagicMock()
@@ -5084,8 +5084,8 @@ async def test_driver_repo_removed_after_start_is_deactivated():
 
     await watcher._refresh_active_repos()
 
-    assert "4paradigm/phanthymotus-driver" not in config.active_repos
-    assert "4paradigm/phanthymotus" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" not in config.active_repos
+    assert "haohao-end/phanthymotus" in config.active_repos
 
 
 @pytest.mark.asyncio
@@ -5096,7 +5096,7 @@ async def test_driver_repo_authorization_refresh_failure_fails_closed():
     from ..github_client import GitHubClient
 
     config = make_config()
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     controller = MagicMock()
@@ -5116,7 +5116,7 @@ async def test_driver_repo_authorization_refresh_failure_fails_closed():
     await watcher._refresh_active_repos()
 
     # Must remain unchanged
-    assert config.active_repos == ["4paradigm/phanthymotus"]
+    assert config.active_repos == ["Haohao-end/phanthymotus"]
     assert config.auth_valid is False
     # Forced token refresh MUST precede repo discovery — it is attempted
     # even though discovery itself fails.
@@ -5134,8 +5134,8 @@ async def test_driver_repo_reactivated_without_replaying_old_commands():
     from ..config import DESIRED_REPOS
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     proxy.get_open_prs = AsyncMock(return_value=[])
@@ -5143,7 +5143,7 @@ async def test_driver_repo_reactivated_without_replaying_old_commands():
 
     github = MagicMock(spec=GitHubClient)
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
     )
 
     github_auth = MagicMock()
@@ -5155,22 +5155,22 @@ async def test_driver_repo_reactivated_without_replaying_old_commands():
 
     # First refresh adds driver
     await watcher._refresh_active_repos()
-    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" in config.active_repos
 
     # Remove driver
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus"]
+        return_value=["Haohao-end/phanthymotus"]
     )
     await watcher._refresh_active_repos()
-    assert "4paradigm/phanthymotus-driver" not in config.active_repos
+    assert "haohao-end/phanthymotus-driver" not in config.active_repos
 
     # Re-add driver
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
     )
     await watcher._refresh_active_repos()
-    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" in config.active_repos
 
     # watcher.start() was never called — no commands dispatched
     watcher.start()
@@ -5192,8 +5192,8 @@ async def test_driver_repo_refresh_keeps_repo_isolation_and_single_writer():
 
     config = make_config()
     config.active_repos = [
-        "4paradigm/phanthymotus",
-        "4paradigm/phanthymotus-driver",
+        "Haohao-end/phanthymotus",
+        "Haohao-end/phanthymotus-driver",
     ]
 
     # PR #1 in phanthymotus with state
@@ -5240,8 +5240,8 @@ async def test_driver_repo_refresh_rejects_unlisted_repositories():
     from ..config import DESIRED_REPOS
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     controller = MagicMock()
@@ -5249,8 +5249,8 @@ async def test_driver_repo_refresh_rejects_unlisted_repositories():
     github = MagicMock(spec=GitHubClient)
     github.list_installation_repositories = AsyncMock(
         return_value=[
-            "4paradigm/phanthymotus",
-            "4paradigm/phanthymotus-driver",
+            "Haohao-end/phanthymotus",
+            "Haohao-end/phanthymotus-driver",
             "evil-org/malicious-repo",
             "some-user/public-repo",
         ]
@@ -5265,7 +5265,7 @@ async def test_driver_repo_refresh_rejects_unlisted_repositories():
 
     await watcher._refresh_active_repos()
 
-    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" in config.active_repos
     assert "evil-org/malicious-repo" not in config.active_repos
     assert "some-user/public-repo" not in config.active_repos
 
@@ -5278,15 +5278,15 @@ async def test_driver_repo_refreshes_cached_installation_token():
     """
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     controller = MagicMock()
 
     github = MagicMock(spec=GitHubClient)
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
     )
 
     github_auth = MagicMock()
@@ -5300,8 +5300,8 @@ async def test_driver_repo_refreshes_cached_installation_token():
 
     github_auth.refresh_installation_token.assert_called_once()
     assert config.active_repos == [
-        "4paradigm/phanthymotus",
-        "4paradigm/phanthymotus-driver",
+        "haohao-end/phanthymotus",
+        "haohao-end/phanthymotus-driver",
     ]
 
 
@@ -5317,7 +5317,7 @@ async def test_driver_refresh_failure_skips_poll_cycle():
     from ..github_client import GitHubClient
 
     config = make_config()
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     proxy.get_open_prs = AsyncMock(return_value=[])
@@ -5337,7 +5337,7 @@ async def test_driver_refresh_failure_skips_poll_cycle():
         raise Exception("token network error")
     async def mock_list():
         call_order.append("list")
-        return ["4paradigm/phanthymotus"]
+        return ["Haohao-end/phanthymotus"]
     github_auth.refresh_installation_token = mock_refresh
     github.list_installation_repositories = mock_list
 
@@ -5413,7 +5413,7 @@ async def test_driver_webhook_fails_closed_when_revoked():
     import hashlib
 
     config = make_config()
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
     config.auth_valid = False  # revoked
 
     proxy = MagicMock()
@@ -5455,15 +5455,15 @@ async def test_driver_token_refresh_precedes_repo_discovery():
     list_installation_repositories in every auth refresh cycle."""
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     controller = MagicMock()
 
     github = MagicMock(spec=GitHubClient)
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
     )
 
     github_auth = MagicMock()
@@ -5473,7 +5473,7 @@ async def test_driver_token_refresh_precedes_repo_discovery():
         return "fresh-token"
     async def mock_list():
         call_order.append("list")
-        return ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+        return ["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
     github_auth.refresh_installation_token = mock_refresh
     github.list_installation_repositories = mock_list
 
@@ -5494,7 +5494,7 @@ async def test_driver_token_refresh_failure_does_not_publish_new_repos():
     from ..github_client import GitHubClient
 
     config = make_config()
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     controller = MagicMock()
@@ -5512,7 +5512,7 @@ async def test_driver_token_refresh_failure_does_not_publish_new_repos():
     await watcher._refresh_active_repos()
 
     # active_repos unchanged
-    assert config.active_repos == ["4paradigm/phanthymotus"]
+    assert config.active_repos == ["Haohao-end/phanthymotus"]
     # auth_valid must be False
     assert config.auth_valid is False
     # list_installation_repositories must NOT have been called
@@ -5527,8 +5527,8 @@ async def test_driver_reactivation_baselines_pending_comments():
     from ..github_client import GitHubClient
     from ..github_command_watcher import GitHubCommandWatcher
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]  # driver not yet active
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]  # driver not yet active
 
     proxy = MagicMock()
     controller = MagicMock()
@@ -5560,10 +5560,10 @@ async def test_driver_reactivation_baselines_pending_comments():
 
     # Activate driver repo
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
     )
     await watcher._refresh_active_repos()
-    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" in config.active_repos
 
     # Driver PR that has old command comments (created before reactivation)
     driver_pr = {"number": 42, "state": "open", "merged": False, "draft": False,
@@ -5651,7 +5651,7 @@ async def test_driver_repo_malformed_or_incomplete_installation_list_fails_close
     from ..github_client import GitHubClient
 
     config = make_config()
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     controller = MagicMock()
@@ -5675,7 +5675,7 @@ async def test_driver_repo_malformed_or_incomplete_installation_list_fails_close
     github.list_installation_repositories = AsyncMock(
         return_value="not-a-list"
     )
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
     config.auth_valid = True
     await watcher._refresh_active_repos()
     assert config.auth_valid is False
@@ -5695,9 +5695,9 @@ async def test_driver_authorized_new_pr_command_dispatch():
     from ..github_command_watcher import GitHubCommandWatcher
 
     config = make_config(github_repos=[
-        "4paradigm/phanthymotus", "4paradigm/phanthymotus-driver",
+        "Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver",
     ])
-    config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    config.active_repos = ["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
     config.auth_valid = True
 
     proxy = MagicMock()
@@ -5783,7 +5783,7 @@ async def test_driver_authorized_new_pr_command_dispatch():
     call_args = controller.on_command.call_args
     # Dispatch must target the DRIVER repo (repo arg is 2nd positional).
     dispatched_repo = call_args.args[1] if len(call_args.args) >= 2 else call_args.kwargs.get("repo")
-    assert dispatched_repo == "4paradigm/phanthymotus-driver", \
+    assert dispatched_repo == "Haohao-end/phanthymotus-driver", \
         f"Expected dispatch on driver repo, got {call_args}"
     # Cursor durability: last persist reflects the consumed comment.
     assert persisted_bodies[-1] == 7002, \
@@ -5804,8 +5804,8 @@ async def test_driver_authorization_grant_does_not_deploy_automatically():
     deployment — it only updates active_repos."""
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     proxy.write_hidden_state = AsyncMock()
@@ -5813,7 +5813,7 @@ async def test_driver_authorization_grant_does_not_deploy_automatically():
 
     github = MagicMock(spec=GitHubClient)
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
     )
 
     github_auth = MagicMock()
@@ -5827,7 +5827,7 @@ async def test_driver_authorization_grant_does_not_deploy_automatically():
     await watcher._refresh_active_repos()
 
     # Driver should be active
-    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" in config.active_repos
 
     # NO write_hidden_state calls (no deployment)
     proxy.write_hidden_state.assert_not_called()
@@ -5837,13 +5837,12 @@ async def test_driver_authorization_grant_does_not_deploy_automatically():
 
 @pytest.mark.asyncio
 async def test_driver_required_repo_authorization_lost_fails_closed():
-    """When the required 4paradigm/phanthymotus repo disappears from
-    authorization, the system must fail closed: auth_valid=False,
-    active_repos=[], no further polling."""
+    """Revoking one fork removes only that watch repo; policy access is
+    recalculated independently from the complete Installation snapshot."""
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
 
     proxy = MagicMock()
     controller = MagicMock()
@@ -5851,7 +5850,7 @@ async def test_driver_required_repo_authorization_lost_fails_closed():
     github = MagicMock(spec=GitHubClient)
     # Only driver is authorized — required repo is missing
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus-driver"]
+        return_value=["Haohao-end/phanthymotus-driver"]
     )
 
     github_auth = MagicMock()
@@ -5863,9 +5862,9 @@ async def test_driver_required_repo_authorization_lost_fails_closed():
 
     await watcher._refresh_active_repos()
 
-    # Must fail closed
-    assert config.auth_valid is False
-    assert config.active_repos == []
+    assert config.auth_valid is True
+    assert config.active_repos == ["haohao-end/phanthymotus-driver"]
+    assert config.policy_active_repos == []
 
 
 @pytest.mark.asyncio
@@ -6009,8 +6008,8 @@ async def test_driver_reactivation_advances_existing_pr_cursor_before_dispatch()
     any command dispatch — preventing revocation-period backlog replay."""
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]  # driver not active
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]  # driver not active
 
     proxy = MagicMock()
     controller = MagicMock()
@@ -6042,10 +6041,10 @@ async def test_driver_reactivation_advances_existing_pr_cursor_before_dispatch()
 
     # Activate driver repo
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"],
     )
     await watcher._refresh_active_repos()
-    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" in config.active_repos
 
     driver_pr = {"number": 42, "state": "open", "merged": False, "draft": False,
                  "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
@@ -6133,8 +6132,8 @@ async def test_driver_reactivation_retries_failed_baseline_without_replay():
     No command dispatch occurs until ALL PRs are baselined."""
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     controller = MagicMock()
@@ -6174,10 +6173,10 @@ async def test_driver_reactivation_retries_failed_baseline_without_replay():
 
     # Activate driver repo — two open PRs
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"],
     )
     await watcher._refresh_active_repos()
-    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" in config.active_repos
 
     driver_pr_42 = {"number": 42, "state": "open", "merged": False, "draft": False,
                     "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
@@ -6246,7 +6245,7 @@ async def test_driver_reactivation_retries_failed_baseline_without_replay():
     controller.on_command.assert_not_called()
 
     # With the production fix, _pending_baseline_repos stays because PR 43 failed
-    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos, \
+    assert "haohao-end/phanthymotus-driver" in watcher._pending_baseline_repos, \
         "Repo must remain pending while any PR baseline is incomplete"
 
     # Cycle 2: PR 43 persist succeeds (restore working persist_cursor)
@@ -6275,7 +6274,7 @@ async def test_driver_reactivation_retries_failed_baseline_without_replay():
     assert pr42_again == 0, f"PR 42 must not be rebaselined on retry, got {pr42_again} extra persists"
 
     # Repo pending flag cleared now that ALL PRs succeeded
-    assert "4paradigm/phanthymotus-driver" not in watcher._pending_baseline_repos
+    assert "haohao-end/phanthymotus-driver" not in watcher._pending_baseline_repos
 
     # Still no dispatch
     controller.on_command.assert_not_called()
@@ -6310,7 +6309,7 @@ async def test_driver_reactivation_retries_failed_baseline_without_replay():
     controller.on_command.assert_called_once()
     call_args = controller.on_command.call_args
     dispatched_repo = call_args.args[1] if len(call_args.args) >= 2 else call_args.kwargs.get("repo")
-    assert dispatched_repo == "4paradigm/phanthymotus-driver"
+    assert dispatched_repo == "Haohao-end/phanthymotus-driver"
 
 
 @pytest.mark.asyncio
@@ -6320,8 +6319,8 @@ async def test_driver_reactivation_preserves_business_state_and_visible_history(
     from ..github_client import GitHubClient
     from ..github_state_proxy import _build_hidden_state_body as _bhsb, _extract_hidden_state
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     controller = MagicMock()
@@ -6339,10 +6338,10 @@ async def test_driver_reactivation_preserves_business_state_and_visible_history(
 
     # Activate driver repo
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"],
     )
     await watcher._refresh_active_repos()
-    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" in config.active_repos
 
     driver_pr = {"number": 42, "state": "open", "merged": False, "draft": False,
                  "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
@@ -6472,8 +6471,8 @@ async def test_driver_reactivation_failed_existing_pr_remains_pending():
     and the repo is cleared."""
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     controller = MagicMock()
@@ -6490,10 +6489,10 @@ async def test_driver_reactivation_failed_existing_pr_remains_pending():
 
     # Activate driver repo
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"],
     )
     await watcher._refresh_active_repos()
-    assert "4paradigm/phanthymotus-driver" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" in config.active_repos
 
     driver_pr_10 = {"number": 10, "state": "open", "merged": False, "draft": False,
                     "head": {"sha": "c" * 40}, "user": {"id": 111, "login": "bob"}}
@@ -6555,7 +6554,7 @@ async def test_driver_reactivation_failed_existing_pr_remains_pending():
     await watcher._poll_once()
 
     # Repo must remain pending
-    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos, \
+    assert "haohao-end/phanthymotus-driver" in watcher._pending_baseline_repos, \
         "Repo must remain pending when PR baseline fails"
     # Zero dispatch
     controller.on_command.assert_not_called()
@@ -6567,7 +6566,7 @@ async def test_driver_reactivation_failed_existing_pr_remains_pending():
     await watcher._poll_once()
 
     # Repo pending cleared
-    assert "4paradigm/phanthymotus-driver" not in watcher._pending_baseline_repos, \
+    assert "haohao-end/phanthymotus-driver" not in watcher._pending_baseline_repos, \
         "Repo pending must clear after all PRs succeed"
     controller.on_command.assert_not_called()
 
@@ -6579,8 +6578,8 @@ async def test_driver_reactivation_successful_pr_not_rebaselined_during_retry():
     and succeeds.  New comments after PR #10's successful baseline ARE dispatched."""
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     controller = MagicMock()
@@ -6596,7 +6595,7 @@ async def test_driver_reactivation_successful_pr_not_rebaselined_during_retry():
     )
 
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"],
     )
     await watcher._refresh_active_repos()
 
@@ -6667,7 +6666,7 @@ async def test_driver_reactivation_successful_pr_not_rebaselined_during_retry():
     proxy.persist_cursor = AsyncMock(side_effect=_persist_fail_11)
     await watcher._poll_once()
 
-    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos
+    assert "haohao-end/phanthymotus-driver" in watcher._pending_baseline_repos
     assert any(c[0] == 10 for c in persist_calls), "PR 10 should be baselined"
     controller.on_command.assert_not_called()
 
@@ -6687,7 +6686,7 @@ async def test_driver_reactivation_successful_pr_not_rebaselined_during_retry():
     # PR 10 must NOT appear again
     pr10_rebase = sum(1 for c in persist_calls if c[0] == 10)
     assert pr10_rebase == 0, f"PR 10 must not be rebaselined during retry, got {pr10_rebase}"
-    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos
+    assert "haohao-end/phanthymotus-driver" in watcher._pending_baseline_repos
 
     # Cycle 3: PR 11 finally succeeds
     persist_calls.clear()
@@ -6696,7 +6695,7 @@ async def test_driver_reactivation_successful_pr_not_rebaselined_during_retry():
 
     pr11_persisted = any(c[0] == 11 for c in persist_calls)
     assert pr11_persisted, "PR 11 should be baselined on retry"
-    assert "4paradigm/phanthymotus-driver" not in watcher._pending_baseline_repos
+    assert "haohao-end/phanthymotus-driver" not in watcher._pending_baseline_repos
     controller.on_command.assert_not_called()
 
 
@@ -6706,8 +6705,8 @@ async def test_driver_reactivation_new_generation_resets_only_driver_progress():
     across auth generations.  Core repo remains active throughout."""
     from ..github_client import GitHubClient
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
     config.auth_valid = True
 
     proxy = MagicMock()
@@ -6724,30 +6723,30 @@ async def test_driver_reactivation_new_generation_resets_only_driver_progress():
 
     # Step 1: Revoke driver
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus"],
+        return_value=["Haohao-end/phanthymotus"],
     )
     await watcher._refresh_active_repos()
-    assert "4paradigm/phanthymotus-driver" not in config.active_repos
-    assert "4paradigm/phanthymotus-driver" not in watcher._pending_baseline_repos
-    assert watcher._baseline_progress.get("4paradigm/phanthymotus-driver") is None, \
+    assert "haohao-end/phanthymotus-driver" not in config.active_repos
+    assert "haohao-end/phanthymotus-driver" not in watcher._pending_baseline_repos
+    assert watcher._baseline_progress.get("haohao-end/phanthymotus-driver") is None, \
         "Progress must be cleared on revoke"
 
     # Core still active
-    assert "4paradigm/phanthymotus" in config.active_repos
+    assert "haohao-end/phanthymotus" in config.active_repos
 
     # Step 2: Re-grant driver — new generation
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"],
     )
     await watcher._refresh_active_repos()
-    assert "4paradigm/phanthymotus-driver" in config.active_repos
-    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos
+    assert "haohao-end/phanthymotus-driver" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" in watcher._pending_baseline_repos
     # New generation: progress reset
-    assert watcher._baseline_progress.get("4paradigm/phanthymotus-driver") == set(), \
+    assert watcher._baseline_progress.get("haohao-end/phanthymotus-driver") == set(), \
         "New auth generation must start with empty progress set"
 
     # Core unaffected
-    assert "4paradigm/phanthymotus" in config.active_repos
+    assert "haohao-end/phanthymotus" in config.active_repos
 
 
 @pytest.mark.asyncio
@@ -6758,8 +6757,8 @@ async def test_driver_reactivation_preserves_exact_visible_history_and_command()
     from ..github_client import GitHubClient
     from ..github_state_proxy import _build_hidden_state_body as _bhsb, _extract_hidden_state
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]
 
     proxy = MagicMock()
     controller = MagicMock()
@@ -6775,7 +6774,7 @@ async def test_driver_reactivation_preserves_exact_visible_history_and_command()
     )
 
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"],
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"],
     )
     await watcher._refresh_active_repos()
 
@@ -6910,8 +6909,8 @@ async def test_driver_startup_existing_pr_baselines_before_command_dispatch():
     from ..github_client import GitHubClient
     from ..github_command_watcher import GitHubCommandWatcher
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
     config.auth_valid = True
 
     proxy = MagicMock()
@@ -6944,7 +6943,7 @@ async def test_driver_startup_existing_pr_baselines_before_command_dispatch():
     )
 
     # Startup baseline gate — Driver already active
-    watcher.mark_repos_pending_baseline(["4paradigm/phanthymotus-driver"])
+    watcher.mark_repos_pending_baseline(["Haohao-end/phanthymotus-driver"])
 
     driver_pr = {"number": 42, "state": "open", "merged": False, "draft": False,
                  "head": {"sha": "d" * 40}, "user": {"id": 111, "login": "carol"}}
@@ -7003,7 +7002,7 @@ async def test_driver_startup_existing_pr_baselines_before_command_dispatch():
     controller.on_command.assert_called_once()
     call_args = controller.on_command.call_args
     dispatched_repo = call_args.args[1] if len(call_args.args) >= 2 else call_args.kwargs.get("repo")
-    assert dispatched_repo == "4paradigm/phanthymotus-driver"
+    assert dispatched_repo == "Haohao-end/phanthymotus-driver"
 
 
 @pytest.mark.asyncio
@@ -7124,8 +7123,8 @@ async def test_driver_auth_refresh_recovery_rebaselines_driver_before_dispatch()
     from ..github_client import GitHubClient
     from ..github_command_watcher import GitHubCommandWatcher
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus"]
     config.auth_valid = True
 
     proxy = MagicMock()
@@ -7194,29 +7193,29 @@ async def test_driver_auth_refresh_recovery_rebaselines_driver_before_dispatch()
     await watcher._refresh_active_repos_if_needed()
     await watcher._poll_once()
     assert not config.auth_valid
-    assert not getattr(watcher, '_baseline_progress', {}).get("4paradigm/phanthymotus-driver")
+    assert not getattr(watcher, '_baseline_progress', {}).get("Haohao-end/phanthymotus-driver")
     controller.on_command.assert_not_called()
 
     # Cycle 2 step 1: token refresh recovers — driver enters pending (before poll)
     watcher._last_auth_refresh = -999.0
     github_auth.refresh_installation_token = AsyncMock(return_value="new-token")
     github.list_installation_repositories = AsyncMock(
-        return_value=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
+        return_value=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
     await watcher._refresh_active_repos_if_needed()
     assert config.auth_valid
-    assert "4paradigm/phanthymotus-driver" in config.active_repos
-    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos,         "Driver must be pending immediately after auth recovery, before poll"
+    assert "haohao-end/phanthymotus-driver" in config.active_repos
+    assert "haohao-end/phanthymotus-driver" in watcher._pending_baseline_repos,         "Driver must be pending immediately after auth recovery, before poll"
 
     # Cycle 2 step 2: poll runs baseline — baseline succeeds, pending cleared
     await watcher._poll_once()
-    assert "4paradigm/phanthymotus-driver" not in watcher._pending_baseline_repos
+    assert "haohao-end/phanthymotus-driver" not in watcher._pending_baseline_repos
     # Still zero dispatch because baseline only
     controller.on_command.assert_not_called()
 
     # Baseline succeeds
     await watcher._refresh_active_repos_if_needed()
     await watcher._poll_once()
-    assert "4paradigm/phanthymotus-driver" not in watcher._pending_baseline_repos
+    assert "haohao-end/phanthymotus-driver" not in watcher._pending_baseline_repos
     assert persisted_bodies and persisted_bodies[-1] == 7001
 
     # A NEW comment above baseline should now dispatch
@@ -7231,7 +7230,7 @@ async def test_driver_auth_refresh_recovery_rebaselines_driver_before_dispatch()
     await watcher._poll_once()
     controller.on_command.assert_called_once()
     call_repo = controller.on_command.call_args.args[1]
-    assert call_repo == "4paradigm/phanthymotus-driver"
+    assert call_repo == "Haohao-end/phanthymotus-driver"
 
 
 @pytest.mark.asyncio
@@ -7241,8 +7240,8 @@ async def test_driver_baseline_enumeration_failure_fails_closed():
     from ..github_client import GitHubClient, GitHubError
     from ..github_command_watcher import GitHubCommandWatcher
 
-    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
-    config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
+    config = make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"])
+    config.active_repos = ["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]
     config.auth_valid = True
 
     proxy = MagicMock()
@@ -7256,7 +7255,7 @@ async def test_driver_baseline_enumeration_failure_fails_closed():
     watcher = GitHubCommandWatcher(
         config, proxy, controller, github=github, github_auth=github_auth)
     # Seed driver as pending
-    watcher.mark_repos_pending_baseline(["4paradigm/phanthymotus-driver"])
+    watcher.mark_repos_pending_baseline(["Haohao-end/phanthymotus-driver"])
 
     # enumerate PRs fails
     proxy.get_open_prs = AsyncMock(side_effect=GitHubError(500, "list failed"))
@@ -7264,7 +7263,7 @@ async def test_driver_baseline_enumeration_failure_fails_closed():
 
     await watcher._poll_once()
     # Should remain pending
-    assert "4paradigm/phanthymotus-driver" in watcher._pending_baseline_repos
+    assert "haohao-end/phanthymotus-driver" in watcher._pending_baseline_repos
     controller.on_command.assert_not_called()
 
 

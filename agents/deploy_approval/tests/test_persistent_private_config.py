@@ -542,14 +542,21 @@ def test_persistent_dir_independent_of_release_dir(tmp_path):
 
     compose = _compose()
     svc = compose["services"]["deploy-approval"]
-    for v in svc.get("volumes", []):
-        if isinstance(v, str) and "machines.yaml" in v:
-            assert "DEPLOY_APPROVAL_CONFIG_DIR" in v
-        if isinstance(v, str) and "secrets.yaml" in v:
-            assert "DEPLOY_APPROVAL_CONFIG_DIR" in v
+    volumes = [v for v in svc.get("volumes", []) if isinstance(v, dict)]
+    by_target = {v.get("target"): v for v in volumes}
+    for target in (
+        "/run/deploy-approval/machines.yaml",
+        "/run/deploy-approval/secrets.yaml",
+    ):
+        assert "DEPLOY_APPROVAL_CONFIG_DIR" in by_target[target]["source"]
+    assert by_target["/run/deploy-approval/policy-candidates"]["source"] == (
+        "/var/lib/deploy-approval/policy-candidates"
+    )
     # Must not contain hardcoded server path
     compose_text = COMPOSE_PATH.read_text(encoding="utf-8")
-    assert "/var/lib/deploy-approval" not in compose_text
+    assert "/var/lib/deploy-approval/policy-candidates" in compose_text
+    assert "/var/lib/deploy-approval/machines.yaml" not in compose_text
+    assert "/var/lib/deploy-approval/secrets.yaml" not in compose_text
 
 
 # ── 7. Read-only mount verification ────────────────────────────────────
@@ -575,32 +582,32 @@ def test_cos_path_protocol_phanthymotus():
     from agents.deploy_approval.cos_client import CosClient
     from agents.deploy_approval.config import Config
 
-    cfg = Config()
+    cfg = Config(github_repos=["Haohao-end/phanthymotus"])
     client = CosClient(cfg, _fake=True)
     head_sha = "a" * 40
     key = client.build_object_key(
-        "4paradigm/phanthymotus", 42, head_sha,
+        "Haohao-end/phanthymotus", 42, head_sha,
         now=datetime.datetime(2026, 9, 17, tzinfo=datetime.timezone.utc).astimezone(
             datetime.timezone(datetime.timedelta(hours=8))
         ),
     )
-    assert key == "phanthymotus_pr/phanthymotus/2026-09/2026-09-17/pr-42/evidence-" + head_sha + ".log.gz"
+    assert key == "phanthymotus_pr/repo-v1-68616f68616f2d656e64-7068616e7468796d6f747573/2026-09/2026-09-17/pr-42/evidence-" + head_sha + ".log.gz"
 
 
 def test_cos_path_protocol_phanthymotus_driver():
     from agents.deploy_approval.cos_client import CosClient
     from agents.deploy_approval.config import Config
 
-    cfg = Config()
+    cfg = Config(github_repos=["Haohao-end/phanthymotus-driver"])
     client = CosClient(cfg, _fake=True)
     head_sha = "b" * 40
     key = client.build_object_key(
-        "4paradigm/phanthymotus-driver", 7, head_sha,
+        "Haohao-end/phanthymotus-driver", 7, head_sha,
         now=datetime.datetime(2026, 10, 1, tzinfo=datetime.timezone.utc).astimezone(
             datetime.timezone(datetime.timedelta(hours=8))
         ),
     )
-    assert key == "phanthymotus_pr/phanthymotus-driver/2026-10/2026-10-01/pr-7/evidence-" + head_sha + ".log.gz"
+    assert key == "phanthymotus_pr/repo-v1-68616f68616f2d656e64-7068616e7468796d6f7475732d647269766572/2026-10/2026-10-01/pr-7/evidence-" + head_sha + ".log.gz"
 
 
 def test_cos_path_rejects_unsupported_repo():
@@ -765,7 +772,9 @@ def test_config_paths_survive_release_directory_change():
     assert "./machines.yaml" not in compose_text
     assert "./secrets.yaml" not in compose_text
     assert "DEPLOY_APPROVAL_CONFIG_DIR" in compose_text
-    assert "/var/lib/deploy-approval" not in compose_text
+    assert "/var/lib/deploy-approval/policy-candidates" in compose_text
+    assert "/var/lib/deploy-approval/machines.yaml" not in compose_text
+    assert "/var/lib/deploy-approval/secrets.yaml" not in compose_text
 
 
 # ── 13. Different config directories ──────────────────────────────────

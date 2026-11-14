@@ -16,7 +16,7 @@ from ..service import DeployController, DeployControllerError
 def config():
     return Config(
 
-        github_repos=["4paradigm/phanthymotus"],
+        github_repos=["Haohao-end/phanthymotus"],
         review_comment_author_id="7950763",
         review_comment_author_login="kentcyq",
         machine_owners_file="/dev/null",
@@ -128,9 +128,9 @@ async def test_request_deploy_re_reads_command_identity_from_github(controller, 
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
 
-    await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
+    await controller.handle_request_deploy("Haohao-end/phanthymotus", 1, 101)
 
-    mock_github.get_comment.assert_called_once_with("4paradigm/phanthymotus", 101)
+    mock_github.get_comment.assert_called_once_with("Haohao-end/phanthymotus", 101)
 
 
 @pytest.mark.asyncio
@@ -166,11 +166,11 @@ async def test_request_deploy_allows_current_pr_author_id(controller, proxy, moc
     )
     with patch('agents.deploy_approval.service.extract_review_evidence', return_value=fake_evidence):
         controller._build_component_snapshot = AsyncMock(return_value=[_component()])
-        result = await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
+        result = await controller.handle_request_deploy("Haohao-end/phanthymotus", 1, 101)
 
     assert result is True
     proxy.write_hidden_state.assert_called_once()
-    proxy.project_status_label.assert_called_once_with("4paradigm/phanthymotus", 1, "deploy-requested")
+    proxy.project_status_label.assert_called_once_with("Haohao-end/phanthymotus", 1, "deploy-requested")
 
 
 @pytest.mark.asyncio
@@ -185,7 +185,7 @@ async def test_request_deploy_rejects_non_pr_author_id(controller, proxy, mock_g
     proxy.write_hidden_state = AsyncMock()
     proxy.post_issue_comment = AsyncMock()
 
-    await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
+    await controller.handle_request_deploy("Haohao-end/phanthymotus", 1, 101)
 
     proxy.write_hidden_state.assert_not_called()
     proxy.post_issue_comment.assert_called_once()
@@ -203,7 +203,7 @@ async def test_request_deploy_missing_comment_identity_fails_closed(controller, 
     proxy.write_hidden_state = AsyncMock()
     proxy.post_issue_comment = AsyncMock()
 
-    await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
+    await controller.handle_request_deploy("Haohao-end/phanthymotus", 1, 101)
 
     proxy.write_hidden_state.assert_not_called()
     proxy.post_issue_comment.assert_called_once()
@@ -221,7 +221,7 @@ async def test_request_deploy_unauthorized_has_zero_registry_and_deploy_side_eff
     proxy.write_hidden_state = AsyncMock()
     proxy.post_issue_comment = AsyncMock()
 
-    await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
+    await controller.handle_request_deploy("Haohao-end/phanthymotus", 1, 101)
 
     proxy.write_hidden_state.assert_not_called()
 
@@ -520,7 +520,7 @@ async def test_request_deploy_zero_registry_dependency(controller, proxy, mock_g
     )
 
     with patch('agents.deploy_approval.service.extract_review_evidence', return_value=fake_evidence):
-        await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
+        await controller.handle_request_deploy("Haohao-end/phanthymotus", 1, 101)
 
     # Verify 4 components were built
     write_call = proxy.write_hidden_state.await_args

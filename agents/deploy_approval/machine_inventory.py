@@ -25,7 +25,6 @@ import ipaddress as _ipaddress
 
 __all__ = ("get_machine_inventory",)
 
-_OWNER_SOURCE_V16 = "V16 legacy machines.yaml SHA16=d4157deaf4b8bb86"
 _DRIVER_PATH_SNAPSHOT = "814b3ca953d33eba0aca9a61dcefa773f5da483b"
 _PLATFORM_LINUX_ARM64 = "linux/arm64"
 _PLATFORM_SOURCE_EXPLICIT = (
@@ -74,55 +73,42 @@ def _record(
     }
 
 
-_VERIFIED_OWNER = ("haohao-end",)
 
 _INVENTORY = (
     _record("001", "beijing-g1-001", "宇树", "G1北京", "10.100.129.168",
-            owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
             driver_path="unitree/g1", driver_path_verified=True,
             platforms=(_PLATFORM_LINUX_ARM64,), platform_status="verified",
             platform_source=f"{_PLATFORM_SOURCE_EXPLICIT}: beijing-g1-001={_PLATFORM_LINUX_ARM64}"),
     _record("002", "unitree-r1-002", "宇树", "R1", "10.100.130.6",
-            owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
             driver_path="unitree/r1", driver_path_verified=True),
     _record("003", "unitree-go2-003", "宇树", "Go2", "10.100.129.166",
-            owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
             driver_path="unitree/go2", driver_path_verified=True),
     _record("004", "unitree-go1-004", "宇树", "Go1", "10.100.130.4",
-            owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
             driver_path="unitree/go1", driver_path_verified=True),
     _record("005", "tianyi2-005", "北京人形", "天轶2.0", "10.100.129.72",
-            owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
             driver_path="x-humanoid/tianyi2.0", driver_path_verified=True,
             platforms=(_PLATFORM_LINUX_ARM64,), platform_status="verified",
             platform_source=f"{_PLATFORM_SOURCE_EXPLICIT}: tianyi2-005={_PLATFORM_LINUX_ARM64}"),
     _record("006", "bumi-006", "松延动力", "Bumi-Edu-Max", "10.100.128.245",
             secondary_ips=("192.168.55.101",),
-            owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
             driver_path="noetix/bumi", driver_path_verified=True),
     _record("007", "m20pro-007", "云深处", "M20 Pro", "10.110.15.219",
-            owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
             driver_path="deep_robotics/lynx_m20", driver_path_verified=True),
     _record("008", "t800-008", "众擎", "T800", "10.110.10.96",
-            owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
             driver_path="engineai/t800", driver_path_verified=True),
     _record("009", "shanghai-g1-009", "宇树", "G1上海", "10.110.12.110",
-            owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
             driver_path="unitree/g1", driver_path_verified=True),
     _record("010", "q5-010", "星动纪元", "Q5", "10.100.128.225",
-            owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
             driver_path="robotera/q5_bundle", driver_path_verified=True,
             platforms=(_PLATFORM_LINUX_ARM64,), platform_status="verified",
             platform_source=f"{_PLATFORM_SOURCE_EXPLICIT}: q5-010={_PLATFORM_LINUX_ARM64}"),
     _record("011", "x2-011", "智元机器人", "灵犀X2旗舰版", "10.100.129.195",
-            owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
             legacy_aliases=("x2-012",),
             driver_path="agibot/AimDK_X2", driver_path_verified=True),
     _record("012", "adam-pro-012", "柏奥尼克", "Adam Pro", "10.100.128.154",
             secondary_ips=("10.10.20.126",),
             driver_path="pndbotics/adam", driver_path_verified=True),
-    _record("013", "rm75-013", "睿尔曼", "RM75-6f-v", "",
-            owners=_VERIFIED_OWNER, owner_status="verified", owner_source=_OWNER_SOURCE_V16,
+    _record("013", "rm75-013", "睿尔曼", "RM75-6f-v", "10.100.130.37",
             driver_path="realman/rm75_6f_v", driver_path_verified=True),
     _record("014", "as2w-014", "宇树", "As2 W", "10.100.129.146",
             secondary_ips=("10.100.128.245",),
@@ -166,10 +152,9 @@ def _validate_static_inventory() -> None:
         "beijing-g1-001", "tianyi2-005", "q5-010",
     }:
         raise RuntimeError("only evidence-backed physical machines may have verified platforms")
-    if sum(machine["owner_status"] == "verified" for machine in _INVENTORY) != 12:
-        raise RuntimeError("exactly the 12 historical owners must remain verified")
-    if sum(machine["owner_status"] == "pending" for machine in _INVENTORY) != 9:
-        raise RuntimeError("the nine newly added machine owners must remain pending")
+    if any(machine["owners"] or machine["owner_status"] != "pending"
+           or machine["owner_source"] != "pending" for machine in _INVENTORY):
+        raise RuntimeError("physical inventory must not supply machine owners")
     numbers: set[str] = set()
     aliases: set[str] = set()
     primary_ips: set[str] = set()
@@ -230,10 +215,6 @@ def _validate_static_inventory() -> None:
         if machine["platform_status"] == "unverified" and (
                 machine["platforms"] or machine["platform_source"] is not None):
             raise RuntimeError("unverified platform must not include a value or fabricated source")
-        if machine["owner_status"] == "verified" and not machine["owners"]:
-            raise RuntimeError("verified owner status must have at least one owner")
-        if machine["owner_status"] == "verified" and machine["owner_source"] != _OWNER_SOURCE_V16:
-            raise RuntimeError("verified historical owner must retain its source")
         if machine["owner_status"] == "pending" and (
                 machine["owners"] or machine["owner_source"] != "pending"):
             raise RuntimeError("pending machine owners must remain unassigned")

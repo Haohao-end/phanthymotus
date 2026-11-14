@@ -6,6 +6,7 @@ import subprocess
 import pytest
 
 from ..config import Config
+from ..config import DEFAULT_GITHUB_REPOS, validate_repository_names
 from ..policy import Policy
 
 
@@ -44,7 +45,7 @@ def make_config(**overrides):
         webhook_enabled=True,
         github_webhook_secret="test-secret",
         machine_owners_file="/dev/null",
-        github_repos=["4paradigm/phanthymotus"],
+        github_repos=["Haohao-end/phanthymotus"],
         poll_enabled=True,
         poll_interval_seconds=30,
         review_comment_author_id="7950763",
@@ -55,8 +56,19 @@ def make_config(**overrides):
     # Offline fixtures model an already authorized installation. Negative
     # authorization tests explicitly override these fields.
     defaults.setdefault("active_repos", list(defaults["github_repos"]))
+    defaults.setdefault("policy_active_repos", list(DEFAULT_GITHUB_REPOS))
     defaults.setdefault("auth_valid", True)
-    return Config(**defaults)
+    config = Config(**defaults)
+    # Match load_config()/validate_config() so offline tests exercise the
+    # canonical repository names used by installation and policy snapshots.
+    config.github_repos = validate_repository_names(config.github_repos)
+    config.active_repos = validate_repository_names(
+        config.active_repos, allow_empty=True,
+    )
+    config.policy_active_repos = validate_repository_names(
+        config.policy_active_repos, allow_empty=True,
+    )
+    return config
 
 
 @pytest.fixture

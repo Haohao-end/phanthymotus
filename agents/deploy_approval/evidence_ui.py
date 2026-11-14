@@ -24,7 +24,6 @@ def render_upload_page(repo, pr_number, head_sha, round_id, *, read_only=False) 
 body{{margin:0;background:#f5f5f7;color:#1d1d1f;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}}
 main{{width:min(100% - 32px,680px);margin:48px auto 72px}}
 h1{{margin:0;font-size:clamp(28px,5vw,36px);line-height:1.15;letter-spacing:-.035em}}
-.subtitle{{margin:10px 0 26px;color:#6e6e73}}
 section.panel{{padding:24px;background:#fff;border:1px solid #e5e5ea;border-radius:16px}}
 button,input{{font:inherit}}
 button{{min-height:44px;padding:9px 16px;border:1px solid #0071e3;border-radius:10px;background:#0071e3;color:#fff;font-weight:600;cursor:pointer}}
@@ -49,6 +48,9 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 .job-footer{{display:flex;align-items:center;justify-content:space-between;gap:12px}}
 .job-state{{color:#424245;font-size:14px;font-weight:600}}
 .job-detail{{color:#6e6e73;font-size:13px;overflow-wrap:anywhere}}
+.job-result{{margin-top:10px;overflow-wrap:anywhere}}
+.job-result img{{display:block;max-width:100%;max-height:360px;margin-top:10px;border-radius:10px}}
+.job-result a{{color:#06c;text-decoration:underline}}
 .job-footer button{{min-height:40px;background:#fff;color:#1d1d1f;border-color:#d2d2d7}}
 [hidden]{{display:none!important}}
 @media (max-width:560px){{
@@ -62,7 +64,7 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 </style><script src="/evidence/assets/app.js" defer></script></head>
 <body>
 <main id="app" data-api="{esc(api)}" data-repo="{esc(repo)}" data-pr="{esc(pr_number)}" data-head="{esc(head_sha)}" data-round="{esc(round_id)}" data-read-only="{str(bool(read_only)).lower()}">
-<header><h1>测试证据上传</h1><p class="subtitle">这里上传供验收人查看的测试效果视频、截图等证据。</p></header>
+<header><h1>测试证据上传</h1></header>
 <p id="message" role="status" aria-live="polite"></p>
 <h2 class="list-heading" id="next-action-heading">下一步：上传测试证据</h2>
 <section id="upload-section" class="panel" aria-labelledby="next-action-heading">
@@ -536,19 +538,55 @@ _JAVASCRIPT = r'''"use strict";
       } else if (!busy && job.status !== "succeeded") runSingle(job);
     };
   }
+  async function showUploadResult(job, attachmentId) {
+    job.resultNode.replaceChildren();
+    const resultText = document.createElement("p");
+    resultText.textContent = "文件与 SHA256 已验证，GitHub 上传评论已同步。";
+    job.resultNode.append(resultText);
+    if (typeof attachmentId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(attachmentId)) return;
+    try {
+      await refresh(job, 15000);
+      const item = Array.isArray(context && context.attachments)
+        ? context.attachments.find(row => row && row.attachment_id === attachmentId &&
+            row.status === "ready" && row.head_sha === bound.head_sha && row.round_id === bound.round_id)
+        : null;
+      if (!item || typeof item.download_capability !== "string" || !item.download_capability) return;
+      const target = new URL(api + "/attachments/" + id(attachmentId) + "/preview", window.location.href);
+      if (target.origin !== window.location.origin) return;
+      target.searchParams.set("cap", item.download_capability);
+      const suffix = String(job.file.name || "").split(".").pop().toLowerCase();
+      if (["png", "jpg", "jpeg", "gif", "webp"].includes(suffix)) {
+        const preview = document.createElement("img");
+        preview.src = target.href; preview.alt = "已上传图片预览";
+        preview.loading = "lazy"; preview.referrerPolicy = "no-referrer";
+        job.resultNode.append(preview);
+      } else if (["mp4", "webm"].includes(suffix)) {
+        const link = document.createElement("a");
+        link.href = target.href; link.target = "_blank"; link.rel = "noopener noreferrer";
+        link.referrerPolicy = "no-referrer"; link.textContent = "▶ 打开视频预览";
+        job.resultNode.append(link);
+      }
+    } catch (_) {
+      // The upload and GitHub comment are confirmed. The comment remains the
+      // durable place to open the attachment if inline preview is unavailable.
+    }
+  }
   function makeJob(file, replacesId = "") {
     const row = document.createElement("li"), heading = document.createElement("div"), title = document.createElement("strong");
     const size = document.createElement("span"), progress = document.createElement("progress");
     const footer = document.createElement("div"), status = document.createElement("span"), detail = document.createElement("span");
+    const result = document.createElement("div");
     const action = document.createElement("button");
     row.className = "job"; heading.className = "job-heading"; title.className = "job-title"; size.className = "file-size";
     title.textContent = file.name; size.textContent = formatBytes(file.size); heading.append(title, size);
     progress.max = 100; progress.value = 0; progress.setAttribute("aria-label", "文件处理进度");
     footer.className = "job-footer"; status.className = "job-state"; status.setAttribute("aria-live", "polite");
     detail.className = "job-detail"; action.type = "button"; action.textContent = "重试 / 继续";
-    footer.append(status, action); row.append(heading, progress, footer, detail);
+    footer.append(status, action); result.className = "job-result";
+    row.append(heading, progress, footer, detail, result);
     $("queue").append(row); $("queue-heading").hidden = false;
-    const job = {file, row, progress, statusNode: status, detailNode: detail, actionButton: action,
+    const job = {file, row, progress, statusNode: status, detailNode: detail,
+      resultNode: result, actionButton: action,
       requests: new Set(), parts: new Map(), paused: false, running: false, status: "排队中",
       completeUnknown: false, replacesId, noteDigest: ""};
     jobs.push(job); updateJob(job); return job;
@@ -651,11 +689,30 @@ _JAVASCRIPT = r'''"use strict";
     for (let count = 0; count < 30 && !stopped && !job.paused; count++) {
       if (!status) status = await uploadStateWithRetry(job);
       if (verifiedReady(status)) {
+        attachmentId = attachmentId || status.attachment_id || "";
+        if (status.github_comment_synced !== true) {
+          try {
+            const synced = await request("/uploads/" + id(job.uploadId) + "/resume", {
+              method: "POST", key: job.uploadId + ":resume", body: {}, job
+            });
+            if (synced && synced.status === "ready" && synced.github_record_persisted === true &&
+                synced.github_comment_synced === true && synced.attachment_id) {
+              status = synced; attachmentId = synced.attachment_id;
+            }
+          } catch (_) { /* Keep the verified upload resumable until its PR comment is confirmed. */ }
+        }
+        if (status.github_comment_synced !== true) {
+          job.progress.value = 100; job.status = "waiting";
+          job.statusText = "文件已验证，GitHub 上传结果评论尚未确认";
+          updateJob(job, job.statusText + "；点击“重试 / 继续”重新确认评论同步。");
+          return false;
+        }
         job.progress.value = 100; job.completeUnknown = false; job.status = "succeeded";
-        job.statusText = "上传成功，文件和 GitHub 记录已确认。";
+        job.statusText = "上传成功，文件和 GitHub 评论已确认。";
         const key = job.fingerprint + ":" + (job.replacesId || "new") + ":" + job.noteDigest;
         delete savedUploads[key]; try { localStorage.setItem(storageKey, JSON.stringify({uploads: savedUploads})); } catch (_) {}
         updateJob(job, job.statusText);
+        await showUploadResult(job, attachmentId);
         return true;
       }
       if (status && status.status === "ready") {

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import inspect
 import ssl
 from unittest.mock import MagicMock
@@ -13,6 +15,7 @@ import httpx
 
 from ..agent_core_client import AgentCoreClient, AgentCoreDeployOutcomeUncertain, AgentCoreError
 from ..config import Config, validate_config
+from ..github_client import GitHubClient, GitHubError, GitHubPermissionError
 from ..models import MachineInfo
 from ..policy import Policy
 from ..service import DeployController, DeployControllerError
@@ -77,16 +80,122 @@ def _open_pr(number: int, updated_at: str, *, marker: str = "") -> dict:
     return pr
 
 
+@pytest.mark.asyncio
+async def test_official_policy_file_auth_uses_policy_scope_not_fork_watch_scope():
+    content = b"version: 1\nmachines: {}\n"
+    source_sha = hashlib.sha1(
+        b"blob " + str(len(content)).encode("ascii") + b"\0" + content,
+    ).hexdigest()
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        assert request.url.path == "/repos/4paradigm/phanthymotus/contents/machines.yaml"
+        assert request.url.params["ref"] == "main"
+        return httpx.Response(
+            200,
+            headers={"ETag": '"machines-v1"'},
+            json={
+                "type": "file",
+                "path": "machines.yaml",
+                "sha": source_sha,
+                "size": len(content),
+                "encoding": "base64",
+                "content": base64.b64encode(content).decode("ascii"),
+            },
+            request=request,
+        )
+
+    config = make_config(
+        github_repos=["Haohao-end/phanthymotus"],
+        active_repos=["haohao-end/phanthymotus"],
+        policy_active_repos=["4paradigm/phanthymotus"],
+        auth_valid=True,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = GitHubClient(
+            config,
+            http=http,
+            token_provider=fake_token_provider,
+        )
+        result = await client.get_repository_file_at_ref(
+            "4paradigm/phanthymotus", "machines.yaml", ref="main",
+        )
+        assert result["content"] == content
+        assert result["sha"] == source_sha
+        with pytest.raises(GitHubPermissionError) as denied:
+            await client.get_repository_file_at_ref(
+                "Haohao-end/phanthymotus", "machines.yaml", ref="main",
+            )
+        assert denied.value.status_code == 403
+        with pytest.raises(GitHubError, match="write requires"):
+            await client.post_issue_comment(
+                "4paradigm/phanthymotus", 1, "This request must stay read-only.",
+            )
+
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_official_policy_read_without_installation_scope_returns_403_without_request():
+    config = make_config(
+        github_repos=["Haohao-end/phanthymotus"],
+        active_repos=["haohao-end/phanthymotus"],
+        policy_active_repos=[],
+        auth_valid=True,
+    )
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        return httpx.Response(404, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = GitHubClient(config, http=http, token_provider=fake_token_provider)
+        with pytest.raises(GitHubPermissionError) as denied:
+            await client.get_repository_file_at_ref(
+                "4paradigm/phanthymotus", "machines.yaml", ref="main",
+            )
+
+    assert denied.value.status_code == 403
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_official_contents_404_is_the_only_missing_file_response():
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        assert request.url.path == "/repos/4paradigm/phanthymotus/contents/test_reviewers.yaml"
+        return httpx.Response(404, request=request)
+
+    config = make_config(
+        github_repos=["Haohao-end/phanthymotus"],
+        active_repos=["haohao-end/phanthymotus"],
+        policy_active_repos=["4paradigm/phanthymotus"],
+        auth_valid=True,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = GitHubClient(config, http=http, token_provider=fake_token_provider)
+        missing = await client.get_repository_file_at_ref(
+            "4paradigm/phanthymotus", "test_reviewers.yaml", ref="main",
+        )
+
+    assert missing is None
+    assert len(requests) == 1
+
+
 @pytest.mark.parametrize(
     "github_repos, should_pass, expected_error",
     [
         ([], False, "GITHUB_REPOS is required"),
-        (["4paradigm/phanthymotus"], True, ""),
-        (["4paradigm/phanthymotus-driver"], True, ""),
-        (["4paradigm/phanthymotus", "4paradigm/phanthymotus"], False, "GITHUB_REPOS must not contain duplicates"),
-        (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"], True, ""),
-        (["4paradigm/phanthymotus-driver", "4paradigm/phanthymotus"], True, ""),
-        (["4paradigm/phanthymotus", "some/other-repo"], True, ""),
+        (["Haohao-end/phanthymotus"], True, ""),
+        (["Haohao-end/phanthymotus-driver"], True, ""),
+        (["Haohao-end/phanthymotus", "Haohao-end/phanthymotus"], False, "GITHUB_REPOS must not contain duplicates"),
+        (["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"], True, ""),
+        (["Haohao-end/phanthymotus-driver", "Haohao-end/phanthymotus"], True, ""),
+        (["Haohao-end/phanthymotus", "some/other-repo"], True, ""),
         (["example/unsupported-repo"], True, ""),
     ],
 )

@@ -884,7 +884,7 @@ def _testing_next_action(
         ])
     else:
         lines.extend([
-            "请把本轮开发的实际效果、视频或截图上传到这里，供审批人检查实现效果，",
+            "请把本轮开发的实际效果视频或图片上传到这里，供审批人检查真实开发效果，",
             "并作为是否通过验收、是否可以合并的依据：",
         ])
     if evidence_url:
@@ -893,6 +893,143 @@ def _testing_next_action(
         lines.extend(["", "[上传测试证据][deploy-approval-upload]"])
     lines.extend(["", "测试完成后，请执行 `/request_acceptance`。"])
     return "\n".join(lines)
+
+
+def _deploying_next_action(
+    deployments, components, attempt=None, *, machine_groups=None,
+    outcome_uncertain: bool = False,
+) -> list[str]:
+    """Describe the machine and target image in the existing Next action."""
+    component_by_id = {
+        item.get("component_id"): item for item in components or []
+        if isinstance(item, dict) and isinstance(item.get("component_id"), str)
+    }
+    active_phases = {
+        "preflight", "deploying", "executing", "uncertain", "in_progress",
+        "in-progress", "running",
+    }
+    active_rows = [
+        row for row in deployments or []
+        if isinstance(row, dict)
+        and str(row.get("phase") or row.get("status") or "").casefold()
+        in active_phases
+    ]
+    source = active_rows[-1] if active_rows else (
+        attempt if isinstance(attempt, dict) else {}
+    )
+    if (not source and not outcome_uncertain
+            and isinstance(deployments, list)):
+        # An already matching image can be adopted without a deployment POST.
+        # Keep its verified machine and target visible while other components
+        # or the final deployment status are being reconciled.
+        source = next((row for row in reversed(deployments)
+                       if isinstance(row, dict)), {})
+    if not source and outcome_uncertain:
+        candidates = [
+            row for row in _record_rows(machine_groups)
+            if isinstance(row, dict) and _machine_alias(row)
+            and _field_flag(row, "identity_confirmed") is True
+            and _field_flag(row, "repo_authorized", "repository_authorized") is True
+            and (_record_value(row, "command_selector")
+                 or _field_flag(row, "approval_available", "safe_to_approve") is True)
+        ]
+        if len(candidates) == 1:
+            source = candidates[0]
+
+    machine = source.get("machine") or source.get("alias") or ""
+    ip = source.get("ip") or source.get("primary_ip") or source.get("node_host") or ""
+    if not ip and isinstance(attempt, dict):
+        args = attempt.get("args") if isinstance(attempt.get("args"), dict) else {}
+        ip = (attempt.get("ip") or attempt.get("primary_ip")
+              or attempt.get("node_host") or args.get("node_host") or "")
+    if not machine and isinstance(attempt, dict):
+        args = attempt.get("args") if isinstance(attempt.get("args"), dict) else {}
+        machine = (
+            attempt.get("machine") or attempt.get("alias")
+            or args.get("machine") or ""
+        )
+    machine_label = (
+        f"`{_escape(machine)}`（IP `{_escape(ip)}`）" if machine and ip else
+        f"`{_escape(machine)}`" if machine else
+        f"IP `{_escape(ip)}`" if ip else
+        "机器信息暂不可用"
+    )
+
+    snapshot = source.get("components", source.get("component_snapshot", []))
+    if isinstance(snapshot, dict):
+        snapshot = ([snapshot] if "component_id" in snapshot else
+                    [dict(item, component_id=key)
+                     for key, item in snapshot.items() if isinstance(item, dict)])
+    if not isinstance(snapshot, (list, tuple)):
+        snapshot = []
+    local_components = dict(component_by_id)
+    snapshot_ids = []
+    for item in snapshot or []:
+        if isinstance(item, dict):
+            component_id = item.get("component_id")
+            if isinstance(component_id, str) and component_id:
+                local_components[component_id] = item
+                snapshot_ids.append(component_id)
+
+    component_ids = source.get("component_ids") or source.get("pending_component_ids")
+    if not component_ids and isinstance(source.get("component_id"), str):
+        component_ids = [source["component_id"]]
+    if not component_ids:
+        component_ids = snapshot_ids
+    if not component_ids:
+        args = source.get("args") if isinstance(source.get("args"), dict) else {}
+        component_ids = args.get("pending_component_ids") or []
+    if isinstance(component_ids, str):
+        component_ids = [component_ids]
+    if not isinstance(component_ids, (list, tuple, set)):
+        component_ids = []
+
+    image_lines = []
+    for component_id in sorted({
+        value for value in component_ids
+        if isinstance(value, str) and value
+    }):
+        component = local_components.get(component_id, {})
+        image_ref = (
+            component.get("image_ref") or component.get("target_image")
+            or source.get("image_ref") or source.get("target_image")
+        )
+        label = _runtime_component_label(component) or component_id
+        image_text = (
+            f"`{_escape(image_ref)}`" if image_ref else "目标镜像信息暂不可用"
+        )
+        image_lines.append(f"- {_escape(label)}：{image_text}")
+
+    if not image_lines:
+        args = source.get("args") if isinstance(source.get("args"), dict) else {}
+        image_ref = (
+            source.get("image_ref") or source.get("target_image")
+            or args.get("image_ref") or args.get("target_image")
+        )
+        image_lines.append(
+            f"- 目标镜像：`{_escape(image_ref)}`" if image_ref else
+            "- 目标镜像信息暂不可用"
+        )
+
+    source_phase = str(source.get("phase") or source.get("status") or "").casefold()
+    if outcome_uncertain:
+        lines = [
+            f"部署结果尚未确认；当前目标机器为 {machine_label}，目标镜像如下。",
+            "当前部署尚未完成，请等待结果。",
+        ]
+    elif source_phase == "deployed":
+        lines = [
+            f"目标镜像已在机器 {machine_label} 确认；本轮整体部署尚未完成，正在汇总其他组件的结果：",
+        ]
+    elif source:
+        lines = [
+            f"正在向机器 {machine_label} 部署以下目标镜像；当前部署尚未完成：",
+        ]
+    else:
+        lines = ["当前部署尚未完成，但机器和目标镜像信息暂不可用。"]
+    lines.extend(image_lines)
+    lines.extend(["", "请等待部署结果；不要重复执行 `/approve_deploy`。"])
+    return lines
 
 
 # ── History helpers ──────────────────────────────────────────────
@@ -937,9 +1074,7 @@ def review_required(
         "",
         "### Next action",
         "",
-        "**Developer**",
-        "",
-        "`/request_bot_review`",
+        "请等待当前 HEAD 的 Review 和镜像构建结果。",
         "",
         "### Current Deployment",
         "",
@@ -1148,12 +1283,22 @@ def deploy_ready(
         "",
         "### Next action",
         "",
-        ("当前版本已经通过代码审查和镜像构建，可以部署。"
+        ("当前 HEAD 的 Review 和镜像构建均已完成，可以部署。"
          if approval_evidence_ready else
          "当前 HEAD 的代码审查或镜像构建尚未确认通过，暂时不能部署。"),
     ]
     if commands:
-        lines.extend(["", "以下机器已通过身份、授权和兼容性检查，可直接执行对应审批命令：", "", *commands])
+        lines.extend([
+            "",
+            "以下为所有当前通过身份、授权和组件兼容性检查的机器及其完整审批命令，可直接执行：",
+            "",
+            *commands,
+        ])
+        if len(commands) > 1:
+            lines.extend([
+                "",
+                "有多台兼容机器，请先选择目标机器，再执行该机器对应的完整命令。",
+            ])
     elif approval_evidence_ready:
         lines.extend([
             "",
@@ -1167,7 +1312,11 @@ def deploy_ready(
     if approval_evidence_ready and len(full_machine_aliases) == 1:
         lines.extend(["", "当前只有一台完整适配机器，也可以直接使用简写 `/approve_deploy`。"])
     if approval_evidence_ready:
-        lines.extend(["", "`/request_deploy` 是可选操作，不是部署审批的前置步骤。"])
+        lines.extend([
+            "",
+            "可以直接执行上方列出的 `/approve_deploy` 命令；"
+            "`/request_deploy` 是可选操作，不是前置步骤。",
+        ])
     lines.extend(["", "### 构建结果", "", _build_table(builds, components)])
     return _lifecycle_body(lines)
 
@@ -2245,9 +2394,20 @@ def deploy_requested(
     seen_commands = set()
     full_machine_aliases = set()
     if display_status == "deploying":
-        lines.extend([
-            "部署申请已收到，当前正在部署。请等待部署结果，不要重复提交审批。",
-        ])
+        lines.extend(_deploying_next_action(
+            deployments, components, attempt,
+            machine_groups=machine_groups,
+            outcome_uncertain=(
+                isinstance(attempt, dict)
+                and str(attempt.get("phase", "")).casefold() == "uncertain"
+                or any(
+                    isinstance(note, str)
+                    and ("outcome is uncertain" in note.casefold()
+                         or "still being verified" in note.casefold())
+                    for note in gate_note or []
+                )
+            ),
+        ))
     else:
         lines.append("部署申请已收到。请对应机器负责人批准明确列出的机器和组件：")
         for state in compatible_states:
@@ -2353,8 +2513,8 @@ def testing(
         if reviewers:
             waiting_for = "、".join(f"@{_escape(name)}" for name in reviewers)
             next_action = [
-                f"已申请验收，正在等待 {waiting_for} 确认。",
-                "请验收人检查本轮测试证据和部署效果，然后执行 "
+                f"本轮验收由以下账号负责检查和记录：{waiting_for}。",
+                "请上述验收账号检查本轮测试证据和部署效果，然后执行 "
                 "`/record_test result=pass` 或 `/record_test result=fail`。",
             ]
         else:
@@ -2486,9 +2646,7 @@ def superseded_comment(
         "",
         "### Next action",
         "",
-        "**Developer**",
-        "",
-        "`/request_bot_review`",
+        "请等待当前 HEAD 的 Review 和镜像构建结果。",
         "",
     ])
 
@@ -2517,7 +2675,10 @@ def uncertain_comment(
         "",
         "### Next action",
         "",
-        "部署结果正在核实，请等待状态更新；请勿重复提交部署审批命令。",
+        *_deploying_next_action(
+            deployments, components, attempt, machine_groups=machine_groups,
+            outcome_uncertain=True,
+        ),
     ]
     lines.extend(_attempt_lines(attempt))
     if deployments:

@@ -15,8 +15,8 @@ from ..github_command_watcher import GitHubCommandWatcher
 from .conftest import make_config
 
 
-REPO = "4paradigm/phanthymotus"
-DRIVER = "4paradigm/phanthymotus-driver"
+REPO = "Haohao-end/phanthymotus"
+DRIVER = "Haohao-end/phanthymotus-driver"
 OLD_HEAD = "1" * 40
 NEW_HEAD = "2" * 40
 

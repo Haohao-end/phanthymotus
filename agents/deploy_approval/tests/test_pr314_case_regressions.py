@@ -143,7 +143,7 @@ async def test_pr314_core_no_case_skips_core_resolution(controller):
     deployments = [{"machine": "test-machine", "component_ids": ["comp-core"], "phase": "deployed"}]
 
     result = await controller._run_automated_case(
-        "4paradigm/phanthymotus",
+        "Haohao-end/phanthymotus",
         1,
         "a" * 40,
         [core_comp],
@@ -170,7 +170,7 @@ async def test_pr314_core_missing_deployment_still_fails(controller, phase):
     }]
 
     result = await controller._run_automated_case(
-        "4paradigm/phanthymotus",
+        "Haohao-end/phanthymotus",
         1,
         "a" * 40,
         [core_comp],
@@ -193,7 +193,7 @@ async def test_pr314_case_selector_exception_fails_closed(controller):
     controller._get_case_runner = MagicMock(return_value=runner)
 
     result = await controller._run_automated_case(
-        "4paradigm/phanthymotus",
+        "Haohao-end/phanthymotus",
         1,
         "a" * 40,
         [perception_comp],
@@ -240,7 +240,7 @@ async def test_pr314_perception_health_contract_pass(controller, variant):
     controller._core_for_node = AsyncMock(return_value=core)
 
     result = await controller._run_automated_case(
-        "4paradigm/phanthymotus",
+        "Haohao-end/phanthymotus",
         1,
         "a" * 40,
         [perc_comp],
@@ -290,7 +290,7 @@ async def test_pr314_actucore_health_contract_pass(controller, variant):
     controller._core_for_node = AsyncMock(return_value=core)
 
     result = await controller._run_automated_case(
-        "4paradigm/phanthymotus",
+        "Haohao-end/phanthymotus",
         1,
         "a" * 40,
         [actucore_comp],
@@ -330,7 +330,7 @@ async def test_pr314_jp511_wrong_image_fails_closed(controller):
     controller._core_for_node = AsyncMock(return_value=core)
 
     result = await controller._run_automated_case(
-        "4paradigm/phanthymotus",
+        "Haohao-end/phanthymotus",
         1,
         "a" * 40,
         [perc_comp],
@@ -365,7 +365,7 @@ async def test_pr314_jp511_mcp_offline_fails_closed(controller):
     controller._core_for_node = AsyncMock(return_value=core)
 
     result = await controller._run_automated_case(
-        "4paradigm/phanthymotus",
+        "Haohao-end/phanthymotus",
         1,
         "a" * 40,
         [perc_comp],
@@ -405,7 +405,7 @@ async def test_stopped_runtime_rejects_automated_case(controller, status_fields)
     controller._core_for_node = AsyncMock(return_value=core)
 
     result = await controller._run_automated_case(
-        "4paradigm/phanthymotus", 314, "a" * 40, [component],
+        "Haohao-end/phanthymotus", 314, "a" * 40, [component],
         [{"machine": "test-machine", "component_ids": [component["component_id"]],
           "phase": "deployed"}],
     )
@@ -526,7 +526,7 @@ async def test_record_test_pass_rejects_failed_case(
     original = copy.deepcopy(state)
 
     assert await controller.handle_record_test(
-        "4paradigm/phanthymotus", 314, 101, "pass", "offline", "owner1", "111",
+        "Haohao-end/phanthymotus", 314, 101, "pass", "offline", "owner1", "111",
     ) is True
 
     assert final_acceptance["state"] == original
@@ -556,7 +556,7 @@ async def test_record_test_pass_requires_core_deployment_and_na(
     original = copy.deepcopy(state)
 
     await controller.handle_record_test(
-        "4paradigm/phanthymotus", 314, 101, "pass", "offline", "owner1", "111",
+        "Haohao-end/phanthymotus", 314, 101, "pass", "offline", "owner1", "111",
     )
 
     assert final_acceptance["state"] == original
@@ -571,7 +571,7 @@ async def test_record_test_pass_accepts_only_deployed_passing_cases_once(
     original = copy.deepcopy(final_acceptance["state"])
     for _ in range(2):
         assert await controller.handle_record_test(
-            "4paradigm/phanthymotus", 314, 101, "pass", "offline", "owner1", "111",
+            "Haohao-end/phanthymotus", 314, 101, "pass", "offline", "owner1", "111",
         ) is True
 
     state = final_acceptance["state"]
@@ -627,7 +627,7 @@ async def test_record_test_pass_preserves_concurrent_hidden_state_changes(
         proxy.find_trusted_lifecycle_comment.side_effect = concurrent_change
 
     assert await controller.handle_record_test(
-        "4paradigm/phanthymotus", 314, 101, "pass", "offline", "owner1", "111",
+        "Haohao-end/phanthymotus", 314, 101, "pass", "offline", "owner1", "111",
     ) is False
 
     state = final_acceptance["state"]

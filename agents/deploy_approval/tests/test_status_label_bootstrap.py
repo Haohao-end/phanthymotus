@@ -257,16 +257,16 @@ async def test_all_repositories_are_preflighted_before_first_create(tmp_path):
     fake = FakeBootstrapGitHub(
         {
             DEFAULT_GITHUB_REPOS[0]: [],
-            "4paradigm/phanthymotus-fake": [],
+            "Haohao-end/phanthymotus-fake": [],
         }
     )
-    fake.list_behaviors["4paradigm/phanthymotus-fake"] = GitHubError("boom")
-    repos_to_bootstrap = list(DEFAULT_GITHUB_REPOS) + ["4paradigm/phanthymotus-fake"]
+    fake.list_behaviors["Haohao-end/phanthymotus-fake"] = GitHubError("boom")
+    repos_to_bootstrap = list(DEFAULT_GITHUB_REPOS) + ["Haohao-end/phanthymotus-fake"]
     summary = await _bootstrap_status_labels(fake, repos=repos_to_bootstrap)  # type: ignore[arg-type]
     # First repo (DEFAULT_GITHUB_REPOS[0]) gets all labels created; fake repo fails
     creates_for_main = [e for e in fake.events if e[0] == "create" and e[1] == DEFAULT_GITHUB_REPOS[0]]
-    assert len(creates_for_main) == 7
-    assert summary["4paradigm/phanthymotus-fake"]["errors"]
+    assert len(creates_for_main) == len(_STATUS_LABEL_SPECS)
+    assert summary["Haohao-end/phanthymotus-fake"]["errors"]
     listed = [event[1] for event in fake.events if event[0] == "list"]
     for r in repos_to_bootstrap:
         assert r in listed
@@ -275,7 +275,7 @@ async def test_all_repositories_are_preflighted_before_first_create(tmp_path):
 @pytest.mark.asyncio
 async def test_create_failure_fails_closed_when_label_still_missing(tmp_path):
     repo = DEFAULT_GITHUB_REPOS[0]
-    fake = FakeBootstrapGitHub({repo: [], "4paradigm/phanthymotus-fake": [_label(name) for name, _, _ in _STATUS_LABEL_SPECS]})
+    fake = FakeBootstrapGitHub({repo: [], "Haohao-end/phanthymotus-fake": [_label(name) for name, _, _ in _STATUS_LABEL_SPECS]})
 
     def _fail_create(repo_name, name, color, description, state):
         raise GitHubError("create failed")
@@ -288,7 +288,7 @@ async def test_create_failure_fails_closed_when_label_still_missing(tmp_path):
 @pytest.mark.asyncio
 async def test_create_failure_is_tolerated_only_when_fresh_get_confirms_exact_label(tmp_path):
     repo = DEFAULT_GITHUB_REPOS[0]
-    fake = FakeBootstrapGitHub({repo: [], "4paradigm/phanthymotus-fake": [_label(name) for name, _, _ in _STATUS_LABEL_SPECS]})
+    fake = FakeBootstrapGitHub({repo: [], "Haohao-end/phanthymotus-fake": [_label(name) for name, _, _ in _STATUS_LABEL_SPECS]})
 
     def _race_create(repo_name, name, color, description, state):
         state.repo_labels.setdefault(repo_name, []).append(
@@ -307,7 +307,7 @@ async def test_final_verification_missing_label_fails_closed(tmp_path):
     fake = FakeBootstrapGitHub(
         {
             repo: [_label(name) for name, _, _ in _STATUS_LABEL_SPECS[:-1]],
-            "4paradigm/phanthymotus-fake": [_label(name) for name, _, _ in _STATUS_LABEL_SPECS],
+            "Haohao-end/phanthymotus-fake": [_label(name) for name, _, _ in _STATUS_LABEL_SPECS],
         }
     )
 
@@ -328,7 +328,7 @@ async def test_restart_is_idempotent(tmp_path):
     state = FakeBootstrapGitHub(
         {
             repo: [_label(name) for name, _, _ in _STATUS_LABEL_SPECS[:2]],
-            "4paradigm/phanthymotus-fake": [_label(name) for name, _, _ in _STATUS_LABEL_SPECS],
+            "Haohao-end/phanthymotus-fake": [_label(name) for name, _, _ in _STATUS_LABEL_SPECS],
         }
     )
     first_creates = []
@@ -469,7 +469,7 @@ async def test_repository_label_list_pagination_is_bounded(tmp_path):
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = GitHubClient(cfg, http=http, token_provider=fake_token_provider)
-        out = await client.list_repository_labels("4paradigm/phanthymotus")
+        out = await client.list_repository_labels("Haohao-end/phanthymotus")
         assert len(out) == 105
         assert calls == [1, 2]
 
@@ -483,13 +483,18 @@ async def test_repository_label_list_pagination_is_bounded(tmp_path):
     async with httpx.AsyncClient(transport=httpx.MockTransport(cap_handler)) as http:
         client = GitHubClient(cfg, http=http, token_provider=fake_token_provider)
         with pytest.raises(GitHubError, match="pagination exceeded 20 pages"):
-            await client.list_repository_labels("4paradigm/phanthymotus")
+            await client.list_repository_labels("Haohao-end/phanthymotus")
     assert calls_2 == list(range(1, 21))
 
 
 @pytest.mark.asyncio
 async def test_create_repository_label_uses_repository_labels_post_only(tmp_path):
-    cfg = _bootstrap_config(tmp_path)
+    cfg = _bootstrap_config(
+        tmp_path,
+        github_repos=["Haohao-end/phanthymotus"],
+        active_repos=["haohao-end/phanthymotus"],
+        auth_valid=True,
+    )
     requests: list[tuple[str, str, dict]] = []
 
     async def handler(request):
@@ -501,7 +506,7 @@ async def test_create_repository_label_uses_repository_labels_post_only(tmp_path
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = GitHubClient(cfg, http=http, token_provider=fake_token_provider)
         out = await client.create_repository_label(
-            "4paradigm/phanthymotus",
+            "Haohao-end/phanthymotus",
             "status: reviewing",
             "5319E7",
             "Deploy Approval: current HEAD is being reviewed",
@@ -511,7 +516,7 @@ async def test_create_repository_label_uses_repository_labels_post_only(tmp_path
     assert requests == [
         (
             "POST",
-            "/repos/4paradigm/phanthymotus/labels",
+            "/repos/Haohao-end/phanthymotus/labels",
             {
                 "name": "status: reviewing",
                 "color": "5319E7",

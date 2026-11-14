@@ -32,6 +32,10 @@ Commands are public:
   - ``/deploy_help`` — Help for commands
   - ``/submit_evidence`` — Persist native PR attachments and notes
   - ``/remove_evidence`` — Add a logical deletion record for an attachment
+
+The parser's stable error codes are part of the command contract. Rejection
+messages may add current PR and repository-policy guidance, but must not relax
+these syntax checks or replace a specific selector with a generic example.
 """
 
 from __future__ import annotations

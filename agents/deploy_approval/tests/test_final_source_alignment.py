@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ..agent_core_client import AgentCoreClient
+from .. import comments as comments_mod
 from ..config import Config
 from ..models import MachineInfo
 from ..policy import Policy
@@ -180,7 +181,11 @@ def test_machine_and_cos_config_are_fixed_read_only_files():
     assert "DEPLOY_APPROVAL_CONFIG_DIR" in deploy_sh
     assert 'PERSISTENT_DIR="${DEPLOY_APPROVAL_CONFIG_DIR:' in deploy_sh
     assert "/var/lib/deploy-approval" not in deploy_sh
-    assert "/var/lib/deploy-approval" not in compose
+    assert "/var/lib/deploy-approval/policy-candidates" in compose
+    assert "/var/lib/deploy-approval/machines.yaml" not in compose
+    assert "/var/lib/deploy-approval/secrets.yaml" not in compose
+    assert 'source: "${DEPLOY_APPROVAL_CONFIG_DIR:?config directory required}/machines.yaml"' in compose
+    assert 'source: "${DEPLOY_APPROVAL_CONFIG_DIR:?config directory required}/secrets.yaml"' in compose
     assert "DEPLOY_APPROVAL_CONFIG_DIR" in compose
     # Long-form volumes: check key elements are present in the YAML text
     assert 'target: /run/deploy-approval/machines.yaml' in compose
@@ -402,7 +407,7 @@ async def test_phanthymotus_core_only_is_not_deployable(controller, proxy, mock_
         proxy.write_hidden_state = AsyncMock()
         proxy.project_status_label = AsyncMock()
 
-        await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 99)
+        await controller.handle_request_deploy("Haohao-end/phanthymotus", 1, 99)
 
     proxy.write_hidden_state.assert_not_called()
     proxy.post_issue_comment.assert_called()
@@ -451,7 +456,7 @@ async def test_phanthymotus_core_plus_perception_deploys_only_perception(control
         proxy.project_status_label = AsyncMock()
         mock_github.resolve_commit_sha.return_value = "a" * 40
 
-        await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 100)
+        await controller.handle_request_deploy("Haohao-end/phanthymotus", 1, 100)
 
     written_state = proxy.write_hidden_state.call_args.args[3]
     assert [c["target"] for c in written_state["components"]] == ["perception"]
@@ -755,3 +760,312 @@ def test_no_registry_legacy_terms_in_production_files():
     assert "Deploy Approval performs zero Registry HTTP" in all_text
     assert "Agent Core receives the exact tag" in all_text
     assert "owns all Registry authentication, pull, and deploy" in all_text
+
+
+def _summary_next_action(markdown: str) -> str:
+    heading = "### Next action"
+    start = markdown.index(heading) + len(heading)
+    next_heading = re.search(r"(?m)^### ", markdown[start:])
+    end = start + next_heading.start() if next_heading else len(markdown)
+    return markdown[start:end].strip()
+
+
+def _summary_headings(markdown: str) -> list[str]:
+    return re.findall(r"(?m)^### (.+)$", markdown)
+
+
+def test_summary_only_next_action_changes_for_lifecycle_states():
+    from ..models import BuildInfo
+
+    repo = "example/phanthymotus"
+    head = "a" * 40
+    component = {
+        "component_id": "component-1",
+        "target": "driver",
+        "driver_path": "example/driver",
+        "variant": "5.11",
+        "image_ref": "registry.example/driver@sha256:" + "b" * 64,
+    }
+    machine = {
+        "alias": "fixture-machine",
+        "ip": "10.100.129.168",
+        "primary_ip": "10.100.129.168",
+        "node_host": "10.100.129.168",
+        "node_id": "node-fixture-machine",
+        "repo_authorized": True,
+        "identity_confirmed": True,
+        "approval_available": True,
+        "ip_command_safe": True,
+        "command_selector": "10.100.129.168",
+        "component_ids": [component["component_id"]],
+    }
+    ready = comments_mod.deploy_ready(
+        repo, 473, head,
+        [BuildInfo(
+            target="driver", driver_path=component["driver_path"],
+            variant="5.11", success=True, image_tag=component["image_ref"],
+            deployable=True, component_id=component["component_id"],
+        )],
+        review_evidence={
+            "build_comment_id": 1,
+            "code_review_comment_id": 2,
+            "resolved_head_sha": head,
+        },
+        machine_groups=[machine],
+        components=[component],
+    )
+    deploying = comments_mod.deploy_requested(
+        repo, 473, head, [component], [machine],
+        deployments=[{
+            "machine": machine["alias"], "ip": machine["ip"],
+            "component_ids": [component["component_id"]], "phase": "deploying",
+        }],
+        display_status="deploying",
+    )
+    testing = comments_mod.testing(repo, 473, head)
+    summaries = {
+        "review-required": comments_mod.review_required(repo, 473, head),
+        "deploy-ready": ready,
+        "deploying": deploying,
+        "testing": testing,
+    }
+    expected_headings = {
+        "review-required": [
+            "Deploy Approval — Lifecycle", "Workflow", "Next action", "Current Deployment",
+        ],
+        "deploy-ready": [
+            "Deploy Approval — Lifecycle", "Workflow", "Next action", "构建结果",
+        ],
+        "deploying": [
+            "Deploy Approval — Lifecycle", "Workflow", "Next action", "部署进度",
+        ],
+        "testing": ["Deploy Approval — Lifecycle", "Workflow", "Next action"],
+    }
+    expected_workflow_steps = [
+        "1. Request Review",
+        "2. Review Agent completed",
+        "3. Request deployment",
+        "4. Machine Owner approval(s)",
+        "5. All required components deployed",
+        "6. Machine Owner uploads evidence",
+        "7. Record validation result",
+        "8. Deployment accepted",
+    ]
+    for status, markdown in summaries.items():
+        assert _summary_headings(markdown) == expected_headings[status]
+        assert markdown.count("### Next action") == 1
+        action = _summary_next_action(markdown)
+        assert "**Machine Owner**" not in action
+        assert "**Developer**" not in action
+        workflow = re.search(
+            r"(?ms)^### Workflow\n\n(.*?)(?=^### )", markdown,
+        )
+        assert workflow is not None
+        assert workflow.group(1).strip() == comments_mod._workflow_lines(status)
+        workflow_steps = [
+            re.sub(r"^- \[[ x]\] ", "", line).split(" ← ", 1)[0]
+            for line in workflow.group(1).strip().splitlines()
+        ]
+        assert workflow_steps == expected_workflow_steps
+
+    assert "**Status:** `review-required`" in summaries["review-required"]
+    assert f"**Bound HEAD:** `{head[:7]}`" in summaries["review-required"]
+    assert "**Repository:** `example/phanthymotus`" in summaries["review-required"]
+    assert "**Status:** `deploy-ready`" in ready
+    assert f"**Bound HEAD:** `{head[:7]}`" in ready
+    assert "**Status:** <code>deploying</code>" in deploying
+    assert f"**Bound HEAD:** <code>{head[:7]}</code>" in deploying
+    assert "**Repository:** <code>example/phanthymotus</code>" in deploying
+    assert "等待当前 HEAD 的 Review 和镜像构建结果" in _summary_next_action(
+        summaries["review-required"],
+    )
+    assert "当前 HEAD 的 Review 和镜像构建均已完成，可以部署" in _summary_next_action(ready)
+    deploying_action = _summary_next_action(deploying)
+    assert machine["alias"] in deploying_action
+    assert machine["ip"] in deploying_action
+    assert component["image_ref"] in deploying_action
+    assert "当前部署尚未完成" in deploying_action
+    assert "等待部署结果" in deploying_action
+    assert "testing" not in deploying_action.casefold()
+    testing_action = _summary_next_action(testing)
+    assert "部署已经完成，现在可以开始测试" in testing_action
+    assert "`/request_acceptance`" in testing_action
+    # The testing builder has no Bound HEAD field in HEAD; retain that layout.
+    assert "**Bound HEAD:**" not in testing
+
+
+def test_summary_workflow_evidence_deployments_and_history_remain_unchanged():
+    target = "registry.example/driver@sha256:" + "a" * 64
+    current = "registry.example/driver@sha256:" + "b" * 64
+    machine = "fixture-machine"
+    ip = "10.100.129.168"
+    markdown = "\n".join([
+        "<!-- deploy-approval-agent -->",
+        "### Deploy Approval — Lifecycle",
+        "",
+        "**Status:** `deploy-ready`",
+        "**Bound HEAD:** `abcdef0`",
+        "**Repository:** `example/phanthymotus`",
+        "",
+        "### Workflow",
+        "",
+        "- [x] 1. Request Review",
+        "- [ ] 2. Review Agent completed ← **Next**",
+        "",
+        "### Next action",
+        "",
+        "Existing next action text.",
+        "",
+        "### Current Deployment",
+        "",
+        "| Machine | IP | Image |",
+        "|---|---|---|",
+        f"| {machine} | {ip} | {current} |",
+        "<!-- evidence-projection:start -->",
+        "### Test Evidence",
+        "Existing test evidence projection.",
+        "<!-- evidence-projection:end -->",
+        "<!-- deploy-approval-visible-history:start -->",
+        "### History",
+        "Existing historical round and event.",
+        "<!-- deploy-approval-visible-history:end -->",
+    ])
+    bounds = comments_mod._next_action_body_bounds(markdown)
+    assert bounds is not None
+    body_start, body_end = bounds
+    prefix, suffix = markdown[:body_start], markdown[body_end:]
+
+    updated = comments_mod.update_runtime_image_checks(
+        markdown,
+        [{
+            "machine": machine,
+            "component_id": "component-1",
+            "status": "mismatch",
+            "primary_ip": ip,
+            "node_host": ip,
+            "command_selector": ip,
+            "approval_available": True,
+            "component_compatible": True,
+            "identity_confirmed": True,
+            "repository_authorized": True,
+            "target_image": target,
+            "observed_image": current,
+        }],
+        [{
+            "component_id": "component-1", "target": "driver",
+            "driver_path": "example/driver", "image_ref": target,
+        }],
+        lifecycle_status="deploy-ready",
+        machine_groups=[{
+            "alias": machine, "primary_ip": ip, "node_host": ip,
+            "approval_available": True, "component_compatible": True,
+            "identity_confirmed": True, "repository_authorized": True,
+        }],
+        machine_inventory=[{"alias": machine, "primary_ip": ip}],
+    )
+
+    assert updated != markdown
+    assert updated.startswith(prefix)
+    assert updated.endswith(suffix)
+    action = _summary_next_action(updated)
+    assert target in action
+    assert current in action
+    assert f"/approve_deploy machine={ip}" in action
+    assert "### Workflow\n\n- [x] 1. Request Review" in updated
+    assert f"| {machine} | {ip} | {current} |" in updated
+    assert "Existing test evidence projection." in updated
+    assert "Existing historical round and event." in updated
+
+
+def test_deploy_ready_lists_exact_machine_commands_without_placeholder():
+    from ..models import BuildInfo
+
+    repo = "example/phanthymotus"
+    head = "c" * 40
+    image = "registry.example/driver@sha256:" + "d" * 64
+    component = {
+        "component_id": "component-1", "target": "driver",
+        "driver_path": "example/driver", "variant": "5.11",
+        "image_ref": image,
+    }
+    build = BuildInfo(
+        target="driver", driver_path="example/driver", variant="5.11",
+        success=True, image_tag=image, deployable=True,
+        component_id="component-1",
+    )
+    review = {
+        "build_comment_id": 1, "code_review_comment_id": 2,
+        "resolved_head_sha": head,
+    }
+
+    def machine(alias: str, ip: str) -> dict:
+        return {
+            "alias": alias, "ip": ip, "primary_ip": ip, "node_host": ip,
+            "node_id": f"node-{alias}", "repo_authorized": True,
+            "identity_confirmed": True, "approval_available": True,
+            "ip_command_safe": True, "command_selector": ip,
+            "component_ids": [component["component_id"]],
+        }
+
+    single = comments_mod.deploy_ready(
+        repo, 473, head, [build], review_evidence=review,
+        machine_groups=[machine("machine-one", "10.100.129.168")],
+        components=[component],
+    )
+    assert "machine-one" in single
+    assert "10.100.129.168" in single
+    assert "driver example/driver" in single
+    assert "`/approve_deploy machine=10.100.129.168`" in single
+    assert "`/approve_deploy`" in single
+    assert "`/request_deploy` 是可选操作" in single
+    assert "machine=<alias-or-ip>" not in single
+    assert "machine=..." not in single
+
+    multiple = comments_mod.deploy_ready(
+        repo, 473, head, [build], review_evidence=review,
+        machine_groups=[
+            machine("machine-one", "10.100.129.168"),
+            machine("machine-two", "10.100.129.169"),
+        ],
+        components=[component],
+    )
+    assert "`/approve_deploy machine=10.100.129.168`" in multiple
+    assert "`/approve_deploy machine=10.100.129.169`" in multiple
+    assert "有多台兼容机器，请先选择目标机器" in multiple
+    assert "`/approve_deploy`" not in _summary_next_action(multiple)
+    assert "machine=<alias-or-ip>" not in multiple
+    assert "machine=..." not in multiple
+
+
+def test_testing_next_action_exposes_upload_url_and_actual_reviewers():
+    repo = "example/phanthymotus"
+    head = "e" * 40
+    upload_url = (
+        "https://evidence.example.com/evidence/example/phanthymotus/pulls/473"
+        "?cap=fixture-capability"
+    )
+    testing = comments_mod.testing(
+        repo, 473, head, evidence_url=upload_url,
+    )
+    testing_action = _summary_next_action(testing)
+    assert "部署已经完成，现在可以开始测试" in testing_action
+    assert f"[上传测试证据](<{upload_url}>)" in testing_action
+    assert "审批人检查真实开发效果" in testing_action
+    assert "是否通过验收、是否可以合并" in testing_action
+    assert "`/request_acceptance`" in testing_action
+
+    reviewers = ["reviewer-one", "reviewer-two"]
+    pending = comments_mod.testing(
+        repo, 473, head,
+        acceptance_pending=True,
+        acceptance_reviewers=reviewers,
+        evidence_url=upload_url,
+    )
+    pending_action = _summary_next_action(pending)
+    for reviewer in reviewers:
+        assert f"@{reviewer}" in pending_action
+    assert "负责检查和记录" in pending_action
+    assert "`/record_test result=pass`" in pending_action
+    assert "`/record_test result=fail`" in pending_action
+    assert f"[补充上传测试证据](<{upload_url}>)" in pending_action
+    assert "test_reviewers.yaml" not in pending_action

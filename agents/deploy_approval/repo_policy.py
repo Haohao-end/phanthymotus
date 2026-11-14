@@ -24,11 +24,8 @@ _POLICY_FILES = ("machines.yaml", "test_reviewers.yaml")
 _POLICY_REPOSITORY_ALIASES = {
     "4paradigm/phanthymotus": "4paradigm/phanthymotus",
     "4paradigm/phanthymotus-driver": "4paradigm/phanthymotus-driver",
-    # PRs are watched in the deployment service's user-owned forks. These
-    # aliases select only the corresponding official policy source below.
-    "haohao-end/phanthymotus": "4paradigm/phanthymotus",
-    "haohao-end/phanthymotus-driver": "4paradigm/phanthymotus-driver",
 }
+_OFFICIAL_REPOSITORIES = frozenset(_POLICY_REPOSITORY_ALIASES)
 _LOCAL_POLICY_DIRECTORY_BY_REPO = {
     "4paradigm/phanthymotus": "core",
     "4paradigm/phanthymotus-driver": "driver",
@@ -84,13 +81,33 @@ class RepositoryPolicyStore:
         self._reported_unconfigured: set[tuple[str, str]] = set()
         self._reported_authorization: set[str] = set()
 
-    @staticmethod
-    def _canonical_repo(repo: str) -> str | None:
+    def _canonical_repo(self, repo: str) -> str | None:
         try:
             canonical = validate_repository_names([repo])[0]
         except (TypeError, ValueError):
             return None
-        return _POLICY_REPOSITORY_ALIASES.get(canonical)
+        official = _POLICY_REPOSITORY_ALIASES.get(canonical)
+        if official is not None:
+            return official
+        # An explicitly configured watched fork may inherit policy only from
+        # the matching official repository, when that upstream is authorized.
+        try:
+            watched = set(validate_repository_names(
+                list(self._config.github_repos), label="configured repositories",
+                allow_empty=True,
+            ))
+            policy_sources = set(validate_repository_names(
+                list(self._config.policy_active_repos),
+                label="authorized official policy repositories", allow_empty=True,
+            ))
+        except (TypeError, ValueError):
+            return None
+        if canonical not in watched:
+            return None
+        matching = [candidate for candidate in _OFFICIAL_REPOSITORIES
+                    if candidate.rsplit("/", 1)[-1] == canonical.rsplit("/", 1)[-1]
+                    and candidate in policy_sources]
+        return matching[0] if len(matching) == 1 else None
 
     def _state(self, repo: str) -> _RepositoryPolicy:
         return self._repositories.setdefault(repo, _RepositoryPolicy())

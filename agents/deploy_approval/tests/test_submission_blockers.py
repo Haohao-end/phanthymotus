@@ -399,7 +399,7 @@ async def test_approve_rechecks_pr_after_preflight_before_executing(controller, 
 
     controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
 
-    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "owner1", "1")
+    await controller.handle_approve_deploy("Haohao-end/phanthymotus", 1, 50, "test-machine", "owner1", "1")
 
     assert proxy.get_pr.await_count >= 2
     assert events.index("list_drivers") < events.index("get_pr_2")
@@ -535,7 +535,7 @@ async def test_record_test_cos_rebind_uses_fresh_terminal_state(controller, prox
 
     cos_key = "phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz"
     result = await controller._rebind_terminal_cos_if_current(
-        "4paradigm/phanthymotus",
+        "Haohao-end/phanthymotus",
         1,
         expected_head="a" * 40,
         expected_terminal_status="succeeded",
@@ -676,7 +676,7 @@ def _is_deployable_build(repo, build, configured_repos=None):
 
 
 class TestSourceMatrixOfficialCore:
-    """Official 4paradigm/phanthymotus: only perception and actucore are deployable."""
+    """Official Haohao-end/phanthymotus: only perception and actucore are deployable."""
 
     def test_official_phanthymotus_perception_is_deployable(self):
         build = FakeBuild(target="perception")
@@ -688,11 +688,11 @@ class TestSourceMatrixOfficialCore:
 
     def test_official_phanthymotus_driver_is_not_deployable(self):
         build = FakeBuild(target="driver")
-        assert _is_deployable_build("4paradigm/phanthymotus", build) is False
+        assert _is_deployable_build("Haohao-end/phanthymotus", build) is False
 
     def test_official_phanthymotus_unknown_target_is_not_deployable(self):
         build = FakeBuild(target="telemetry")
-        assert _is_deployable_build("4paradigm/phanthymotus", build) is False
+        assert _is_deployable_build("Haohao-end/phanthymotus", build) is False
 
 
 class TestSourceMatrixForkCore:
@@ -734,11 +734,11 @@ class TestSourceMatrixDriverRepos:
 
     def test_official_driver_repo_driver_without_path_is_not_deployable(self):
         build = FakeBuild(target="driver", driver_path="")
-        assert _is_deployable_build("4paradigm/phanthymotus-driver", build) is False
+        assert _is_deployable_build("Haohao-end/phanthymotus-driver", build) is False
 
     def test_official_driver_repo_perception_is_not_deployable(self):
         build = FakeBuild(target="perception")
-        assert _is_deployable_build("4paradigm/phanthymotus-driver", build) is False
+        assert _is_deployable_build("Haohao-end/phanthymotus-driver", build) is False
         for target in ("core", "perception", "actucore"):
             assert _is_deployable_build(
                 "haohao-end/phanthymotus-driver", FakeBuild(target=target, driver_path="custom/driver"),
@@ -790,15 +790,15 @@ class TestSourceMatrixFailedBuilds:
 
     def test_failed_build_is_not_deployable(self):
         build = FakeBuild(target="perception", success=False)
-        assert _is_deployable_build("4paradigm/phanthymotus", build) is False
+        assert _is_deployable_build("Haohao-end/phanthymotus", build) is False
 
     def test_empty_image_tag_is_not_deployable(self):
         build = FakeBuild(target="perception", image_tag="")
-        assert _is_deployable_build("4paradigm/phanthymotus", build) is False
+        assert _is_deployable_build("Haohao-end/phanthymotus", build) is False
 
     def test_driver_repo_failed_build_is_not_deployable(self):
         build = FakeBuild(target="driver", driver_path="go2", success=False)
-        assert _is_deployable_build("4paradigm/phanthymotus-driver", build) is False
+        assert _is_deployable_build("Haohao-end/phanthymotus-driver", build) is False
 
 
 # ── Self-approval prohibition removal tests ─────────────────────────────
@@ -868,7 +868,7 @@ async def test_approve_pr_author_machine_owner_allowed(controller, proxy, fake_g
 
     controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
 
-    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "owner1", "10")
+    await controller.handle_approve_deploy("Haohao-end/phanthymotus", 1, 50, "test-machine", "owner1", "10")
 
     # Verify key sequence
     assert "list_drivers" in events_tb
@@ -945,7 +945,7 @@ async def test_approve_pr_author_admin_allowed(controller, proxy, fake_github):
 
     controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
 
-    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "admin_user", "20")
+    await controller.handle_approve_deploy("Haohao-end/phanthymotus", 1, 50, "test-machine", "admin_user", "20")
 
     assert "deploy_post" in events_tb2
     proxy.collaborator_permission.assert_awaited()
@@ -1010,7 +1010,7 @@ async def test_approve_pr_author_write_allowed(controller, proxy, fake_github):
 
     controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
 
-    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "write_user", "30")
+    await controller.handle_approve_deploy("Haohao-end/phanthymotus", 1, 50, "test-machine", "write_user", "30")
 
     assert "deploy_post" in events_tb3
 
@@ -1074,7 +1074,7 @@ async def test_approve_pr_author_maintain_allowed(controller, proxy, fake_github
 
     controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
 
-    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "maintain_user", "40")
+    await controller.handle_approve_deploy("Haohao-end/phanthymotus", 1, 50, "test-machine", "maintain_user", "40")
 
     assert "deploy_post" in events_tb4
 
@@ -1138,7 +1138,7 @@ async def test_approve_pr_author_read_non_owner_denied(controller, proxy, fake_g
 
     controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
 
-    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "read_user", "50")
+    await controller.handle_approve_deploy("Haohao-end/phanthymotus", 1, 50, "test-machine", "read_user", "50")
 
     # Must NOT reach deploy
     assert "deploy_post" not in events_tb5
@@ -1212,7 +1212,7 @@ async def test_machine_owner_approval_skips_collaborator_lookup(controller, prox
     controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
 
     # Should NOT raise — owner path bypasses collaborator lookup
-    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "owner1", "60")
+    await controller.handle_approve_deploy("Haohao-end/phanthymotus", 1, 50, "test-machine", "owner1", "60")
 
     assert "deploy_post" in events_tb6
     proxy.collaborator_permission.assert_not_awaited()

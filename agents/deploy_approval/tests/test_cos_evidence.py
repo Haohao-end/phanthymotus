@@ -14,6 +14,176 @@ from ..cos_client import CosClient, CosError, EVIDENCE_MAX_ARCHIVE_BYTES
 from ..evidence_builder import EvidenceBuilder
 from .conftest import make_config
 
+
+def test_upload_page_contains_only_upload_controls():
+    from agents.deploy_approval.evidence_ui import render_upload_page
+    page = render_upload_page("team/repo", 1, "a" * 40, "a" * 40 + "-1")
+    assert 'type="file"' in page and 'id="upload"' in page
+    assert "上传进度" in page and "测试证据上传" in page
+
+
+def test_upload_page_hides_history_deployment_logs_and_attachment_listing():
+    from agents.deploy_approval.evidence_ui import render_upload_page
+    page = render_upload_page("team/repo", 1, "a" * 40, "a" * 40 + "-1")
+    for phrase in ("历史轮次", "附件说明", "历史附件", "部署记录", "部署日志", "机器部署日志"):
+        assert phrase not in page
+    assert "archive_links" not in page and "deployment_logs" not in page
+
+
+def test_internal_evidence_record_has_no_visible_chinese_summary():
+    from agents.deploy_approval.evidence_service import EvidenceService
+    record = {"actor_verified": True, "actor_login": "4pd-pr-assistant[bot]",
+              "note": "自动保存的内部证据记录（无需操作）"}
+    assert EvidenceService._is_internal_bot_note(record)
+    assert not EvidenceService._is_internal_bot_note({**record, "actor_verified": False})
+
+
+class _EvidenceNotificationProxy:
+    def __init__(self):
+        self.comments = []
+
+    async def get_issue_comments(self, _repo, _pr_number):
+        return list(self.comments)
+
+    def is_bot_comment(self, comment):
+        user = comment.get("user") if isinstance(comment, dict) else None
+        return isinstance(user, dict) and user.get("login") == "4pd-pr-assistant[bot]"
+
+    async def post_issue_comment(self, _repo, _pr_number, body):
+        comment = {
+            "body": body,
+            "user": {"id": 1, "login": "4pd-pr-assistant[bot]", "type": "Bot"},
+        }
+        self.comments.append(comment)
+        return comment
+
+
+def _ready_attachment(**overrides):
+    operation = {
+        "repo": "haohao-end/phanthymotus",
+        "pr_number": 7,
+        "status": "ready",
+        "cos_content_verified": True,
+        "evidence_kind": "media",
+        "object_key": "private/evidence/screen",
+        "size": 10,
+        "sha256": "b" * 64,
+        "head_sha": HEAD,
+        "round_id": HEAD + "-1",
+        "attachment_id": "attachment_1",
+        "filename": "screen.png",
+        "actor_verified": True,
+        "actor_login": "real-user",
+    }
+    operation.update(overrides)
+    return operation
+
+
+def _notification_service(proxy):
+    from agents.deploy_approval.evidence_service import EvidenceService
+    config = make_config(
+        evidence_public_base_url="https://evidence.example",
+        cos_secret_key="test-cos-secret",
+    )
+    return EvidenceService(
+        config=config, github=None, proxy=proxy, policy=None,
+        controller=SimpleNamespace(), store=None,
+    )
+
+
+def test_chinese_internal_bot_note_does_not_post_comment():
+    proxy = _EvidenceNotificationProxy()
+    service = _notification_service(proxy)
+    operation = _ready_attachment(
+        actor_login="4pd-pr-assistant[bot]",
+        note="自动保存的内部证据记录（无需操作）",
+    )
+
+    assert asyncio.run(service._notify_ready_attachment(
+        "haohao-end/phanthymotus", 7, operation,
+    )) is False
+    assert proxy.comments == []
+
+
+@pytest.mark.parametrize("note", [
+    "server-side cos multipart acceptance",
+    "server-side 20mb h.264 cos transport acceptance",
+])
+def test_existing_english_internal_bot_notes_do_not_post_comment(note):
+    proxy = _EvidenceNotificationProxy()
+    service = _notification_service(proxy)
+    operation = _ready_attachment(
+        actor_login="4pd-pr-assistant[bot]",
+        note=note,
+    )
+
+    assert asyncio.run(service._notify_ready_attachment(
+        "haohao-end/phanthymotus", 7, operation,
+    )) is False
+    assert proxy.comments == []
+
+
+def test_internal_bot_note_flag_does_not_post_comment():
+    proxy = _EvidenceNotificationProxy()
+    service = _notification_service(proxy)
+
+    assert asyncio.run(service._notify_ready_attachment(
+        "haohao-end/phanthymotus", 7,
+        _ready_attachment(internal_bot_note=True),
+    )) is False
+    assert proxy.comments == []
+
+
+def test_real_user_image_posts_comment():
+    proxy = _EvidenceNotificationProxy()
+    service = _notification_service(proxy)
+
+    assert asyncio.run(service._notify_ready_attachment(
+        "haohao-end/phanthymotus", 7,
+        _ready_attachment(filename="screen.png"),
+    )) is True
+    assert len(proxy.comments) == 1
+    assert "![screen.png]" in proxy.comments[0]["body"]
+
+
+def test_real_user_video_posts_comment():
+    proxy = _EvidenceNotificationProxy()
+    service = _notification_service(proxy)
+
+    assert asyncio.run(service._notify_ready_attachment(
+        "haohao-end/phanthymotus", 7,
+        _ready_attachment(filename="capture.mp4"),
+    )) is True
+    assert len(proxy.comments) == 1
+    assert "capture.mp4" in proxy.comments[0]["body"]
+
+
+def test_repeated_upload_does_not_duplicate_comment():
+    proxy = _EvidenceNotificationProxy()
+    service = _notification_service(proxy)
+    operation = _ready_attachment(filename="capture.mp4")
+
+    assert asyncio.run(service._notify_ready_attachment(
+        "haohao-end/phanthymotus", 7, operation,
+    )) is True
+    assert asyncio.run(service._notify_ready_attachment(
+        "haohao-end/phanthymotus", 7, operation,
+    )) is True
+    assert len(proxy.comments) == 1
+
+
+def test_ready_attachment_posts_one_idempotent_comment_with_media_links():
+    from agents.deploy_approval.comments import evidence_upload_comment
+    body = evidence_upload_comment(
+        "team/repo", 1, HEAD, HEAD + "-1", "attachment_1", "screen.png",
+        download_url="https://evidence.example/api/attachments/attachment_1/download?cap=token",
+        preview_url="https://evidence.example/api/attachments/attachment_1/preview?cap=token",
+        public_base_url="https://evidence.example",
+    )
+    assert "![screen.png]" in body
+    assert "下载图片" in body
+    assert body.count("deploy-approval-evidence-upload:") == 1
+
 HEAD = "a" * 40
 
 
@@ -25,7 +195,7 @@ def _state(**overrides):
 
 
 def _build(**kwargs):
-    args = {"repo": "4paradigm/phanthymotus", "pr_number": 7, "head_sha": HEAD,
+    args = {"repo": "Haohao-end/phanthymotus", "pr_number": 7, "head_sha": HEAD,
             "state": _state(), "result": "pass"}
     args.update(kwargs)
     return asyncio.run(EvidenceBuilder(make_config()).build_evidence(**args))
@@ -38,7 +208,7 @@ def _text(archive):
 def test_evidence_is_single_gzip_utf8_text():
     body = _text(_build()[0])
     assert body.startswith("[metadata]")
-    assert "repo=4paradigm/phanthymotus" in body and "pr=7" in body
+    assert "repo=Haohao-end/phanthymotus" in body and "pr=7" in body
     assert f"head={HEAD}" in body and "review_build_comment_id=1001" in body
     assert "result=pass" in body and "[deploy]" in body
     assert "manifest" not in body.lower() and not body.startswith("ustar")
@@ -46,7 +216,7 @@ def test_evidence_is_single_gzip_utf8_text():
 
 def test_evidence_fixed_metadata_survives_large_runtime_logs():
     body = _text(_build(runtime_logs={"agent": "x" * (11 * 1024 * 1024)})[0])
-    for value in ("repo=4paradigm/phanthymotus", "pr=7", f"head={HEAD}",
+    for value in ("repo=Haohao-end/phanthymotus", "pr=7", f"head={HEAD}",
                   "review_build_comment_id=1001", "result=pass"):
         assert value in body
 
@@ -87,11 +257,11 @@ def test_real_record_test_contains_test_section():
 
 
 def test_cos_object_key_exact_layout():
-    client = CosClient(make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]))
+    client = CosClient(make_config(github_repos=["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver"]))
     now = datetime(2026, 9, 17, 20, 30)
     for repo, expected in [
-        ("4paradigm/phanthymotus", "phanthymotus_pr/phanthymotus/2026-09/2026-09-17/pr-7/evidence-" + HEAD + ".log.gz"),
-        ("4paradigm/phanthymotus-driver", "phanthymotus_pr/phanthymotus-driver/2026-09/2026-09-17/pr-7/evidence-" + HEAD + ".log.gz"),
+        ("Haohao-end/phanthymotus", "phanthymotus_pr/repo-v1-68616f68616f2d656e64-7068616e7468796d6f747573/2026-09/2026-09-17/pr-7/evidence-" + HEAD + ".log.gz"),
+        ("Haohao-end/phanthymotus-driver", "phanthymotus_pr/repo-v1-68616f68616f2d656e64-7068616e7468796d6f7475732d647269766572/2026-09/2026-09-17/pr-7/evidence-" + HEAD + ".log.gz"),
     ]:
         assert client.build_object_key(repo, 7, HEAD, now=now) == expected
     with pytest.raises(ValueError):
@@ -111,7 +281,7 @@ def test_cos_object_key_exact_layout():
 ])
 def test_cos_validate_object_key_fail_closed(key):
     with pytest.raises(ValueError):
-        CosClient.validate_object_key("4paradigm/phanthymotus", 7, HEAD, key)
+        CosClient.validate_object_key("Haohao-end/phanthymotus", 7, HEAD, key)
 
 
 class _Body:
@@ -138,7 +308,7 @@ def _install_qcloud(monkeypatch, client, body, length):
 
 def test_cos_download_head_before_get_and_hard_bound(monkeypatch):
     client = CosClient(make_config())
-    key = client.build_object_key("4paradigm/phanthymotus", 7, HEAD)
+    key = client.build_object_key("Haohao-end/phanthymotus", 7, HEAD)
     body = _Body([b"evidence"])
     events = _install_qcloud(monkeypatch, client, body, 8)
     assert asyncio.run(client.download_evidence_archive(key, 10)) == b"evidence"
@@ -171,7 +341,7 @@ def test_cos_presign_ttl_is_365_days():
 async def test_cos_presign_missing_credentials_returns_empty(monkeypatch):
     """When credentials are missing, generate_evidence_download_url returns ''."""
     client = CosClient(make_config(cos_secret_id="", cos_secret_key=""))
-    result = client.generate_evidence_download_url(client.build_object_key("4paradigm/phanthymotus", 7, HEAD))
+    result = client.generate_evidence_download_url(client.build_object_key("Haohao-end/phanthymotus", 7, HEAD))
     assert result == ""
 
 
@@ -233,7 +403,7 @@ async def test_cos_presign_https_accepted_http_rejected(monkeypatch):
             self._test_url = "https://bucket-123456.cos.ap-shanghai.myqcloud.com/phanthymotus_pr/test/evidence.gz"
         FakeCosS3Client.__init__ = patched_init
 
-        result = client.generate_evidence_download_url(client.build_object_key("4paradigm/phanthymotus", 7, HEAD))
+        result = client.generate_evidence_download_url(client.build_object_key("Haohao-end/phanthymotus", 7, HEAD))
         assert result.startswith("https://"), f"expected https URL, got {result!r}"
 
         # HTTP -> rejected
@@ -242,7 +412,7 @@ async def test_cos_presign_https_accepted_http_rejected(monkeypatch):
             self._test_url = "http://bucket-123456.cos.ap-shanghai.myqcloud.com/phanthymotus_pr/test/evidence.gz"
         FakeCosS3Client.__init__ = patched_init_http
 
-        result2 = client.generate_evidence_download_url(client.build_object_key("4paradigm/phanthymotus", 7, HEAD))
+        result2 = client.generate_evidence_download_url(client.build_object_key("Haohao-end/phanthymotus", 7, HEAD))
         assert result2 == "", f"expected empty for http URL, got {result2!r}"
     finally:
         FakeCosS3Client.__init__ = orig_init
@@ -277,7 +447,7 @@ async def test_cos_presign_sdk_exception_returns_empty(monkeypatch):
     try:
         client = CosClient(make_config(cos_region="ap-shanghai", cos_bucket="test-bucket",
                                       cos_secret_id="OFFLINE_ID", cos_secret_key="OFFLINE_KEY"))
-        result = client.generate_evidence_download_url(client.build_object_key("4paradigm/phanthymotus", 7, HEAD))
+        result = client.generate_evidence_download_url(client.build_object_key("Haohao-end/phanthymotus", 7, HEAD))
         assert result == ""
     finally:
         if saved:
@@ -363,8 +533,10 @@ async def test_machine_partial_coverage_includes_only_compatible_components():
             node_id="node-1",
             node_host="192.0.2.10",
             platforms=["linux/arm64"],
+            targets=["perception"],
             variants=[],
             driver_paths=[],
+            owners=["alpha-owner"],
             machine_supports_target=lambda alias, target: True,
         )
     ]
@@ -375,7 +547,13 @@ async def test_machine_partial_coverage_includes_only_compatible_components():
     ]
 
     mock_policy = SimpleNamespace()
-    mock_policy.get_machines = lambda: machines
+    mock_policy.get_machines = lambda repo=None: machines
+    mock_policy.get_machine = lambda alias, repo=None: next(
+        (machine for machine in machines if machine.alias == alias), None,
+    )
+    mock_policy.repo_policy_status = lambda _repo: {
+        "authorized": True, "machines_configured": True,
+    }
     # "planning" is not a supported target (only perception/actucore/driver)
     def _supports_target(alias, target):
         return target in ("perception", "actucore", "driver")
@@ -391,13 +569,20 @@ async def test_machine_partial_coverage_includes_only_compatible_components():
         policy=mock_policy,
         github=None,
     )
+    controller._physical_machine_inventory = lambda: [{
+        "alias": "alpha", "node_id": "node-1", "primary_ip": "192.0.2.10",
+        "platform_status": "verified", "platforms": ["linux/arm64"],
+        "platform_verified": True,
+    }]
 
-    groups = controller._get_machine_groups_for_components(components)
+    groups = controller._get_machine_groups_for_components(
+        components, "4paradigm/phanthymotus",
+    )
     # Partial coverage is allowed: machine supports perception but not planning,
     # so it should be listed with only the compatible component.
     assert len(groups) == 1
     assert groups[0]["alias"] == "alpha"
-    assert groups[0]["component_ids"] == ["comp-a"]
+    assert groups[0]["compatible_component_ids"] == ["comp-a"]
 
 
 @pytest.mark.asyncio
@@ -412,23 +597,24 @@ async def test_no_post_deploy_health_gate():
 @pytest.mark.asyncio
 async def test_cos_runtime_repo_key_legacy_and_collision_safe():
     """Exercise actual gzip identity/upload/read-back for configured namespaces."""
-    repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver",
+    repos = ["Haohao-end/phanthymotus", "Haohao-end/phanthymotus-driver",
              "team/phanthymotus", "other/phanthymotus", "team-a/b", "team/a-b"]
     cfg = make_config(github_repos=repos)
     client = CosClient(cfg, _fake=True)
     now = datetime(2026, 10, 14)
     keys = {repo: client.build_object_key(repo, 7, HEAD, now=now) for repo in repos}
-    assert keys[repos[0]] == f"phanthymotus_pr/phanthymotus/2026-10/2026-10-14/pr-7/evidence-{HEAD}.log.gz"
-    assert keys[repos[1]] == f"phanthymotus_pr/phanthymotus-driver/2026-10/2026-10-14/pr-7/evidence-{HEAD}.log.gz"
+    assert keys[repos[0]] == f"phanthymotus_pr/repo-v1-68616f68616f2d656e64-7068616e7468796d6f747573/2026-10/2026-10-14/pr-7/evidence-{HEAD}.log.gz"
+    assert keys[repos[1]] == f"phanthymotus_pr/repo-v1-68616f68616f2d656e64-7068616e7468796d6f7475732d647269766572/2026-10/2026-10-14/pr-7/evidence-{HEAD}.log.gz"
     assert len(set(keys.values())) == len(repos)
     for repo, key in keys.items():
         assert key.split("/")[1] not in (".", "..")
-        assert CosClient._repo_from_key(key) == repo
-        assert CosClient.validate_object_key(repo, 7, HEAD, key) == key
+        assert CosClient._repo_from_key(key) == repo.lower()
+        canonical_repo = repo.lower()
+        assert CosClient.validate_object_key(canonical_repo, 7, HEAD, key) == key
         archive, sha, size = await EvidenceBuilder(cfg).build_evidence(
-            repo=repo, pr_number=7, head_sha=HEAD, state=_state(), result="pass")
+            repo=canonical_repo, pr_number=7, head_sha=HEAD, state=_state(), result="pass")
         metadata = await client.ensure_evidence_archive(
-            object_key=key, archive_bytes=archive, repo=repo,
+            object_key=key, archive_bytes=archive, repo=canonical_repo,
             pr_number=7, head_sha=HEAD, result="pass")
         assert metadata == {"object_key": key, "sha256": sha, "size": size}
         assert await client.download_evidence_archive(key, size) == archive

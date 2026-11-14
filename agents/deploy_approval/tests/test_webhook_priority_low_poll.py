@@ -38,14 +38,14 @@ def _request(body: bytes, *, event: str, delivery: str = "delivery-1", app=None)
 async def test_webhook_enqueues_once_without_comment_api_read(config):
     config.webhook_enabled = True
     config.github_webhook_secret = "offline-secret"
-    config.github_repos = ["4paradigm/phanthymotus-driver"]
+    config.github_repos = ["Haohao-end/phanthymotus-driver"]
     config.active_repos = list(config.github_repos)
     config.auth_valid = True
     watcher = SimpleNamespace(enqueue_pr=MagicMock(return_value=True))
     app = SimpleNamespace(state=SimpleNamespace(config=config, watcher=watcher))
     payload = {
         "action": "created",
-        "repository": {"full_name": "4paradigm/phanthymotus-driver"},
+        "repository": {"full_name": "Haohao-end/phanthymotus-driver"},
         "issue": {"number": 442, "pull_request": {"url": "ignored"}},
         "comment": {"id": 6406856003, "body": "/request_deploy"},
     }
@@ -53,12 +53,12 @@ async def test_webhook_enqueues_once_without_comment_api_read(config):
     with patch("agents.deploy_approval.router_webhook._verify_signature_impl", return_value=True):
         assert await webhook(request) == {"status": "queued"}
         assert await webhook(request) == {"status": "duplicate"}
-    watcher.enqueue_pr.assert_called_once_with("4paradigm/phanthymotus-driver", 442)
+    watcher.enqueue_pr.assert_called_once_with("Haohao-end/phanthymotus-driver", 442)
 
 
 @pytest.mark.asyncio
 async def test_new_pull_request_event_enqueues_for_initialization(config):
-    repo = "4paradigm/phanthymotus-driver"
+    repo = "Haohao-end/phanthymotus-driver"
     config.webhook_enabled = True
     config.github_repos = [repo]
     config.active_repos = [repo]
@@ -70,12 +70,14 @@ async def test_new_pull_request_event_enqueues_for_initialization(config):
         assert await webhook(_request(json.dumps(payload).encode(), event="pull_request", app=app)) == {
             "status": "queued"
         }
-    watcher.enqueue_pr.assert_called_once_with(repo, 501)
+    watcher.enqueue_pr.assert_called_once_with(
+        repo, 501, action="opened", event_updated_at=None,
+    )
 
 
 @pytest.mark.asyncio
 async def test_review_agent_review_event_queues_only(config):
-    repo = "4paradigm/phanthymotus-driver"
+    repo = "Haohao-end/phanthymotus-driver"
     config.webhook_enabled = True
     config.github_repos = [repo]
     config.active_repos = [repo]
@@ -95,7 +97,7 @@ async def test_review_agent_review_event_queues_only(config):
 
 @pytest.mark.asyncio
 async def test_priority_pr_is_fresh_read_before_open_pr_scan(config):
-    repo = "4paradigm/phanthymotus-driver"
+    repo = "Haohao-end/phanthymotus-driver"
     config.github_repos = [repo]
     config.active_repos = [repo]
     events = []
@@ -117,7 +119,9 @@ async def test_priority_pr_is_fresh_read_before_open_pr_scan(config):
     proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
     controller = SimpleNamespace(project_evidence=AsyncMock(side_effect=lambda *_: events.append("project")))
     watcher = GitHubCommandWatcher(config, proxy, controller)
-    watcher._process_pr = AsyncMock(side_effect=lambda *_: events.append("process"))
+    watcher._process_pr = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: events.append("process"),
+    )
     watcher._validated_current_summary_cos_links = AsyncMock(return_value=set())
     assert watcher.enqueue_pr(repo, 442)
 
@@ -125,12 +129,14 @@ async def test_priority_pr_is_fresh_read_before_open_pr_scan(config):
 
     assert events.index("process") < events.index("list_open_prs")
     assert not watcher._priority_pr_queue
-    watcher._process_pr.assert_awaited_once_with(repo, 442)
+    watcher._process_pr.assert_awaited_once_with(
+        repo, 442, yield_for_priority=False,
+    )
 
 
 @pytest.mark.asyncio
 async def test_unchanged_pr_skips_repeated_evidence_projection(config):
-    repo = "4paradigm/phanthymotus-driver"
+    repo = "Haohao-end/phanthymotus-driver"
     config.github_repos = [repo]
     config.active_repos = [repo]
     proxy = MagicMock()
@@ -155,7 +161,7 @@ async def test_unchanged_pr_skips_repeated_evidence_projection(config):
 
 
 def test_priority_queue_prefers_newest_unique_pr_and_deduplicates(config):
-    repo = "4paradigm/phanthymotus-driver"
+    repo = "Haohao-end/phanthymotus-driver"
     config.github_repos = [repo]
     config.active_repos = [repo]
     watcher = GitHubCommandWatcher(config, MagicMock(), MagicMock())
@@ -164,14 +170,14 @@ def test_priority_queue_prefers_newest_unique_pr_and_deduplicates(config):
     assert watcher.enqueue_pr(repo, 443)
     assert watcher.enqueue_pr(repo, 442)
 
-    assert list(watcher._priority_pr_queue) == [(repo, 442), (repo, 443)]
+    assert list(watcher._priority_pr_queue) == [(repo, 443), (repo, 442)]
     assert len(watcher._priority_pr_set) == 2
 
 
 @pytest.mark.asyncio
 async def test_large_repo_fallback_rotation_is_bounded_and_repo_fair(config):
-    main = "4paradigm/phanthymotus"
-    driver = "4paradigm/phanthymotus-driver"
+    main = "Haohao-end/phanthymotus"
+    driver = "Haohao-end/phanthymotus-driver"
     config.github_repos = [main, driver]
     config.active_repos = [main, driver]
     prs = {
@@ -190,7 +196,8 @@ async def test_large_repo_fallback_rotation_is_bounded_and_repo_fair(config):
     seen = {main: [], driver: []}
     controller = SimpleNamespace(project_evidence=AsyncMock())
     watcher = GitHubCommandWatcher(config, proxy, controller)
-    async def process(repo, number):
+    async def process(repo, number, *, yield_for_priority=False):
+        del yield_for_priority
         seen[repo].append(number)
     watcher._process_pr = AsyncMock(side_effect=process)
     watcher._validated_current_summary_cos_links = AsyncMock(return_value=set())
@@ -209,7 +216,7 @@ async def test_large_repo_fallback_rotation_is_bounded_and_repo_fair(config):
 
 @pytest.mark.asyncio
 async def test_closed_priority_pr_is_not_written(config):
-    repo = "4paradigm/phanthymotus-driver"
+    repo = "Haohao-end/phanthymotus-driver"
     config.github_repos = [repo]
     config.active_repos = [repo]
     proxy = MagicMock()
@@ -229,7 +236,7 @@ async def test_closed_priority_pr_is_not_written(config):
 
 @pytest.mark.asyncio
 async def test_priority_baseline_requeues_for_new_comments_next_turn(config):
-    repo = "4paradigm/phanthymotus-driver"
+    repo = "Haohao-end/phanthymotus-driver"
     config.github_repos = [repo]
     config.active_repos = [repo]
     proxy = MagicMock()
@@ -256,7 +263,9 @@ async def test_priority_baseline_requeues_for_new_comments_next_turn(config):
 
     await watcher._poll_once()
 
-    watcher._process_pr.assert_awaited_once_with(repo, 442)
+    watcher._process_pr.assert_awaited_once_with(
+        repo, 442, yield_for_priority=False,
+    )
     assert not watcher._priority_pr_queue
 
 
@@ -276,11 +285,11 @@ async def test_secondary_rate_limit_keeps_authorization_and_backs_off(config):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = GitHubClient(config, http=http, token_provider=AsyncMock(return_value="offline-token"))
         with pytest.raises(GitHubRateLimitError) as caught:
-            await client._request("GET", "/repos/4paradigm/phanthymotus/pulls/1")
+            await client._request("GET", "/repos/Haohao-end/phanthymotus/pulls/1")
         assert caught.value.retry_after_seconds >= 17
         assert config.auth_valid is True
         with pytest.raises(GitHubRateLimitError):
-            await client._request("GET", "/repos/4paradigm/phanthymotus/pulls/1")
+            await client._request("GET", "/repos/Haohao-end/phanthymotus/pulls/1")
     assert len(calls) == 1
 
 
@@ -288,7 +297,7 @@ async def test_secondary_rate_limit_keeps_authorization_and_backs_off(config):
 async def test_rate_limited_authorization_refresh_does_not_start_new_baseline(config):
     from ..github_command_watcher import GitHubCommandWatcher
 
-    repo = "4paradigm/phanthymotus-driver"
+    repo = "Haohao-end/phanthymotus-driver"
     config.github_repos = [repo]
     config.active_repos = [repo]
     config.auth_valid = True
@@ -319,7 +328,7 @@ async def test_permanent_permission_403_closes_authorization(config):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = GitHubClient(config, http=http, token_provider=AsyncMock(return_value="offline-token"))
         with pytest.raises(GitHubPermissionError):
-            await client._request("GET", "/repos/4paradigm/phanthymotus/pulls/1")
+            await client._request("GET", "/repos/Haohao-end/phanthymotus/pulls/1")
     assert config.auth_valid is False
 
 
@@ -331,7 +340,7 @@ async def test_401_closes_authorization(config):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = GitHubClient(config, http=http, token_provider=AsyncMock(return_value="offline-token"))
         with pytest.raises(GitHubPermissionError):
-            await client._request("GET", "/repos/4paradigm/phanthymotus/pulls/1")
+            await client._request("GET", "/repos/Haohao-end/phanthymotus/pulls/1")
     assert config.auth_valid is False
 
 
@@ -343,7 +352,7 @@ async def test_429_retries_after_without_closing_authorization(config):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = GitHubClient(config, http=http, token_provider=AsyncMock(return_value="offline-token"))
         with pytest.raises(GitHubRateLimitError) as caught:
-            await client._request("GET", "/repos/4paradigm/phanthymotus/pulls/1")
+            await client._request("GET", "/repos/Haohao-end/phanthymotus/pulls/1")
     assert caught.value.retry_after_seconds >= 9
     assert config.auth_valid is True
 
@@ -359,9 +368,9 @@ async def test_5xx_uses_bounded_backoff_without_closing_authorization(config):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = GitHubClient(config, http=http, token_provider=AsyncMock(return_value="offline-token"))
         with pytest.raises(GitHubTransientError):
-            await client._request("GET", "/repos/4paradigm/phanthymotus/pulls/1")
+            await client._request("GET", "/repos/Haohao-end/phanthymotus/pulls/1")
         with pytest.raises(GitHubTransientError):
-            await client._request("GET", "/repos/4paradigm/phanthymotus/pulls/1")
+            await client._request("GET", "/repos/Haohao-end/phanthymotus/pulls/1")
     assert len(calls) == 1
     assert config.auth_valid is True
 
@@ -374,7 +383,7 @@ async def test_transport_timeout_uses_backoff(config):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = GitHubClient(config, http=http, token_provider=AsyncMock(return_value="offline-token"))
         with pytest.raises(GitHubTransientError):
-            await client._request("GET", "/repos/4paradigm/phanthymotus/pulls/1")
+            await client._request("GET", "/repos/Haohao-end/phanthymotus/pulls/1")
     assert client.diagnostics()["backing_off"] is True
     assert config.auth_valid is True
 
@@ -393,7 +402,7 @@ async def test_open_pr_listing_reuses_authorized_304_snapshot(config):
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = GitHubClient(config, http=http, token_provider=AsyncMock(return_value="offline-token"))
-        first = await client.list_open_prs("4paradigm/phanthymotus")
-        second = await client.list_open_prs("4paradigm/phanthymotus")
+        first = await client.list_open_prs("Haohao-end/phanthymotus")
+        second = await client.list_open_prs("Haohao-end/phanthymotus")
     assert first == second == pr_page
     assert len(calls) == 2

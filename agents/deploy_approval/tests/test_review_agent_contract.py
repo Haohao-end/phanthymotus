@@ -1028,7 +1028,7 @@ async def test_existing_history_lifecycle_write_executes_without_nameerror():
     from agents.deploy_approval.policy import Policy
     from agents.deploy_approval.service import DeployController
 
-    config = Config(github_repos=["4paradigm/phanthymotus"],
+    config = Config(github_repos=["Haohao-end/phanthymotus"],
                     review_comment_author_id=TRUSTED_AUTHOR_ID,
                     review_comment_author_login=TRUSTED_AUTHOR_LOGIN)
     proxy = MagicMock()
@@ -1047,7 +1047,7 @@ async def test_existing_history_lifecycle_write_executes_without_nameerror():
     state = {"status": "review-required"}
     visible = _insert_history_into_visible(
         comments_mod.review_required(
-            "4paradigm/phanthymotus", 279, "a" * 40,
+            "Haohao-end/phanthymotus", 279, "a" * 40,
         ),
         {
             "event": "Existing event",
@@ -1064,10 +1064,10 @@ async def test_existing_history_lifecycle_write_executes_without_nameerror():
     proxy.is_bot_comment = MagicMock(return_value=False)
 
     await controller._write_lifecycle_with_history(
-        "4paradigm/phanthymotus",
+        "Haohao-end/phanthymotus",
         279,
         state,
-        comments_mod.reviewing("4paradigm/phanthymotus", 279, "a" * 40),
+        comments_mod.reviewing("Haohao-end/phanthymotus", 279, "a" * 40),
         event={
             "event": "New event",
             "lifecycle": "`review-required` → `reviewing`",
@@ -1094,7 +1094,7 @@ async def test_reconcile_pr279_failed_tests_keep_review_required():
     from agents.deploy_approval.policy import Policy
     from agents.deploy_approval.service import DeployController
 
-    repo = "4paradigm/phanthymotus"
+    repo = "Haohao-end/phanthymotus"
     pr_number = 279
     head = "885ff7799061a8e25fd68fe9743492b1d35cc6e6"
     author = {"id": TRUSTED_AUTHOR_ID, "login": TRUSTED_AUTHOR_LOGIN}
@@ -1311,7 +1311,7 @@ def _core_contract_controller():
     from agents.deploy_approval.policy import Policy
     from agents.deploy_approval.service import DeployController
 
-    config = Config(github_repos=["4paradigm/phanthymotus"],
+    config = Config(github_repos=["Haohao-end/phanthymotus"],
                     review_comment_author_id=TRUSTED_AUTHOR_ID,
                     review_comment_author_login=TRUSTED_AUTHOR_LOGIN)
     proxy = MagicMock()
@@ -1400,7 +1400,7 @@ async def test_core_component_snapshot_binds_core_runtime_without_driver_resolut
     )
 
     snapshot = await controller._build_component_snapshot(
-        "4paradigm/phanthymotus", 279, "a" * 40, [build],
+        "Haohao-end/phanthymotus", 279, "a" * 40, [build],
     )
 
     assert snapshot is not None
@@ -1471,7 +1471,7 @@ async def test_request_deploy_uses_canonical_review_snapshot_and_core_component(
         return_value=evidence,
     ):
         handled = await controller.handle_request_deploy(
-            "4paradigm/phanthymotus", 279, 501,
+            "Haohao-end/phanthymotus", 279, 501,
         )
 
     assert handled is True
@@ -1492,7 +1492,7 @@ async def test_request_deploy_uses_canonical_review_snapshot_and_core_component(
     assert written_state["components"][0]["driver_path"] == ""
     controller._validate_hidden_state(written_state)
     proxy.project_status_label.assert_awaited_once_with(
-        "4paradigm/phanthymotus", 279, "deploy-requested",
+        "Haohao-end/phanthymotus", 279, "deploy-requested",
     )
 
 
@@ -1736,7 +1736,7 @@ async def _run_core_uncertain_recovery(controller, proxy, github, state, evidenc
         return_value=evidence,
     ):
         result = await controller._refresh_uncertain_state(
-            "4paradigm/phanthymotus", 279, state,
+            "Haohao-end/phanthymotus", 279, state,
         )
     assert proxy.write_hidden_state.await_count == 1
     written_state = proxy.write_hidden_state.call_args.args[3]
@@ -1930,7 +1930,7 @@ async def test_review_author_runtime_trust_provenance_fail_closed(tmp_path, monk
     secrets.chmod(0o600)
     real_loader = config_mod._load_secrets_config
     monkeypatch.setattr(config_mod, "_load_secrets_config", lambda _path: real_loader(str(secrets)))
-    monkeypatch.setenv("GITHUB_REPOS", "4paradigm/phanthymotus")
+    monkeypatch.setenv("GITHUB_REPOS", "Haohao-end/phanthymotus")
     monkeypatch.setenv("REVIEW_COMMENT_AUTHOR_ID", TRUSTED_AUTHOR_ID)
     monkeypatch.setenv("REVIEW_COMMENT_AUTHOR_LOGIN", TRUSTED_AUTHOR_LOGIN)
     cfg = config_mod.load_config()
@@ -1940,7 +1940,7 @@ async def test_review_author_runtime_trust_provenance_fail_closed(tmp_path, monk
 
     async def handler(request):
         assert request.method == "GET"
-        assert request.url.path == "/repos/4paradigm/phanthymotus/issues/279/comments"
+        assert request.url.path == "/repos/Haohao-end/phanthymotus/issues/279/comments"
         return httpx.Response(200, json=actual_comments)
 
     async def token():

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from ..case_runner import CaseRunner
 from ..cos_client import CosClient
+from ..evidence_builder import EvidenceBuilder
 from ..github_state_proxy import GitHubStateProxy, MalformedHiddenStateError, _validate_hidden_state
 from ..models import MachineInfo
 from ..policy import Policy
@@ -199,9 +200,13 @@ def _fake_cos_sdk(*, put_error=None):
             except (ValueError, TypeError):
                 return self._code
 
+    class CosClientError(Exception):
+        pass
+
     class CosS3Client:
-        def __init__(self, cfg):
+        def __init__(self, cfg, retry=0):
             self.cfg = cfg
+            self.retry = retry
 
         def head_object(self, **kwargs):
             raise CosServiceError("404", "Not Found")
@@ -215,6 +220,7 @@ def _fake_cos_sdk(*, put_error=None):
                 raise put_error
 
     module.CosConfig = CosConfig
+    module.CosClientError = CosClientError
     module.CosServiceError = CosServiceError
     module.CosS3Client = CosS3Client
     return module, calls
@@ -249,19 +255,19 @@ async def test_proxy_get_comment_passthrough_exists(proxy, mock_github):
 async def test_webhook_re_reads_comment_through_proxy(config, proxy, controller, mock_github):
     payload = {
         "action": "created",
-        "repository": {"full_name": "4paradigm/phanthymotus"},
+        "repository": {"full_name": "Haohao-end/phanthymotus"},
         "issue": {"number": 1, "pull_request": {}},
         "comment": {"id": 99},
     }
     request = _fake_webhook_request(config, proxy, controller, payload, "sha256=" + "0" * 64)
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
     config.auth_valid = True
 
     with patch("agents.deploy_approval.router_webhook._verify_signature_impl", return_value=True):
         mock_github.get_comment.return_value = {"id": 99, "body": "/request_deploy"}
         result = await webhook(request)
 
-    mock_github.get_comment.assert_called_once_with("4paradigm/phanthymotus", 99)
+    mock_github.get_comment.assert_called_once_with("Haohao-end/phanthymotus", 99)
     assert result["status"] == "deferred"
 
 
@@ -269,12 +275,12 @@ async def test_webhook_re_reads_comment_through_proxy(config, proxy, controller,
 async def test_webhook_recognized_command_returns_deferred(config, proxy, controller, mock_github):
     payload = {
         "action": "created",
-        "repository": {"full_name": "4paradigm/phanthymotus"},
+        "repository": {"full_name": "Haohao-end/phanthymotus"},
         "issue": {"number": 1, "pull_request": {}},
         "comment": {"id": 99},
     }
     request = _fake_webhook_request(config, proxy, controller, payload, "sha256=" + "0" * 64)
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
     config.auth_valid = True
 
     with patch("agents.deploy_approval.router_webhook._verify_signature_impl", return_value=True):
@@ -288,12 +294,12 @@ async def test_webhook_recognized_command_returns_deferred(config, proxy, contro
 async def test_webhook_command_has_zero_controller_dispatch(config, proxy, controller, mock_github):
     payload = {
         "action": "created",
-        "repository": {"full_name": "4paradigm/phanthymotus"},
+        "repository": {"full_name": "Haohao-end/phanthymotus"},
         "issue": {"number": 1, "pull_request": {}},
         "comment": {"id": 99},
     }
     request = _fake_webhook_request(config, proxy, controller, payload, "sha256=" + "0" * 64)
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
     config.auth_valid = True
     controller.handle_request_deploy = AsyncMock()
     controller.handle_approve_deploy = AsyncMock()
@@ -312,12 +318,12 @@ async def test_webhook_command_has_zero_controller_dispatch(config, proxy, contr
 async def test_webhook_command_has_zero_hidden_state_write(config, proxy, controller, mock_github):
     payload = {
         "action": "created",
-        "repository": {"full_name": "4paradigm/phanthymotus"},
+        "repository": {"full_name": "Haohao-end/phanthymotus"},
         "issue": {"number": 1, "pull_request": {}},
         "comment": {"id": 99},
     }
     request = _fake_webhook_request(config, proxy, controller, payload, "sha256=" + "0" * 64)
-    config.active_repos = ["4paradigm/phanthymotus"]
+    config.active_repos = ["Haohao-end/phanthymotus"]
     config.auth_valid = True
     proxy.write_hidden_state = AsyncMock()
 
@@ -635,12 +641,18 @@ def test_cos_production_path_calls_real_sdk_put_object(config):
     config.cos_secret_key = "skey"
     sdk, calls = _fake_cos_sdk()
     client = CosClient(config)
+    object_key = client.build_object_key(
+        "Haohao-end/phanthymotus", 1, "a" * 40,
+    )
+    import asyncio
+    archive, _, _ = asyncio.run(EvidenceBuilder(config).build_evidence(
+        repo="haohao-end/phanthymotus", pr_number=1, head_sha="a" * 40,
+        state=_state(), result="pass",
+    ))
 
     cos_svc_err = sdk.CosServiceError
     with patch.dict(sys.modules, {"qcloud_cos": sdk, "qcloud_cos.CosServiceError": cos_svc_err}):
-        import asyncio
-
-        assert asyncio.run(client.upload_evidence_archive('phanthymotus_pr/phanthymotus/2026-09/2026-09-17/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz', b'\x1f\x8b\x08\x00\x0b\xe9\xccj\x02\xff\x8b\xceM-ILI,I\x8c\xe5*J-\xc8\xb75)H,JL\xc9L\xcf\xd5/\xc8H\xcc+\xc9\xa8\xcc\xcd/)-\xe6*(\xb25\xe4\xcaHML\xb1M$\x12\x00\x8d+.\xcd)\xb1-H,.\xe6\xe2\x02\x00\xad\x8a?Gg\x00\x00\x00')) is True
+        assert asyncio.run(client.upload_evidence_archive(object_key, archive)) is True
 
     assert calls["put"]
     assert calls["put"][0]["Bucket"] == "bucket-1"
@@ -653,11 +665,17 @@ def test_cos_production_path_upload_failure_returns_false(config):
     config.cos_secret_key = "skey"
     sdk, _ = _fake_cos_sdk(put_error=RuntimeError("boom"))
     client = CosClient(config)
+    object_key = client.build_object_key(
+        "Haohao-end/phanthymotus", 1, "a" * 40,
+    )
+    import asyncio
+    archive, _, _ = asyncio.run(EvidenceBuilder(config).build_evidence(
+        repo="haohao-end/phanthymotus", pr_number=1, head_sha="a" * 40,
+        state=_state(), result="pass",
+    ))
 
     with patch.dict(sys.modules, {"qcloud_cos": sdk}):
-        import asyncio
-
-        assert asyncio.run(client.upload_evidence_archive('phanthymotus_pr/phanthymotus/2026-09/2026-09-17/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz', b'\x1f\x8b\x08\x00\x0b\xe9\xccj\x02\xff\x8b\xceM-ILI,I\x8c\xe5*J-\xc8\xb75)H,JL\xc9L\xcf\xd5/\xc8H\xcc+\xc9\xa8\xcc\xcd/)-\xe6*(\xb25\xe4\xcaHML\xb1M$\x12\x00\x8d+.\xcd)\xb1-H,.\xe6\xe2\x02\x00\xad\x8a?Gg\x00\x00\x00')) is False
+        assert asyncio.run(client.upload_evidence_archive(object_key, archive)) is False
 
 
 def test_cos_production_path_missing_sdk_fails_closed(config):
@@ -666,6 +684,14 @@ def test_cos_production_path_missing_sdk_fails_closed(config):
     config.cos_secret_id = "sid"
     config.cos_secret_key = "skey"
     client = CosClient(config)
+    object_key = client.build_object_key(
+        "Haohao-end/phanthymotus", 1, "a" * 40,
+    )
+    import asyncio
+    archive, _, _ = asyncio.run(EvidenceBuilder(config).build_evidence(
+        repo="haohao-end/phanthymotus", pr_number=1, head_sha="a" * 40,
+        state=_state(), result="pass",
+    ))
 
     orig_import = builtins.__import__
 
@@ -675,9 +701,7 @@ def test_cos_production_path_missing_sdk_fails_closed(config):
         return orig_import(name, globals, locals, fromlist, level)
 
     with patch("builtins.__import__", side_effect=_missing_sdk):
-        import asyncio
-
-        assert asyncio.run(client.upload_evidence_archive('phanthymotus_pr/phanthymotus/2026-09/2026-09-17/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz', b'\x1f\x8b\x08\x00\x0b\xe9\xccj\x02\xff\x8b\xceM-ILI,I\x8c\xe5*J-\xc8\xb75)H,JL\xc9L\xcf\xd5/\xc8H\xcc+\xc9\xa8\xcc\xcd/)-\xe6*(\xb25\xe4\xcaHML\xb1M$\x12\x00\x8d+.\xcd)\xb1-H,.\xe6\xe2\x02\x00\xad\x8a?Gg\x00\x00\x00')) is False
+        assert asyncio.run(client.upload_evidence_archive(object_key, archive)) is False
 
 
 def test_cos_production_source_contains_no_placeholder_signed_url():
@@ -695,10 +719,12 @@ async def test_cos_metadata_written_only_after_real_upload_success(controller, p
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
     mock_github.collaborator_permission = AsyncMock(return_value="admin")
-    valid_cos_key = "phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz"
+    valid_cos_key = CosClient(controller.config).build_object_key(
+        "Haohao-end/phanthymotus", 1, "a" * 40,
+    )
     controller._upload_evidence = AsyncMock(return_value={"object_key": valid_cos_key, "sha256": "b" * 64, "size": 12})
 
-    await controller.handle_record_test("4paradigm/phanthymotus", 1, 101, "pass", "", "owner1", "")
+    await controller.handle_record_test("Haohao-end/phanthymotus", 1, 101, "pass", "", "owner1", "")
 
     written_state = proxy.write_hidden_state.call_args_list[-1].args[3]
     assert written_state["cos"]["object_key"] == valid_cos_key
@@ -708,7 +734,7 @@ async def test_cos_metadata_written_only_after_real_upload_success(controller, p
     # Use _state() with no components so bound_ids is empty and A4 check passes
     proxy.read_hidden_state = AsyncMock(return_value=_state(components=[], deployments=[]))
     controller._upload_evidence = AsyncMock(return_value={"object_key": "", "sha256": "", "size": 0})
-    await controller.handle_record_test("4paradigm/phanthymotus", 1, 102, "fail", "", "owner1", "")
+    await controller.handle_record_test("Haohao-end/phanthymotus", 1, 102, "fail", "", "owner1", "")
 
     written_state = proxy.write_hidden_state.call_args_list[-1].args[3]
     assert written_state["cos"]["object_key"] == ""

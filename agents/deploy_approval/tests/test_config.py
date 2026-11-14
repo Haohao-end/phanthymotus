@@ -54,10 +54,10 @@ def test_validate_config_default_repos():
     [
         (list(DEFAULT_GITHUB_REPOS), True),
         (list(reversed(DEFAULT_GITHUB_REPOS)), True),
-        (["4paradigm/phanthymotus"], True),
-        (["4paradigm/phanthymotus-driver"], True),
-        (["4paradigm/phanthymotus", "4paradigm/phanthymotus"], False),
-        (["4paradigm/phanthymotus", "some/fork-repo"], True),
+        (["Haohao-end/phanthymotus"], True),
+        (["Haohao-end/phanthymotus-driver"], True),
+        (["Haohao-end/phanthymotus", "Haohao-end/phanthymotus"], False),
+        (["Haohao-end/phanthymotus", "some/fork-repo"], True),
         (["some/other"], True),
         ([], False),
         ([*DEFAULT_GITHUB_REPOS, "some/other"], True),
@@ -131,7 +131,7 @@ def test_env_bool():
 
 def test_config_env_override(monkeypatch, tmp_path):
     """Explicit GITHUB_REPOS overrides the default."""
-    monkeypatch.setenv("GITHUB_REPOS", "4paradigm/phanthymotus,4paradigm/phanthymotus-driver")
+    monkeypatch.setenv("GITHUB_REPOS", "Haohao-end/phanthymotus,Haohao-end/phanthymotus-driver")
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
     secrets = tmp_path / "secrets.yaml"
     secrets.write_text('version: 1\ncos:\n  region: ap-beijing\n  bucket: testbucket123\n  secret_id: TEST_FAKE_SECRET_ID_AAAA\n  secret_key: TEST_FAKE_SECRET_KEY_AAAA\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "kentcyq"\nagent_core_tokens:\n  test-machine: test-token\n')
@@ -141,7 +141,9 @@ def test_config_env_override(monkeypatch, tmp_path):
         return orig(str(secrets))
     monkeypatch.setattr(config_mod, "_load_secrets_config", patched)
     cfg = load_config()
-    assert cfg.github_repos == list(DEFAULT_GITHUB_REPOS)
+    assert cfg.github_repos == [
+        "haohao-end/phanthymotus", "haohao-end/phanthymotus-driver",
+    ]
 
 
 
@@ -165,8 +167,7 @@ def test_config_env_unset_uses_default(monkeypatch, tmp_path):
         return orig(str(secrets))
     monkeypatch.setattr(config_mod, "_load_secrets_config", patched)
     cfg = load_config()
-    assert "4paradigm/phanthymotus" in cfg.github_repos
-    assert "4paradigm/phanthymotus-driver" in cfg.github_repos
+    assert cfg.github_repos == list(DEFAULT_GITHUB_REPOS)
 
 
 # ── migrated from test_v8_contract.py ──────────────────────────────────────
@@ -666,7 +667,8 @@ def test_config_runtime_repos_dynamic_and_validated(monkeypatch):
         "agent_core_tokens": {"test-machine": "OFFLINE_TOKEN"}, "agent_core_ca_pem": {},
     })
     for raw, expected in (
-        ("4paradigm/phanthymotus,4paradigm/phanthymotus-driver", list(DEFAULT_GITHUB_REPOS)),
+        ("Haohao-end/phanthymotus,Haohao-end/phanthymotus-driver",
+         ["haohao-end/phanthymotus", "haohao-end/phanthymotus-driver"]),
         ("Example-Team/Main, example-team/drivers", ["example-team/main", "example-team/drivers"]),
     ):
         monkeypatch.setenv("GITHUB_REPOS", raw)

@@ -78,8 +78,7 @@ def _github_failure_reason(exc: Exception) -> str:
 # replies so every failure states what failed, why, and which command to run.
 _NEXT_COMMAND = {
     "request_deploy": "`/request_deploy`（无需任何参数）",
-    "approve_deploy": "`/approve_deploy machine=<机器别名或唯一 IPv4>`"
-                      "（仅当只有一台完整兼容机器时可省略 machine=）",
+    "approve_deploy": "使用当前 PR 生命周期和仓库策略生成的审批指导；指导不可用时不要猜测机器。",
     "record_test": "`/record_test result=pass` 或 `/record_test result=fail`",
     "request_acceptance": "`/request_acceptance`（无需任何参数）",
     "deploy_status": "`/deploy_status`（无需任何参数）",
@@ -88,6 +87,152 @@ _NEXT_COMMAND = {
     "submit_evidence": "按 PR Summary 生成的完整 `head=`、`round=` 参数重新提交",
     "remove_evidence": "按 PR Summary 生成的完整 `head=`、`round=`、`id=` 参数重新提交",
 }
+
+_REJECTION_CODES = {
+    "unknown_argument": "parameter_error",
+    "extra_parameter": "parameter_error",
+    "missing_machine_value": "parameter_error",
+    "invalid_ip_format": "parameter_error",
+    "missing_parameter": "parameter_error",
+    "invalid_parameter": "parameter_error",
+    "duplicate_argument": "parameter_error",
+    "invalid_arguments": "parameter_error",
+    "command_not_found": "command_not_found",
+    "unknown_command": "command_not_found",
+    "machine_not_found": "machine_not_found",
+    "machine_selector_not_found": "machine_not_found",
+    "unknown_machine": "machine_not_found",
+    "machine_not_unique": "machine_not_unique",
+    "machine_ambiguous": "machine_not_unique",
+    "ambiguous_machine": "machine_not_unique",
+    "ambiguous_ip": "machine_not_unique",
+    "machine_not_authorized": "machine_not_authorized",
+    "machine_unauthorized": "machine_not_authorized",
+    "unauthorized_machine": "machine_not_authorized",
+    "machine_permission_denied": "machine_not_authorized",
+    "machine_access_denied": "machine_not_authorized",
+    "machine_authorization_failed": "machine_not_authorized",
+    "owner_not_authorized": "machine_not_authorized",
+    "machine_owner_required": "machine_not_authorized",
+    "machine_owner_not_authorized": "machine_not_authorized",
+    "actor_not_machine_owner": "machine_not_authorized",
+    "machine_incompatible": "machine_incompatible",
+    "incompatible_machine": "machine_incompatible",
+    "component_incompatible": "machine_incompatible",
+    "target_unsupported": "machine_incompatible",
+    "platform_mismatch": "machine_incompatible",
+    "head_changed": "head_changed",
+    "stale_head": "head_changed",
+    "round_changed": "head_changed",
+    "pr_closed": "pr_closed",
+    "pr_not_open": "pr_closed",
+    "pr_merged": "pr_merged",
+    "merged_pr": "pr_merged",
+    "pr_draft": "pr_draft",
+    "pr_is_draft": "pr_draft",
+    "draft_pr": "pr_draft",
+    "state_not_allowed": "state_not_allowed",
+    "current_state_not_allowed": "state_not_allowed",
+    "lifecycle_state_not_allowed": "state_not_allowed",
+    "invalid_lifecycle_state": "state_not_allowed",
+    "command_not_allowed_in_state": "state_not_allowed",
+    "repository_policy_unavailable": "repository_policy_unavailable",
+    "repo_policy_unavailable": "repository_policy_unavailable",
+    "policy_unavailable": "repository_policy_unavailable",
+    "repository_policy_missing": "repository_policy_unavailable",
+    "repository_policy_not_configured": "repository_policy_unavailable",
+    "repo_policy_missing": "repository_policy_unavailable",
+    "machines_yaml_unavailable": "repository_policy_unavailable",
+    "machine_policy_unavailable": "repository_policy_unavailable",
+}
+
+_REJECTION_TEXT = {
+    "parameter_error": (
+        "参数错误",
+        "参数解析或验证未通过；命令仍按严格参数规则校验，没有执行。",
+        "按下方命令格式修正后重新提交。",
+    ),
+    "command_not_found": (
+        "命令不存在",
+        "当前输入不是 Deploy Approval 支持的命令。",
+        "检查拼写后运行命令帮助。",
+    ),
+    "machine_not_found": (
+        "机器不存在",
+        "当前仓库策略中找不到该机器选择器对应的机器。",
+        "使用当前 PR 指导列出的机器命令；若清单缺少目标机器，请检查仓库 main 的机器策略。",
+    ),
+    "machine_not_unique": (
+        "机器不唯一",
+        "该选择器匹配多个机器，无法安全确定审批目标。",
+        "使用当前 PR 指导中的完整 alias 命令，明确选择一台机器。",
+    ),
+    "machine_not_authorized": (
+        "机器无权限",
+        "当前用户或该物理机器未获当前仓库机器策略授权；这不是参数格式错误。",
+        "请让当前仓库策略列出的该机器 Owner 执行对应命令，或由仓库管理员修复 main 上的机器授权。",
+    ),
+    "machine_incompatible": (
+        "机器不兼容",
+        "该机器没有通过当前组件、平台或驱动配置的完整兼容性检查。",
+        "使用当前 PR 指导中列出的兼容机器命令；没有命令时先修复机器策略或构建配置。",
+    ),
+    "head_changed": (
+        "HEAD 已变化",
+        "审批命令绑定的旧 HEAD 已失效，不能用于当前提交。",
+        "先查看最新 Lifecycle Summary，等待当前 HEAD 的审核完成，再使用其中的机器命令。",
+    ),
+    "pr_closed": (
+        "PR 已关闭",
+        "关闭的 PR 不允许执行部署审批。",
+        "如仍需部署，请为变更创建新的 PR，并等待新 PR 的 Lifecycle Summary。",
+    ),
+    "pr_merged": (
+        "PR 已合并",
+        "已合并的 PR 不能继续部署。",
+        "如需新的部署变更，请创建新的 PR；不要重放此审批命令。",
+    ),
+    "pr_draft": (
+        "PR 仍为 Draft",
+        "Draft PR 尚未准备好部署。",
+        "先将 PR 标记为 Ready，等待当前 HEAD 的审核和 Lifecycle Summary 更新。",
+    ),
+    "state_not_allowed": (
+        "当前状态不允许执行",
+        "当前 Lifecycle 状态没有开放此命令对应的操作。",
+        "运行 `/deploy_status` 查看状态，并等待 Lifecycle Summary 提供下一步命令。",
+    ),
+    "repository_policy_unavailable": (
+        "仓库策略不可用",
+        "当前无法验证仓库 main 上的机器审批策略，因此不能安全选择或审批机器。",
+        "请管理员修复并等待仓库机器策略刷新；在策略可验证前不要执行部署命令。",
+    ),
+    "unknown_exception": (
+        "未知异常或错误 code",
+        "处理失败没有匹配的稳定错误 code；不能据此断定具体失败原因。",
+        "运行 `/deploy_status` 检查结果；确认状态前不要重放可能已开始的部署命令。",
+    ),
+}
+
+
+def _stable_error_code(value: str) -> str:
+    """Normalize a stable code while retaining its stable suffix for display."""
+    if not isinstance(value, str):
+        return ""
+    code = value.strip().split(":", 1)[0].strip().casefold().replace("-", "_")
+    return code
+
+
+def _exception_code(exc: Exception | None) -> str:
+    if exc is None:
+        return ""
+    for name in ("code", "error_code", "stable_code"):
+        value = getattr(exc, name, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raw = str(exc).strip()
+    code = _stable_error_code(raw)
+    return raw if code in _REJECTION_CODES else ""
 
 
 def _command_kind(cmd) -> str:
@@ -99,80 +244,161 @@ def _command_kind(cmd) -> str:
 
 
 def _command_error_explanation(cmd) -> tuple[str, str]:
-    """Return (what_failed, why) for a parsed command's rejection.
-
-    Codes come from ``commands.parse_command``; execution-time rejections
-    (machine not found/ambiguous, not authorized, incompatible, HEAD changed,
-    PR closed, state not ready) are phrased by the controller, so the fallback
-    here stays deliberately generic without swallowing the command.
-    """
-    kind = _command_kind(cmd)
+    """Compatibility helper for strict parse-level error descriptions."""
     error = getattr(cmd, "error", "") or ""
+    code = _stable_error_code(error)
+    if code in _REJECTION_CODES:
+        category = _REJECTION_CODES[code]
+        label, why, _ = _REJECTION_TEXT[category]
+        detail = error if error else label
+        return detail, why
     if getattr(cmd, "intent", ""):
-        return (
-            f"未识别的命令，已按 `/{kind}` 处理。",
-            "该行不是当前支持的部署命令，可能是拼写错误或旧命令。",
-        )
-    if error.startswith("unknown_argument:"):
-        keys = error.partition(":")[2] or "?"
-        return (
-            f"`/{kind}` 不接受参数 `{keys}`。",
-            "该参数不属于此命令允许的参数集合，因此没有执行任何部署或状态变更。",
-        )
-    if error == "extra_parameter":
-        return (
-            f"`/{kind}` 收到了多余的位置参数。",
-            "命令只接受规定的 `key=value` 形式，多余内容无法安全解析。",
-        )
-    if error == "missing_machine_value":
-        return (
-            "`machine=` 的值为空。",
-            "空的机器选择器无法定位唯一的当前机器，因此没有执行。",
-        )
-    if error == "invalid_ip_format":
-        return (
-            "`machine=` 不是有效的 IPv4 地址，也不是已知别名的格式。",
-            "机器选择器必须使用配置中的机器别名或设备主 IPv4 地址。",
-        )
-    if error.startswith("missing_parameter:"):
-        key = error.partition(":")[2] or "?"
-        return (
-            f"`/{kind}` 缺少必需参数 `{key}=`。",
-            "缺少该参数无法确定要处理的对象，因此没有执行。",
-        )
-    if error.startswith("invalid_parameter:"):
-        key = error.partition(":")[2] or "?"
-        return (
-            f"`/{kind}` 的参数 `{key}=` 格式或取值无效。",
-            "参数值不符合命令要求，因此没有执行。",
-        )
-    if error.startswith("duplicate_argument:"):
-        key = error.partition(":")[2] or "?"
-        return (
-            f"`/{kind}` 重复提供了参数 `{key}=`。",
-            "同一个参数只允许出现一次，重复时无法确定意图。",
-        )
-    if error == "invalid_arguments":
-        return (
-            f"`/{kind}` 的参数无法解析。",
-            "引号未闭合或参数格式不完整，因此没有执行。",
-        )
-    return (
-        f"`/{kind}` 的当前状态或参数无法处理。",
-        "命令未能通过执行前检查，因此没有产生任何部署或状态变更。",
-    )
+        return "command_not_found", _REJECTION_TEXT["command_not_found"][1]
+    return "invalid_arguments", _REJECTION_TEXT["parameter_error"][1]
 
 
-def _command_rejection_message(cmd) -> str:
-    """Build the public rejection reply for a command the watcher rejected."""
+def _command_rejection_message(
+    cmd, exc: Exception | None = None, *, current_pr: dict | None = None,
+    current_state: dict | None = None, approval_guidance: str = "",
+) -> str:
+    """Build a command-bound rejection from the actual failure and live context."""
     kind = _command_kind(cmd)
-    what, why = _command_error_explanation(cmd)
-    next_command = _NEXT_COMMAND.get(kind, "`/deploy_help` 查看命令说明")
+    raw = getattr(cmd, "raw", "")
+    if isinstance(raw, str) and raw.strip():
+        command_source = raw.strip().splitlines()[0]
+        if not command_source.startswith("/"):
+            top_level = commands_mod._iter_top_level_command_lines(raw)
+            if top_level:
+                command_source = top_level[0]
+        command_text = command_source[:300].replace("`", "\\`")
+        if not command_text.startswith("/"):
+            command_text = "/" + command_text
+    else:
+        command_text = "/" + kind
+
+    code = _exception_code(exc)
+    code_key = _stable_error_code(code)
+    category = _REJECTION_CODES.get(code_key, "") if code else ""
+    error_code = code
+    if not exc and not category:
+        parsed_error = getattr(cmd, "error", "") or ""
+        code_key = _stable_error_code(parsed_error)
+        category = _REJECTION_CODES.get(code_key, "")
+        error_code = parsed_error
+    if not category and not exc and getattr(cmd, "intent", ""):
+        category = "command_not_found"
+        error_code = "command_not_found"
+
+    pr_status = ""
+    if isinstance(current_pr, dict):
+        if current_pr.get("merged") is True:
+            pr_status = "pr_merged"
+        elif current_pr.get("state") == "closed":
+            pr_status = "pr_closed"
+        elif current_pr.get("draft") is True:
+            pr_status = "pr_draft"
+    pr_head = ((current_pr.get("head") or {}).get("sha")
+               if isinstance(current_pr, dict)
+               and isinstance(current_pr.get("head"), dict) else None)
+    state_head = current_state.get("head_sha") if isinstance(current_state, dict) else None
+    if (not pr_status and isinstance(pr_head, str) and isinstance(state_head, str)
+            and pr_head != state_head):
+        pr_status = "head_changed"
+
+    if category == "parameter_error":
+        pass
+    elif not category and pr_status and not exc:
+        category, error_code = pr_status, pr_status
+    elif not category and (exc or getattr(cmd, "error", "")):
+        category = "unknown_exception"
+        error_code = (
+            f"{type(exc).__name__} (no stable code)" if exc else
+            str(getattr(cmd, "error", "") or "unknown")
+        )
+    elif not category:
+        category = "state_not_allowed"
+        error_code = "state_not_allowed"
+
+    label, default_why, default_next = _REJECTION_TEXT[category]
+    if category == "parameter_error":
+        error = getattr(cmd, "error", "") or error_code or "invalid_arguments"
+        stable_code = _stable_error_code(error)
+        if stable_code == "unknown_argument":
+            detail = f"不支持参数 `{error.partition(':')[2] or '?'}=`（{error}）。"
+        elif stable_code == "missing_parameter":
+            detail = f"缺少必需参数 `{error.partition(':')[2] or '?'}=`（{error}）。"
+        elif stable_code == "invalid_parameter":
+            detail = f"参数 `{error.partition(':')[2] or '?'}=` 无效（{error}）。"
+        elif stable_code == "duplicate_argument":
+            detail = f"参数 `{error.partition(':')[2] or '?'}=` 重复（{error}）。"
+        elif stable_code == "extra_parameter":
+            detail = f"命令包含多余参数（{error}）。"
+        elif stable_code == "missing_machine_value":
+            detail = f"`machine=` 的值为空（{error}）。"
+        elif stable_code == "invalid_ip_format":
+            detail = f"`machine=` 不是有效 IPv4 地址（{error}）。"
+        elif stable_code == "invalid_arguments":
+            detail = f"命令参数无法解析（{error}）。"
+        else:
+            detail = f"参数验证失败（{error}）。"
+    elif category == "unknown_exception":
+        if exc:
+            detail = (
+                f"{type(exc).__name__}：稳定错误 code `{error_code}` 未分类。"
+                if code else
+                f"{type(exc).__name__}：未提供可识别的稳定错误 code。"
+            )
+        else:
+            detail = f"未识别错误 code `{error_code}`。"
+        if isinstance(current_pr, dict):
+            if pr_status:
+                default_why += f" 当前 PR 状态为 `{pr_status}`；无法把该异常归因于状态检查。"
+            elif isinstance(current_state, dict):
+                default_why += f" 当前 Lifecycle 状态为 `{current_state.get('status') or 'unknown'}`。"
+    else:
+        detail = error_code or label
+
+    recommendation = _NEXT_COMMAND.get(kind, "运行 `/deploy_help` 查看支持的命令。")
+    if category in {"pr_closed", "pr_merged", "pr_draft", "head_changed",
+                    "state_not_allowed", "repository_policy_unavailable"}:
+        recommendation = "运行 `/deploy_status` 查看当前状态；不要在状态未就绪时重试部署。"
+        if approval_guidance.strip():
+            recommendation += "\n" + approval_guidance.strip()
+    elif kind == "approve_deploy":
+        if approval_guidance.strip():
+            recommendation = approval_guidance.strip()
+        elif category in {"pr_closed", "pr_merged", "pr_draft", "head_changed",
+                          "repository_policy_unavailable", "machine_not_found",
+                          "machine_not_unique", "machine_not_authorized",
+                          "machine_incompatible"}:
+            recommendation = "当前没有可确认的机器审批命令；请按下方下一步处理。"
+    elif category == "command_not_found":
+        recommendation = "运行 `/deploy_help` 查看支持的命令。"
+
+    current_status = ""
+    if pr_status:
+        current_status = pr_status
+    elif isinstance(current_pr, dict):
+        current_status = str(current_pr.get("state") or "unknown")
+        if current_pr.get("draft") is True:
+            current_status += "/draft"
+        if current_pr.get("merged") is True:
+            current_status += "/merged"
+    if isinstance(current_state, dict) and current_state.get("status"):
+        current_status += f"；Lifecycle `{current_state['status']}`"
+    status_line = f"\n- 当前 PR 状态：{current_status}" if current_status else ""
+    why = default_why
+    if category == "parameter_error":
+        why += " 不会放宽命令参数验证。"
+    if exc and category != "unknown_exception" and error_code:
+        detail += f"（错误 code：{error_code}）" if error_code not in detail else ""
     return "\n".join([
-        f"`/{kind}` 未执行。",
-        f"- 错误：{what}",
-        f"- 原因：{why}",
-        f"- 下一步：{next_command}",
+        f"`{command_text}` 未执行。",
+        f"- 失败命令：`{command_text}`",
+        f"- 具体错误：{label}；{detail}",
+        f"- 失败原因：{why}" + status_line,
+        f"- 建议命令：{recommendation}",
+        f"- 下一步：{default_next}",
     ])
 
 
@@ -182,27 +408,36 @@ def _command_rejection_message(cmd) -> str:
 # mirroring parse-level rejections.
 #
 # Only reasons that can still be bound to the command comment are listed.
-# Edited comments, unreadable timestamps, closed/merged/draft PRs and revoked
-# installation authorization are refused earlier: the bot can no longer prove
-# or reach the comment/installation, so a reply cannot be delivered there.
+# Edited comments, unreadable timestamps, unreadable PR identity, and revoked
+# installation authorization are refused earlier because the bot cannot prove
+# the source comment or safely address the repository.
 _BOUNDARY_REJECTIONS = {
     "head_changed": (
-        "PR HEAD 在审批执行前发生了变化。",
-        "审批只对提交命令时的 HEAD 有效；HEAD 变化后旧的 Review 与审批失效。",
-        "请在最新 HEAD 重新等待 Review 结果后再发送：",
+        "HEAD 已变化，旧命令已经失效。",
+        "审批绑定提交命令时的 HEAD；HEAD 变化后旧的 Review 与审批不能用于新提交。",
+        "查看最新 Lifecycle Summary，等待当前 HEAD 审核完成后再使用其中的机器命令。",
     ),
 }
 
 
-def _boundary_rejection_message(kind: str, reason: str) -> str:
+def _boundary_rejection_message(
+    kind: str, reason: str, *, approval_guidance: str = "",
+) -> str:
     """Build the public 错误/原因/下一步 reply for a dispatch-boundary rejection."""
     what, why, next_step = _BOUNDARY_REJECTIONS[reason]
-    next_command = _NEXT_COMMAND.get(kind, "`/deploy_help` 查看命令说明")
+    next_command = (
+        "`/deploy_status` 查看当前状态；审核完成后使用 Lifecycle Summary 中的机器命令。"
+        if kind == "approve_deploy" else
+        _NEXT_COMMAND.get(kind, "运行 `/deploy_help` 查看命令说明")
+    )
+    if kind == "approve_deploy" and approval_guidance.strip():
+        next_command += "\n" + approval_guidance.strip()
     return "\n".join([
         f"`/{kind}` 未执行。",
         f"- 错误：{what}",
         f"- 原因：{why}",
-        f"- 下一步：{next_step}{next_command}",
+        f"- 建议命令：{next_command}",
+        f"- 下一步：{next_step}",
     ])
 
 
@@ -1079,7 +1314,7 @@ class GitHubCommandWatcher:
     async def _post_boundary_rejection(
         self, repo: str, pr_number: int, comment_id: int, *,
         kind: str, reason: str,
-    ) -> None:
+    ) -> bool:
         """Post one public rejection notice for a dispatch-boundary decision.
 
         The notice states what failed, why, and the next command to use. It is
@@ -1088,14 +1323,17 @@ class GitHubCommandWatcher:
         """
         topic = f"command-rejected-{reason}-{kind}"
         if self._recent_command_notice_posted(repo, pr_number, comment_id, topic):
-            return
+            return True
         post_reply = getattr(self.controller, "_post_command_reply", None)
         if not callable(post_reply):
-            return
+            return False
         try:
-            await post_reply(
+            approval_guidance = await self._approval_guidance(repo, pr_number) if kind == "approve_deploy" else ""
+            delivered = await post_reply(
                 repo, pr_number, comment_id,
-                _boundary_rejection_message(kind, reason),
+                _boundary_rejection_message(
+                    kind, reason, approval_guidance=approval_guidance,
+                ),
                 topic=topic,
             )
         except Exception as exc:
@@ -1103,8 +1341,283 @@ class GitHubCommandWatcher:
                 "watcher boundary rejection notice failed repo=%s pr=%s comment_id=%s reason=%s",
                 repo, pr_number, comment_id, _github_failure_reason(exc),
             )
-            return
+            return False
+        if delivered is not True:
+            return False
         self._mark_recent_command_notice_posted(repo, pr_number, comment_id, topic)
+        return True
+
+    async def _approval_guidance(self, repo: str, pr_number: int) -> str:
+        guidance = getattr(self.controller, "_approval_command_guidance", None)
+        if not callable(guidance):
+            return "当前控制器无法提供经过仓库策略验证的机器审批命令；请勿猜测机器。"
+        try:
+            result = await guidance(repo, pr_number)
+        except Exception as exc:
+            logger.warning(
+                "watcher approval guidance unavailable %s#%s exception=%s",
+                repo, pr_number, type(exc).__name__,
+            )
+            return "当前 PR 的仓库机器策略不可用，无法生成安全审批命令。"
+        if isinstance(result, str) and result.strip():
+            return result.strip()
+        return "当前 PR 的仓库机器策略不可用，无法生成安全审批命令。"
+
+    async def _command_rejection_context(
+        self, repo: str, pr_number: int, cmd, *, exc=None,
+        current_pr=None, current_state=None,
+    ) -> tuple[str, str]:
+        if current_pr is None:
+            try:
+                current_pr = await self.proxy.get_pr(repo, pr_number)
+            except Exception as exc:
+                logger.warning(
+                    "watcher rejection PR read %s#%s exception=%s",
+                    repo, pr_number, type(exc).__name__,
+                )
+        if current_state is None:
+            try:
+                current_state = await self.proxy.read_hidden_state(repo, pr_number)
+            except Exception as exc:
+                logger.warning(
+                    "watcher rejection lifecycle read %s#%s exception=%s",
+                    repo, pr_number, type(exc).__name__,
+                )
+        guidance = await self._approval_guidance(repo, pr_number) if _command_kind(cmd) == "approve_deploy" else ""
+        return (
+            _command_rejection_message(
+                cmd, exc=exc,
+                current_pr=current_pr if isinstance(current_pr, dict) else None,
+                current_state=current_state if isinstance(current_state, dict) else None,
+                approval_guidance=guidance,
+            ),
+            guidance,
+        )
+
+    @staticmethod
+    def _terminal_pr_reason(pr: dict | None) -> str:
+        if not isinstance(pr, dict):
+            return ""
+        if pr.get("merged") is True:
+            return "pr_merged"
+        if pr.get("state") == "closed":
+            return "pr_closed"
+        if pr.get("draft") is True:
+            return "pr_draft"
+        return ""
+
+    @staticmethod
+    def _terminal_command_failure(reason: str) -> bool:
+        return (reason in {"pr_is_draft", "pr_not_open", "dispatch_pr_not_open"}
+                or reason.startswith((
+                    "pr_closed", "pr_merged", "pr_draft",
+                    "dispatch_pr_head_changed", "terminal_notice_pr_",
+                    "terminal_pr_",
+                )))
+
+    async def _post_terminal_status_rejection(
+        self, repo: str, pr_number: int, comment_id: int, *, cmd,
+        expected_status: str, source_comment: dict,
+    ) -> bool:
+        """Post an idempotent comment for a trusted command on a terminal PR.
+
+        Unlike lifecycle-bound notices, this is allowed on a closed, merged, or
+        draft PR. It still rechecks the PR, original comment ID, author, body,
+        and timestamp before posting, and never dispatches the command.
+        """
+        from hashlib import sha256
+        from . import comments as comments_mod
+        from .evidence_models import make_round_id, round_id_for_state
+
+        topic = f"terminal-command-{expected_status}-{_command_kind(cmd)}"
+        if self._recent_command_notice_posted(repo, pr_number, comment_id, topic):
+            return True
+        try:
+            pr = await self.proxy.get_pr(repo, pr_number)
+            origin = await self.proxy.get_comment(repo, comment_id)
+            state = await self.proxy.read_hidden_state(repo, pr_number)
+            comments = await self.proxy.get_issue_comments(repo, pr_number)
+        except Exception as exc:
+            logger.warning(
+                "watcher terminal rejection context failed %s#%s comment_id=%s exception=%s",
+                repo, pr_number, comment_id, type(exc).__name__,
+            )
+            return False
+        base = pr.get("base", {}) if isinstance(pr, dict) else {}
+        base_repo = base.get("repo", {}) if isinstance(base, dict) else {}
+        head = pr.get("head", {}) if isinstance(pr, dict) else {}
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if (not isinstance(pr, dict) or type(pr.get("number")) is not int
+                or pr.get("number") != pr_number
+                or not isinstance(base_repo.get("full_name"), str)
+                or base_repo["full_name"].casefold() != repo.casefold()
+                or not isinstance(head_sha, str)
+                or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+                or self._terminal_pr_reason(pr) != expected_status
+                or not isinstance(origin, dict) or type(origin.get("id")) is not int
+                or origin.get("id") != comment_id
+                or origin.get("body") != source_comment.get("body")
+                or origin.get("created_at") != source_comment.get("created_at")
+                or origin.get("updated_at") != source_comment.get("updated_at")
+                or origin.get("created_at") != origin.get("updated_at")
+                or self.proxy.is_bot_comment(origin)
+                or not isinstance(comments, list)):
+            return False
+        expected_user = source_comment.get("user")
+        actual_user = origin.get("user")
+        if (not isinstance(expected_user, dict) or not isinstance(actual_user, dict)
+                or type(expected_user.get("id")) is not int or expected_user.get("id") <= 0
+                or expected_user.get("id") != actual_user.get("id")
+                or not isinstance(expected_user.get("login"), str)
+                or expected_user.get("login") != actual_user.get("login")):
+            return False
+        try:
+            author_id, author_login = await self.proxy.comment_identity(repo, comment_id)
+        except Exception:
+            return False
+        if (author_id != str(expected_user["id"])
+                or author_login != expected_user["login"]):
+            return False
+        try:
+            round_id = (round_id_for_state(state)
+                        if isinstance(state, dict) and state.get("head_sha") == head_sha
+                        else make_round_id(head_sha, comment_id))
+        except (TypeError, ValueError):
+            return False
+        marker_key = sha256(
+            "\0".join((repo, str(pr_number), head_sha, round_id,
+                        str(comment_id), expected_status)).encode("utf-8"),
+        ).hexdigest()
+        marker = f"<!-- deploy-approval-terminal-command:v1:{marker_key} -->"
+
+        def marker_exists(items):
+            return any(
+                isinstance(item, dict) and isinstance(item.get("body"), str)
+                and marker in item["body"] and self.proxy.is_bot_comment(item)
+                for item in items
+            )
+
+        if marker_exists(comments):
+            self._mark_recent_command_notice_posted(repo, pr_number, comment_id, topic)
+            return True
+        message_cmd = commands_mod.ParsedCommand(
+            kind=_command_kind(cmd), raw=getattr(cmd, "raw", "") or f"/{_command_kind(cmd)}",
+        )
+        current_state = state if isinstance(state, dict) else None
+        approval_guidance = (
+            await self._approval_guidance(repo, pr_number)
+            if _command_kind(message_cmd) == "approve_deploy" else ""
+        )
+        message = _command_rejection_message(
+            message_cmd, current_pr=pr, current_state=current_state,
+            approval_guidance=approval_guidance,
+        )
+        body = "\n".join((comments_mod.BOT_MARKER, marker, "", message))
+        try:
+            posted = await self.proxy.post_issue_comment(repo, pr_number, body)
+        except Exception as exc:
+            logger.warning(
+                "watcher terminal rejection post outcome unclear %s#%s comment_id=%s exception=%s",
+                repo, pr_number, comment_id, type(exc).__name__,
+            )
+            try:
+                latest = await self.proxy.get_issue_comments(repo, pr_number)
+            except Exception:
+                return False
+            if not isinstance(latest, list) or not marker_exists(latest):
+                return False
+        else:
+            if not (isinstance(posted, dict) and marker in posted.get("body", "")
+                    and self.proxy.is_bot_comment(posted)):
+                try:
+                    latest = await self.proxy.get_issue_comments(repo, pr_number)
+                except Exception:
+                    return False
+                if not isinstance(latest, list) or not marker_exists(latest):
+                    return False
+        self._mark_recent_command_notice_posted(repo, pr_number, comment_id, topic)
+        return True
+
+    async def _handle_terminal_pr_commands(
+        self, repo: str, pr_number: int, current_pr: dict, expected_status: str,
+    ) -> bool:
+        """Reply to one recent, trusted slash command without executing it."""
+        try:
+            state = await self.proxy.read_hidden_state(repo, pr_number)
+            comments = await self.proxy.get_issue_comments(repo, pr_number)
+        except Exception as exc:
+            logger.warning(
+                "watcher terminal PR command scan failed %s#%s exception=%s",
+                repo, pr_number, type(exc).__name__,
+            )
+            return False
+        if not isinstance(comments, list):
+            return False
+        cutoff = self._repo_baseline_cutoff_utc.get(repo)
+        if (not isinstance(cutoff, datetime) or cutoff.tzinfo is None
+                or cutoff.utcoffset() is None):
+            return True
+        cursor = state.get("last_processed_comment_id", 0) if isinstance(state, dict) else 0
+        if type(cursor) is not int or cursor < 0:
+            cursor = 0
+        candidates = sorted(
+            (item for item in comments
+             if isinstance(item, dict) and type(item.get("id")) is int
+             and item["id"] > cursor),
+            key=lambda item: item["id"],
+        )
+        for listed in candidates:
+            if self.proxy.is_bot_comment(listed):
+                continue
+            created = self._parse_comment_time(listed.get("created_at"))
+            if (created is None or created <= cutoff.astimezone(timezone.utc)
+                    or listed.get("updated_at") != listed.get("created_at")):
+                continue
+            body = listed.get("body")
+            if not isinstance(body, str) or not body.strip():
+                continue
+            cmd = commands_mod.parse_command(body)
+            if not cmd.is_command:
+                likely_intent = commands_mod.detect_deployment_command_intent(body)
+                if likely_intent:
+                    cmd.intent = likely_intent
+                    cmd.raw = body
+            if not cmd.is_command:
+                continue
+            comment_id = listed["id"]
+            try:
+                fresh_pr = await self.proxy.get_pr(repo, pr_number)
+                fresh_comment = await self.proxy.get_comment(repo, comment_id)
+            except Exception:
+                return False
+            if (not isinstance(fresh_comment, dict)
+                    or type(fresh_comment.get("id")) is not int
+                    or fresh_comment.get("id") != comment_id
+                    or fresh_comment.get("body") != body
+                    or fresh_comment.get("created_at") != listed.get("created_at")
+                    or fresh_comment.get("updated_at") != listed.get("updated_at")
+                    or self._recent_comment_pr_number(repo, fresh_comment) != pr_number
+                    or self._terminal_pr_reason(fresh_pr) != expected_status):
+                continue
+            self._observe_recent_command(
+                repo, pr_number, fresh_comment, created.astimezone(timezone.utc),
+            )
+            if not await self._post_terminal_status_rejection(
+                    repo, pr_number, comment_id, cmd=cmd,
+                    expected_status=expected_status, source_comment=fresh_comment):
+                return False
+            consumed = (
+                await self._consume_comment_cursor(repo, pr_number, comment_id)
+                if isinstance(state, dict) else True
+            )
+            self._finish_recent_command(
+                repo, pr_number, comment_id,
+                failure_reason=(expected_status if consumed else
+                                f"{expected_status}_cursor_persist_not_confirmed"),
+                retryable=not consumed,
+            )
+            return consumed
+        return True
 
     def _fail_recent_commands_for_pr(self, repo, pr_number, reason, *, retryable=True):
         for (observed_repo, observed_pr, comment_id), record in list(
@@ -1901,7 +2414,16 @@ class GitHubCommandWatcher:
                 self._draft_label_attempts.pop((queued_repo, pr_number), None)
             if (not isinstance(current_pr, dict) or current_pr.get("state") != "open"
                     or current_pr.get("merged") or current_pr.get("draft")):
-                failure_reason = "pr_is_draft" if draft_pr else "pr_not_open"
+                terminal_status = self._terminal_pr_reason(current_pr)
+                if terminal_status and not await self._handle_terminal_pr_commands(
+                        queued_repo, pr_number, current_pr, terminal_status):
+                    self._queue_priority_pr(item, source)
+                    cycle_ok = False
+                    self._scan_failure_reasons.append(
+                        f"terminal_command_notice:{queued_repo}#{pr_number}:retry",
+                    )
+                    continue
+                failure_reason = terminal_status or ("pr_is_draft" if draft_pr else "pr_not_open")
                 for observed_repo, observed_pr, observed_comment_id in list(
                         self._recent_command_records):
                     if observed_repo == queued_repo and observed_pr == pr_number:
@@ -3098,7 +3620,9 @@ class GitHubCommandWatcher:
                     return
                 continue
             if (isinstance(recent_command, dict)
-                    and recent_command.get("failure_reason") == "pr_is_draft"):
+                    and self._terminal_command_failure(
+                        str(recent_command.get("failure_reason") or ""),
+                    )):
                 if not await self._consume_comment_cursor(repo, pr_number, comment_id):
                     return
                 continue
@@ -3443,14 +3967,28 @@ class GitHubCommandWatcher:
                     failure_reason="dispatch_pr_identity_or_head_mismatch",
                 )
                 return
-            if (dispatch_pr.get("state") != "open"
-                    or dispatch_pr.get("merged")
-                    or dispatch_pr.get("draft")):
-                # Closed/merged/draft PRs cannot receive a bound reply; the
-                # Lifecycle Summary already reports the terminal state.
+            terminal_status = self._terminal_pr_reason(dispatch_pr)
+            if terminal_status:
+                # The dispatch-boundary identity check above proves the PR and
+                # source comment. Report terminal PR state by comment_id, but
+                # never send this command to the controller.
+                posted = await self._post_terminal_status_rejection(
+                    repo, pr_number, comment_id, cmd=cmd,
+                    expected_status=terminal_status,
+                    source_comment=dispatch_comment,
+                )
+                if not posted:
+                    self._finish_recent_command(
+                        repo, pr_number, comment_id,
+                        failure_reason=f"terminal_notice_{terminal_status}_retry",
+                    )
+                    return
+                consumed = await self._consume_comment_cursor(repo, pr_number, comment_id)
                 self._finish_recent_command(
                     repo, pr_number, comment_id,
-                    failure_reason="dispatch_pr_not_open",
+                    failure_reason=(terminal_status if consumed else
+                                    f"{terminal_status}_cursor_persist_not_confirmed"),
+                    retryable=not consumed,
                 )
                 return
             if dispatch_head != state.get("head_sha"):
@@ -3463,19 +4001,25 @@ class GitHubCommandWatcher:
                         failure_reason="dispatch_pr_identity_or_head_mismatch",
                     )
                     return
-                # HEAD moved between reconcile and dispatch: this command was
-                # issued for a different round. Consume it so it can never be
-                # replayed against the new HEAD, and say so publicly.
+                # Do not advance the cursor until the bound rejection comment
+                # has been confirmed. A failed post remains safely retryable.
+                posted = await self._post_boundary_rejection(
+                    repo, pr_number, comment_id,
+                    kind=_command_kind(cmd), reason="head_changed",
+                )
+                if not posted:
+                    self._finish_recent_command(
+                        repo, pr_number, comment_id,
+                        failure_reason="dispatch_pr_head_changed_notice_not_confirmed",
+                        retryable=True,
+                    )
+                    return
                 consumed = await self._consume_comment_cursor(repo, pr_number, comment_id)
                 self._finish_recent_command(
                     repo, pr_number, comment_id,
                     failure_reason=("dispatch_pr_head_changed" if consumed
                                     else "dispatch_pr_head_changed_cursor_persist_not_confirmed"),
                     retryable=not consumed,
-                )
-                await self._post_boundary_rejection(
-                    repo, pr_number, comment_id,
-                    kind=_command_kind(cmd), reason="head_changed",
                 )
                 return
 
@@ -3495,8 +4039,75 @@ class GitHubCommandWatcher:
                 )
                 return
 
+            if getattr(cmd, "error", "") or getattr(cmd, "intent", ""):
+                # Keep parser validation strict and report its stable code from
+                # the watcher, where live PR and repository-policy context is
+                # available. Reconfirm the source author before posting.
+                try:
+                    author_id, author_login = await self.proxy.comment_identity(
+                        repo, comment_id,
+                    )
+                except Exception as exc:
+                    self._finish_recent_command(
+                        repo, pr_number, comment_id,
+                        failure_reason=f"rejection_author_read_{_github_failure_reason(exc)}",
+                    )
+                    return
+                user = dispatch_comment.get("user", {})
+                if (not isinstance(user, dict)
+                        or author_id != str(user.get("id") or "")
+                        or author_login != user.get("login")):
+                    self._finish_recent_command(
+                        repo, pr_number, comment_id,
+                        failure_reason="rejection_author_identity_mismatch",
+                    )
+                    return
+                message, _guidance = await self._command_rejection_context(
+                    repo, pr_number, cmd, current_pr=dispatch_pr,
+                )
+                post_reply = getattr(self.controller, "_post_command_reply", None)
+                if not callable(post_reply):
+                    self._finish_recent_command(
+                        repo, pr_number, comment_id,
+                        failure_reason="rejection_notice_api_unavailable",
+                        retryable=True,
+                    )
+                    return
+                try:
+                    posted = await post_reply(
+                        repo, pr_number, comment_id, message,
+                        topic=f"command-rejected-{_command_kind(cmd)}",
+                    )
+                except Exception as exc:
+                    self._finish_recent_command(
+                        repo, pr_number, comment_id,
+                        failure_reason=f"rejection_notice_{_github_failure_reason(exc)}",
+                        retryable=True,
+                    )
+                    return
+                if posted is not True:
+                    self._finish_recent_command(
+                        repo, pr_number, comment_id,
+                        failure_reason="rejection_notice_not_confirmed",
+                        retryable=True,
+                    )
+                    return
+                consumed = await self._consume_comment_cursor(repo, pr_number, comment_id)
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason=(None if consumed else "cursor_persist_not_confirmed"),
+                    retryable=not consumed,
+                )
+                return
+
             # Dispatch to controller — transient failure must NOT advance cursor
             try:
+                begin_reply_tracking = getattr(
+                    self.controller, "begin_command_reply_tracking", None,
+                )
+                if (callable(begin_reply_tracking)
+                        and not asyncio.iscoroutinefunction(begin_reply_tracking)):
+                    begin_reply_tracking(repo, pr_number, comment_id)
                 self._mark_recent_command_dispatch_started(
                     repo, pr_number, comment_id,
                 )
@@ -3506,7 +4117,23 @@ class GitHubCommandWatcher:
                 self._mark_recent_command_dispatch_completed(
                     repo, pr_number, comment_id,
                 )
+                take_reply_delivery = getattr(
+                    self.controller, "take_command_reply_delivery", None,
+                )
+                reply_delivery = (
+                    take_reply_delivery(repo, pr_number, comment_id)
+                    if (callable(take_reply_delivery)
+                        and not asyncio.iscoroutinefunction(take_reply_delivery))
+                    else None
+                )
                 if handled:
+                    if reply_delivery is False:
+                        self._finish_recent_command(
+                            repo, pr_number, comment_id,
+                            failure_reason="command_rejection_notice_not_confirmed",
+                            retryable=True,
+                        )
+                        return
                     if await self._consume_comment_cursor(repo, pr_number, comment_id):
                         self._finish_recent_command(repo, pr_number, comment_id)
                     else:
@@ -3524,11 +4151,13 @@ class GitHubCommandWatcher:
                         try:
                             await post_reply(
                                 repo, pr_number, comment_id,
-                                f"`/{cmd.kind}` 尚未完成。\n"
-                                "- 错误：Controller 未确认执行结果，本次不会标记为成功。\n"
-                                "- 原因：命令已进入处理但结果未返回，自动重放可能造成重复部署。\n"
+                                f"`/{_command_kind(cmd)}` 尚未完成。\n"
+                                f"- 失败命令：`/{_command_kind(cmd)}`。\n"
+                                "- 具体错误：Controller 未确认处理结果。\n"
+                                "- 失败原因：命令已进入处理但结果未返回，自动重放可能造成重复部署。\n"
+                                "- 建议命令：`/deploy_status` 查看当前状态。\n"
                                 "- 下一步：查看 Lifecycle Summary；若状态为 `deploying` 或结果确认中，"
-                                "请等待只读恢复检查完成后再提交新命令。",
+                                "等待只读恢复检查完成后再提交新命令。",
                                 topic=f"command-unfinished-{cmd.kind}",
                             )
                         except Exception as reply_error:
@@ -3545,8 +4174,36 @@ class GitHubCommandWatcher:
                     "command %s comment %s in %s#%s rejected error=%s",
                     cmd.kind, comment_id, repo, pr_number, type(e).__name__,
                 )
-                # Invalid/unauthorized commands are terminally handled — advance cursor
-                # only when an authoritative lifecycle already exists.
+                take_reply_delivery = getattr(
+                    self.controller, "take_command_reply_delivery", None,
+                )
+                if (callable(take_reply_delivery)
+                        and not asyncio.iscoroutinefunction(take_reply_delivery)):
+                    take_reply_delivery(repo, pr_number, comment_id)
+                post_reply = getattr(self.controller, "_post_command_reply", None)
+                try:
+                    rejection_message, _guidance = await self._command_rejection_context(
+                        repo, pr_number, cmd, exc=e,
+                    )
+                    posted = await post_reply(
+                        repo, pr_number, comment_id,
+                        rejection_message,
+                        topic=f"command-rejected-{_command_kind(cmd)}",
+                    ) if callable(post_reply) else False
+                except Exception as reply_error:
+                    logger.warning(
+                        "command rejection notice failed repo=%s pr=%s comment_id=%s reason=%s",
+                        repo, pr_number, comment_id,
+                        _github_failure_reason(reply_error),
+                    )
+                    posted = False
+                if posted is not True:
+                    self._finish_recent_command(
+                        repo, pr_number, comment_id,
+                        failure_reason="command_rejection_notice_not_confirmed",
+                        retryable=True,
+                    )
+                    return
                 consumed = await self._consume_comment_cursor(repo, pr_number, comment_id)
                 self._finish_recent_command(
                     repo, pr_number, comment_id,
@@ -3554,22 +4211,50 @@ class GitHubCommandWatcher:
                                     else "cursor_persist_not_confirmed"),
                     retryable=not consumed,
                 )
-                post_reply = getattr(self.controller, "_post_command_reply", None)
-                if callable(post_reply):
+                return
+            except Exception as e:
+                exception_code = _exception_code(e)
+                normalized_code = _stable_error_code(exception_code)
+                if normalized_code in _REJECTION_CODES:
+                    take_reply_delivery = getattr(
+                        self.controller, "take_command_reply_delivery", None,
+                    )
+                    if (callable(take_reply_delivery)
+                            and not asyncio.iscoroutinefunction(take_reply_delivery)):
+                        take_reply_delivery(repo, pr_number, comment_id)
+                    post_reply = getattr(self.controller, "_post_command_reply", None)
                     try:
-                        await post_reply(
-                            repo, pr_number, comment_id,
-                            _command_rejection_message(cmd),
-                            topic=f"command-rejected-{cmd.kind}",
+                        rejection_message, _guidance = await self._command_rejection_context(
+                            repo, pr_number, cmd, exc=e,
                         )
+                        posted = await post_reply(
+                            repo, pr_number, comment_id, rejection_message,
+                            topic=f"command-rejected-{_command_kind(cmd)}",
+                        ) if callable(post_reply) else False
                     except Exception as reply_error:
                         logger.warning(
                             "command rejection notice failed repo=%s pr=%s comment_id=%s reason=%s",
                             repo, pr_number, comment_id,
                             _github_failure_reason(reply_error),
                         )
-                return
-            except Exception as e:
+                        posted = False
+                    if posted is not True:
+                        self._finish_recent_command(
+                            repo, pr_number, comment_id,
+                            failure_reason="command_rejection_notice_not_confirmed",
+                            retryable=True,
+                        )
+                        return
+                    consumed = await self._consume_comment_cursor(
+                        repo, pr_number, comment_id,
+                    )
+                    self._finish_recent_command(
+                        repo, pr_number, comment_id,
+                        failure_reason=(normalized_code if consumed else
+                                        "cursor_persist_not_confirmed"),
+                        retryable=not consumed,
+                    )
+                    return
                 self._finish_recent_command(
                     repo, pr_number, comment_id,
                     failure_reason=f"dispatch_outcome_unknown_{_github_failure_reason(e)}",
@@ -3584,14 +4269,50 @@ class GitHubCommandWatcher:
                 post_reply = getattr(self.controller, "_post_command_reply", None)
                 if callable(post_reply):
                     try:
+                        exception_detail = (
+                            f"稳定错误 code `{exception_code}`。"
+                            if exception_code else
+                            f"异常类型 `{type(e).__name__}`，未提供稳定错误 code。"
+                        )
+                        try:
+                            failure_pr = await self.proxy.get_pr(repo, pr_number)
+                        except Exception:
+                            failure_pr = None
+                        try:
+                            failure_state = await self.proxy.read_hidden_state(repo, pr_number)
+                        except Exception:
+                            failure_state = None
+                        pr_status = "unknown"
+                        if isinstance(failure_pr, dict):
+                            if failure_pr.get("merged") is True:
+                                pr_status = "merged"
+                            elif failure_pr.get("state") == "closed":
+                                pr_status = "closed"
+                            elif failure_pr.get("draft") is True:
+                                pr_status = "open/Draft"
+                            else:
+                                pr_status = str(failure_pr.get("state") or "unknown")
+                        if isinstance(failure_state, dict) and failure_state.get("status"):
+                            pr_status += f"；Lifecycle `{failure_state['status']}`"
+                        approval_guidance = (
+                            await self._approval_guidance(repo, pr_number)
+                            if _command_kind(cmd) == "approve_deploy" else ""
+                        )
+                        status_and_guidance = f"- 当前 PR 状态：{pr_status}\n"
+                        if approval_guidance:
+                            status_and_guidance += f"- 当前机器审批指导：{approval_guidance}\n"
                         await post_reply(
                             repo, pr_number, comment_id,
-                            f"`/{cmd.kind}` 的执行结果暂时无法确认。\n"
-                            "- 错误：处理过程中出现异常，无法判断部署是否已经开始。\n"
-                            "- 原因：自动重放可能造成重复部署，因此当前命令不会自动重放。\n"
+                            f"`/{_command_kind(cmd)}` 的执行结果暂时无法确认。\n"
+                            f"- 失败命令：`/{_command_kind(cmd)}`。\n"
+                            f"- 具体错误：{exception_detail}\n"
+                            "- 失败原因：异常发生在命令处理期间，无法确认部署是否已经开始；"
+                            "自动重放可能造成重复部署。\n"
+                            f"{status_and_guidance}"
+                            "- 建议命令：`/deploy_status` 查看当前状态。\n"
                             "- 下一步：检查 Lifecycle Summary；若状态为 `deploying` 或结果确认中，"
-                            "请等待只读恢复检查完成后再提交新的审批命令。",
-                            topic=f"command-outcome-unknown-{cmd.kind}",
+                            "等待只读恢复检查完成后再提交新的审批命令。",
+                            topic=f"command-outcome-unknown-{_command_kind(cmd)}",
                         )
                     except Exception as reply_error:
                         logger.warning(
