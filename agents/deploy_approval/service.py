@@ -96,6 +96,45 @@ def _short(sha: str) -> str:
     return (sha or "")[:7]
 
 
+def _invalid_ip_machine_selector(value: str) -> bool:
+    """Return whether a rejected selector is malformed or unsupported IP text."""
+    if ":" in value:
+        return True  # IPv6 is not a supported machine selector.
+    if re.fullmatch(r"[\d.]+", value):
+        try:
+            ipaddress.IPv4Address(value)
+        except ValueError:
+            return True
+    return False
+
+
+def _is_machine_not_found_error(message: str) -> bool:
+    """Match machine lookup failures without treating malformed IPs as missing."""
+    if not isinstance(message, str):
+        return False
+    lowered = message.casefold()
+    cues = (
+        "invalid machine selector",
+        "not a known alias",
+        "unknown machine alias",
+        "no machine found with",
+    )
+    if not any(cue in lowered for cue in cues):
+        return False
+
+    selector_match = re.search(
+        r"(?:invalid machine selector|unknown machine alias|"
+        r"no machine found with(?:\s+IP)?)\s*[:=]?\s*"
+        r"(['\"`])(?P<selector>[^'\"`]+)\1",
+        message,
+        re.IGNORECASE,
+    )
+    if (selector_match
+            and _invalid_ip_machine_selector(selector_match.group("selector"))):
+        return False
+    return True
+
+
 
 def _is_supported_target(target: str) -> bool:
     return target in ("core", "perception", "actucore", "driver")
@@ -3583,38 +3622,9 @@ class DeployController:
                     selection_problem = (
                         f"Machine `{machine_alias}` does not match any remaining component's target, platform, variant, and driver path."
                     )
-                state["status"] = "deploy-requested"
-                state["command"] = {
-                    "comment_id": comment_id,
-                    "kind": "approve_deploy",
-                    "phase": "completed",
-                    "args": {"machine": machine_alias, "actor": actor},
-                }
-                state["last_processed_comment_id"] = comment_id
-                markdown = self._deploy_requested_markdown(
-                    repo, pr_number, pr_head,
-                    state["components"],
-                    self._get_machine_groups_for_components(undeployed_components, repo),
-                    test_only=self._is_test_only_pr(pr_data),
-                    gate_note=[
-                        selection_problem,
-                        "ZERO deploy POST.",
-                        "Use one of the complete machine approval commands in this Summary for a compatible machine.",
-                    ],
-                    deployments=self._enrich_deployments_for_render(state["deployments"], repo),
-                )
-                event = {
-                    "event": f"Machine `{machine_alias}` selected",
-                    "machine": machine_alias,
-                    "timestamp": comments_mod.beijing_now_str(),
-                }
-                written = await self._write_lifecycle_with_history(
-                    repo, pr_number, state, markdown, event=event,
-                    expected_lifecycle_state=initial_lifecycle_state,
-                )
-                if not written:
-                    return False
-                await self._project_status_best_effort(repo, pr_number, "deploy-requested")
+                # A rejected machine choice must not consume this command or
+                # alter the lifecycle. Report the current compatible options
+                # directly, while keeping the original hidden state untouched.
                 compatible_groups = self._get_machine_groups_for_components(
                     undeployed_components, repo,
                 )
@@ -10840,7 +10850,7 @@ class DeployController:
                 }
                 error_label = topic_error_labels.get(topic, "")
                 if not error_label and topic.startswith("runtime-redeploy-machine-not-found"):
-                    error_label = "机器不存在：当前仓库策略无法解析所选机器"
+                    error_label = "机器不存在。"
                 elif not error_label and topic.startswith((
                         "runtime-redeploy-machine-incompatible",
                         "runtime-redeploy-component-incompatible",
@@ -10867,9 +10877,8 @@ class DeployController:
                     elif any(value in message_lower for value in (
                             "head changed", "head 已变化", "head drift")):
                         error_label = "HEAD 已变化：旧审核和审批失效"
-                    elif any(value in message_lower for value in (
-                            "not found", "找不到", "不存在")):
-                        error_label = "机器不存在：无法解析当前仓库中的机器"
+                    elif _is_machine_not_found_error(message):
+                        error_label = "机器不存在。"
                     elif any(value in message_lower for value in (
                             "incompatible", "不兼容", "不适配", "does not match")):
                         error_label = "机器不兼容：无法覆盖本次组件"
@@ -10932,6 +10941,8 @@ class DeployController:
             detail_lines = detail.splitlines()
             if detail_lines and detail_lines[0].startswith("### "):
                 detail = "\n".join(detail_lines[1:]).strip()
+            if error_label == "机器不存在。":
+                detail = "当前仓库机器配置中不存在该 alias 或 IP。"
             message = "\n".join([
                 comments_mod.BOT_MARKER,
                 "### Deploy Approval — Command rejected",
