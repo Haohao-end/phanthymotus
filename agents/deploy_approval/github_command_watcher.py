@@ -41,6 +41,12 @@ logger = logging.getLogger(__name__)
 PR_RECONCILE_CACHE_SECONDS = 120.0
 PRIORITY_BASELINE_RETRY_BASE_SECONDS = 30.0
 PRIORITY_BASELINE_RETRY_MAX_SECONDS = 300.0
+# Ready-evidence reconcile pacing. Every item is one repo/PR hint, so the
+# queue is bounded per PR and never scans the whole repository.
+EVIDENCE_SYNC_RETRY_BASE_SECONDS = 30.0
+EVIDENCE_SYNC_RETRY_MAX_SECONDS = 300.0
+EVIDENCE_SYNC_QUEUE_MAX = 128
+EVIDENCE_SYNC_STARTUP_SEED_PER_REPO = 32
 CANONICAL_STATUS_LABELS = frozenset({
     "status: review-required",
     "status: reviewing",
@@ -570,6 +576,14 @@ class GitHubCommandWatcher:
         self._cycle_durations: deque[float] = deque(maxlen=100)
         self._pr_durations: deque[float] = deque(maxlen=200)
         self._last_evidence_projection: dict[tuple[str, int], tuple[str, float]] = {}
+        # Ready-evidence reconcile hints. One entry per repo/PR; the serial
+        # worker decides what is missing from persisted records, so a hint is
+        # only a scheduling nudge and never an instruction.
+        self._evidence_sync_queue: deque[tuple[str, int]] = deque()
+        self._evidence_sync_set: set[tuple[str, int]] = set()
+        self._evidence_sync_failures: dict[tuple[str, int], int] = {}
+        self._evidence_sync_retry_after: dict[tuple[str, int], float] = {}
+        self._evidence_sync_seeded_repos: set[str] = set()
 
     async def _validated_current_summary_cos_links(self, repo: str, pr_number: int) -> set[str]:
         """Return one-year COS URLs present in the trusted current Summary."""
@@ -790,6 +804,196 @@ class GitHubCommandWatcher:
         """Wake a started watcher; preserve queued hints before startup."""
         if self._wakeup is not None:
             self._wakeup.set()
+
+    def schedule_evidence_sync(self, repo: str, pr_number: int) -> bool:
+        """Queue one bounded ready-attachment reconcile hint for the writer.
+
+        Called from the ready event and from read-only polls. The hint carries
+        no attachment payload: the serial worker re-reads persisted records and
+        the live lifecycle state before any write, so a stale hint is harmless.
+        """
+        item = (repo, pr_number)
+        if (not isinstance(repo, str) or type(pr_number) is not int or pr_number <= 0
+                or not getattr(self.config, "auth_valid", False)
+                or repo not in self.config.active_repos
+                or repo not in self.config.github_repos):
+            return False
+        # Clear evidence projection cache so ready evidence triggers projection
+        self._last_evidence_projection.pop(item, None)
+        self._clear_evidence_sync_retry(item)
+        if item in self._evidence_sync_set:
+            self._signal_wakeup()
+            return True
+        if len(self._evidence_sync_queue) >= EVIDENCE_SYNC_QUEUE_MAX:
+            logger.warning(
+                "watcher evidence sync queue full; hint was not queued repo=%s pr=%s",
+                repo, pr_number,
+            )
+            return False
+        self._evidence_sync_queue.append(item)
+        self._evidence_sync_set.add(item)
+        self._signal_wakeup()
+        return True
+
+    def _retry_evidence_sync(self, item: tuple[str, int]) -> None:
+        """Keep a failed reconcile queued with capped exponential backoff."""
+        failures = self._evidence_sync_failures.get(item, 0) + 1
+        self._evidence_sync_failures[item] = failures
+        base = max(EVIDENCE_SYNC_RETRY_BASE_SECONDS,
+                   float(self.config.poll_interval_seconds))
+        delay = min(EVIDENCE_SYNC_RETRY_MAX_SECONDS,
+                    base * (2 ** min(failures - 1, 8)))
+        self._evidence_sync_retry_after[item] = self._monotonic() + delay
+        if item not in self._evidence_sync_set:
+            if len(self._evidence_sync_queue) >= EVIDENCE_SYNC_QUEUE_MAX:
+                # A retry just removed this item before other hints filled the
+                # queue. Retain one overflow slot so this failure is not lost.
+                logger.warning(
+                    "watcher evidence retry retained beyond queue limit repo=%s pr=%s",
+                    item[0], item[1],
+                )
+            self._evidence_sync_queue.append(item)
+            self._evidence_sync_set.add(item)
+        logger.warning(
+            "watcher evidence sync deferred repo=%s pr=%s failures=%s delay_seconds=%.1f",
+            item[0], item[1], failures, delay,
+        )
+
+    def _clear_evidence_sync_retry(self, item: tuple[str, int]) -> None:
+        self._evidence_sync_failures.pop(item, None)
+        self._evidence_sync_retry_after.pop(item, None)
+
+    def _seed_evidence_sync_for_repo(self, repo: str, prs) -> None:
+        """Seed restart recovery from the most recent open PRs only.
+
+        Bounded per repository: an attachment verified before a restart is
+        reconciled without scanning every PR. The reconcile itself decides
+        from persisted records whether anything is actually missing.
+        """
+        if repo in self._evidence_sync_seeded_repos:
+            return
+        self._evidence_sync_seeded_repos.add(repo)
+        candidates = []
+        for item in prs or []:
+            pr = item[1] if isinstance(item, tuple) and len(item) == 2 else item
+            if not isinstance(pr, dict) or pr.get("draft") is True:
+                continue
+            number = pr.get("number")
+            if type(number) is not int or number <= 0:
+                continue
+            candidates.append((str(pr.get("updated_at") or ""), number))
+        candidates.sort(reverse=True)
+        for _, number in candidates[:EVIDENCE_SYNC_STARTUP_SEED_PER_REPO]:
+            self.schedule_evidence_sync(repo, number)
+
+    async def _reconcile_ready_evidence(self, repo: str, pr_number: int) -> bool:
+        """Run the bounded ready-evidence reconcile through the serial writer.
+
+        The Summary is re-projected only when a verified ready attachment is
+        not yet present in the trusted visible Summary. This does not depend on
+        the PR ``updated_at`` version.
+        """
+        service = getattr(self, "evidence_service", None) or getattr(self.controller, "evidence_service", None)
+        reconcile = getattr(service, "reconcile_ready_evidence", None)
+        if not callable(reconcile):
+            return True
+        pr = await self.proxy.get_pr(repo, pr_number)
+        if (not isinstance(pr, dict) or pr.get("state") != "open"
+                or pr.get("merged") or pr.get("draft")):
+            return True
+        self._current_scan_stage = "evidence_sync"
+        self._current_scan_repo = repo
+        self._current_scan_pr = pr_number
+        outcome = await reconcile(repo, pr_number)
+        if not isinstance(outcome, dict):
+            logger.warning(
+                "watcher evidence reconcile returned malformed result %s#%s",
+                repo, pr_number,
+            )
+            return False
+        if outcome.get("error"):
+            logger.warning(
+                "watcher evidence reconcile unavailable %s#%s error=%s",
+                repo, pr_number, outcome.get("error"),
+            )
+            return False
+        if outcome.get("restore_pending"):
+            logger.warning(
+                "watcher evidence COS restore pending %s#%s count=%s",
+                repo, pr_number, outcome.get("restore_pending"),
+            )
+        # The Summary link is the primary user-visible requirement, so it is
+        # re-projected even when one comment still needs a retry.
+        if outcome.get("needs_projection"):
+            if self._defer_evidence_projection_for_priority(repo, pr_number):
+                return False
+            self._current_scan_stage = "evidence_sync_projection"
+            await self.controller.project_evidence(repo, pr_number)
+            self._last_evidence_projection[(repo, pr_number)] = (
+                f"{pr.get('head', {}).get('sha')}:{pr.get('updated_at')}",
+                self._monotonic(),
+            )
+        if outcome.get("pending"):
+            # Keep lifecycle commands moving while retrying visible evidence
+            # synchronization and pending COS restoration.
+            return False
+        if outcome.get("failed"):
+            # Temporary GitHub failures stay pending and retry with backoff.
+            return False
+        return True
+
+    async def _drain_evidence_sync(self, *, max_items: int = 2) -> bool:
+        """Process bounded evidence-sync hints on the serial writer."""
+        cycle_ok = True
+        processed = 0
+        while self._evidence_sync_queue and processed < max_items:
+            item = self._evidence_sync_queue[0]
+            if self._monotonic() < self._evidence_sync_retry_after.get(item, 0.0):
+                # Rotate the queue so one backed-off PR cannot starve others.
+                self._evidence_sync_queue.rotate(-1)
+                if all(self._monotonic() < self._evidence_sync_retry_after.get(
+                        queued, 0.0) for queued in self._evidence_sync_queue):
+                    break
+                continue
+            self._evidence_sync_queue.popleft()
+            self._evidence_sync_set.discard(item)
+            repo, pr_number = item
+            if (self.config.auth_valid is not True
+                    or repo not in self.config.active_repos
+                    or repo not in self.config.github_repos):
+                self._clear_evidence_sync_retry(item)
+                continue
+            processed += 1
+            try:
+                succeeded = await self._reconcile_ready_evidence(repo, pr_number)
+            except GitHubRateLimitError as exc:
+                logger.warning(
+                    "watcher rate limited during evidence sync %s#%s; retry_after=%.1f",
+                    repo, pr_number, exc.retry_after_seconds,
+                )
+                self._retry_evidence_sync(item)
+                cycle_ok = False
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "watcher evidence sync %s#%s failed: %s",
+                    repo, pr_number, type(exc).__name__,
+                )
+                self._retry_evidence_sync(item)
+                self._scan_failure_reasons.append(
+                    f"evidence_sync:{repo}#{pr_number}:{type(exc).__name__}",
+                )
+                cycle_ok = False
+                continue
+            if succeeded:
+                self._clear_evidence_sync_retry(item)
+            else:
+                self._retry_evidence_sync(item)
+                cycle_ok = False
+        return cycle_ok
+
 
     def start(self) -> None:
         if self._running:
@@ -2232,25 +2436,90 @@ class GitHubCommandWatcher:
             now = self._monotonic()
             refresh_due = previous is None or now - previous[1] >= 6 * 24 * 60 * 60
             changed = not projection_version or previous is None or previous[0] != projection_version
+
+            item = (repo, pr_number)
+            # Reconcile ready attachments when scheduled, when the PR changed,
+            # or when a previous reconcile is due for retry. Never re-enqueue
+            # unconditionally on every routine scan pass.
+            if item in self._evidence_sync_set or changed:
+                if self._monotonic() >= self._evidence_sync_retry_after.get(item, 0.0):
+                    try:
+                        succeeded = await self._reconcile_ready_evidence(repo, pr_number)
+                    except Exception as exc:
+                        logger.warning(
+                            "watcher scheduled evidence reconcile failed %s#%s: %s",
+                            repo, pr_number, type(exc).__name__,
+                        )
+                        self._scan_failure_reasons.append(
+                            f"evidence_sync:{repo}#{pr_number}:{type(exc).__name__}",
+                        )
+                        succeeded = False
+                    if succeeded:
+                        self._clear_evidence_sync_retry(item)
+                        if item in self._evidence_sync_set:
+                            self._evidence_sync_set.discard(item)
+                            try:
+                                self._evidence_sync_queue.remove(item)
+                            except ValueError:
+                                pass
+                    else:
+                        self._retry_evidence_sync(item)
+                    previous = self._last_evidence_projection.get(key)
+                    changed = not projection_version or previous is None or previous[0] != projection_version
+
             if changed or refresh_due:
                 self._current_scan_stage = "evidence_projection"
-                await self.controller.project_evidence(repo, pr_number)
+                projection_succeeded = True
+                try:
+                    await self.controller.project_evidence(repo, pr_number)
+                except Exception as exc:
+                    logger.warning(
+                        "evidence projection failed %s#%s: %s; retry scheduled",
+                        repo, pr_number, type(exc).__name__,
+                    )
+                    self._scan_failure_reasons.append(
+                        f"evidence_projection:{repo}#{pr_number}:{type(exc).__name__}",
+                    )
+                    self._retry_evidence_sync(item)
+                    projection_succeeded = False
                 if self._defer_evidence_projection_for_priority(repo, pr_number):
                     return baseline_succeeded
                 self._current_scan_stage = "visible_archive_migration"
-                await self.proxy.ensure_visible_evidence_archive_comments(
-                    repo, pr_number, limit=2,
-                )
+                try:
+                    await self.proxy.ensure_visible_evidence_archive_comments(
+                        repo, pr_number, limit=2,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "visible archive migration failed %s#%s: %s; retry scheduled",
+                        repo, pr_number, type(exc).__name__,
+                    )
+                    self._scan_failure_reasons.append(
+                        f"evidence_archive:{repo}#{pr_number}:{type(exc).__name__}",
+                    )
+                    self._retry_evidence_sync(item)
+                    projection_succeeded = False
                 if self._defer_evidence_projection_for_priority(repo, pr_number):
                     return baseline_succeeded
                 self._current_scan_stage = "legacy_reply_retirement"
-                valid_cos_links = await self._validated_current_summary_cos_links(repo, pr_number)
-                if self._defer_evidence_projection_for_priority(repo, pr_number):
-                    return baseline_succeeded
-                await self.proxy.retire_legacy_evidence_link_replies(
-                    repo, pr_number, valid_cos_links, limit=2,
-                )
-                if projection_version:
+                try:
+                    valid_cos_links = await self._validated_current_summary_cos_links(repo, pr_number)
+                    if self._defer_evidence_projection_for_priority(repo, pr_number):
+                        return baseline_succeeded
+                    await self.proxy.retire_legacy_evidence_link_replies(
+                        repo, pr_number, valid_cos_links, limit=2,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "legacy evidence reply retirement failed %s#%s: %s; retry scheduled",
+                        repo, pr_number, type(exc).__name__,
+                    )
+                    self._scan_failure_reasons.append(
+                        f"evidence_retirement:{repo}#{pr_number}:{type(exc).__name__}",
+                    )
+                    self._retry_evidence_sync(item)
+                    projection_succeeded = False
+                if projection_version and projection_succeeded:
                     self._last_evidence_projection.pop(key, None)
                     self._last_evidence_projection[key] = (projection_version, now)
                     if len(self._last_evidence_projection) > 4096:
@@ -2535,6 +2804,15 @@ class GitHubCommandWatcher:
             priority_done, priority_attempted, recent_attempted,
             allowed_sources={"webhook", "recent"}, max_items=2,
         ) and cycle_ok
+        # Ready-evidence hints are bounded and yield to priority work: they
+        # only read persisted records and re-project when a link is missing.
+        # At least one item is still attempted under a continuous priority
+        # backlog so a ready attachment is never stranded indefinitely.
+        # Evidence sync failures or rate limits must not taint cycle_ok or
+        # block priority commands (/request_acceptance, approve, etc.).
+        self._current_scan_stage = "evidence_sync"
+        evidence_budget = 1 if self._priority_pr_queue else 2
+        await self._drain_evidence_sync(max_items=evidence_budget)
         priority_generation_after_drain = self._priority_generation
         interrupted_for_new_priority = False
 
@@ -2632,6 +2910,10 @@ class GitHubCommandWatcher:
                 valid_prs.sort(key=lambda item: item[0])
                 open_numbers = [number for number, _ in valid_prs]
                 pr_by_number = {number: pr for number, pr in valid_prs}
+                # Restart recovery: seed a bounded set of recent open PRs so a
+                # ready attachment persisted before the restart is reconciled
+                # without waiting for a new commit or a manual status request.
+                self._seed_evidence_sync_for_repo(repo, valid_prs)
                 baseline_numbers = [
                     number for number, pr in valid_prs if pr.get("draft") is not True
                 ]

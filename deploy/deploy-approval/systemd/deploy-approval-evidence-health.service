@@ -1,0 +1,25 @@
+[Unit]
+Description=Deploy Approval Evidence stable ingress health check
+Documentation=file:///usr/local/share/doc/deploy-approval/stable-evidence-ingress.md
+After=network-online.target docker.service nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/deploy-approval/evidence-ingress.env
+ExecStart=/usr/local/sbin/deploy-approval-evidence-health-check
+# Read-only probe: no DNS changes, no GitHub writes, no approval actions.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/deploy-approval/stable-evidence-ingress
+# Diagnostics on failure shell out to `nginx -t` (needs its temp dirs) and to
+# the Docker CLI (needs the socket writable). Both are optional paths so the
+# unit still starts if a component is absent.
+ReadWritePaths=-/var/lib/nginx
+ReadWritePaths=-/var/cache/nginx
+ReadWritePaths=-/var/log/nginx
+ReadWritePaths=-/run/docker.sock
+TimeoutStartSec=180

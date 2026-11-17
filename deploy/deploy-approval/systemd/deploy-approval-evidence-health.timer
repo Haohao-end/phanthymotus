@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Deploy Approval Evidence health check every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=deploy-approval-evidence-health.service
+
+[Install]
+WantedBy=timers.target

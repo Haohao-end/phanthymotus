@@ -5,21 +5,30 @@ import base64
 import binascii
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import re
+import socket
+import ssl
+import threading
 import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request
-from fastapi.responses import RedirectResponse
 
 from .config import is_evidence_ingress_url, is_stable_public_base_url
 
 CAPABILITY_COOKIE = 'evidence-capability'
 SESSION_COOKIE = CAPABILITY_COOKIE
 SESSION_SECONDS = 3600
+# The permanent per-PR upload link is public; the upload authority it grants is
+# a short, round-scoped server session held in an HttpOnly cookie. Reopening
+# the same fixed link renews the session from trusted GitHub state.
+UPLOAD_SESSION_SECONDS = 2 * 60 * 60
 PURPOSE = 'deploy-evidence'
 DOWNLOAD_PURPOSE = 'deploy-evidence-download'
 UPLOAD_PURPOSE = 'deploy-evidence-upload'
@@ -32,6 +41,16 @@ DOWNLOAD_MAX_LIFETIME_SECONDS = 365 * 24 * 60 * 60
 PROOF_HEADER = 'x-evidence-secret'
 NONCE_HEADER = 'x-evidence-nonce'
 PROOF_SECONDS = 24 * 60 * 60
+# Process-local write throttling (abuse mitigation, never authorization).
+# Part transfers are the bulk of a legitimate round (10 GiB / 8 MiB ≈ 1280
+# parts), so their ceiling is high enough to finish a maximum-size round while
+# still bounding worst-case COS cost per browser per minute.
+WRITE_RATE_WINDOW_SECONDS = 60
+WRITE_RATE_MAX_WRITES = 120
+WRITE_RATE_MAX_PARTS = 2000
+_WRITE_RATE_MAX_KEYS = 8192
+_WRITE_RATE_STATE: dict[str, tuple[float, int]] = {}
+_WRITE_RATE_PART_ACTIONS = frozenset({'put_part', 'sign_part'})
 
 
 def _internal_http_host(host):
@@ -61,9 +80,133 @@ def cos_ready(config):
         for name in ('cos_region', 'cos_bucket', 'cos_secret_id', 'cos_secret_key'))
 
 
-def public_https_ingress_ready(config):
+_INGRESS_PROBE_CACHE: dict[tuple[str, int], tuple[float, bool]] = {}
+_INGRESS_PROBE_TTL = 20.0
+_INGRESS_PROBE_TIMEOUT_SECONDS = 3.5
+_INGRESS_PROBE_MAX_WORKERS = 2
+_INGRESS_PROBE_MAX_CACHE_ENTRIES = 64
+_INGRESS_PROBE_LOCK = threading.Lock()
+_INGRESS_PROBE_SLOTS = threading.BoundedSemaphore(_INGRESS_PROBE_MAX_WORKERS)
+_INGRESS_PROBE_IN_FLIGHT: set[tuple[str, int]] = set()
+_INGRESS_PROBE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_INGRESS_PROBE_MAX_WORKERS,
+    thread_name_prefix='evidence-ingress-probe',
+)
+
+
+def _execute_https_probe(host: str, port: int) -> bool:
+    """Execute a strict outbound HTTPS health probe to https://<host>:<port>/healthz.
+
+    Validates TLS certificates, expects HTTP 200, strictly rejects redirects,
+    and requires both health fields from the Deploy Approval Controller.
+    """
+    conn = None
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        conn = http.client.HTTPSConnection(
+            host=host,
+            port=port,
+            timeout=_INGRESS_PROBE_TIMEOUT_SECONDS,
+            context=ctx,
+        )
+        authority = f"{host}:{port}" if port != 443 else host
+        conn.request(
+            "GET",
+            "/healthz",
+            headers={
+                "Host": authority,
+                "Accept": "application/json",
+                "User-Agent": "DeployApproval-HealthProbe/1.0",
+                "Connection": "close",
+            },
+        )
+        resp = conn.getresponse()
+        # Strictly reject redirects (3xx) and non-200 responses
+        if resp.status != 200:
+            return False
+        body = resp.read(4096)
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+        return (isinstance(payload, dict)
+                and payload.get("status") == "ok"
+                and payload.get("service") == "deploy-approval")
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def public_https_ingress_configured(config) -> bool:
+    """Validate that the configured public ingress URL has legitimate HTTPS syntax."""
     base = getattr(config, 'evidence_public_base_url', '')
     return is_evidence_ingress_url(base)
+
+
+def _cache_ingress_probe(key: tuple[str, int], accessible: bool) -> None:
+    now = time.monotonic()
+    with _INGRESS_PROBE_LOCK:
+        _INGRESS_PROBE_CACHE[key] = (now, accessible)
+        if len(_INGRESS_PROBE_CACHE) > _INGRESS_PROBE_MAX_CACHE_ENTRIES:
+            oldest = min(_INGRESS_PROBE_CACHE, key=lambda item: _INGRESS_PROBE_CACHE[item][0])
+            _INGRESS_PROBE_CACHE.pop(oldest, None)
+        _INGRESS_PROBE_IN_FLIGHT.discard(key)
+    _INGRESS_PROBE_SLOTS.release()
+
+
+def _run_ingress_probe(key: tuple[str, int]) -> None:
+    try:
+        accessible = _execute_https_probe(*key)
+    except Exception:
+        accessible = False
+    _cache_ingress_probe(key, accessible)
+
+
+def public_https_ingress_accessible(config) -> bool:
+    """Return fresh public HTTPS health without blocking the request thread.
+
+    Network I/O runs in a bounded worker pool. A cache miss starts a probe and
+    fails closed until that probe completes; an async FastAPI handler never
+    waits for DNS, connect, TLS, or response-body I/O here.
+    """
+    base = getattr(config, 'evidence_public_base_url', '')
+    if not is_stable_public_base_url(base):
+        return False
+    parsed = urlsplit(base)
+    if parsed.scheme.lower() != 'https':
+        return False
+    host = (parsed.hostname or '').lower()
+    port = parsed.port or 443
+    if not host:
+        return False
+
+    key = (host, port)
+    now = time.monotonic()
+    with _INGRESS_PROBE_LOCK:
+        cached = _INGRESS_PROBE_CACHE.get(key)
+        if cached is not None and now - cached[0] < _INGRESS_PROBE_TTL:
+            return cached[1]
+        if key in _INGRESS_PROBE_IN_FLIGHT:
+            return False
+        if not _INGRESS_PROBE_SLOTS.acquire(blocking=False):
+            return False
+        _INGRESS_PROBE_IN_FLIGHT.add(key)
+        try:
+            _INGRESS_PROBE_EXECUTOR.submit(_run_ingress_probe, key)
+        except RuntimeError:
+            _INGRESS_PROBE_IN_FLIGHT.discard(key)
+            _INGRESS_PROBE_SLOTS.release()
+            return False
+    return False
+
+
+def public_https_ingress_ready(config) -> bool:
+    """Public ingress is ready only if syntactically configured AND actively reachable."""
+    return public_https_ingress_configured(config) and public_https_ingress_accessible(config)
 
 
 def _configured_https_authority(config):
@@ -85,7 +228,7 @@ def _configured_https_request(request):
     Never use forwarded host data to select or validate the public origin.
     """
     config = request.app.state.config
-    if not public_https_ingress_ready(config):
+    if not public_https_ingress_configured(config):
         return False
     parsed = urlsplit(config.evidence_public_base_url)
     supplied_host = request.headers.get('host', '').lower()
@@ -110,22 +253,26 @@ def _configured_https_request(request):
 def readiness(config, evidence_service=None, request=None):
     storage = cos_ready(config)
     backend = storage and evidence_service is not None and bool(getattr(config, 'auth_valid', False))
-    ingress = public_https_ingress_ready(config)
+    configured = public_https_ingress_configured(config)
+    accessible = configured and public_https_ingress_accessible(config)
+    ingress_ready = configured and accessible
     local_tunnel = bool(backend and request is not None and _is_local_tunnel_request(
         request, require_origin=False))
     return {
         'COS_READY': storage,
         'EVIDENCE_BACKEND_READY': backend,
-        'PUBLIC_HTTPS_INGRESS_READY': ingress,
-        'STABLE_PUBLIC_HTTPS_INGRESS_READY': is_stable_public_base_url(
-            getattr(config, 'evidence_public_base_url', ''),
-        ),
+        'STABLE_PUBLIC_HTTPS_INGRESS_CONFIGURED': configured,
+        'PUBLIC_HTTPS_INGRESS_ACCESSIBLE': accessible,
+        'PUBLIC_HTTPS_INGRESS_READY': ingress_ready,
+        'STABLE_PUBLIC_HTTPS_INGRESS_READY': configured and accessible,
         'LOCAL_SSH_TUNNEL_READY': local_tunnel,
         # A loopback SSH tunnel is useful for local development, but it cannot
         # back Summary links that must remain usable after the tunnel ends.
-        'BROWSER_UPLOAD_READY': backend and ingress,
-        'status': '' if backend and ingress else (
-            'EVIDENCE_BACKEND_PENDING' if not backend else 'PUBLIC_INGRESS_PENDING'),
+        'BROWSER_UPLOAD_READY': backend and ingress_ready,
+        'status': '' if backend and ingress_ready else (
+            'EVIDENCE_BACKEND_PENDING' if not backend else
+            'PUBLIC_INGRESS_UNAVAILABLE' if (configured and not accessible) else
+            'PUBLIC_INGRESS_PENDING'),
     }
 
 
@@ -252,34 +399,6 @@ def verify_capability(config, token, repo, pr_number, *, purpose=None, resource=
         raise HTTPException(403, detail='invalid_evidence_capability') from None
 
 
-def capability_lookup_target(token, repo, pr_number):
-    """Read only a bounded, unverified capability payload as a lookup hint.
-
-    The returned values are never authorization. Callers must match them to a
-    trusted lifecycle state or verified round archive before minting a new
-    read capability.
-    """
-    try:
-        if not isinstance(token, str) or len(token) > 2048:
-            return None
-        body, _signature = token.split('.', 1)
-        raw = base64.urlsafe_b64decode(body + '=' * (-len(body) % 4))
-        claims = json.loads(raw)
-        if not isinstance(claims, dict):
-            return None
-        head, round_id = claims.get('head'), claims.get('round')
-        if (claims.get('repo') != repo
-                or type(claims.get('pr')) is not int or claims['pr'] != pr_number
-                or claims.get('purpose') not in _PURPOSES
-                or not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head)
-                or not isinstance(round_id, str)
-                or not re.fullmatch(re.escape(head) + r'-[0-9]+', round_id)):
-            return None
-        return {'head': head, 'round': round_id}
-    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, binascii.Error):
-        return None
-
-
 def _verify_page_capability(config, token, repo, pr_number):
     try:
         return verify_capability(config, token, repo, pr_number, purpose=PURPOSE)
@@ -295,7 +414,7 @@ def _verify_upload_capability(config, token, repo, pr_number):
 def _secure(request):
     config = request.app.state.config
     base = getattr(config, 'evidence_public_base_url', '')
-    return public_https_ingress_ready(config) and urlsplit(base).scheme == 'https'
+    return urlsplit(base).scheme.lower() == 'https' or request.scope.get('scheme') == 'https'
 
 
 def _cookie(response, request, name, token, max_age):
@@ -303,88 +422,52 @@ def _cookie(response, request, name, token, max_age):
                         httponly=True, samesite='lax')
 
 
-def bind_page_capability(request, repo, pr_number, *, trusted_summary_capability=None,
-                         read_only=False):
-    """Exchange a Summary read or upload capability for an HttpOnly cookie."""
-    require_enabled(request)
-    if read_only:
-        # view=read is an explicit read-only mode. Never inspect the query cap
-        # or upload cookie here; only a page-scoped read capability can bind it.
-        token = trusted_summary_capability or request.cookies.get(CAPABILITY_COOKIE, '')
-        if not token:
-            raise HTTPException(403, detail='invalid_evidence_capability')
-        claims = _verify_page_capability(request.app.state.config, token, repo, pr_number)
-        requested_head = request.query_params.get('head_sha')
-        requested_round = request.query_params.get('round_id')
-        if ((requested_head and requested_head != claims.get('head'))
-                or (requested_round and requested_round != claims.get('round'))):
-            raise HTTPException(403, detail='invalid_evidence_capability')
-        target_query = urlencode({'view': 'read', 'head_sha': claims['head'],
-                                  'round_id': claims['round']})
-        expected_query = {'view': 'read', 'head_sha': claims['head'],
-                          'round_id': claims['round']}
-        response = None
-        if (dict(request.query_params) != expected_query or 'cap' in request.query_params):
-            response = RedirectResponse(
-                request.url.path + '?' + target_query, status_code=303,
-                headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'},
-            )
-        elif token != request.cookies.get(CAPABILITY_COOKIE, ''):
-            response = RedirectResponse(
-                request.url.path + '?' + target_query, status_code=303,
-                headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'},
-            )
-        if response is not None and token != request.cookies.get(CAPABILITY_COOKIE, ''):
-            _cookie(response, request, CAPABILITY_COOKIE, token, SESSION_SECONDS)
-        return response
-    token = request.query_params.get('cap')
-    if 'cap' in request.query_params and not token:
-        raise HTTPException(403, detail='invalid_evidence_capability')
-    if 'cap' not in request.query_params and trusted_summary_capability:
-        # The page handler supplies a read capability recovered from the
-        # trusted Summary or a verified upload cookie; neither overrides an
-        # explicitly supplied query capability.
-        token = trusted_summary_capability
-    if token:
-        try:
-            claims = _verify_upload_capability(request.app.state.config, token, repo, pr_number)
-            upload = True
-        except HTTPException:
-            claims = _verify_page_capability(request.app.state.config, token, repo, pr_number)
-            upload = False
-        if upload:
-            if not _configured_https_request(request):
-                raise HTTPException(403, detail='evidence_origin_failed')
-        target_path = request.url.path if upload else request.url.path + '?view=read'
-        response = RedirectResponse(target_path, status_code=303,
-                                    headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
-        if upload:
-            _cookie(response, request, UPLOAD_COOKIE, token,
-                    max(1, claims['expires_at'] - int(time.time())))
-            response.delete_cookie(
-                CAPABILITY_COOKIE, path='/', secure=_secure(request),
-                httponly=True, samesite='lax',
-            )
-        else:
-            _cookie(response, request, CAPABILITY_COOKIE, token, SESSION_SECONDS)
-        return response
-    token = request.cookies.get(CAPABILITY_COOKIE, '')
-    if token:
-        try:
-            _verify_page_capability(request.app.state.config, token, repo, pr_number)
-            return None
-        except HTTPException:
-            pass
-    token = request.cookies.get(UPLOAD_COOKIE, '')
-    if token:
-        try:
-            _verify_upload_capability(request.app.state.config, token, repo, pr_number)
-            if not _configured_https_request(request):
-                raise HTTPException(403, detail='evidence_origin_failed')
-            return None
-        except HTTPException:
-            pass
-    raise HTTPException(403, detail='invalid_evidence_capability')
+def issue_upload_session(config, repo, pr_number, head_sha, round_id):
+    """Mint the short, repo/PR/HEAD/round-scoped server session for this round."""
+    return issue_capability(
+        config, repo, pr_number, head_sha, round_id,
+        purpose=UPLOAD_PURPOSE,
+        expires_at=int(time.time()) + UPLOAD_SESSION_SECONDS,
+    )
+
+
+def bind_upload_session(response, request, token):
+    """Install the upload session in an HttpOnly cookie; drop legacy read caps."""
+    _cookie(response, request, UPLOAD_COOKIE, token, UPLOAD_SESSION_SECONDS)
+    response.delete_cookie(CAPABILITY_COOKIE, path='/', secure=_secure(request),
+                           httponly=True, samesite='lax')
+
+
+def drop_upload_session(response, request):
+    response.delete_cookie(UPLOAD_COOKIE, path='/', secure=_secure(request),
+                           httponly=True, samesite='lax')
+
+
+def enforce_write_rate_limit(principal, repo, pr_number, action):
+    """Bound per-identity write bursts in process memory (never authorization)."""
+    identity = principal.get('id') if isinstance(principal, dict) else None
+    key = f'{repo}:{pr_number}:{action}:{identity}'
+    limit = (WRITE_RATE_MAX_PARTS if action in _WRITE_RATE_PART_ACTIONS
+             else WRITE_RATE_MAX_WRITES)
+    now = time.monotonic()
+    window_start, count = _WRITE_RATE_STATE.get(key, (now, 0))
+    if now - window_start >= WRITE_RATE_WINDOW_SECONDS:
+        window_start, count = now, 0
+    count += 1
+    if len(_WRITE_RATE_STATE) >= _WRITE_RATE_MAX_KEYS and key not in _WRITE_RATE_STATE:
+        for stale in [k for k, (start, _) in _WRITE_RATE_STATE.items()
+                      if now - start >= WRITE_RATE_WINDOW_SECONDS]:
+            _WRITE_RATE_STATE.pop(stale, None)
+        if len(_WRITE_RATE_STATE) >= _WRITE_RATE_MAX_KEYS:
+            raise HTTPException(429, detail='evidence_rate_limited')
+    _WRITE_RATE_STATE[key] = (window_start, count)
+    if count > limit:
+        raise HTTPException(429, detail='evidence_rate_limited')
+
+
+def bind_read_session(response, request, token):
+    """Bind a page-scoped read capability for read-only round history."""
+    _cookie(response, request, CAPABILITY_COOKIE, token, SESSION_SECONDS)
 
 
 def _trusted_origin(request, *, require_header=True):

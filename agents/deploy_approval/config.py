@@ -85,30 +85,12 @@ def is_stable_public_base_url(value: str) -> bool:
 
 
 def is_evidence_ingress_url(value: str) -> bool:
-    """Accept a stable public origin or a configured HTTPS quick-tunnel origin."""
-    if is_stable_public_base_url(value):
-        return True
-    if not isinstance(value, str):
-        return False
-    try:
-        if (not value or any(ord(char) < 33 or ord(char) == 127 for char in value)
-                or '?' in value or '#' in value):
-            return False
-        parsed = urlsplit(value)
-        if (parsed.scheme.lower() != 'https' or parsed.username is not None
-                or parsed.password is not None or '@' in parsed.netloc
-                or parsed.query or parsed.fragment or parsed.path not in ('', '/')
-                or parsed.port not in (None, 443)):
-            return False
-        host = parsed.hostname.lower() if parsed.hostname else ''
-        suffix = '.trycloudflare.com'
-        if (not host.endswith(suffix)
-                or parsed.netloc.lower() not in {host, host + ':443'}):
-            return False
-        label = host[:-len(suffix)]
-        return bool(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label))
-    except (UnicodeError, TypeError, ValueError):
-        return False
+    """Public upload ingress must be the same persistent origin as Summary links.
+
+    Ephemeral quick-tunnel hostnames change on every process restart and cannot
+    back a permanent per-PR upload address, so they are never accepted here.
+    """
+    return is_stable_public_base_url(value)
 
 _OWNER_RE = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
 _REPOSITORY_RE = re.compile(rf"{_OWNER_RE}/[A-Za-z0-9_.-]{{1,100}}")
@@ -203,6 +185,8 @@ class Config:
     evidence_max_video_bytes: int = 512 * 1024 * 1024
     evidence_part_bytes: int = 8 * 1024 * 1024
     evidence_max_note_bytes: int = 64 * 1024
+    evidence_ingress_port: int = 25002
+    evidence_tunnel_metrics_port: int = 25003
 
     # Agent Core access tokens keyed by machine alias
     agent_core_tokens: dict[str, str] = field(
@@ -511,6 +495,8 @@ def load_config() -> Config:
         ),
         evidence_public_base_url=evidence.get("public_base_url", "").strip().rstrip("/"),
         evidence_session_key=evidence.get("session_key", ""),
+        evidence_ingress_port=int(os.getenv("EVIDENCE_INGRESS_PORT", "25002")),
+        evidence_tunnel_metrics_port=int(os.getenv("EVIDENCE_TUNNEL_METRICS_PORT", "25003")),
         agent_core_tokens=secrets.get("agent_core_tokens", {}),
         agent_core_tls_mode=validate_agent_core_tls_mode(os.getenv("AGENT_CORE_TLS_MODE", "strict")),
         agent_core_ca_pem=secrets.get("agent_core_ca_pem", {}),

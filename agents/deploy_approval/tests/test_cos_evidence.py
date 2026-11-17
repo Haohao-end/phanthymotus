@@ -12,6 +12,7 @@ import pytest
 
 from ..cos_client import CosClient, CosError, EVIDENCE_MAX_ARCHIVE_BYTES
 from ..evidence_builder import EvidenceBuilder
+from ..evidence_service import NOTIFICATION_SKIPPED, NOTIFICATION_SYNCED
 from .conftest import make_config
 
 
@@ -101,7 +102,7 @@ def test_chinese_internal_bot_note_does_not_post_comment():
 
     assert asyncio.run(service._notify_ready_attachment(
         "haohao-end/phanthymotus", 7, operation,
-    )) is False
+    )) == NOTIFICATION_SKIPPED
     assert proxy.comments == []
 
 
@@ -119,7 +120,7 @@ def test_existing_english_internal_bot_notes_do_not_post_comment(note):
 
     assert asyncio.run(service._notify_ready_attachment(
         "haohao-end/phanthymotus", 7, operation,
-    )) is False
+    )) == NOTIFICATION_SKIPPED
     assert proxy.comments == []
 
 
@@ -130,7 +131,7 @@ def test_internal_bot_note_flag_does_not_post_comment():
     assert asyncio.run(service._notify_ready_attachment(
         "haohao-end/phanthymotus", 7,
         _ready_attachment(internal_bot_note=True),
-    )) is False
+    )) == NOTIFICATION_SKIPPED
     assert proxy.comments == []
 
 
@@ -141,7 +142,7 @@ def test_real_user_image_posts_comment():
     assert asyncio.run(service._notify_ready_attachment(
         "haohao-end/phanthymotus", 7,
         _ready_attachment(filename="screen.png"),
-    )) is True
+    )) == NOTIFICATION_SYNCED
     assert len(proxy.comments) == 1
     assert "![screen.png]" in proxy.comments[0]["body"]
 
@@ -153,7 +154,7 @@ def test_real_user_video_posts_comment():
     assert asyncio.run(service._notify_ready_attachment(
         "haohao-end/phanthymotus", 7,
         _ready_attachment(filename="capture.mp4"),
-    )) is True
+    )) == NOTIFICATION_SYNCED
     assert len(proxy.comments) == 1
     assert "capture.mp4" in proxy.comments[0]["body"]
 
@@ -165,10 +166,10 @@ def test_repeated_upload_does_not_duplicate_comment():
 
     assert asyncio.run(service._notify_ready_attachment(
         "haohao-end/phanthymotus", 7, operation,
-    )) is True
+    )) == NOTIFICATION_SYNCED
     assert asyncio.run(service._notify_ready_attachment(
         "haohao-end/phanthymotus", 7, operation,
-    )) is True
+    )) == NOTIFICATION_SYNCED
     assert len(proxy.comments) == 1
 
 

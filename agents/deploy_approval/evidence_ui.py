@@ -49,8 +49,8 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 .job-state{{color:#424245;font-size:14px;font-weight:600}}
 .job-detail{{color:#6e6e73;font-size:13px;overflow-wrap:anywhere}}
 .job-result{{margin-top:10px;overflow-wrap:anywhere}}
-.job-result img{{display:block;max-width:100%;max-height:360px;margin-top:10px;border-radius:10px}}
-.job-result a{{color:#06c;text-decoration:underline}}
+.job-result img,.job-result video{{display:block;max-width:100%;max-height:360px;margin-top:10px;border-radius:10px}}
+.job-result a{{display:inline-block;margin-top:8px;margin-right:12px;color:#06c;text-decoration:underline}}
 .job-footer button{{min-height:40px;background:#fff;color:#1d1d1f;border-color:#d2d2d7}}
 [hidden]{{display:none!important}}
 @media (max-width:560px){{
@@ -66,13 +66,14 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 <main id="app" data-api="{esc(api)}" data-repo="{esc(repo)}" data-pr="{esc(pr_number)}" data-head="{esc(head_sha)}" data-round="{esc(round_id)}" data-read-only="{str(bool(read_only)).lower()}">
 <header><h1>测试证据上传</h1></header>
 <p id="message" role="status" aria-live="polite"></p>
-<h2 class="list-heading" id="next-action-heading">下一步：上传测试证据</h2>
+<h2 class="list-heading" id="next-action-heading">可选上传测试视频或图片，方便验收人了解实际效果</h2>
 <section id="upload-section" class="panel" aria-labelledby="next-action-heading">
 <fieldset id="writes" disabled hidden>
-<label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><span class="file-hint">最多 20 个文件 · 单个文件最大 512 MiB · 总计最大 10 GiB</span><input id="file" type="file" multiple></label>
+<label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><span class="file-hint">上传完全可选 · 最多 20 个文件 · 单个文件最大 512 MiB · 总计最大 10 GiB</span><input id="file" type="file" multiple></label>
 <div class="primary-row"><button id="upload" type="button">上传测试证据</button></div>
 </fieldset>
 <h2 class="list-heading" id="queue-heading" hidden>上传进度</h2><ul id="queue" class="queue" aria-labelledby="queue-heading" aria-live="polite"></ul>
+<h2 class="list-heading" id="completed-heading" hidden>已完成</h2><ul id="completed" class="queue" aria-labelledby="completed-heading" aria-live="polite"></ul>
 </section>
 </main></body></html>'''
 
@@ -89,28 +90,19 @@ _JAVASCRIPT = r'''"use strict";
   const api = app.dataset.api;
   const bound = {head_sha: app.dataset.head, round_id: app.dataset.round};
   const storageKey = "evidence:" + api + ":" + bound.head_sha + ":" + bound.round_id;
-  const proofKey = "evidence-proof:" + api + ":" + bound.head_sha + ":" + bound.round_id;
   const clientKeyStorage = "evidence-client-key:" + api + ":" + bound.head_sha + ":" + bound.round_id;
   const PART_BYTES = 8 * 1024 * 1024, MAX_BYTES = 512 * 1024 * 1024;
   const MAX_FILES = 20, MAX_TOTAL_BYTES = 10 * 1024 * 1024 * 1024;
-  const active = new Set(), jobs = [];
-  let context = null, stopped = false, pageLeaving = false, busy = false, proofSecret = "", clientKey = "", savedUploads = {};
-  let contextAuthorized = false;
-  const fragment = new URLSearchParams(window.location.hash.slice(1));
-  const incomingProof = fragment.get("proof");
-  if (window.location.hash) history.replaceState(history.state, "", window.location.pathname + window.location.search);
-  try {
-    if (incomingProof !== null) {
-      if (/^[0-9a-f]{64}$/.test(incomingProof)) {
-        sessionStorage.setItem(proofKey, incomingProof);
-        proofSecret = incomingProof;
-      } else sessionStorage.removeItem(proofKey);
-    } else {
-      const stored = sessionStorage.getItem(proofKey) || "";
-      if (/^[0-9a-f]{64}$/.test(stored)) proofSecret = stored;
-      else sessionStorage.removeItem(proofKey);
-    }
-  } catch (_) { proofSecret = ""; }
+  // A verified, COS-checked, GitHub-persisted file is final. The remaining
+  // GitHub comment/Summary projection is display-only reconciliation, so it
+  // is retried with a bounded backoff and never re-uploads or repeats complete.
+  const SYNC_BACKOFF_MS = [2000, 4000, 8000, 15000, 30000];
+  const SYNC_MAX_ATTEMPTS = 20;
+  const active = new Set(), jobs = [], renderedSaved = new Set(), syncTimers = new Map(), syncRunning = new Set();
+  let context = null, stopped = false, pageLeaving = false, busy = false, clientKey = "", savedUploads = {};
+  let contextAuthorized = false, resumeRunning = false;
+  // Round binding comes from the server-rendered page. The HttpOnly upload
+  // session cookie is the only credential; this script never stores one.
   const message = text => { $("message").textContent = String(text); };
   const id = value => {
     if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("服务端返回了无效标识符");
@@ -151,29 +143,19 @@ _JAVASCRIPT = r'''"use strict";
   }
   const jobStatusLabel = status => ({
     排队中: "等待上传", 核对中: "检查文件中", running: "正在上传", verifying: "确认上传中",
-    waiting: "等待恢复", succeeded: "上传成功", failed: "失败", paused: "已暂停"
+    waiting: "等待恢复", saved: "上传成功", succeeded: "上传成功", failed: "失败", paused: "已暂停"
   }[status] || "处理中");
-  function proofTransportAllowed(target) {
-    if (target.origin !== window.location.origin) return false;
-    if (window.location.protocol === "https:") return target.protocol === "https:";
-    return window.location.origin === "http://127.0.0.1:25001" && target.origin === window.location.origin;
-  }
   function inviteTransportAllowed(target) {
     const invite = context && (context.auth_method === "signed_invite" || context.upload_invite === true);
     return !!invite && target.origin === window.location.origin &&
       window.location.protocol === "https:" && target.protocol === "https:";
   }
   function writable() {
-    const secureInvite = context && context.auth_method === "signed_invite" && context.can_write === true &&
-      context.actor_verified === false && context.github_user_authenticated === false &&
-      window.location.protocol === "https:";
     const invite = context && context.upload_invite === true &&
       context.actor_verified === false && context.github_user_authenticated === false;
-    const proofUser = context && context.actor_verified === true &&
-      context.github_user_authenticated === true && !!proofSecret;
     return contextAuthorized && context && roundMatches(context) && context.enabled !== false && context.evidence_enabled !== false &&
-      context.can_write === true && context.status === "testing" &&
-      (secureInvite || (invite && proofTransportAllowed(new URL(api, window.location.href))) || proofUser) &&
+      context.can_write === true && context.status === "testing" && invite &&
+      inviteTransportAllowed(new URL(api, window.location.href)) &&
       context.readiness && context.readiness.COS_READY === true &&
       context.readiness.EVIDENCE_BACKEND_READY === true &&
       context.readiness.BROWSER_UPLOAD_READY === true &&
@@ -213,10 +195,6 @@ _JAVASCRIPT = r'''"use strict";
   class ApiError extends Error {
     constructor(status, text, detail = "") { super(text); this.status = status; this.detail = detail; }
   }
-  function clearProof() {
-    proofSecret = "";
-    try { sessionStorage.removeItem(proofKey); } catch (_) {}
-  }
   function requestStage(path, method) {
     if (path === "/context") return "核对当前测试轮次";
     if (path === "/uploads" && method === "POST") return "准备上传";
@@ -231,23 +209,17 @@ _JAVASCRIPT = r'''"use strict";
     if (/\/complete$/.test(path)) return 120000;
     return 20000;
   }
-  function evidenceRequestHeaders(target, method, authMode = "auto") {
+  function evidenceRequestHeaders(target, method) {
+    // The HttpOnly session cookie authenticates same-origin requests. No
+    // bearer capability is ever added to headers or URLs by this client.
     const headers = {Accept: "application/json", "X-Evidence-Client-Key": clientKey};
-    const sendProof = proofSecret && (authMode === "proof" ||
-      authMode === "auto" && !(context && (context.auth_method === "signed_invite" || context.upload_invite === true))) &&
-      proofTransportAllowed(target);
-    const transportAllowed = sendProof ? proofTransportAllowed(target) : inviteTransportAllowed(target);
-    if (sendProof) {
-      headers["X-Evidence-Secret"] = proofSecret;
-      headers["X-Evidence-Nonce"] = randomHex();
-    } else if (method !== "GET" && !transportAllowed) {
+    if (method !== "GET" && !inviteTransportAllowed(target))
       throw new Error("当前链接没有有效上传授权，或请求不是安全的同源 HTTPS 请求。");
-    }
     return headers;
   }
-  async function request(path, {method = "GET", body, key, job, timeoutMs, authMode = "auto"} = {}) {
+  async function request(path, {method = "GET", body, key, job, timeoutMs} = {}) {
     const write = method !== "GET";
-    if (write && !writable()) throw new Error("当前测试轮次已变化或无法上传，请刷新 PR Summary 后重新打开页面。");
+    if (write && !writable()) throw new Error("当前测试轮次已变化或无法上传，请重新打开 PR Summary 中的固定上传链接。");
     const target = new URL(api + path, window.location.href);
     if (path === "/context") {
       target.searchParams.set("head_sha", bound.head_sha);
@@ -255,7 +227,7 @@ _JAVASCRIPT = r'''"use strict";
       if (app.dataset.readOnly === "true") target.searchParams.set("read_view", "1");
     }
     if (target.origin !== window.location.origin) throw new Error("拒绝跨站 Evidence 请求。");
-    const headers = evidenceRequestHeaders(target, method, authMode);
+    const headers = evidenceRequestHeaders(target, method);
     if (write) headers["Content-Type"] = "application/json";
     let stage = requestStage(path, method);
     if (job && job.status === "verifying" && method === "GET" && /\/uploads\/[^/]+$/.test(path))
@@ -279,22 +251,29 @@ _JAVASCRIPT = r'''"use strict";
       let value; try { value = await response.json(); } catch (_) { value = {}; }
       if (!response.ok) {
         const detail = typeof value.detail === "string" ? value.detail : typeof value.error === "string" ? value.error : "";
+        // Server-declared pacing (seconds) is honored by the sync reconcile so
+        // it never hammers a throttled or recovering GitHub/COS backend.
+        const retryAfter = Number(response.headers.get("Retry-After") || 0);
+        const withPacing = error => {
+          if (Number.isFinite(retryAfter) && retryAfter > 0)
+            error.retryAfterMs = Math.min(retryAfter, 300) * 1000;
+          return error;
+        };
         if (/invalid_evidence_capability|invalid_evidence|evidence_capability/i.test(detail))
-          throw new ApiError(response.status, "上传链接无效或已失效。请从当前 PR Summary 重新打开附件页面。", detail);
-        if ([401, 403].includes(response.status) && proofSecret && authMode === "proof") clearProof();
-        else if (response.status === 401 && proofSecret && authMode !== "invite") clearProof();
+          throw withPacing(new ApiError(response.status, "上传会话无效或已失效。请重新打开 PR Summary 中的固定上传链接。", detail));
         if (response.status === 401) {
-          const expired = "上传链接可能已过期或失效。请刷新 PR Summary 并打开最新上传链接。";
-          if (!(path === "/context" && authMode === "invite")) halt(expired);
-          throw new ApiError(401, expired, detail);
+          const expired = "上传会话可能已过期或失效。请重新打开 PR Summary 中的固定上传链接。";
+          if (path !== "/context") halt(expired);
+          throw withPacing(new ApiError(401, expired, detail));
         }
-        if (response.status === 403) throw new ApiError(403, "当前链接没有上传权限。请刷新 PR Summary 并打开最新上传链接。", detail);
-        if (response.status === 503) throw new ApiError(503, "附件或 GitHub 服务暂时无法读取；当前操作未确认完成。请稍后重试，或重新打开 PR Summary 中的附件页面。", detail);
+        if (response.status === 403) throw withPacing(new ApiError(403, "当前链接没有上传权限。请重新打开 PR Summary 中的固定上传链接。", detail));
+        if (response.status === 429) throw withPacing(new ApiError(429, "上传过于频繁，请稍后再试。", detail));
+        if (response.status === 503) throw withPacing(new ApiError(503, "附件或 GitHub 服务暂时无法读取；当前操作未确认完成。请稍后重试，或重新打开 PR Summary 中的固定上传链接。", detail));
         if (response.status === 409 && ["round_changed", "context_not_writable", "pr_closed",
           "pr_closed_or_mismatched", "pr_draft", "state_unavailable"].includes(detail))
-          halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请刷新 PR Summary 并打开最新上传链接。");
-        if (response.status === 413) throw new ApiError(413, "超过服务端大小限制。 " + detail, detail);
-        throw new ApiError(response.status, response.status + ": " + (detail || response.statusText), detail);
+          halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请重新打开 PR Summary 中的固定上传链接。");
+        if (response.status === 413) throw withPacing(new ApiError(413, "超过服务端大小限制。 " + detail, detail));
+        throw withPacing(new ApiError(response.status, response.status + ": " + (detail || response.statusText), detail));
       }
       return value;
     } catch (error) {
@@ -411,9 +390,9 @@ _JAVASCRIPT = r'''"use strict";
       retry.addEventListener("click", () => refresh().catch(refreshFailure));
       $("message").append(label, retry);
     } else if (!pageAvailable) {
-      message("无法确认当前测试轮次，上传已暂停。请从 PR Summary 重新打开附件页。");
+      message("无法确认当前测试轮次，上传已暂停。请重新打开 PR Summary 中的固定上传链接。");
     } else if (!writable()) {
-      message("当前页面没有本轮上传权限，请从 PR Summary 的上传入口重新打开。");
+      message("当前页面没有本轮上传权限（上传完全可选）。请重新打开 PR Summary 中的固定上传链接。");
     } else {
       message("");
     }
@@ -422,39 +401,46 @@ _JAVASCRIPT = r'''"use strict";
     controls();
   }
   async function refresh(job, timeoutMs = 20000) {
-    let next, useProofFallback = false;
-    try {
-      // Let the browser's HttpOnly upload cookie authenticate first. An old
-      // proof is a one-time compatibility fallback only after invite auth fails.
-      next = await request("/context", {job, authMode: "invite", timeoutMs});
-    } catch (inviteError) {
-      if (!proofSecret || ![401, 403].includes(inviteError.status)) throw inviteError;
-      useProofFallback = true;
-    }
-    // The API owns the authoritative live-PR check. Do not repeat it here:
-    // context responses may be served by compatible backends that omit the
-    // presentation-only PR fields, which must not disable a valid open-PR invite.
-    if (!useProofFallback && proofSecret && next.auth_method !== "signed_invite" &&
-        roundMatches(next)) {
-      // A valid read-only page cookie is not an upload invitation. Preserve
-      // the legacy proof path when it is available, but never replace stale
-      // HEAD/round or closed-PR responses with a second auth result.
-      useProofFallback = true;
-    }
-    if (useProofFallback) next = await request("/context", {job, authMode: "proof", timeoutMs});
+    // The HttpOnly upload session cookie minted by the fixed per-PR page is the
+    // only credential. It is scoped to repo/PR/HEAD/round and expires on its
+    // own, so there is no client-side proof or fallback mode to negotiate.
+    const next = await request("/context", {job, timeoutMs});
     context = next;
     contextAuthorized = next.authenticated === true && next.enabled === true;
-    if (!roundMatches(next)) halt("当前 HEAD/round 已变化，已停止写入。请刷新 PR Summary 并打开最新上传链接。");
-    else if (next.auth_method === "signed_invite") clearProof();
-    render(); return next;
+    if (!roundMatches(next))
+      halt("当前 HEAD/round 已变化，已停止写入。请重新打开 PR Summary 中的固定上传链接。");
+    render(); hydrateCompleted(); return next;
   }
   function persist(job) {
     if (!job.fingerprint) return;
     const key = job.fingerprint + ":" + (job.replacesId || "new") + ":" + job.noteDigest;
+    // The durable operation record is kept until the upload is fully done, so
+    // reopening the page can confirm a saved file without reselecting it.
     savedUploads[key] = {upload_id: job.uploadId || "", init_key: job.initKey || "",
       fingerprint: job.fingerprint, filename: job.file.name, size: job.file.size,
-      replaces_id: job.replacesId, note_digest: job.noteDigest, complete_unknown: job.completeUnknown === true};
+      replaces_id: job.replacesId, note_digest: job.noteDigest, complete_unknown: job.completeUnknown === true,
+      attachment_id: job.attachmentId || ""};
+    storeUploads();
+  }
+  function storeUploads() {
     try { localStorage.setItem(storageKey, JSON.stringify({uploads: savedUploads})); } catch (_) {}
+  }
+  function dropSavedRecord(job) {
+    let changed = false;
+    if (job.fingerprint) {
+      const key = job.fingerprint + ":" + (job.replacesId || "new") + ":" + job.noteDigest;
+      if (key in savedUploads) { delete savedUploads[key]; changed = true; }
+    }
+    // A row recovered from localStorage has no File/fingerprint; match by the
+    // durable server operation id so its record is still cleared.
+    if (job.uploadId) {
+      for (const [key, record] of Object.entries(savedUploads)) {
+        if (record && record.upload_id === job.uploadId) {
+          delete savedUploads[key]; changed = true;
+        }
+      }
+    }
+    if (changed) storeUploads();
   }
   function restore() {
     try {
@@ -518,57 +504,105 @@ _JAVASCRIPT = r'''"use strict";
     throw lastError || new Error("上传状态查询已暂停；重试时会重新核对 COS 状态。");
   }
   const terminalReady = value => value && value.status === "ready" &&
-    value.github_record_persisted === true &&
-    (value.verified === true || value.cos_content_verified === true);
+    (value.verified === true || value.cos_content_verified === true || value.github_record_persisted === true);
   const verifiedReady = value => terminalReady(value) &&
-    typeof value.sha256 === "string" && /^[0-9a-f]{64}$/.test(value.sha256) &&
-    value.head_sha === bound.head_sha && value.round_id === bound.round_id;
+    (!value.sha256 || /^[0-9a-f]{64}$/.test(value.sha256)) &&
+    (!value.head_sha || value.head_sha === bound.head_sha) &&
+    (!value.round_id || value.round_id === bound.round_id);
+  // GitHub comment/Summary state is display-only once the file record is
+  // ready. A `status` poll may omit the comment fields entirely, which means
+  // "not yet reconciled", never "upload failed".
+  const syncStateOf = value => {
+    if (!value) return "";
+    if (value.github_comment_synced === true) return "synced";
+    const state = typeof value.github_comment_state === "string" ? value.github_comment_state : "";
+    if (state === "skipped") return "skipped";
+    if (state === "synced") return "synced";
+    if (state === "pending" || value.github_comment_pending === true) return "pending";
+    return "";
+  };
   function updateJob(job, text) {
     job.statusNode.textContent = jobStatusLabel(job.status);
     if (text !== undefined) job.detailNode.textContent = text;
-    job.actionButton.textContent = job.running ? "暂停" : (job.status === "succeeded" ? "已完成" : "重试 / 继续");
+    // A saved file is never waiting for a user retry: only the display
+    // projection is outstanding, and the background reconcile owns it.
+    job.actionButton.textContent = job.running
+      ? "暂停" : job.status === "succeeded" ? "已完成"
+      : job.status === "saved" ? "自动同步中" : "重试 / 继续";
     job.actionButton.dataset.jobAction = job.running ? "pause" : "retry";
-    job.actionButton.disabled = !writable() || (busy && job.actionButton.dataset.jobAction !== "pause") || job.status === "succeeded";
+    job.actionButton.hidden = job.status === "saved" || job.status === "succeeded";
+    job.actionButton.disabled = !writable() || job.status === "saved" || job.status === "succeeded" ||
+      (busy && job.actionButton.dataset.jobAction !== "pause");
     job.actionButton.onclick = () => {
       if (job.running) {
         job.paused = true;
         job.pauseReason = "已暂停；继续前会重新查询 COS 状态。";
         for (const request of job.requests) abortRequest(request, "paused");
         updateJob(job, "暂停中；续传前会重新查询 COS 状态。");
-      } else if (!busy && job.status !== "succeeded") runSingle(job);
+      } else if (!busy && job.status !== "succeeded" && job.status !== "saved") runSingle(job);
     };
   }
-  async function showUploadResult(job, attachmentId) {
+  function appendPreview(container, attachmentId, capability, filename) {
+    if (typeof attachmentId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(attachmentId)) return;
+    if (typeof capability !== "string" || !capability) return;
+    const target = new URL(api + "/attachments/" + id(attachmentId) + "/preview", window.location.href);
+    if (target.origin !== window.location.origin) return;
+    target.searchParams.set("cap", capability);
+    const suffix = String(filename || "").split(".").pop().toLowerCase();
+    if (["png", "jpg", "jpeg", "gif", "webp"].includes(suffix)) {
+      const preview = document.createElement("img");
+      preview.src = target.href; preview.alt = "已上传图片预览";
+      preview.loading = "lazy"; preview.referrerPolicy = "no-referrer";
+      container.append(preview);
+    } else if (["mp4", "webm"].includes(suffix)) {
+      // A playable inline preview is the usable entry for a saved video; the
+      // direct link stays as a fallback when the browser cannot play it.
+      const video = document.createElement("video");
+      video.controls = true; video.playsInline = true; video.preload = "metadata";
+      video.src = target.href; video.referrerPolicy = "no-referrer";
+      const link = document.createElement("a");
+      link.href = target.href; link.target = "_blank"; link.rel = "noopener noreferrer";
+      link.referrerPolicy = "no-referrer"; link.textContent = "打开视频预览";
+      container.append(video, link);
+    }
+    const downloadTarget = new URL(api + "/attachments/" + id(attachmentId) + "/download", window.location.href);
+    if (downloadTarget.origin === window.location.origin) {
+      downloadTarget.searchParams.set("cap", capability);
+      const downloadLink = document.createElement("a");
+      downloadLink.href = downloadTarget.href;
+      downloadLink.className = "download-link";
+      downloadLink.textContent = "下载文件";
+      downloadLink.setAttribute("download", filename || "attachment");
+      container.append(downloadLink);
+    }
+  }
+  async function showUploadResult(job, attachmentId, syncState = "synced") {
     job.resultNode.replaceChildren();
     const resultText = document.createElement("p");
-    resultText.textContent = "文件与 SHA256 已验证，GitHub 上传评论已同步。";
+    resultText.textContent = syncState === "saved"
+      ? "文件与 SHA256 已验证并保存；正在同步 GitHub 展示，无需操作。"
+      : syncState === "server"
+        ? "文件与 SHA256 已验证并保存；GitHub 展示由服务端继续同步，无需操作。"
+        : syncState === "pending"
+          ? "文件与 SHA256 已验证并保存；持久公网入口就绪后会自动补发一条可见的成功通知。"
+          : syncState === "skipped"
+            ? "文件与 SHA256 已验证并保存；该文件类型不生成独立的成功通知。"
+            : "文件与 SHA256 已验证，GitHub 上传成功通知已同步。";
     job.resultNode.append(resultText);
-    if (typeof attachmentId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(attachmentId)) return;
     try {
-      await refresh(job, 15000);
+      // Do not pass the job here: the saved-file wording must stay visible
+      // while the preview lookup runs in the background.
+      await refresh(null, 15000);
       const item = Array.isArray(context && context.attachments)
         ? context.attachments.find(row => row && row.attachment_id === attachmentId &&
             row.status === "ready" && row.head_sha === bound.head_sha && row.round_id === bound.round_id)
         : null;
-      if (!item || typeof item.download_capability !== "string" || !item.download_capability) return;
-      const target = new URL(api + "/attachments/" + id(attachmentId) + "/preview", window.location.href);
-      if (target.origin !== window.location.origin) return;
-      target.searchParams.set("cap", item.download_capability);
-      const suffix = String(job.file.name || "").split(".").pop().toLowerCase();
-      if (["png", "jpg", "jpeg", "gif", "webp"].includes(suffix)) {
-        const preview = document.createElement("img");
-        preview.src = target.href; preview.alt = "已上传图片预览";
-        preview.loading = "lazy"; preview.referrerPolicy = "no-referrer";
-        job.resultNode.append(preview);
-      } else if (["mp4", "webm"].includes(suffix)) {
-        const link = document.createElement("a");
-        link.href = target.href; link.target = "_blank"; link.rel = "noopener noreferrer";
-        link.referrerPolicy = "no-referrer"; link.textContent = "▶ 打开视频预览";
-        job.resultNode.append(link);
-      }
+      if (!item) return;
+      appendPreview(job.resultNode, attachmentId, item.download_capability,
+        job.file && job.file.name || item.filename || "");
     } catch (_) {
-      // The upload and GitHub comment are confirmed. The comment remains the
-      // durable place to open the attachment if inline preview is unavailable.
+      // The upload is already confirmed. The comment remains the durable place
+      // to open the attachment if inline preview is unavailable.
     }
   }
   function makeJob(file, replacesId = "") {
@@ -584,7 +618,7 @@ _JAVASCRIPT = r'''"use strict";
     detail.className = "job-detail"; action.type = "button"; action.textContent = "重试 / 继续";
     footer.append(status, action); result.className = "job-result";
     row.append(heading, progress, footer, detail, result);
-    $("queue").append(row); $("queue-heading").hidden = false;
+    $("queue").append(row); refreshHeadings();
     const job = {file, row, progress, statusNode: status, detailNode: detail,
       resultNode: result, actionButton: action,
       requests: new Set(), parts: new Map(), paused: false, running: false, status: "排队中",
@@ -617,7 +651,9 @@ _JAVASCRIPT = r'''"use strict";
     }
     const serverIds = new Set(records.keys());
     for (const job of jobs) {
-      if (job.status === "succeeded") continue;
+      // Files already acknowledged (succeeded) or persisted on the server
+      // (saved) are counted from the trusted rows above, never twice.
+      if (job.status === "succeeded" || job.status === "saved") continue;
       if (job.uploadId && serverIds.has(job.uploadId)) continue;
       if (!job.file || !Number.isSafeInteger(job.file.size) || job.file.size < 1) return null;
       pendingFiles.push({id: "local:" + job.fingerprint + ":" + (job.replacesId || "new"), size: job.file.size, row: job});
@@ -688,48 +724,297 @@ _JAVASCRIPT = r'''"use strict";
     let status = initialStatus;
     for (let count = 0; count < 30 && !stopped && !job.paused; count++) {
       if (!status) status = await uploadStateWithRetry(job);
-      if (verifiedReady(status)) {
+      if (verifiedReady(status) || (status && status.status === "ready")) {
         attachmentId = attachmentId || status.attachment_id || "";
-        if (status.github_comment_synced !== true) {
-          try {
-            const synced = await request("/uploads/" + id(job.uploadId) + "/resume", {
-              method: "POST", key: job.uploadId + ":resume", body: {}, job
-            });
-            if (synced && synced.status === "ready" && synced.github_record_persisted === true &&
-                synced.github_comment_synced === true && synced.attachment_id) {
-              status = synced; attachmentId = synced.attachment_id;
-            }
-          } catch (_) { /* Keep the verified upload resumable until its PR comment is confirmed. */ }
-        }
-        if (status.github_comment_synced !== true) {
-          job.progress.value = 100; job.status = "waiting";
-          job.statusText = "文件已验证，GitHub 上传结果评论尚未确认";
-          updateJob(job, job.statusText + "；点击“重试 / 继续”重新确认评论同步。");
-          return false;
-        }
-        job.progress.value = 100; job.completeUnknown = false; job.status = "succeeded";
-        job.statusText = "上传成功，文件和 GitHub 评论已确认。";
-        const key = job.fingerprint + ":" + (job.replacesId || "new") + ":" + job.noteDigest;
-        delete savedUploads[key]; try { localStorage.setItem(storageKey, JSON.stringify({uploads: savedUploads})); } catch (_) {}
-        updateJob(job, job.statusText);
-        await showUploadResult(job, attachmentId);
+        job.attachmentId = attachmentId;
+        job.completeUnknown = false;
+        job.progress.value = 100;
+        // The file is saved: COS content matches SHA256, the ready record is
+        // persisted, and HEAD/round still match this page. GitHub comment or
+        // Summary projection is a separate, display-only concern that must
+        // never turn this result back into a failed or retryable upload.
+        const syncState = syncStateOf(status);
+        if (syncState === "synced" || syncState === "skipped")
+          return finishSaved(job, syncState);
+        markSaved(job, attachmentId, syncState === "pending" ? "pending" : "saved");
         return true;
-      }
-      if (status && status.status === "ready") {
-        if (status === initialStatus) {
-          initialStatus = null; status = null;
-          continue;
-        }
-        job.status = "waiting";
-        updateJob(job, "上传记录尚未完成保存；请点“重试 / 继续”核对并恢复。文件和备注仍保留在本地队列中。");
-        return false;
       }
       status = null;
       await delay(2000);
     }
     job.status = "waiting";
-    updateJob(job, "上传尚未确认完成；请点“重试 / 继续”核对状态并恢复。若授权失效，请从 PR Summary 重新打开上传页。");
+    updateJob(job, "上传仍在服务端处理中；稍后可点“重试 / 继续”核对（会先查询状态，不会重复上传）。");
     return false;
+  }
+  function moveToCompleted(job) {
+    if (job.attachmentId) renderedSaved.add(job.attachmentId);
+    if (job.row && job.row.parentNode !== $("completed")) $("completed").append(job.row);
+    refreshHeadings();
+  }
+  // Completed uploads leave the progress queue entirely and appear once in the
+  // "已完成" list, with their preview entry already rendered.
+  function refreshHeadings() {
+    const completed = $("completed"), queue = $("queue");
+    $("completed-heading").hidden = completed.children.length === 0;
+    $("queue-heading").hidden = queue.children.length === 0;
+  }
+  function finishSaved(job, syncState = "synced") {
+    job.progress.value = 100; job.completeUnknown = false;
+    job.status = "succeeded";
+    job.statusText = syncState === "skipped"
+      ? "上传完成；该文件类型无需单独的 GitHub 通知。"
+      : "上传完成。";
+    dropSavedRecord(job);
+    job.syncStopped = true;
+    updateJob(job, job.statusText);
+    moveToCompleted(job);
+    showUploadResult(job, job.attachmentId, syncState);
+    return true;
+  }
+  function markSaved(job, attachmentId, syncState = "saved") {
+    job.progress.value = 100; job.completeUnknown = false;
+    job.attachmentId = attachmentId || job.attachmentId || "";
+    job.status = "saved";
+    job.syncStopped = false;
+    job.statusText = "上传成功，正在同步 GitHub 展示";
+    persist(job);
+    updateJob(job, job.statusText + "；无需操作，后台会自动完成。");
+    moveToCompleted(job);
+    showUploadResult(job, job.attachmentId, syncState);
+    scheduleSync(job, true);
+  }
+  async function confirmSavedOnce(job, background = false) {
+    if (!writable() || !job.uploadId) return null;
+    // A background reconcile must not overwrite the saved-file message with
+    // generic request stage text, so it does not pass the job for UI updates.
+    const next = await request("/uploads/" + id(job.uploadId) + "/resume", {
+      method: "POST", key: job.uploadId + ":resume", body: {},
+      job: background ? null : job, timeoutMs: 30000
+    });
+    if (next && next.upload_id && next.upload_id !== job.uploadId)
+      throw new Error("恢复结果上传标识不匹配");
+    return next && roundMatches(next) ? next : null;
+  }
+  function syncKey(job) {
+    return job.uploadId ? "upload:" + job.uploadId : job.attachmentId ? "attachment:" + job.attachmentId : "";
+  }
+  function scheduleSync(job, immediate = false, delayMs = null) {
+    const key = syncKey(job);
+    if (!key || stopped || pageLeaving || job.status === "succeeded" || job.syncStopped) return;
+    if (syncTimers.has(key)) return;  // never run two reconciles for one file
+    const attempt = Number(job.syncAttempts || 0);
+    const wait = immediate ? 0
+      : delayMs != null ? delayMs
+      : SYNC_BACKOFF_MS[Math.min(attempt, SYNC_BACKOFF_MS.length - 1)];
+    const timer = setTimeout(() => {
+      syncTimers.delete(key);
+      reconcileSync(job);
+    }, wait);
+    syncTimers.set(key, timer);
+  }
+  function stopSync(job, detail, syncState = "server") {
+    job.syncStopped = true;
+    const key = syncKey(job);
+    const timer = key ? syncTimers.get(key) : null;
+    if (timer) { clearTimeout(timer); syncTimers.delete(key); }
+    // The saved file stays successful; only the display projection pauses.
+    job.status = "succeeded";
+    job.statusText = detail;
+    dropSavedRecord(job);
+    updateJob(job, detail);
+    moveToCompleted(job);
+    showUploadResult(job, job.attachmentId, syncState);
+  }
+  async function reconcileSync(job) {
+    if (stopped || pageLeaving || job.status === "succeeded" || job.syncStopped) return;
+    if (!job.uploadId) return;
+    const key = syncKey(job);
+    // A network-recovery or visibility event can race a pending timer; only
+    // one reconcile may ever be in flight for a given file.
+    if (!key || syncRunning.has(key)) return;
+    if (!writable()) {
+      // Session no longer allows writes (expired/PR left testing). The server
+      // still reconciles the ready record; show the file as saved.
+      stopSync(job, "文件已保存；GitHub 展示同步由服务端继续，无需操作。");
+      return;
+    }
+    syncRunning.add(key);
+    job.syncAttempts = Number(job.syncAttempts || 0) + 1;
+    let retryAfterMs = 0;
+    try {
+      const next = await confirmSavedOnce(job, true);
+      if (next && terminalReady(next)) {
+        job.attachmentId = next.attachment_id || job.attachmentId;
+        const state = syncStateOf(next);
+        if (state === "synced" || state === "skipped") { finishSaved(job, state); return; }
+        job.status = "saved";
+        updateJob(job, "文件已保存，正在同步 GitHub 展示；无需操作，后台会自动完成。");
+      } else if (next && next.status === "ready") {
+        // GitHub record was not confirmed by the server yet; keep the saved
+        // state and retry, never re-upload or re-complete.
+        job.status = "saved";
+        updateJob(job, "文件已保存；后台正在补齐 GitHub 记录，无需操作。");
+      }
+    } catch (error) {
+      const status = error && Number(error.status || 0);
+      if ([401, 403, 409].includes(status) || stopped) {
+        const detail = status === 409
+          ? "文件已保存；PR 或轮次状态已变化，GitHub 展示同步已停止，服务端会继续处理。"
+          : "文件已保存；当前上传会话已失效，GitHub 展示同步由服务端继续，无需操作。";
+        stopSync(job, detail);
+        return;
+      }
+      if (!temporaryNetworkFailure(error) && !(error && error.recoveryRetryable)) {
+        stopSync(job, "文件已保存；GitHub 展示同步暂时中止，服务端会在后台重试，无需操作。");
+        return;
+      }
+      retryAfterMs = Number(error && error.retryAfterMs) || 0;
+    } finally { syncRunning.delete(key); }
+    if (job.syncAttempts >= SYNC_MAX_ATTEMPTS) {
+      stopSync(job, "文件已保存；GitHub 展示同步将在服务端后台继续，无需操作。");
+      return;
+    }
+    const backoff = SYNC_BACKOFF_MS[Math.min(job.syncAttempts, SYNC_BACKOFF_MS.length - 1)];
+    scheduleSync(job, false, Math.max(backoff, retryAfterMs));
+  }
+  function reconcileAllSaved() {
+    for (const job of jobs) {
+      if (job.status === "saved" && !job.syncStopped) scheduleSync(job, true);
+    }
+  }
+  // After a reload the page has no File handle for an upload that was already
+  // finished. The localStorage record plus the server-side ready state is
+  // enough to confirm the save and continue the display sync, so the user is
+  // never asked to select the same video again.
+  async function resumeSavedUploads() {
+    if (!writable() || resumeRunning) return;
+    resumeRunning = true;
+    try {
+      for (const [key, record] of Object.entries(savedUploads)) {
+        if (!record || typeof record !== "object") continue;
+        const uploadId = record.upload_id;
+        if (typeof uploadId !== "string" || !/^[A-Za-z0-9_-]+$/.test(uploadId)) continue;
+        if (jobs.some(job => job.uploadId === uploadId)) continue;
+        try {
+          let status = await request("/uploads/" + id(uploadId), {timeoutMs: 20000});
+          if (!status || !roundMatches(status)) continue;
+          if (!verifiedReady(status)) {
+            // The server is still archiving. Leave the record for the normal
+            // upload/resume path; nothing is deleted and nothing is re-uploaded.
+            continue;
+          }
+          // The public status projection omits attachment_id; the idempotent
+          // resume call is the only way to learn it without a re-upload. It
+          // never submits complete again.
+          if (!record.attachment_id) {
+            status = await request("/uploads/" + id(uploadId) + "/resume", {
+              method: "POST", key: uploadId + ":resume", body: {}, timeoutMs: 30000
+            });
+            if (!status || !roundMatches(status)) continue;
+          }
+          const attachmentId = status.attachment_id || record.attachment_id || "";
+          const state = syncStateOf(status);
+          const done = state === "synced" || state === "skipped";
+          if (done) {
+            delete savedUploads[key]; storeUploads();
+            continue;
+          }
+          // Keep the saved file visible and keep reconciling its display state.
+          // The server has its own background reconcile, so closing the browser
+          // never stops the GitHub update.
+          savedUploads[key] = {...record, attachment_id: attachmentId};
+          storeUploads();
+          let row = attachmentId && Array.isArray(context && context.attachments)
+            ? context.attachments.find(item => item && item.attachment_id === attachmentId &&
+                item.status === "ready" && item.head_sha === bound.head_sha &&
+                item.round_id === bound.round_id)
+            : null;
+          if (!row && status && status.status === "ready") {
+            row = {
+              attachment_id: attachmentId,
+              filename: record.filename || status.filename || "已保存的测试证据",
+              size: record.size || status.size || 0,
+              head_sha: bound.head_sha,
+              round_id: bound.round_id,
+              status: "ready",
+              download_capability: status.download_capability || "",
+            };
+          }
+          if (row) {
+            const job = savedJobFromRow(row, uploadId, attachmentId);
+            jobs.push(job);
+            markSavedLight(job);
+          }
+        } catch (_) { /* A temporary read failure keeps the record untouched. */ }
+      }
+    } finally { resumeRunning = false; }
+  }
+  // A reload has no File handle, so the recovered row renders from server
+  // facts only; it never uploads or completes anything. It reuses the row
+  // already rendered by hydrateCompleted so one file appears exactly once.
+  function savedJobFromRow(row, uploadId, attachmentId) {
+    let li = $("completed").querySelector('.job[data-attachment-id="' + attachmentId + '"]');
+    if (!li) {
+      li = completedRow(row);
+      $("completed").append(li);
+    }
+    let status = li.querySelector(".job-state");
+    let detail = li.querySelector(".job-detail");
+    if (!status || !detail) {
+      const footer = document.createElement("div"); footer.className = "job-footer";
+      status = document.createElement("span"); status.className = "job-state";
+      status.setAttribute("aria-live", "polite");
+      detail = document.createElement("span"); detail.className = "job-detail";
+      footer.append(status, detail); li.append(footer);
+    }
+    refreshHeadings();
+    renderedSaved.add(attachmentId);
+    return {file: null, row: li, progress: {value: 100}, statusNode: status,
+      detailNode: detail, resultNode: li.querySelector(".job-result"),
+      actionButton: document.createElement("button"), requests: new Set(), parts: new Map(),
+      uploadId, attachmentId, paused: false, running: false, status: "saved",
+      completeUnknown: false, replacesId: row.replaces_id || "", noteDigest: "",
+      syncStopped: false, syncAttempts: 0};
+  }
+  function markSavedLight(job) {
+    job.status = "saved"; job.syncStopped = false;
+    job.statusText = "上传成功，正在同步 GitHub 展示";
+    updateJob(job, job.statusText + "；无需操作，后台会自动完成。");
+    scheduleSync(job, true);
+  }
+  function completedRow(row) {
+    const li = document.createElement("li"); li.className = "job";
+    if (typeof row.attachment_id === "string") li.dataset.attachmentId = row.attachment_id;
+    const heading = document.createElement("div"); heading.className = "job-heading";
+    const title = document.createElement("strong"); title.className = "job-title";
+    title.textContent = row.filename || "已保存的测试证据";
+    const size = document.createElement("span"); size.className = "file-size";
+    size.textContent = formatBytes(row.size);
+    heading.append(title, size);
+    const result = document.createElement("div"); result.className = "job-result";
+    const note = document.createElement("p");
+    note.textContent = "上传成功，文件已保存并通过完整性校验。";
+    result.append(note);
+    appendPreview(result, row.attachment_id, row.download_capability, row.filename);
+    li.append(heading, result);
+    return li;
+  }
+  // On load (including a fresh reload or another tab) the server is the source
+  // of truth: an already-ready file is shown as saved without reselecting it.
+  function hydrateCompleted() {
+    const rows = Array.isArray(context && context.attachments) ? context.attachments : [];
+    for (const row of rows) {
+      if (!row || row.status !== "ready" || row.deleted_at) continue;
+      if (row.head_sha !== bound.head_sha || row.round_id !== bound.round_id) continue;
+      if (isTextRecord(row) || row.internal_bot_note === true) continue;
+      const attachmentId = row.attachment_id;
+      if (typeof attachmentId !== "string" || renderedSaved.has(attachmentId)) continue;
+      // Do not duplicate a still-visible queue row that owns the same file.
+      if (jobs.some(job => job.attachmentId === attachmentId)) continue;
+      renderedSaved.add(attachmentId);
+      $("completed").append(completedRow(row));
+    }
+    refreshHeadings();
   }
   async function startOrRestore(job) {
     job.status = "核对中"; updateJob(job, "正在检查文件并准备上传。");
@@ -885,7 +1170,9 @@ _JAVASCRIPT = r'''"use strict";
   async function uploadOne(job) {
     if (!(job.file.size >= 1 && job.file.size <= MAX_BYTES)) throw new Error("单个文件必须为 1..512 MiB。");
     let state = await startOrRestore(job);
-    if (job.status === "succeeded") return;
+    // A restored/reconciled file is already final: never upload parts or
+    // submit complete again just because its GitHub projection lags behind.
+    if (job.status === "succeeded" || job.status === "saved") return;
     if (!state || typeof state !== "object") return;
     if (["failed", "deleted", "aborted", "expired", "invalid"].includes(state.status))
       throw new Error("服务端上传状态不可继续：" + state.status);
@@ -904,7 +1191,7 @@ _JAVASCRIPT = r'''"use strict";
     job.status = "running"; updateJob(job, "处理中。"); controls();
     try {
       await uploadOne(job);
-      if (job.status !== "succeeded" && job.status !== "waiting") {
+      if (job.status !== "succeeded" && job.status !== "saved" && job.status !== "waiting") {
         job.status = "waiting"; updateJob(job, "等待恢复；点“重试 / 继续”会先核对上传进度。");
       }
     } catch (error) {
@@ -959,7 +1246,7 @@ _JAVASCRIPT = r'''"use strict";
   function refreshFailure(error) {
     contextAuthorized = false; controls();
     const status = error && Number(error.status || 0);
-    const text = status === 401 ? "授权已失效，请从可信 PR Summary 重新打开附件页。"
+    const text = status === 401 ? "授权已失效，请重新打开 PR Summary 中的固定上传链接。"
       : status === 403 ? "当前账号无权读取或修改附件；写入操作已禁用。"
       : status === 409 ? "PR 或轮次状态已变化，请重试以获取可信数据。"
       : status === 503 || status === 0 ? "服务暂不可用或网络超时；已保留已确认内容。"
@@ -969,7 +1256,19 @@ _JAVASCRIPT = r'''"use strict";
     const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "重试";
     retry.addEventListener("click", () => refresh().catch(refreshFailure));
     $("message").append(label, retry);
+    // A saved file's GitHub projection is never lost to a client-side read
+    // failure: the server reconciles it and this page retries automatically.
+    for (const job of jobs) if (job.status === "saved" && !job.syncStopped) scheduleSync(job);
   }
-  restore(); refresh().catch(refreshFailure);
+  async function reloadContext() {
+    try { await refresh(); await resumeSavedUploads(); reconcileAllSaved(); }
+    catch (_) { /* keep the saved state; the next event retries */ }
+  }
+  window.addEventListener("online", reloadContext);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && !pageLeaving) reloadContext();
+  });
+  restore();
+  refresh().then(async () => { await resumeSavedUploads(); reconcileAllSaved(); }).catch(refreshFailure);
 })();
 '''

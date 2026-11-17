@@ -4909,9 +4909,10 @@ class DeployController:
                 approval_comment_id=comment_id,
             )
             upload_message = (
-                f"本轮测试视频/图片上传入口：[打开上传页面](<{upload_url}>)。"
+                f"可选上传测试视频或图片，方便验收人了解实际效果：[打开固定上传页面](<{upload_url}>)。"
                 if upload_url else
-                "当前轮安全上传入口不可用，请从 PR Summary 查看上传状态；不要使用旧轮次链接。"
+                "测试视频或图片上传完全可选；公共上传入口暂时不可用时不影响测试和验收，"
+                "恢复后 PR Summary 会出现同一个固定链接。"
             )
             await self._post_bound_notice(
                 repo, pr_number, head_sha=pr_head,
@@ -4921,7 +4922,6 @@ class DeployController:
                 message=(f"部署已完成，Lifecycle 已进入 `testing`。当前 HEAD 为 `{_short(pr_head)}`，"
                          f"round 为 `{round_id_for_state(state)}`。现在可以开始测试。\n\n"
                          f"{upload_message}\n\n"
-                         "请将本轮实际测试证据上传到此入口；审批人会据此核对实现效果，判断是否通过验收以及能否合并。\n\n"
                          "测试完成后，请由本轮 Machine Owner 执行 `/request_acceptance`。"),
             )
 
@@ -5458,9 +5458,11 @@ class DeployController:
                 "配置有效的当前仓库验收名单后，获授权账号才能执行 `/record_test result=pass` 或 `/record_test result=fail`。"
             )
             evidence_location = (
-                f"本轮测试证据：PR Summary 的测试证据区域，或[打开本轮证据页](<{evidence_url}>)。"
+                f"本轮测试视频或图片（可选）：[打开固定上传页面](<{evidence_url}>)，"
+                "也可在 PR Summary 的测试证据区域查看。"
                 if evidence_url else
-                "本轮测试证据：请查看 PR Summary 的测试证据区域；需要补充时使用 Summary 中本轮有效的上传入口。"
+                "本轮测试视频或图片为可选上传；请查看 PR Summary 的测试证据区域，"
+                "公共上传入口恢复后会出现同一个固定链接。"
             )
             await self._post_bound_notice(
                 repo, pr_number, head_sha=head, round_id=round_id,
@@ -5723,7 +5725,7 @@ class DeployController:
                 "下一步：检查 Summary 中的通过结果，并按当前仓库的 PR 流程完成后续审阅与合并。"
                 if result == "pass" else
                 "下一步：根据失败结果修复问题并更新 PR；新 HEAD 需要重新等待 Review Agent 完成审核和构建，"
-                "之后再按新的 Lifecycle Summary 重新部署并上传测试证据。"
+                "之后再按新的 Lifecycle Summary 重新部署（测试视频或图片为可选上传）。"
             )
             await self._post_bound_notice(
                 repo, pr_number, head_sha=pr_head,
@@ -8443,6 +8445,14 @@ class DeployController:
         return "\n".join(result).strip()
 
     async def _render_evidence_projection(self, repo, pr_number, state, visible):
+        evidence_service = getattr(self, "evidence_service", None)
+        schedule_backfill = getattr(
+            evidence_service, "schedule_ready_notification_backfill", None,
+        )
+        if callable(schedule_backfill):
+            # After a switch to the fixed public origin, announce attachments
+            # that were verified while only an ephemeral tunnel existed.
+            schedule_backfill(repo, pr_number)
         renderer = getattr(comments_mod, "render_evidence_section", None)
         if renderer is None:
             visible, history = self._extract_visible_history(visible)
@@ -8452,6 +8462,52 @@ class DeployController:
         records = await self.proxy.read_evidence_records(repo, pr_number)
         archives = [r["data"] for r in records if r["kind"] == "round"]
         attachments = [r["data"] for r in records if r["kind"] == "attachment"]
+        operation_candidates_by_identity = {}
+        for record in records:
+            if record.get("kind") != "operation" or not isinstance(record.get("data"), dict):
+                continue
+            operation = record["data"]
+            identity = (
+                operation.get("repo"), operation.get("pr_number"),
+                operation.get("head_sha"), operation.get("round_id"),
+                operation.get("attachment_id"),
+            )
+            if all(value is not None for value in identity):
+                operation_candidates_by_identity.setdefault(identity, []).append(
+                    (record.get("key", ""), operation),
+                )
+
+        operation_phase_rank = {
+            "prepared": 10, "initializing": 20, "uploading": 30,
+            "completing": 40, "verifying": 50, "processing": 60,
+            "ready": 70, "invalid": 80, "deleted": 90,
+        }
+
+        def operation_candidate_rank(candidate):
+            record_key, operation = candidate
+            timestamp = float("-inf")
+            for field in ("updated_at", "completed_at", "created_at"):
+                value = operation.get(field)
+                if not isinstance(value, str):
+                    continue
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                timestamp = parsed.timestamp()
+                break
+            # Deletion and invalidation are terminal. A persisted ready phase
+            # outranks stale upload phases regardless of record iteration order.
+            phase_rank = operation_phase_rank.get(operation.get("status"), 0)
+            return phase_rank, timestamp, str(record_key)
+
+        operation_records_by_identity = {
+            identity: max(candidates, key=operation_candidate_rank)[1]
+            for identity, candidates in operation_candidates_by_identity.items()
+            if candidates
+        }
         trusted_records_by_key = {
             (record.get("kind"), record.get("key")): record
             for record in records
@@ -8463,6 +8519,20 @@ class DeployController:
 
         def attachment_is_deleted(row):
             return bool(row.get("deleted_at")) or row.get("status") == "deleted"
+
+        def operation_matches_attachment(row, operation):
+            if (not isinstance(operation, dict)
+                    or operation.get("status") != "ready"
+                    or operation.get("deleted_at")
+                    or operation.get("cos_content_verified") is not True):
+                return False
+            return all(
+                operation.get(field) == row.get(field)
+                for field in (
+                    "repo", "pr_number", "head_sha", "round_id", "attachment_id",
+                    "object_key", "filename", "size", "sha256",
+                )
+            )
 
         for row in attachments:
             attachment_id = row.get("attachment_id") if isinstance(row, dict) else None
@@ -8521,7 +8591,8 @@ class DeployController:
             return uploaded_at, filename, display_uploaded_at
 
         def verified_evidence_row(
-            row, head_sha, round_id, *, archived_invite_provenance=False,
+            row, head_sha, round_id, *, operation=None,
+            archived_invite_provenance=False,
         ):
             if not isinstance(row, dict):
                 return False
@@ -8567,6 +8638,8 @@ class DeployController:
             if (not isinstance(digest, str)
                     or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
                 return False
+            if not operation_matches_attachment(row, operation):
+                return False
             if (row.get("upload_method") == "signed_invite"
                     and not archived_invite_provenance
                     and row.get("cos_content_verified") is not True):
@@ -8584,8 +8657,77 @@ class DeployController:
                 return False
             return row.get("object_key") == expected_key
 
-        confirmed_current = any(
-            verified_evidence_row(row, state.get("head_sha"), current_round)
+        store = getattr(getattr(self, "evidence_service", None), "store", None)
+
+        async def cos_object_is_verified(
+            row, head_sha, round_id, operation, *,
+            archived_invite_provenance=False,
+        ):
+            if not verified_evidence_row(
+                    row, head_sha, round_id, operation=operation,
+                    archived_invite_provenance=archived_invite_provenance):
+                return row.get("status") == "text" and verified_evidence_row(
+                    row, head_sha, round_id, operation=operation,
+                )
+            verify = getattr(store, "verify_summary_attachment", None)
+            if callable(verify):
+                try:
+                    identity = await verify(
+                        repo=repo, pr_number=pr_number, operation=operation,
+                    )
+                except Exception:
+                    return False
+            else:
+                # Older store adapters can prove readiness only by issuing a
+                # signed Summary URL, whose signer also reads back the object.
+                sign = getattr(store, "sign_summary_attachment", None)
+                if not callable(sign):
+                    return False
+                try:
+                    signed = await sign(
+                        repo=repo, pr_number=pr_number, operation=operation,
+                    )
+                except Exception:
+                    return False
+                if not isinstance(signed, dict):
+                    return False
+                identity = {
+                    "key": signed.get("object_key"),
+                    "head_sha": signed.get("head_sha"),
+                    "round_id": signed.get("round_id"),
+                    "attachment_id": signed.get("attachment_id"),
+                    "size": signed.get("size"),
+                    "sha256": signed.get("sha256"),
+                }
+            return (
+                isinstance(identity, dict)
+                and identity.get("key") == row.get("object_key")
+                and identity.get("head_sha") == head_sha
+                and identity.get("round_id") == round_id
+                and identity.get("attachment_id") == row.get("attachment_id")
+                and identity.get("size") == row.get("size")
+                and identity.get("sha256") == row.get("sha256")
+            )
+
+        verified_current = set()
+        for row in current_rows:
+            identity = (
+                repo, pr_number, row.get("head_sha"), row.get("round_id"),
+                row.get("attachment_id"),
+            )
+            operation = operation_records_by_identity.get(identity)
+            if await cos_object_is_verified(
+                    row, state.get("head_sha"), current_round, operation):
+                verified_current.add(identity)
+        confirmed_current = bool(verified_current) or any(
+            row.get("status") == "text"
+            and verified_evidence_row(
+                row, state.get("head_sha"), current_round,
+                operation=operation_records_by_identity.get((
+                    repo, pr_number, row.get("head_sha"), row.get("round_id"),
+                    row.get("attachment_id"),
+                )),
+            )
             for row in current_rows
         )
         if state.get("status") == "testing":
@@ -8679,7 +8821,7 @@ class DeployController:
                     else:
                         upload_followup = next((
                             line for line in next_action.splitlines()
-                            if line.startswith("需要补充本轮测试证据时，可")
+                            if line.startswith("如需补充测试视频或图片，可")
                         ), "")
                         next_action = "\n\n".join(
                             part for part in (
@@ -8784,6 +8926,18 @@ class DeployController:
             attachments=current_rows,
         )
         round_numbers = trusted_round_numbers(records, state, repo, pr_number)
+        if current_round not in round_numbers and state.get("status") in {"testing", "succeeded", "failed"}:
+            if not archives:
+                round_numbers[current_round] = 1
+            else:
+                max_archive_number = max(
+                    (round_numbers.get(a.get("round_id"), 0) for a in archives if isinstance(a, dict)),
+                    default=0,
+                )
+                if max_archive_number > 0:
+                    round_numbers[current_round] = max_archive_number + 1
+                else:
+                    round_numbers[current_round] = len(archives) + 1
         verified_current_round = (
             state.get("status") in {"testing", "succeeded", "failed"}
             and current_round in round_numbers
@@ -8806,10 +8960,7 @@ class DeployController:
             if is_evidence_ingress_url(configured_public_base) else ""
         )
         historical_cos_sign_budget = [24]
-        from .evidence_auth import (
-            DOWNLOAD_PURPOSE, UPLOAD_MAX_LIFETIME_SECONDS, UPLOAD_PURPOSE,
-            issue_capability, verify_capability,
-        )
+        from .evidence_auth import DOWNLOAD_PURPOSE, issue_capability
 
         # Reuse only long-lived COS URLs from the previous trusted lifecycle
         # projection. They are matched to their exact decoded object key and
@@ -8818,23 +8969,48 @@ class DeployController:
         # into hidden state or evidence records.
         store = getattr(self.evidence_service, "store", None)
         cached_cos_urls = {}
+        cached_cos_preview_urls = {}
         inferred_cos_download_urls = set()
         if backend_ready and store is not None:
             for match in re.finditer(r"<(?P<url>https://[^<>\s]+)>", previous_visible):
                 candidate = match.group("url")
                 try:
-                    from urllib.parse import unquote, urlsplit
-                    object_key = unquote(urlsplit(candidate).path.lstrip("/"))
-                    expiry = store.download_url_expiry(candidate, key=object_key)
+                    from urllib.parse import parse_qsl, unquote, urlsplit
+                    parsed = urlsplit(candidate)
+                    object_key = unquote(parsed.path.lstrip("/"))
+                    q = dict(parse_qsl(parsed.query))
+                    if q.get("response-content-disposition") == "inline":
+                        cached_cos_preview_urls.setdefault(object_key, []).append(candidate)
+                    else:
+                        expiry = store.download_url_expiry(candidate, key=object_key)
+                        if expiry is not None and expiry > cached_cos_urls.get(object_key, (0, ""))[0]:
+                            cached_cos_urls[object_key] = (expiry, candidate)
                 except (AttributeError, TypeError, ValueError):
                     continue
-                if expiry is not None and expiry > cached_cos_urls.get(object_key, (0, ""))[0]:
-                    cached_cos_urls[object_key] = (expiry, candidate)
 
         async def stable_cos_url(
             object_key, filename, *, attachment_id=None, sign_budget=None,
+            operation=None,
         ):
+            """Return a verified long-lived Summary URL, or "".
+
+            The projection channel is separate from browser downloads. For a
+            ready attachment the caller supplies its persisted record, so the
+            signer re-derives repo/PR/HEAD/round/attachment identity and
+            re-verifies the COS content SHA256 before issuing a one-year URL
+            that must pass ``download_url_expiry``. Lifecycle logs keep the
+            narrower key-only path because they have no attachment identity.
+            """
             if not backend_ready or store is None:
+                return ""
+            using_summary_signer = False
+            if (operation is not None and attachment_id
+                    and callable(getattr(store, "sign_summary_attachment", None))):
+                sign = store.sign_summary_attachment
+                using_summary_signer = True
+            else:
+                sign = getattr(store, "issue_projection_url", None)
+            if not callable(sign):
                 return ""
             cached = cached_cos_urls.get(object_key)
             now = int(time.time())
@@ -8846,7 +9022,9 @@ class DeployController:
                 if checked_expiry is not None:
                     cached = (checked_expiry, cached[1])
                     cached_cos_urls[object_key] = cached
-                    if checked_expiry - now > 7 * 24 * 60 * 60:
+                    # Re-sign close to expiry so the Summary never shows a
+                    # link that dies within its own projection window.
+                    if checked_expiry - now > 30 * 24 * 60 * 60:
                         return cached[1]
                 else:
                     cached = None
@@ -8855,13 +9033,20 @@ class DeployController:
             if sign_budget is not None:
                 sign_budget[0] -= 1
             try:
-                candidate = await store._io(
-                    store.issue_download_url, key=object_key, filename=filename,
-                )
-                expiry = store.download_url_expiry(
-                    candidate, key=object_key, filename=filename,
-                    attachment_id=attachment_id,
-                )
+                if using_summary_signer:
+                    signed = await sign(
+                        repo=repo, pr_number=pr_number, operation=operation,
+                    )
+                    candidate, expiry = signed["url"], signed["expires_at"]
+                else:
+                    candidate = await store._io(
+                        sign, key=object_key, filename=filename,
+                        attachment_id=attachment_id,
+                    )
+                    expiry = store.download_url_expiry(
+                        candidate, key=object_key, filename=filename,
+                        attachment_id=attachment_id,
+                    )
                 if expiry is not None and expiry > now:
                     cached_cos_urls[object_key] = (expiry, candidate)
                     return candidate
@@ -8873,6 +9058,73 @@ class DeployController:
             if cached and cached[0] > now:
                 return cached[1]
             return ""
+
+        async def stable_cos_preview_url(
+            object_key, filename, *, attachment_id, sign_budget=None,
+            operation=None,
+        ):
+            """Return a validated long-lived inline media URL, or "".
+
+            Images are inlined for direct display and videos for a clickable
+            playback preview. Both are bound to the persisted attachment
+            identity and checked by the same one-year projection window.
+            """
+            if not backend_ready or store is None:
+                return ""
+            text = str(filename or "")
+            suffix = text.rsplit(".", 1)[-1].lower() if "." in text else ""
+            if suffix not in {"png", "jpg", "jpeg", "gif", "webp", "mp4", "webm"}:
+                return ""
+            sign = getattr(store, "sign_summary_attachment", None)
+            using_summary_signer = bool(operation is not None and callable(sign))
+            if using_summary_signer:
+                project, validate = sign, store.projection_inline_url_expiry
+                images_only = False
+            else:
+                project = getattr(store, "issue_projection_preview_url", None)
+                validate = getattr(store, "projection_preview_url_expiry", None)
+                images_only = True
+                if suffix not in {"png", "jpg", "jpeg", "gif", "webp"}:
+                    return ""
+            if not callable(project) or not callable(validate):
+                return ""
+            now = int(time.time())
+            cached_candidates = cached_cos_preview_urls.get(object_key, [])
+            for prev_url in cached_candidates:
+                try:
+                    checked_expiry = validate(
+                        prev_url, key=object_key, filename=text,
+                        attachment_id=attachment_id,
+                    )
+                except Exception:
+                    checked_expiry = None
+                if checked_expiry is not None and checked_expiry - now > 30 * 24 * 60 * 60:
+                    return prev_url
+            if sign_budget is not None and sign_budget[0] <= 0:
+                return ""
+            if sign_budget is not None:
+                sign_budget[0] -= 1
+            try:
+                if using_summary_signer:
+                    signed = await sign(
+                        repo=repo, pr_number=pr_number, operation=operation,
+                        inline=True,
+                    )
+                    candidate, expiry = signed["url"], signed["expires_at"]
+                else:
+                    candidate = await store._io(
+                        project, key=object_key, filename=text,
+                        attachment_id=attachment_id,
+                    )
+                    expiry = validate(
+                        candidate, key=object_key, filename=text,
+                        attachment_id=attachment_id,
+                    )
+            except Exception as exc:
+                logger.warning("COS evidence preview refresh failed %s#%s exception=%s",
+                               repo, pr_number, type(exc).__name__)
+                return ""
+            return candidate if expiry is not None and expiry > int(time.time()) else ""
 
         async def bind_download_capabilities(
             rows, head_sha, round_id, *, include_cos_urls=True,
@@ -8899,9 +9151,11 @@ class DeployController:
                     item.pop("uploaded_at", None)
                 attachment_id = item.get("attachment_id")
                 identity = (repo, pr_number, head_sha, round_id, attachment_id)
+                operation = operation_records_by_identity.get(identity)
                 valid_row = (
                     verified_evidence_row(
                         item, head_sha, round_id,
+                        operation=operation,
                         archived_invite_provenance=(
                             identity in legacy_signed_invite_identities
                         ),
@@ -8912,6 +9166,13 @@ class DeployController:
                     and isinstance(item.get("sha256"), str)
                     and re.fullmatch(r"[0-9a-f]{64}", item.get("sha256", "")) is not None
                 )
+                if valid_row:
+                    valid_row = await cos_object_is_verified(
+                        item, head_sha, round_id, operation,
+                        archived_invite_provenance=(
+                            identity in legacy_signed_invite_identities
+                        ),
+                    )
                 if valid_row:
                     uploaded_at, filename, display_uploaded_at = attachment_key_inputs(item)
                     try:
@@ -8935,9 +9196,9 @@ class DeployController:
                                 item.pop("created_at", None)
                                 item.pop("uploaded_at", None)
                 item["cos_projection_verified"] = bool(valid_row)
-                if valid_row and identity in legacy_signed_invite_identities:
-                    # Render-only evidence from the paired trusted archive
-                    # operation authorizes this compatibility projection.
+                if valid_row:
+                    # Render-only proof: the persisted ready records agreed
+                    # and COS read-back matched the attachment SHA256.
                     item["cos_content_verified"] = True
                 if (valid_row and isinstance(attachment_id, str)
                         and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id)):
@@ -8973,6 +9234,7 @@ class DeployController:
                             expected_key, item.get("filename", ""),
                             attachment_id=attachment_id,
                             sign_budget=cos_sign_budget,
+                            operation=operation,
                         )
                         if cos_url:
                             item["cos_download_url"] = cos_url
@@ -8992,6 +9254,23 @@ class DeployController:
                         # attachment-scoped API when clicked; do not sign every
                         # archived COS object on each Summary projection.
                         item.pop("cos_download_url", None)
+                    # Temporary public ingress compatibility: when no stable
+                    # Controller origin is available the Summary carries the
+                    # validated COS link directly instead of dropping the
+                    # already-verified attachment. Quick Tunnel URLs are never
+                    # persisted here.
+                    item.pop("cos_preview_url", None)
+                    if (item.get("cos_download_url")
+                            and not public_base_url):
+                        preview_url = await stable_cos_preview_url(
+                            expected_key, item.get("filename", ""),
+                            attachment_id=attachment_id,
+                            sign_budget=cos_sign_budget,
+                            operation=operation,
+                        )
+                        if preview_url:
+                            item["cos_preview_url"] = preview_url
+                            inferred_cos_download_urls.add(preview_url)
                 else:
                     item.pop("download_capability", None)
                     item.pop("cos_download_url", None)
@@ -9039,51 +9318,9 @@ class DeployController:
                 self.config, repo, pr_number, state["head_sha"], current_round,
                 purpose=DOWNLOAD_PURPOSE, resource="page",
             )
-            if browser_upload_ready and state.get("status") == "testing":
-                upload_capability = ""
-                page_path = comments_mod._evidence_path(repo, pr_number).replace(
-                    "/api/evidence/", "/evidence/", 1,
-                )
-                try:
-                    configured_origin = urlsplit(upload_public_base_url)
-                    now = int(time.time())
-                    for match in re.finditer(
-                            r"\[打开附件页\]\(<(?P<url>https://[^<>\s]+)>\)", previous_visible):
-                        candidate = urlsplit(match.group("url"))
-                        if (candidate.scheme != "https"
-                                or candidate.netloc.casefold() != configured_origin.netloc.casefold()
-                                or candidate.path != page_path or candidate.fragment):
-                            continue
-                        query = parse_qs(candidate.query, strict_parsing=True)
-                        values = query.get("cap")
-                        if set(query) != {"cap"} or not isinstance(values, list) or len(values) != 1:
-                            continue
-                        token = values[0]
-                        claims = verify_capability(
-                            self.config, token, repo, pr_number, purpose=UPLOAD_PURPOSE,
-                        )
-                        if (claims.get("head") == state.get("head_sha")
-                                and claims.get("round") == current_round
-                                and claims.get("status") == "testing"
-                                and claims.get("expires_at", 0) > now):
-                            upload_capability = token
-                            break
-                except Exception:
-                    # Old, expired or malformed Summary capabilities are never
-                    # trusted; issue a fresh one bound to the current round.
-                    upload_capability = ""
-                if not upload_capability:
-                    try:
-                        upload_capability = issue_capability(
-                            self.config, repo, pr_number, state["head_sha"], current_round,
-                            purpose=UPLOAD_PURPOSE,
-                            expires_at=int(time.time()) + UPLOAD_MAX_LIFETIME_SECONDS,
-                        )
-                    except (OverflowError, TypeError, ValueError):
-                        logger.warning("Evidence upload capability unavailable %s#%s",
-                                       repo, pr_number)
-                if upload_capability:
-                    render_state["upload_capability"] = upload_capability
+            # The public upload entry is the permanent per-PR path; the upload
+            # session itself is minted only when that page is opened and is
+            # never stored in the Summary. No capability is projected here.
             render_state["log_capability"] = issue_capability(
                 self.config, repo, pr_number, state["head_sha"], current_round,
                 purpose=DOWNLOAD_PURPOSE, resource="log:" + current_round,
@@ -9284,13 +9521,21 @@ class DeployController:
             return download_url_expiry(
                 url, key=key, filename=filename, attachment_id=attachment_id,
             )
+        inline_url_expiry = getattr(store, "projection_inline_url_expiry", None)
+        def validate_cos_inline_url(url, *, key, filename, attachment_id):
+            if not callable(inline_url_expiry):
+                return None
+            return inline_url_expiry(
+                url, key=key, filename=filename, attachment_id=attachment_id,
+            )
         section = renderer(repo, pr_number, render_state, current_rows[-20:], bundles,
                            public_base_url=public_base_url,
                            upload_public_base_url=(
                                upload_public_base_url
                                if backend_ready and attachment_access_allowed else ""
                            ),
-                           cos_download_url_expiry=validate_cos_download_url)
+                           cos_download_url_expiry=validate_cos_download_url,
+                           cos_inline_url_expiry=validate_cos_inline_url)
         if not isinstance(section, str):
             raise GitHubStateProxyError("Evidence renderer must return markdown")
         section = remove_attachment_page_download_links(section)
@@ -9364,13 +9609,14 @@ class DeployController:
             # carrying a display-only round number into the upload-only UI.
             compact_state.pop("round_number", None)
             compact_section = renderer(
-                repo, pr_number, compact_state, compact_current_rows, [],
+                repo, pr_number, compact_state, compact_current_rows, bundles,
                 public_base_url=public_base_url,
                 upload_public_base_url=(
                     upload_public_base_url
                     if backend_ready and attachment_access_allowed else ""
                 ),
                 cos_download_url_expiry=validate_cos_download_url,
+                cos_inline_url_expiry=validate_cos_inline_url,
             )
             if not isinstance(compact_section, str):
                 raise GitHubStateProxyError(
@@ -9384,19 +9630,19 @@ class DeployController:
                 )
             body = projection_body(compact_section)
             if _count_visible_bytes(body) > _MAX_VISIBLE_LIFECYCLE_BYTES:
-                # Re-render only the current HEAD/round upload entry. Keep the
-                # same renderer and capability inputs as normal presentation;
-                # never append attachment, archive, or deployment history here.
+                # Drop attachment rows if needed, while retaining the current
+                # and archived round structure in the compact Summary.
                 minimal_state = copy.deepcopy(compact_state)
                 minimal_state["attachments"] = []
                 minimal_section = renderer(
-                    repo, pr_number, minimal_state, [], [],
+                    repo, pr_number, minimal_state, [], bundles,
                     public_base_url=public_base_url,
                     upload_public_base_url=(
                         upload_public_base_url
                         if backend_ready and attachment_access_allowed else ""
                     ),
                     cos_download_url_expiry=validate_cos_download_url,
+                    cos_inline_url_expiry=validate_cos_inline_url,
                 )
                 if not isinstance(minimal_section, str):
                     raise GitHubStateProxyError(
@@ -10158,7 +10404,14 @@ class DeployController:
         self, repo: str, pr_number: int, *, head_sha: str, round_id: str,
         approval_comment_id: int,
     ) -> str:
-        """Return only the current Summary's verified upload link for this testing round."""
+        """Return the permanent per-PR upload address while this round tests.
+
+        The address depends only on the configured stable origin, the repository
+        and the PR number. It never embeds HEAD, round, expiry or a capability:
+        authority is minted by the page from trusted GitHub state. The trusted
+        Summary must already advertise that entry; a legacy ``?cap=`` reference
+        is still accepted for compatibility but is never returned.
+        """
         try:
             pr = await self.proxy.get_pr(repo, pr_number)
             state = await self.proxy.read_hidden_state(repo, pr_number)
@@ -10211,7 +10464,12 @@ class DeployController:
             ).rstrip("/")
             if not is_evidence_ingress_url(configured_origin):
                 return ""
-            configured_parts = urlsplit(configured_origin)
+            page_path = comments_mod._evidence_path(repo, pr_number).replace(
+                "/api/evidence/", "/evidence/", 1,
+            )
+            if not page_path.startswith("/evidence/"):
+                return ""
+            fixed_url = configured_origin + page_path
 
             comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
             body = comment.get("body") if isinstance(comment, dict) else None
@@ -10234,22 +10492,26 @@ class DeployController:
             if not candidate:
                 return ""
             parsed = urlsplit(candidate)
+            configured_parts = urlsplit(configured_origin)
             if (parsed.scheme != "https"
                     or parsed.netloc.casefold() != configured_parts.netloc.casefold()):
                 return ""
-            query = parse_qs(parsed.query, strict_parsing=True)
-            values = query.get("cap")
-            if set(query) != {"cap"} or not isinstance(values, list) or len(values) != 1:
-                return ""
-            claims = verify_capability(
-                self.config, values[0], repo, pr_number,
-                purpose=UPLOAD_PURPOSE,
-            )
-            if (claims.get("head") != head_sha
-                    or claims.get("round") != round_id
-                    or claims.get("status") != "testing"):
-                return ""
-            return candidate
+            if parsed.query:
+                # Legacy Summary reference: verify it was minted for this exact
+                # round, then hand out only the parameter-free permanent path.
+                query = parse_qs(parsed.query, strict_parsing=True)
+                values = query.get("cap")
+                if set(query) != {"cap"} or not isinstance(values, list) or len(values) != 1:
+                    return ""
+                claims = verify_capability(
+                    self.config, values[0], repo, pr_number,
+                    purpose=UPLOAD_PURPOSE,
+                )
+                if (claims.get("head") != head_sha
+                        or claims.get("round") != round_id
+                        or claims.get("status") != "testing"):
+                    return ""
+            return fixed_url
         except Exception as exc:
             logger.warning("current testing upload link unavailable %s#%s exception=%s",
                            repo, pr_number, type(exc).__name__)
@@ -10647,7 +10909,8 @@ class DeployController:
                         next_action = "等待当前 HEAD 的 Review Agent 审核与镜像构建结果，再按更新后的 Summary 操作。"
                 elif intent == "request_acceptance":
                     next_action = (
-                        "确认 Lifecycle 为 `testing`、测试证据已上传，并由本轮实际部署机器 Owner 执行 `/request_acceptance`。"
+                        "确认 Lifecycle 为 `testing`，并由本轮实际部署机器 Owner 执行 "
+                        "`/request_acceptance`；测试视频或图片上传完全可选。"
                     )
                 elif intent == "record_test":
                     next_action = (
@@ -10655,7 +10918,10 @@ class DeployController:
                         "`/record_test result=pass` 或 `/record_test result=fail`。"
                     )
                 elif status == "testing":
-                    next_action = "查看 PR Summary 中的测试证据入口；测试完成后由本轮机器 Owner 执行 `/request_acceptance`。"
+                    next_action = (
+                        "查看 PR Summary 中的固定上传链接（可选上传测试视频或图片，方便验收人了解实际效果）；"
+                        "测试完成后由本轮机器 Owner 执行 `/request_acceptance`。"
+                    )
                 elif status in {"review-required", "reviewing", "no-lifecycle"}:
                     next_action = "等待 Review Agent 完成当前 HEAD 的审核和镜像构建，并查看 PR Summary。"
                 else:

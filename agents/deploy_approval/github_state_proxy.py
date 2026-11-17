@@ -20,7 +20,9 @@ Responsibilities:
 - preserve non-status labels
 - enforce trusted identity on lifecycle hidden state
 - persist cursor while preserving exact visible markdown (no stale state write)
-- persist immutable per-PR evidence in a dedicated Git Notes ref
+- persist immutable per-PR evidence in a dedicated Git Notes ref, or in the
+  configured COS record backend when Git Data writes are denied
+- never publish internal evidence records as user-visible PR comments
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ from typing import Any
 
 from .config import Config
 from .image_ref import validate_image_ref
-from .github_client import GitHubClient, GitHubError
+from .github_client import GitHubClient, GitHubError, GitHubRefConflict
 from .comments import beijing_now_str
 
 logger = logging.getLogger(__name__)
@@ -68,9 +70,10 @@ _MAX_HIDDEN_STATE_BYTES = 8192
 # Maximum lifecycle comment body size (64 KB)
 _MAX_COMMENT_BODY_BYTES = 65536
 _MAX_EVIDENCE_DATA_BYTES = 8 * 1024 * 1024
-_EVIDENCE_SINGLE_RECORD_MAX_BYTES = 24000
-_EVIDENCE_PART_BYTES = 24000
 _EVIDENCE_MAX_PARTS = 512
+# Bounded compare-and-swap attempts for the per-PR Git Notes ref. Each retry
+# re-reads the ref and merges, never overwriting another writer's records.
+_EVIDENCE_GIT_REF_RETRIES = 5
 
 # Maximum visible lifecycle markdown soft budget (48 KiB)
 _MAX_VISIBLE_LIFECYCLE_BYTES = 48 * 1024
@@ -131,6 +134,10 @@ class MultipleTrustedCommentsError(GitHubStateProxyError):
 class MalformedHiddenStateError(GitHubStateProxyError):
     """Hidden state JSON is malformed or fails validation."""
     pass
+
+
+class _GitNotesPermissionDenied(Exception):
+    """The installation can read but not write the Git Notes ref (HTTP 403)."""
 
 
 class TrustedIdentityRequiredError(GitHubStateProxyError):
@@ -1499,11 +1506,6 @@ class GitHubStateProxy:
         except ValueError:
             raise GitHubStateProxyError("Malformed trusted evidence envelope")
 
-    @staticmethod
-    def _evidence_visible_description(envelope: dict) -> str:
-        """Keep the record envelope recoverable without rendering storage copy."""
-        return "<!-- deploy-approval-evidence-record:v1 -->"
-
     async def ensure_visible_evidence_archive_comments(
         self, repo: str, pr_number: int, limit: int = 10,
     ) -> int:
@@ -1662,8 +1664,6 @@ class GitHubStateProxy:
             "created_at", "updated_at", "completed_at", "deleted_at",
             "invalidated_at", "archived_at", "ended_at",
         }
-        if kind == "round":
-            volatile.add("reason")
         return ({key: value for key, value in left.items() if key not in volatile}
                 == {key: value for key, value in right.items() if key not in volatile})
 
@@ -1739,7 +1739,7 @@ class GitHubStateProxy:
         except GitHubStateProxyError:
             # Some installations can read refs but not commit/tree/blob data.
             # Re-verify the public repository and the same ref anonymously;
-            # never reinterpret a failed authenticated read as empty history.
+            # ref is known to exist, so allow_missing=False. Never reinterpret failed read as empty history!
             return await self._read_public_git_note_records(repo, pr_number, ref, allow_missing=False)
 
     async def _public_git_data(self, repo: str, path: str, *, params: dict | None = None) -> dict:
@@ -1761,13 +1761,18 @@ class GitHubStateProxy:
         if (type(pr_number) is not int or pr_number <= 0
                 or ref != self._evidence_note_ref(pr_number)):
             raise GitHubStateProxyError("Git Notes evidence ref identity is invalid")
+        if allow_missing:
+            await self._confirm_public_evidence_repository(repo, pr_number)
         try:
             ref_data = await self._public_git_data(repo, f"git/ref/{ref}")
         except GitHubStateProxyError as exc:
             cause = exc
             while cause is not None and getattr(cause, "status_code", None) != 404:
                 cause = cause.__cause__
-            if allow_missing and cause is not None:
+            if allow_missing and cause is not None and getattr(cause, "status_code", None) == 404:
+                # Recheck visibility after the exact ref lookup too: an
+                # anonymous 404 can also hide a repository that became private.
+                await self._confirm_public_evidence_repository(repo, pr_number)
                 return []
             raise GitHubStateProxyError("Git Notes evidence ref could not be verified publicly") from exc
         target = ref_data.get("object") if isinstance(ref_data, dict) else None
@@ -1779,6 +1784,31 @@ class GitHubStateProxy:
         return await self._read_git_note_commit_records(
             repo, pr_number, commit_sha, public=True,
         )
+
+    async def _confirm_public_evidence_repository(self, repo: str, pr_number: int) -> None:
+        """Prove anonymous access to this PR's base repository before accepting a 404.
+
+        GitHub's anonymous API also returns 404 for private repositories. A
+        404 from the note-ref request therefore means "missing" only after an
+        authenticated PR snapshot identifies the expected public base repo
+        and an anonymous read confirms one of that repo's real Git objects.
+        """
+        try:
+            pr = await self._github.get_pr(repo, pr_number)
+        except Exception as exc:
+            raise GitHubStateProxyError(
+                "Git Notes evidence repository visibility could not be verified") from exc
+        base = pr.get("base") if isinstance(pr, dict) else None
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        base_sha = base.get("sha") if isinstance(base, dict) else None
+        full_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+        is_private = base_repo.get("private") if isinstance(base_repo, dict) else None
+        if (full_name != repo or is_private is not False
+                or not isinstance(base_sha, str)
+                or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None):
+            raise GitHubStateProxyError(
+                "Git Notes evidence repository is not confirmed public")
+        await self._public_git_data(repo, f"git/commits/{base_sha}")
 
     async def _read_git_note_commit_records(
         self, repo: str, pr_number: int, commit_sha: str, *, public: bool = False,
@@ -1861,13 +1891,46 @@ class GitHubStateProxy:
             raise GitHubStateProxyError("Git Notes evidence integrity validation failed") from exc
 
     async def read_evidence_records(self, repo: str, pr_number: int) -> list[dict]:
-        """Read Git Notes records and trusted legacy comment records."""
+        """Merge internal records (Git Notes, COS) with legacy comment records.
+
+        Every source is authoritative: an unreadable source is never treated as
+        empty history, and two records with the same kind+key but different
+        immutable business content fail closed. Legacy comment records keep
+        their ``comment_id`` so existing callers remain unchanged.
+        """
         self._evidence_repo_guard(repo)
         if type(pr_number) is not int or pr_number <= 0:
             raise GitHubStateProxyError("Evidence PR identity is invalid")
-        result = await self._read_git_note_evidence_records(repo, pr_number)
-        seen = {(row["kind"], row["key"]): row["data"]
-                for row in result}
+        result: list[dict] = []
+        seen: dict[tuple[str, str], dict] = {}
+        seen_sources: dict[tuple[str, str], str] = {}
+
+        def merge(record: dict, source: str) -> None:
+            identity = (record["kind"], record["key"])
+            previous = seen.get(identity)
+            if previous is not None:
+                if not self._same_evidence_operation(
+                        identity[0], previous["data"], record["data"]):
+                    raise GitHubStateProxyError(
+                        "Conflicting immutable evidence record "
+                        f"{identity[0]}:{identity[1]} between "
+                        f"{seen_sources[identity]} and {source}")
+                if (type(record.get("comment_id")) is int
+                        and type(previous.get("comment_id")) is not int):
+                    # Keep the legacy comment identity on an otherwise
+                    # identical record so old callers see the same shape.
+                    previous.update(comment_id=record["comment_id"],
+                                    url=record.get("url", ""))
+                return
+            seen[identity] = record
+            seen_sources[identity] = source
+            result.append(record)
+
+        for record in await self._read_git_note_evidence_records(repo, pr_number):
+            merge(dict(record), "Git Notes")
+        for record in await self._read_internal_evidence_records(repo, pr_number):
+            merge(record, "COS")
+
         comments = await self.get_issue_comments(repo, pr_number)
         expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
         trusted = {c["id"]: c for c in comments
@@ -1907,15 +1970,9 @@ class GitHubStateProxy:
         def add_record(envelope, comment, raw=None, data=None):
             if raw is None or data is None:
                 raw, data = decode_document(envelope)
-            key = (envelope["kind"], envelope["key"])
-            if key in seen:
-                if not self._same_evidence_operation(key[0], seen[key], data):
-                    raise GitHubStateProxyError("Conflicting immutable evidence documents")
-                return
-            seen[key] = data
-            result.append({"kind": key[0], "key": key[1], "data": data,
-                           "comment_id": comment["id"], "url": comment.get("html_url", ""),
-                           "sha256": envelope["sha256"]})
+            merge({"kind": envelope["kind"], "key": envelope["key"], "data": data,
+                   "comment_id": comment["id"], "url": comment.get("html_url", ""),
+                   "sha256": envelope["sha256"]}, "legacy comments")
 
         for comment in trusted.values():
             envelope = self._evidence_envelope(comment)
@@ -1965,13 +2022,170 @@ class GitHubStateProxy:
             record.get("comment_id", 0), record["kind"], record["key"],
         ))
 
+    def _record_backend(self):
+        """Lazily build the COS fallback; nothing is imported at module load."""
+        backend = getattr(self, "_evidence_record_backend", None)
+        if backend is None:
+            from .evidence_record_backend import CosEvidenceRecordBackend
+            backend = CosEvidenceRecordBackend(self.config)
+            self._evidence_record_backend = backend
+        return backend
+
+    async def _read_internal_evidence_records(
+        self, repo: str, pr_number: int,
+    ) -> list[dict]:
+        """Read the COS record backend, if it is configured for this deployment."""
+        from .evidence_record_backend import EvidenceRecordBackendError
+        backend = self._record_backend()
+        if not backend.configured():
+            return []
+        try:
+            return await backend.read(repo, pr_number)
+        except EvidenceRecordBackendError as exc:
+            raise GitHubStateProxyError(
+                "Internal evidence record backend could not be read") from exc
+
+    async def _write_internal_evidence_record(
+        self, repo: str, pr_number: int, kind: str, key: str, data: dict,
+    ) -> dict:
+        """Fallback durability path used only when Git Data writes are denied."""
+        from .evidence_record_backend import EvidenceRecordBackendError
+        backend = self._record_backend()
+        if not backend.configured():
+            raise GitHubStateProxyError(
+                "Git Notes evidence write is denied and no internal record backend is configured")
+        try:
+            return await backend.append(
+                repo=repo, pr_number=pr_number, kind=kind, key=key, data=data)
+        except EvidenceRecordBackendError as exc:
+            raise GitHubStateProxyError(
+                "Internal evidence record persistence failed") from exc
+
+    async def _write_git_note_evidence_record(
+        self, repo: str, pr_number: int, kind: str, key: str, data: dict,
+        *, head_sha: str, round_id: str, digest: str,
+        assert_writable_pr,
+    ) -> dict:
+        """Append one record to the dedicated per-PR Git Notes ref.
+
+        Ref updates are non-forced compare-and-swap. A 409/422 rereads the ref
+        and merges every existing record, so a concurrent writer is never
+        overwritten. The ref, commit, tree and blob identities are verified
+        before the write is reported as stored.
+        """
+        ref = self._evidence_note_ref(pr_number)
+        target_raw, path = self._evidence_note_target(kind, key, data)
+        note_raw = self._canonical_evidence_data({
+            "version": 1, "repo": repo, "pr_number": pr_number, "kind": kind,
+            "key": key, "head_sha": head_sha, "round_id": round_id,
+            "sha256": digest, "data": data,
+        })
+        if len(note_raw) > _MAX_EVIDENCE_DATA_BYTES:
+            raise GitHubStateProxyError("Evidence Git Notes record exceeds safe capacity")
+
+        for _attempt in range(_EVIDENCE_GIT_REF_RETRIES):
+            await assert_writable_pr()
+            try:
+                ref_data = await self._github.get_git_ref(repo, ref)
+            except GitHubError as exc:
+                status = getattr(exc, "status_code", None)
+                if status == 404:
+                    ref_data = None
+                elif status == 403:
+                    raise _GitNotesPermissionDenied() from exc
+                else:
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence ref could not be read") from exc
+            base_commit = base_tree = None
+            if ref_data is not None:
+                target = ref_data.get("object") if isinstance(ref_data, dict) else None
+                base_commit = target.get("sha") if isinstance(target, dict) else None
+                if (not isinstance(target, dict) or target.get("type") != "commit"
+                        or not isinstance(base_commit, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", base_commit)):
+                    raise GitHubStateProxyError("Git Notes evidence ref is malformed")
+                try:
+                    commit = await self._github.get_git_commit(repo, base_commit)
+                except GitHubError as exc:
+                    if getattr(exc, "status_code", None) == 403:
+                        raise _GitNotesPermissionDenied() from exc
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence base commit could not be read") from exc
+                base_tree = (commit.get("tree") or {}).get("sha")
+                if (not isinstance(base_tree, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", base_tree)):
+                    raise GitHubStateProxyError("Git Notes evidence base tree is malformed")
+                for record in await self._read_git_note_commit_records(
+                        repo, pr_number, base_commit):
+                    if (record["kind"], record["key"]) == (kind, key):
+                        if not self._same_evidence_operation(kind, record["data"], data):
+                            raise GitHubStateProxyError("Immutable evidence record conflicts")
+                        return record
+            try:
+                # Creating the identity blob first proves that the canonical
+                # record bytes hash to the tree path this reader requires.
+                target_blob = await self._github.create_git_blob(
+                    repo, target_raw.decode("utf-8"))
+                if not isinstance(target_blob, dict) or target_blob.get("sha") != path:
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence target object was not confirmed")
+                blob = await self._github.create_git_blob(repo, note_raw.decode("utf-8"))
+                blob_sha = blob.get("sha") if isinstance(blob, dict) else None
+                if (not isinstance(blob_sha, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", blob_sha)):
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence blob creation was not confirmed")
+                tree = await self._github.create_git_tree(
+                    repo, [{"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}],
+                    base_tree=base_tree,
+                )
+                tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+                if (not isinstance(tree_sha, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", tree_sha)):
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence tree creation was not confirmed")
+                commit = await self._github.create_git_commit(
+                    repo, "Store Deploy Approval evidence record", tree_sha,
+                    [base_commit] if base_commit else [],
+                )
+                commit_sha = commit.get("sha") if isinstance(commit, dict) else None
+                if (not isinstance(commit_sha, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", commit_sha)):
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence commit creation was not confirmed")
+                await assert_writable_pr()
+                if base_commit:
+                    await self._github.update_git_ref(repo, ref, commit_sha)
+                else:
+                    await self._github.create_git_ref(repo, ref, commit_sha)
+            except GitHubRefConflict:
+                # Another writer advanced the ref. Reread and merge.
+                continue
+            except GitHubError as exc:
+                status = getattr(exc, "status_code", None)
+                if status == 403:
+                    raise _GitNotesPermissionDenied() from exc
+                raise GitHubStateProxyError(
+                    "Git Notes evidence persistence failed") from exc
+            readback = await self._read_git_note_evidence_records(repo, pr_number)
+            result = next((item for item in readback
+                           if item.get("kind") == kind and item.get("key") == key), None)
+            if result is None or result.get("sha256") != digest:
+                raise GitHubStateProxyError("Git Notes evidence write readback failed")
+            return result
+        raise GitHubStateProxyError(
+            "Git Notes evidence ref remained contended after bounded retries")
+
     async def write_evidence_record(
         self, repo: str, pr_number: int, kind: str, key: str, data: dict,
     ) -> dict:
-        """Persist one immutable record as a trusted, bounded GitHub comment.
+        """Persist one immutable evidence record outside the PR conversation.
 
-        Git Notes remain readable for migration compatibility, but writing an
-        evidence record does not require Git Data API write permission.
+        Records go to the dedicated Git Notes ref. If the GitHub App lacks Git
+        Data write permission they go to the configured COS record backend.
+        Neither path posts an issue comment, so upload phases never appear as
+        user-visible bot comments. The returned dict may omit ``comment_id``
+        when the record was not read from a legacy evidence comment.
         """
         self._evidence_repo_guard(repo)
         if (not isinstance(repo, str) or type(pr_number) is not int or pr_number <= 0
@@ -2019,8 +2233,6 @@ class GitHubStateProxy:
             raise GitHubStateProxyError("Evidence snapshot exceeds safe archive capacity")
         digest = hashlib.sha256(raw).hexdigest()
 
-        expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
-
         async def assert_writable_pr() -> None:
             self._evidence_repo_guard(repo)
             pr = await self.get_pr(repo, pr_number)
@@ -2030,207 +2242,34 @@ class GitHubStateProxy:
             if kind != "round" and (pr.get("head") or {}).get("sha") != head_sha:
                 raise GitHubStateProxyError("Evidence record HEAD no longer matches the PR")
 
-        # Read Notes before comments. A permission failure is not equivalent
-        # to an empty ref: fail closed rather than forking an unreadable history.
-        existing_records = await self.read_evidence_records(repo, pr_number)
-        for record in existing_records:
+        # Legacy Git Notes, internal COS records and old trusted comments are all
+        # read before any write. An unreadable source fails closed rather than
+        # forking a new history that could shadow existing records.
+        for record in await self.read_evidence_records(repo, pr_number):
             if (record.get("kind"), record.get("key")) == (kind, key):
                 if not self._same_evidence_operation(kind, record.get("data"), data):
                     raise GitHubStateProxyError("Immutable evidence record conflicts")
                 return record
 
-        comments = await self.get_issue_comments(repo, pr_number)
-        trusted = {
-            item["id"]: item for item in comments
-            if type(item.get("id")) is int and item["id"] > 0
-            and item.get("issue_url") == expected_url and self.is_bot_comment(item)
-        }
-        pending: dict[str, dict[int, dict]] = {}
-        for comment in trusted.values():
-            envelope = self._evidence_envelope(comment)
-            if (envelope and envelope.get("type") == "part"
-                    and envelope.get("repo") == repo
-                    and envelope.get("pr_number") == pr_number
-                    and envelope.get("kind") == kind and envelope.get("key") == key):
-                digest_value, index = envelope.get("sha256"), envelope.get("index")
-                if (not isinstance(digest_value, str)
-                        or re.fullmatch(r"[0-9a-f]{64}", digest_value) is None
-                        or type(index) is not int or not 0 <= index < _EVIDENCE_MAX_PARTS):
-                    raise GitHubStateProxyError("Malformed pending evidence part")
-                indexed = pending.setdefault(digest_value, {})
-                previous = indexed.get(index)
-                if previous is not None and previous != envelope:
-                    raise GitHubStateProxyError("Conflicting duplicate evidence parts")
-                indexed[index] = envelope
+        await assert_writable_pr()
+        try:
+            result = await self._write_git_note_evidence_record(
+                repo, pr_number, kind, key, data,
+                head_sha=head_sha, round_id=round_id, digest=digest,
+                assert_writable_pr=assert_writable_pr,
+            )
+        except _GitNotesPermissionDenied:
+            # The App can read Git Notes but cannot write Git Data. Persist the
+            # same record to the configured COS backend; never fall back to a
+            # user-visible PR comment.
+            result = await self._write_internal_evidence_record(
+                repo, pr_number, kind, key, data)
 
-        def decode_complete_parts(part_digest: str, indexed_parts: dict[int, dict]):
-            indices = sorted(indexed_parts)
-            if not indices or indices != list(range(len(indices))):
-                return None
-            try:
-                chunks = [base64.b64decode(indexed_parts[index]["data"], validate=True)
-                          for index in indices]
-                if (any(len(chunk) != _EVIDENCE_PART_BYTES for chunk in chunks[:-1])
-                        or not 0 < len(chunks[-1]) <= _EVIDENCE_PART_BYTES):
-                    return None
-                candidate_raw = b"".join(chunks)
-                if (len(candidate_raw) > _MAX_EVIDENCE_DATA_BYTES
-                        or hashlib.sha256(candidate_raw).hexdigest() != part_digest):
-                    return None
-
-                def unique_object(pairs):
-                    value = {}
-                    for name, item in pairs:
-                        if name in value:
-                            raise ValueError("duplicate evidence JSON key")
-                        value[name] = item
-                    return value
-
-                candidate = json.loads(candidate_raw, object_pairs_hook=unique_object)
-                if (not isinstance(candidate, dict)
-                        or self._canonical_evidence_data(candidate) != candidate_raw
-                        or candidate.get("repo") != repo
-                        or type(candidate.get("pr_number")) is not int
-                        or candidate.get("pr_number") != pr_number):
-                    return None
-                candidate_head, candidate_round = candidate.get("head_sha"), candidate.get("round_id")
-                if (not isinstance(candidate_head, str)
-                        or re.fullmatch(r"[0-9a-f]{40}", candidate_head) is None
-                        or not isinstance(candidate_round, str)
-                        or re.fullmatch(re.escape(candidate_head) + r"-[0-9]+", candidate_round) is None):
-                    return None
-                return candidate_raw, candidate
-            except (ValueError, TypeError, KeyError, UnicodeDecodeError):
-                return None
-
-        parts = pending.get(digest, {})
-        part_count = (len(raw) + _EVIDENCE_PART_BYTES - 1) // _EVIDENCE_PART_BYTES
-        if part_count > _EVIDENCE_MAX_PARTS:
-            raise GitHubStateProxyError("Evidence record exceeds safe part count")
-        for index, envelope in parts.items():
-            expected_chunk = raw[index * _EVIDENCE_PART_BYTES:(index + 1) * _EVIDENCE_PART_BYTES]
-            try:
-                chunk = base64.b64decode(envelope["data"], validate=True)
-            except (ValueError, KeyError, TypeError):
-                raise GitHubStateProxyError("Malformed pending evidence part data") from None
-            if index >= part_count or chunk != expected_chunk:
-                raise GitHubStateProxyError("Pending evidence part does not match immutable record")
-
-        recovered = None
-        for pending_digest, indexed_parts in pending.items():
-            if pending_digest == digest:
-                continue
-            candidate = decode_complete_parts(pending_digest, indexed_parts)
-            if candidate is None or not self._same_evidence_operation(kind, candidate[1], data):
-                raise GitHubStateProxyError(
-                    "Incomplete evidence parts cannot be safely matched to this retry"
-                )
-            if recovered is not None and not self._same_evidence_operation(
-                    kind, recovered[1], candidate[1]):
-                raise GitHubStateProxyError("Conflicting completed evidence parts")
-            recovered = (pending_digest, indexed_parts, candidate)
-        if not parts and recovered is not None:
-            digest, parts, (raw, data) = recovered[0], recovered[1], recovered[2]
-            part_count = len(parts)
-
-        async def publish(envelope: dict) -> dict:
-            body = (self._evidence_visible_description(envelope) + "\n\n"
-                    + "<!-- deploy-approval-evidence:v1\n"
-                    + json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n-->")
-            if len(body.encode("utf-8")) > _MAX_COMMENT_BODY_BYTES:
-                raise GitHubStateProxyError("Evidence comment exceeds safe body limit")
-
-            found = next((item for item in comments
-                          if self.is_bot_comment(item)
-                          and item.get("issue_url") == expected_url
-                          and self._evidence_envelope(item) == envelope), None)
-            if found is None:
-                await assert_writable_pr()
-                try:
-                    found = await self.post_issue_comment(repo, pr_number, body)
-                except Exception as post_error:
-                    # A timed-out POST may have committed on GitHub. Re-read
-                    # before deciding whether retrying could duplicate it.
-                    try:
-                        latest_comments = await self.get_issue_comments(repo, pr_number)
-                    except Exception as read_error:
-                        raise GitHubStateProxyError(
-                            "Evidence comment POST outcome is unknown; readback unavailable"
-                        ) from read_error
-                    candidate = next((item for item in latest_comments
-                                      if self.is_bot_comment(item)
-                                      and item.get("issue_url") == expected_url
-                                      and self._evidence_envelope(item) == envelope), None)
-                    if candidate is None:
-                        raise GitHubStateProxyError(
-                            "Evidence comment POST failed and no persisted record was found"
-                        ) from post_error
-                    comments[:] = latest_comments
-                    found = candidate
-            if not isinstance(found, dict) or type(found.get("id")) is not int or found["id"] <= 0:
-                raise GitHubStateProxyError("Evidence comment write was not confirmed")
-            if (found.get("issue_url") != expected_url
-                    or not self.is_bot_comment(found)
-                    or self._evidence_envelope(found) != envelope):
-                raise GitHubStateProxyError("Evidence comment write identity failed")
-            comments[:] = [item for item in comments if item.get("id") != found["id"]]
-            comments.append(found)
-            trusted[found["id"]] = found
-            return found
-
-        common = {"repo": repo, "pr_number": pr_number, "kind": kind,
-                  "key": key, "sha256": digest}
-        expected_stored_envelope = None
-        if len(raw) <= _EVIDENCE_SINGLE_RECORD_MAX_BYTES and not parts:
-            envelope = {**common, "type": "record",
-                        "data": base64.b64encode(raw).decode("ascii")}
-            expected_stored_envelope = envelope
-            stored_comment = await publish(envelope)
-        else:
-            part_ids = []
-            for index in range(part_count):
-                envelope = parts.get(index)
-                if envelope is None:
-                    start = index * _EVIDENCE_PART_BYTES
-                    envelope = {
-                        **common, "type": "part", "index": index,
-                        "data": base64.b64encode(
-                            raw[start:start + _EVIDENCE_PART_BYTES]
-                        ).decode("ascii"),
-                    }
-                    confirmed_part = await publish(envelope)
-                else:
-                    comment_id = next((cid for cid, item in trusted.items()
-                                       if self._evidence_envelope(item) == envelope), None)
-                    if comment_id is None:
-                        raise GitHubStateProxyError("Pending evidence part is not linked to a trusted comment")
-                    confirmed_part = trusted.get(comment_id)
-                    if (not isinstance(confirmed_part, dict)
-                            or not self.is_bot_comment(confirmed_part)
-                            or confirmed_part.get("issue_url") != expected_url
-                            or self._evidence_envelope(confirmed_part) != envelope):
-                        raise GitHubStateProxyError("Pending evidence part readback failed")
-                part_ids.append(confirmed_part["id"])
-            manifest = {**common, "type": "manifest", "parts": part_ids}
-            expected_stored_envelope = manifest
-            stored_comment = await publish(manifest)
-
-        readback = await self.get_comment(repo, stored_comment["id"])
-        stored_envelope = self._evidence_envelope(readback) if isinstance(readback, dict) else None
-        if (not isinstance(readback, dict) or readback.get("id") != stored_comment["id"]
-                or readback.get("issue_url") != expected_url
-                or not self.is_bot_comment(readback)
-                or stored_envelope != expected_stored_envelope):
-            raise GitHubStateProxyError("Evidence comment write readback failed")
-
-        verified = await self.read_evidence_records(repo, pr_number)
-        result = next((item for item in verified
-                       if item.get("kind") == kind and item.get("key") == key), None)
-        if (result is None or result.get("sha256") != digest
+        if (not isinstance(result, dict) or result.get("sha256") != digest
                 or self._canonical_evidence_data(result.get("data")) != raw):
-            raise GitHubStateProxyError("Evidence comment persistence readback failed")
-        if type(result.get("comment_id")) is not int:
-            raise GitHubStateProxyError("Evidence comment record identity is missing")
+            raise GitHubStateProxyError("Evidence record persistence readback failed")
+        # Old callers only fail when the record itself is missing. Internal
+        # records legitimately have no comment_id; never invent one.
         return result
 
     async def persist_cursor(

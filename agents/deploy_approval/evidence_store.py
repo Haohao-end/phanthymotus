@@ -22,7 +22,26 @@ class EvidenceStoreError(Exception):
     """An object is unavailable, incomplete, or failed integrity verification."""
 
 
+class EvidenceOverwriteProtectionError(EvidenceStoreError):
+    """The outgoing COS write did not carry the required no-overwrite header."""
+
+
 _SHORT_DOWNLOAD_TTL_SECONDS = 900
+# Media types allowed for the Summary-only inline projection channel. Browser
+# downloads keep using the short-lived octet-stream authorization below.
+_PROJECTION_MEDIA_TYPES = {
+    '.mp4': 'video/mp4', '.webm': 'video/webm', '.png': 'image/png',
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+    '.webp': 'image/webp',
+}
+
+
+def _projection_media_type(filename: str) -> str:
+    suffix = '.' + filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+    media_type = _PROJECTION_MEDIA_TYPES.get(suffix)
+    if media_type is None:
+        raise EvidenceStoreError('inline preview media type is not allowed')
+    return media_type
 
 
 def safe_filename(filename: str) -> str:
@@ -61,10 +80,21 @@ def build_attachment_key(repo, pr_number, head_sha, round_id, attachment_id, upl
 
 
 class CosAttachmentStore:
+    # Bound the read-back verification cache used by the Summary projection
+    # signer. Keys are content identities, never bearer URLs.
+    _PROJECTION_VERIFY_CACHE_SECONDS = 6 * 60 * 60
+    _PROJECTION_VERIFY_CACHE_MAX = 512
+
     def __init__(self, config, client=None):
         self.config = config
         self._client = client
         self._slots = asyncio.Semaphore(4)
+        self._projection_verified = {}
+
+    @property
+    def projection_cos_host(self):
+        """The single COS bucket host accepted by projection validation."""
+        return f'{self.config.cos_bucket}.cos.{self.config.cos_region}.myqcloud.com'
 
     def _sdk(self):
         if self._client is None:
@@ -79,13 +109,60 @@ class CosAttachmentStore:
                     kwargs['verify'] = True
                     return super().request(method, url, **kwargs)
 
+                def send(self, request, **kwargs):
+                    if CosAttachmentStore._requires_forbid_overwrite(
+                            request.method, request.url):
+                        header_value = request.headers.get('x-cos-forbid-overwrite')
+                        if not isinstance(header_value, str) or header_value.lower() != 'true':
+                            raise EvidenceOverwriteProtectionError(
+                                'COS outgoing write omitted x-cos-forbid-overwrite: true',
+                            )
+                    return super().send(request, **kwargs)
+
             session = EvidenceSession()
             session.trust_env = False
+            session._evidence_forbid_overwrite_guard = True
             self._client = CosS3Client(CosConfig(
                 Region=self.config.cos_region, SecretId=self.config.cos_secret_id,
                 SecretKey=self.config.cos_secret_key, Scheme='https',
                 Timeout=30, VerifySSL=True), retry=0, session=session)
         return self._client
+
+    @staticmethod
+    def _requires_forbid_overwrite(method, url):
+        """Identify object creation writes, excluding multipart part uploads."""
+        method = str(method or '').upper()
+        try:
+            query_names = {
+                name.casefold()
+                for name, _ in parse_qsl(urlsplit(url).query, keep_blank_values=True)
+            }
+        except (TypeError, ValueError):
+            return method in {'PUT', 'POST'}
+        if method == 'PUT':
+            return not {'uploadid', 'partnumber'} <= query_names
+        return method == 'POST' and 'uploadid' in query_names and 'partnumber' not in query_names
+
+    def _forbid_overwrite_client(self):
+        """Require SDK mapping support and the session that checks real headers."""
+        try:
+            from qcloud_cos.cos_comm import maplist
+        except Exception:
+            raise EvidenceStoreError(
+                'installed COS SDK does not expose ForbidOverwrite support',
+            ) from None
+        if (not isinstance(maplist, dict)
+                or maplist.get('ForbidOverwrite') != 'x-cos-forbid-overwrite'):
+            raise EvidenceStoreError(
+                'installed COS SDK does not support the ForbidOverwrite request parameter',
+            )
+        client = self._sdk()
+        session = getattr(client, '_session', None)
+        if not getattr(session, '_evidence_forbid_overwrite_guard', False):
+            raise EvidenceStoreError(
+                'COS client cannot validate the outgoing forbid-overwrite request header',
+            )
+        return client
 
     @staticmethod
     def _cos_failure_is_ambiguous(exc):
@@ -144,28 +221,59 @@ class CosAttachmentStore:
         self, *, key, filename, ttl=_SHORT_DOWNLOAD_TTL_SECONDS,
     ) -> str:
         filename = safe_filename(filename)
-        media_types = {
-            '.mp4': 'video/mp4', '.webm': 'video/webm', '.png': 'image/png',
-            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
-            '.webp': 'image/webp',
-        }
-        suffix = '.' + filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
-        media_type = media_types.get(suffix)
-        if media_type is None:
-            raise EvidenceStoreError('inline preview media type is not allowed')
+        media_type = _projection_media_type(filename)
         ttl = self._download_ttl(ttl)
         return self._sdk().get_presigned_url(
             Method='GET', Bucket=self.config.cos_bucket, Key=self._key(key), Expired=ttl,
             Params={'response-content-disposition': 'inline',
                     'response-content-type': media_type})
 
-    def download_url_expiry(self, url, *, key, filename=None, attachment_id=None):
+    def issue_projection_url(
+        self, *, key, filename, attachment_id=None, ttl=None,
+    ) -> str:
+        """Sign a long-lived download URL for the trusted Summary projection.
+
+        This is a separate, narrow channel: the browser download and preview
+        endpoints keep their 1..900 second authorization. The object identity
+        is re-derived from the caller-supplied trusted record identity and the
+        resulting URL must pass :meth:`download_url_expiry` before use, so only
+        server-issued COS URLs are ever projected.
+        """
+        from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
+        filename = safe_filename(filename)
+        key = self._key(key)
+        # The record identity must match the object path it claims. Deployment
+        # logs are not attachment objects and never carry an attachment id.
+        if attachment_id is None:
+            if '/attachments/' in f'/{key}/':
+                raise ValueError('attachment object requires attachment identity')
+        elif (not isinstance(attachment_id, str)
+                or f'/attachments/{_segment(attachment_id)}/' not in f'/{key}/'):
+            raise ValueError('attachment identity does not match object key')
+        if ttl is None:
+            ttl = EVIDENCE_PRESIGNED_URL_TTL_SECONDS
+        if (isinstance(ttl, bool) or not isinstance(ttl, int)
+                or not 1 <= ttl <= EVIDENCE_PRESIGNED_URL_TTL_SECONDS + 120):
+            raise ValueError('projection TTL exceeds the signed window')
+        disposition = (
+            "attachment; filename=download; filename*=UTF-8''"
+            + quote(filename, safe='')
+        )
+        return self._sdk().get_presigned_url(
+            Method='GET', Bucket=self.config.cos_bucket, Key=key, Expired=ttl,
+            Params={'response-content-disposition': disposition,
+                    'response-content-type': 'application/octet-stream'})
+
+    def download_url_expiry(self, url, *, key, filename=None, attachment_id=None,
+                            inline_media_type=None):
         """Return a trusted signed-URL expiry, or None for any mismatch.
 
-        Reuse is limited to links previously projected in the trusted lifecycle
-        comment. The exact configured bucket host, object path, attachment
-        identity, COS signing fields, response disposition, and one-year window
-        must all match before a prior URL is retained.
+        Reuse is limited to links previously issued by this store. The exact
+        configured bucket host, object path, attachment identity, COS signing
+        fields, response disposition, and one-year window must all match before
+        a prior URL is retained. ``inline_media_type`` selects the separate
+        inline image projection channel; the default stays the browser
+        download disposition.
         """
         from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
         try:
@@ -173,7 +281,7 @@ class CosAttachmentStore:
             if attachment_id is not None and f'/attachments/{_segment(attachment_id)}/' not in f'/{key}/':
                 return None
             parsed = urlsplit(url)
-            expected_host = f'{self.config.cos_bucket}.cos.{self.config.cos_region}.myqcloud.com'
+            expected_host = self.projection_cos_host
             if (parsed.scheme != 'https' or parsed.hostname != expected_host
                     or parsed.username is not None or parsed.password is not None
                     or parsed.port is not None or parsed.fragment
@@ -208,11 +316,20 @@ class CosAttachmentStore:
             signed_params = {part.lower() for part in query['q-url-param-list'].split(';') if part}
             if 'response-content-disposition' not in signed_params:
                 return None
-            if ('response-content-type' in query
-                    and ('response-content-type' not in signed_params
-                         or query['response-content-type'] != 'application/octet-stream')):
-                return None
-            if filename is not None:
+            if inline_media_type is not None:
+                if (query.get('response-content-disposition') != 'inline'
+                        or query.get('response-content-type') != inline_media_type
+                        or 'response-content-type' not in signed_params):
+                    return None
+            else:
+                disposition = query['response-content-disposition']
+                if not re.match(r'(?i)^attachment(?:;|$)', disposition):
+                    return None
+                if ('response-content-type' in query
+                        and ('response-content-type' not in signed_params
+                             or query['response-content-type'] != 'application/octet-stream')):
+                    return None
+            if filename is not None and inline_media_type is None:
                 disposition = query['response-content-disposition']
                 safe_name = safe_filename(filename)
                 if ("filename*=UTF-8''" + quote(safe_name, safe='') not in disposition
@@ -220,11 +337,202 @@ class CosAttachmentStore:
                         and f'filename={safe_name}' not in disposition):
                     return None
             now = int(time.time())
-            if start > now or expiry <= now:
+            if start > now + 60 or expiry <= now:
                 return None
             return expiry
         except (TypeError, ValueError, UnicodeError):
             return None
+
+    def projection_preview_url_expiry(
+        self, url, *, key, filename, attachment_id,
+    ):
+        """Validate a Summary inline-image URL signed by this store."""
+        try:
+            filename = safe_filename(filename)
+            media_type = _projection_media_type(filename)
+        except (ValueError, EvidenceStoreError, UnicodeError):
+            return None
+        return self.download_url_expiry(
+            url, key=key, filename=filename, attachment_id=attachment_id,
+            inline_media_type=media_type,
+        )
+
+    def issue_projection_preview_url(self, *, key, filename, attachment_id, ttl=None):
+        """Sign a long-lived inline image URL for the trusted Summary projection.
+
+        Only raster image media types are accepted; video and arbitrary files
+        always use the download channel.
+        """
+        return self.issue_projection_inline_url(
+            key=key, filename=filename, attachment_id=attachment_id, ttl=ttl,
+            images_only=True,
+        )
+
+    def issue_projection_inline_url(
+        self, *, key, filename, attachment_id, ttl=None, images_only=False,
+    ):
+        """Sign a long-lived inline media URL bound to one attachment identity.
+
+        Used for the browser-playable preview of a verified video/image. The
+        Summary download channel and the browser 1..900 second download tokens
+        are unaffected.
+        """
+        from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
+        filename = safe_filename(filename)
+        media_type = _projection_media_type(filename)
+        if images_only and not media_type.startswith('image/'):
+            raise ValueError('inline projection is limited to images')
+        key = self._key(key)
+        if (not isinstance(attachment_id, str)
+                or f'/attachments/{_segment(attachment_id)}/' not in f'/{key}/'):
+            raise ValueError('attachment identity does not match object key')
+        if ttl is None:
+            ttl = EVIDENCE_PRESIGNED_URL_TTL_SECONDS
+        if (isinstance(ttl, bool) or not isinstance(ttl, int)
+                or not 1 <= ttl <= EVIDENCE_PRESIGNED_URL_TTL_SECONDS + 120):
+            raise ValueError('projection TTL exceeds the signed window')
+        return self._sdk().get_presigned_url(
+            Method='GET', Bucket=self.config.cos_bucket, Key=key, Expired=ttl,
+            Params={'response-content-disposition': 'inline',
+                    'response-content-type': media_type})
+
+    def projection_inline_url_expiry(self, url, *, key, filename, attachment_id):
+        """Validate a Summary inline image/video URL signed by this store."""
+        try:
+            filename = safe_filename(filename)
+            media_type = _projection_media_type(filename)
+        except (ValueError, EvidenceStoreError, UnicodeError):
+            return None
+        return self.download_url_expiry(
+            url, key=key, filename=filename, attachment_id=attachment_id,
+            inline_media_type=media_type,
+        )
+
+    def _projection_record_key(self, operation, *, repo, pr_number):
+        """Re-derive the exact object identity from one persisted attachment record."""
+        required = ('repo', 'pr_number', 'head_sha', 'round_id', 'attachment_id',
+                    'filename', 'object_key')
+        if not isinstance(operation, dict) or any(
+                operation.get(name) in (None, '') for name in required):
+            raise EvidenceStoreError('persisted attachment identity missing')
+        if operation.get('repo') != repo or operation.get('pr_number') != pr_number:
+            raise EvidenceStoreError('persisted attachment repository mismatch')
+        if (operation.get('status') != 'ready' or operation.get('deleted_at')
+                or operation.get('cos_content_verified') is not True):
+            raise EvidenceStoreError('persisted attachment is not ready')
+        head_sha, round_id = operation.get('head_sha'), operation.get('round_id')
+        if (not isinstance(head_sha, str) or not re.fullmatch(r'[0-9a-fA-F]{40}', head_sha)
+                or not isinstance(round_id, str)
+                or not re.fullmatch(re.escape(head_sha) + r'-[0-9]+', round_id, re.IGNORECASE)):
+            raise EvidenceStoreError('persisted attachment round mismatch')
+        size = operation.get('size')
+        sha256 = operation.get('sha256')
+        if (type(size) is not int or not 1 <= size <= self.config.evidence_max_file_bytes
+                or not isinstance(sha256, str)
+                or re.fullmatch(r'[0-9a-f]{64}', sha256) is None):
+            raise EvidenceStoreError('persisted attachment content identity invalid')
+        key = self._key(operation['object_key'])
+        try:
+            from .cos_client import _repo_directory
+            repo_dir = _repo_directory(repo)
+        except (TypeError, ValueError):
+            raise EvidenceStoreError('persisted attachment repository invalid') from None
+        attachment_id = operation['attachment_id']
+        if (not isinstance(attachment_id, str)
+                or re.fullmatch(r'[A-Za-z0-9_-]{1,128}', attachment_id) is None):
+            raise EvidenceStoreError('persisted attachment identity invalid')
+        try:
+            filename = safe_filename(str(operation['filename']))
+        except ValueError:
+            raise EvidenceStoreError('persisted attachment filename invalid')
+        layout = re.fullmatch(
+            r'phanthymotus_pr/' + re.escape(repo_dir)
+            + r'/[0-9]{4}-[0-9]{2}/[0-9]{4}-[0-9]{2}(?:-[0-9]{2})?'
+            + r'/pr-' + str(pr_number)
+            + r'/head-' + re.escape(head_sha.lower())
+            + r'/round-' + re.escape(round_id)
+            + r'/attachments/' + re.escape(attachment_id)
+            + r'/' + re.escape(filename),
+            key,
+            re.IGNORECASE,
+        )
+        if layout is None:
+            raise EvidenceStoreError('persisted attachment object identity mismatch')
+        return {
+            'key': key, 'filename': filename,
+            'attachment_id': attachment_id,
+            'head_sha': head_sha, 'round_id': round_id,
+            'size': size, 'sha256': sha256,
+        }
+
+    async def sign_summary_attachment(
+        self, *, repo, pr_number, operation, inline=False, ttl=None,
+    ) -> dict:
+        """Sign one Summary display URL for a trusted, already-verified record.
+
+        The persisted record is the only identity source: repo, PR, HEAD, round,
+        attachment id, filename and object key are re-derived and must match.
+        Content identity and SHA256 are re-verified on read (cached briefly to
+        avoid re-streaming unchanged objects on every projection), and the
+        issued URL must pass :meth:`download_url_expiry`. Browser download and
+        preview endpoints keep their 1..900 second authorization.
+        """
+        identity = await self.verify_summary_attachment(
+            repo=repo, pr_number=pr_number, operation=operation,
+        )
+        key = identity['key']
+        size, sha256 = identity['size'], identity['sha256']
+        now_wall = time.time()
+        issuer = (self.issue_projection_inline_url if inline
+                  else self.issue_projection_url)
+        url = await self._io(
+            issuer, key=key, filename=identity['filename'],
+            attachment_id=identity['attachment_id'], ttl=ttl,
+        )
+        validator = ((self.projection_inline_url_expiry if inline
+                      else self.download_url_expiry))
+        expiry = validator(
+            url, key=key, filename=identity['filename'],
+            attachment_id=identity['attachment_id'],
+        )
+        if expiry is None or expiry <= int(now_wall):
+            raise EvidenceStoreError('projection signature was not accepted')
+        return {
+            'url': url, 'expires_at': expiry, 'object_key': key,
+            'sha256': sha256, 'size': size,
+            'attachment_id': identity['attachment_id'],
+            'head_sha': identity['head_sha'], 'round_id': identity['round_id'],
+        }
+
+    async def verify_summary_attachment(
+        self, *, repo, pr_number, operation,
+    ) -> dict:
+        """Verify one persisted ready attachment and its COS content identity.
+
+        This read-only check also guards stable Controller links: projecting
+        an attachment URL cannot bypass the persisted ready record or the
+        object's SHA256 verification.
+        """
+        identity = self._projection_record_key(
+            operation, repo=repo, pr_number=pr_number,
+        )
+        key, size, sha256 = identity['key'], identity['size'], identity['sha256']
+        cache_key = (key, size, sha256)
+        now_wall = time.time()
+        if not hasattr(self, '_projection_verified') or not isinstance(self._projection_verified, dict):
+            self._projection_verified = {}
+        cached = self._projection_verified.get(cache_key)
+        if cached is None or cached <= now_wall:
+            await self.verify_object(
+                key=key, size=size,
+                metadata=self._identity_metadata(operation), sha256=sha256,
+            )
+            # Bound the cache; verified identities are content-addressed.
+            if len(self._projection_verified) >= self._PROJECTION_VERIFY_CACHE_MAX:
+                self._projection_verified.clear()
+            self._projection_verified[cache_key] = (
+                now_wall + self._PROJECTION_VERIFY_CACHE_SECONDS)
+        return identity
 
     async def _io(self, function, **kwargs):
         async with self._slots:
@@ -378,11 +686,14 @@ class CosAttachmentStore:
                 [p['part_number'] for p in parts] != list(range(1, expected_count + 1)) or
                 any(p['size'] != min(chunk, size - i * chunk) for i, p in enumerate(parts))):
             raise EvidenceStoreError('multipart upload is incomplete')
+        client = self._forbid_overwrite_client()
         try:
-            await self._io(self._sdk().complete_multipart_upload,
+            await self._io(client.complete_multipart_upload,
                 Bucket=self.config.cos_bucket, Key=key, UploadId=upload_id,
                 MultipartUpload={'Part': [{'PartNumber': p['part_number'], 'ETag': p['etag']} for p in parts]},
-                Metadata={'x-cos-forbid-overwrite': 'true'})
+                ForbidOverwrite='true')
+        except EvidenceOverwriteProtectionError:
+            raise
         except EvidenceStoreError:
             pass
         return await self.verify_object(key=key, size=size, metadata=metadata, sha256=sha256)
@@ -407,10 +718,13 @@ class CosAttachmentStore:
         except EvidenceStoreError:
             pass
         body.seek(0)
+        client = self._forbid_overwrite_client()
         try:
-            await self._io(self._sdk().put_object, Bucket=self.config.cos_bucket,
+            await self._io(client.put_object, Bucket=self.config.cos_bucket,
                 Key=key, Body=body, ContentLength=str(size), ContentType='application/octet-stream',
-                Metadata={**self._metadata(metadata), 'x-cos-forbid-overwrite': 'true'})
+                Metadata=self._metadata(metadata), ForbidOverwrite='true')
+        except EvidenceOverwriteProtectionError:
+            raise
         except EvidenceStoreError:
             # The PUT response may be lost after COS committed the object.
             # Only an exact read-back is considered success.
@@ -585,10 +899,13 @@ class CosAttachmentStore:
             actual = hashlib.sha256(body).hexdigest()
             if len(body) != size or (sha and sha != actual):
                 raise EvidenceStoreError('note identity mismatch')
+            client = self._forbid_overwrite_client()
             try:
-                await self._io(self._sdk().put_object, Bucket=self.config.cos_bucket,
+                await self._io(client.put_object, Bucket=self.config.cos_bucket,
                     Key=key, Body=body, ContentType='application/octet-stream',
-                    Metadata={**self._metadata(metadata), 'x-cos-forbid-overwrite': 'true'})
+                    Metadata=self._metadata(metadata), ForbidOverwrite='true')
+            except EvidenceOverwriteProtectionError:
+                raise
             except EvidenceStoreError:
                 pass
             return await self.verify_object(key=key, size=size, metadata=metadata, sha256=actual)

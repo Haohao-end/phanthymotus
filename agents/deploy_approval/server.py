@@ -347,6 +347,13 @@ def create_app(config: Config | None = None):
 
     # Single serial command watcher
     watcher = GitHubCommandWatcher(config, proxy, controller, github=github, github_auth=github_auth)
+    if evidence_service is not None:
+        watcher.evidence_service = evidence_service
+        # Ready-attachment reconciliation is scheduled through the single
+        # serial writer. The service only enqueues a bounded repo/PR hint; the
+        # watcher re-reads persisted records and the live lifecycle state
+        # before making any visible change.
+        evidence_service.bind_ready_sync_scheduler(watcher.schedule_evidence_sync)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -397,7 +404,7 @@ def create_app(config: Config | None = None):
 
     @app.get("/healthz")
     async def healthz():
-        return {"status": "ok"}
+        return {"status": "ok", "service": "deploy-approval"}
 
     app.include_router(webhook_router)
     app.include_router(evidence_router)

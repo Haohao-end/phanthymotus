@@ -13,6 +13,7 @@ import ipaddress
 import re
 import html
 import json
+import time
 from zoneinfo import ZoneInfo
 
 import urllib.parse
@@ -691,11 +692,20 @@ def evidence_upload_comment(
     repo: str, pr_number: int, head_sha: str, round_id: str,
     attachment_id: str, filename: str, *, download_url: str,
     preview_url: str = "", note: str = "", public_base_url: str = "",
+    cos_url_validator=None,
 ) -> str:
     """Build a safe notification for a ready media file.
 
     Text evidence remains in the trusted evidence record; public upload
     comments show only the media preview and its download link.
+
+    Two link channels are accepted. The persistent Controller origin is the
+    default. While only an ephemeral ingress exists, a caller may pass
+    ``cos_url_validator``; each COS link is then accepted only if that
+    server-supplied validator re-derives the object key, attachment identity
+    and signature window for this exact attachment. Quick Tunnel hostnames are
+    never accepted because the validator only recognizes the configured COS
+    bucket host.
     """
     if (not _evidence_path(repo, pr_number)
             or not isinstance(head_sha, str)
@@ -707,13 +717,11 @@ def evidence_upload_comment(
         return ""
 
     stable_base = _public_base(public_base_url)
-    if not stable_base:
-        return ""
     api_path = (_evidence_path(repo, pr_number) + "/attachments/"
                 + urllib.parse.quote(attachment_id, safe=""))
 
     def trusted_access_url(value: str, action: str) -> str:
-        if not isinstance(value, str) or len(value) > 4096:
+        if not stable_base or not isinstance(value, str) or len(value) > 4096:
             return ""
         try:
             parsed = urllib.parse.urlsplit(value)
@@ -729,8 +737,26 @@ def evidence_upload_comment(
             return ""
         return value
 
-    download_url = trusted_access_url(download_url, "download")
-    preview_url = trusted_access_url(preview_url, "preview")
+    def trusted_cos_url(value: str, action: str) -> str:
+        if not callable(cos_url_validator) or not isinstance(value, str):
+            return ""
+        if not value or len(value) > 4096:
+            return ""
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            if (parsed.scheme != "https" or parsed.username
+                    or parsed.password or parsed.fragment):
+                return ""
+            if cos_url_validator(value, action) is not True:
+                return ""
+        except Exception:
+            return ""
+        return value
+
+    stable_download = trusted_access_url(download_url, "download")
+    stable_preview = trusted_access_url(preview_url, "preview")
+    download_url = stable_download or trusted_cos_url(download_url, "download")
+    preview_url = stable_preview or trusted_cos_url(preview_url, "preview")
     if not download_url:
         return ""
     clean_filename = filename if isinstance(filename, str) and filename.strip() else "测试证据"
@@ -740,8 +766,6 @@ def evidence_upload_comment(
     video_suffixes = {"mp4", "webm"}
     if suffix not in image_suffixes | video_suffixes:
         return ""
-    if not preview_url:
-        return ""
     lines = [
         "### 测试证据已上传",
         "",
@@ -750,7 +774,8 @@ def evidence_upload_comment(
     if suffix in image_suffixes and preview_url:
         lines.extend(["", f"![{label}](<{preview_url}>)", "", f"[下载图片](<{download_url}>)"])
     elif suffix in video_suffixes:
-        lines[-1] = f"已保存：[▶ 预览视频：{label}](<{preview_url}>)"
+        if preview_url:
+            lines[-1] = f"已保存：[▶ 预览视频：{label}](<{preview_url}>)"
         lines.extend(["", f"[下载视频](<{download_url}>)"])
     notification_key = hashlib.sha256(
         f"{repo}:{pr_number}:{head_sha}:{round_id}:{attachment_id}".encode("utf-8")
@@ -799,7 +824,7 @@ def _workflow_lines(
         ("3. Request deployment", 2, "request"),
         ("4. Machine Owner approval(s)", 3, "approval"),
         ("5. All required components deployed", 4, "deployment"),
-        ("6. Machine Owner uploads evidence", 4, "evidence"),
+        ("6. Upload test video/images (optional)", 4, "evidence"),
         ("7. Record validation result", 5, "result"),
         ("8. Deployment accepted", 6, "accepted"),
     ]
@@ -840,13 +865,12 @@ def _workflow_lines(
                 checked = bool(record_test_complete)
         mark = "[x]" if checked else "[ ]"
         line = f"- {mark} {label}"
-        if not checked and not next_marked:
+        if not checked and not next_marked and step != "evidence":
             line += " \u2190 **Next**"
             next_marked = True
         lines.append(line)
 
     return "\n".join(lines)
-
 
 def _trusted_upload_page_url(value: str, repo: str, pr_number: int) -> str:
     """Accept only the configured HTTPS upload page for this exact PR."""
@@ -854,7 +878,8 @@ def _trusted_upload_page_url(value: str, repo: str, pr_number: int) -> str:
         return ""
     try:
         parsed = urllib.parse.urlsplit(value)
-        query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+        query = (urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+                 if parsed.query else {})
         from .config import is_evidence_ingress_url
         origin = f"{parsed.scheme}://{parsed.netloc}"
         expected_path = _evidence_path(repo, pr_number).replace(
@@ -864,8 +889,11 @@ def _trusted_upload_page_url(value: str, repo: str, pr_number: int) -> str:
         return ""
     if (not expected_path or not is_evidence_ingress_url(origin)
             or parsed.path != expected_path or parsed.fragment
-            or parsed.username or parsed.password
-            or set(query) != {"cap"} or len(query["cap"]) != 1
+            or parsed.username or parsed.password):
+        return ""
+    if not query:
+        return f"{origin}{expected_path}"
+    if (set(query) != {"cap"} or len(query["cap"]) != 1
             or re.fullmatch(r"[A-Za-z0-9_.-]{1,2048}", query["cap"][0]) is None):
         return ""
     return value
@@ -876,24 +904,16 @@ def _testing_next_action(
     repo: str = "", pr_number: int = 0,
 ) -> str:
     evidence_url = _trusted_upload_page_url(evidence_url, repo, pr_number)
-    lines = ["部署已经完成，现在可以开始测试。"]
-    if evidence_complete:
-        lines.extend([
-            "本轮测试证据已收到。审批人会据此核对实现效果，并判断是否通过验收、是否可以合并。",
-            "如需补充视频或图片，可继续上传：",
-        ])
-    else:
-        lines.extend([
-            "请把本轮开发的实际效果视频或图片上传到这里，供审批人检查真实开发效果，",
-            "并作为是否通过验收、是否可以合并的依据：",
-        ])
+    lines = [
+        "机器已部署，可以开始测试。",
+        "可选上传实际效果视频或图片，方便验收人查看。",
+    ]
     if evidence_url:
-        lines.extend(["", f"[上传测试证据](<{evidence_url}>)"])
+        lines.extend(["", f"[可选上传测试视频或图片](<{evidence_url}>)"])
     else:
-        lines.extend(["", "[上传测试证据][deploy-approval-upload]"])
-    lines.extend(["", "测试完成后，请执行 `/request_acceptance`。"])
+        lines.extend(["", "[可选上传测试视频或图片][deploy-approval-upload]"])
+    lines.extend(["", "测试完成后执行 `/request_acceptance`。"])
     return "\n".join(lines)
-
 
 def _deploying_next_action(
     deployments, components, attempt=None, *, machine_groups=None,
@@ -1050,7 +1070,6 @@ def _archives_link_block(archives: list[dict]) -> str:
             lines.append(f"- History Archive Page {page}")
     lines.append("")
     return "\n".join(lines)
-
 
 # ── Lifecycle comment builders ───────────────────────────────────
 
@@ -2525,10 +2544,10 @@ def testing(
             next_action = [reason]
         upload_url = _trusted_upload_page_url(evidence_url, repo, pr_number)
         upload_link = (
-            f"[补充上传测试证据](<{upload_url}>)" if upload_url
-            else "[补充上传测试证据][deploy-approval-upload]"
+            f"[可选上传测试视频或图片](<{upload_url}>)" if upload_url
+            else "[可选上传测试视频或图片][deploy-approval-upload]"
         )
-        next_action.extend(["", f"需要补充本轮测试证据时，可{upload_link}。"])
+        next_action.extend(["", f"如需补充测试视频或图片，可随时{upload_link}；上传完全可选，不影响验收。"])
     else:
         next_action = _testing_next_action(
             evidence_complete, evidence_url, repo=repo, pr_number=pr_number,
@@ -2951,6 +2970,7 @@ def _machine_log_lines(group, key, api, origin):
 def render_evidence_section(
     repo, pr_number, state, records, archive_links, *, public_base_url="",
     upload_public_base_url="", cos_download_url_expiry=None,
+    cos_inline_url_expiry=None,
 ) -> str:
     """Render current evidence and archived rounds without mutating history.
 
@@ -3111,42 +3131,20 @@ def render_evidence_section(
         else:
             group.setdefault("attachments", []).append(row)
 
-    page_path = api.replace("/api/evidence/", "/evidence/", 1)
-
-    def page_url_at(capability, origin):
-        if not origin or not capability or not page_path.startswith("/evidence/"):
-            return ""
-        return (origin + page_path + "?cap="
-                + urllib.parse.quote(str(capability), safe=""))
-
-    def stable_read_page_url(key, origin):
-        if (not origin or not page_path.startswith("/evidence/")
-                or not isinstance(key, tuple) or len(key) != 2
-                or not valid_round_binding(key[0], key[1])):
-            return ""
-        query = urllib.parse.urlencode({
-            "view": "read", "head_sha": key[0], "round_id": key[1],
-        })
-        return origin + page_path + "?" + query
-
-    def stable_attachment_download_url(item, key, origin):
+    def stable_attachment_access_url(item, key, origin, action):
+        """Build a scoped attachment URL; the route signs private COS on click."""
         if (not isinstance(item, dict) or not origin or not api
                 or item.get("status") != "ready" or item.get("deleted_at")
                 or item.get("cos_projection_verified") is not True
+                or item.get("cos_content_verified") is not True
                 or item.get("head_sha") != key[0] or item.get("round_id") != key[1]
                 or not isinstance(item.get("sha256"), str)
                 or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None):
             return ""
-        verified_content = (
-            item.get("cos_content_verified") is True
-            or item.get("actor_verified") is True
-            and item.get("upload_method") != "signed_invite"
-        )
         attachment_id = item.get("attachment_id")
         capability = item.get("download_capability")
         size = item.get("size")
-        if (not verified_content
-                or not isinstance(attachment_id, str)
+        if (not isinstance(attachment_id, str)
                 or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id) is None
                 or not isinstance(capability, str) or not capability
                 or len(capability) > 2048
@@ -3154,8 +3152,43 @@ def render_evidence_section(
                 or not 1 <= size <= 512 * 1024 * 1024
                 or any(char.isspace() or ord(char) < 32 for char in capability)):
             return ""
-        path = api + "/attachments/" + urllib.parse.quote(attachment_id, safe="") + "/download"
+        path = api + "/attachments/" + urllib.parse.quote(attachment_id, safe="") + "/" + action
         return origin + path + "?" + urllib.parse.urlencode({"cap": capability})
+
+    def stable_attachment_download_url(item, key, origin):
+        return stable_attachment_access_url(item, key, origin, "download")
+
+    def stable_attachment_preview_url(item, key, origin):
+        return stable_attachment_access_url(item, key, origin, "preview")
+
+    def projection_cos_url(item, key, field):
+        """Return a server-validated COS link for Summary display."""
+        if (not isinstance(item, dict) or not callable(cos_download_url_expiry)
+                or item.get("status") != "ready" or item.get("deleted_at")
+                or item.get("cos_projection_verified") is not True
+                or item.get("cos_content_verified") is not True
+                or item.get("head_sha") != key[0] or item.get("round_id") != key[1]):
+            return ""
+        url = item.get(field)
+        object_key = item.get("object_key")
+        filename = item.get("filename")
+        attachment_id = item.get("attachment_id")
+        if (not isinstance(url, str) or not url or len(url) > 4096
+                or not isinstance(object_key, str) or not object_key
+                or not isinstance(filename, str) or not filename
+                or not isinstance(attachment_id, str) or not attachment_id):
+            return ""
+        validator = (cos_inline_url_expiry if field == "cos_preview_url"
+                     and callable(cos_inline_url_expiry)
+                     else cos_download_url_expiry)
+        try:
+            expiry = validator(
+                url, key=object_key, filename=filename,
+                attachment_id=attachment_id,
+            )
+        except (TypeError, ValueError):
+            return ""
+        return url if type(expiry) is int and expiry > int(time.time()) else ""
 
     def latest_attachments(group, key):
         latest_items = {}
@@ -3260,7 +3293,7 @@ def render_evidence_section(
         round_number = group.get("round_number")
         if type(round_number) is int and round_number > 0:
             return f"第 {round_number} 轮"
-        return "历史轮次" if historical else "当前轮"
+        return "历史轮次" if historical else "第 1 轮"
 
     def round_status(group, key):
         request = group.get("acceptance_request")
@@ -3278,188 +3311,73 @@ def render_evidence_section(
 
     def render_round(key, group, *, historical=False):
         h, r = key
-        remaining_note_chars = 900
-        notes_truncated = False
         test_result = group.get("test_result")
         result_labels = {"pass": "通过", "fail": "失败"}
-        component_by_id = {
-            component.get("component_id"): component
-            for component in group.get("components", [])
-            if isinstance(component, dict)
-            and isinstance(component.get("component_id"), str)
-        }
-        case_labels = {
-            "running": "运行中", "pass": "通过", "fail": "失败", "n/a": "不适用",
-        }
-        case_lines = []
-        case_results = group.get("case_results")
-        if isinstance(case_results, dict):
-            for component_id, result in case_results.items():
-                if (not isinstance(component_id, str) or not isinstance(result, str)
-                        or result not in case_labels):
-                    continue
-                component = component_by_id.get(component_id, {})
-                target = component.get("target")
-                if target == "driver" and component.get("driver_path"):
-                    label = f"driver {component['driver_path']}"
-                elif target and component.get("variant"):
-                    label = f"{target} {component['variant']}"
-                else:
-                    label = target or component_id
-                case_lines.append(f"- {_escape(label)}：{case_labels[result]}")
-
-        test_summary = ""
-        command = group.get("command")
-        command_args = command.get("args") if isinstance(command, dict) else None
-        request = group.get("acceptance_request")
-        if (isinstance(test_result, str) and test_result in result_labels
-                and isinstance(request, dict) and request.get("status") == "completed"
-                and request.get("head_sha") == key[0]
-                and request.get("round_id") == key[1]
-                and request.get("result") == test_result
-                and isinstance(request.get("summary"), str)):
-            test_summary = request["summary"].strip()
-        elif (isinstance(test_result, str) and test_result in result_labels
-              and isinstance(command, dict) and command.get("kind") == "record_test"
-              and command.get("phase") == "completed"
-              and isinstance(command_args, dict)
-              and command_args.get("result") == test_result
-              and isinstance(command_args.get("summary"), str)):
-            test_summary = command_args["summary"].strip()
-        if test_summary:
-            try:
-                json.loads(test_summary)
-                test_summary = ""
-            except (TypeError, ValueError):
-                test_summary = safe_note_text(test_summary[:500])
-        test_details = []
-        if case_lines:
-            test_details.extend(case_lines)
-        if test_summary:
-            test_details.append(f"- **测试摘要：** {_escape(test_summary)}")
         items = visible_attachments(group, key)
         items.sort(key=lambda item: sortable_time(first_valid_time(
             item.get("created_at"), item.get("uploaded_at"))), reverse=True)
-        lines = []
-        lines.extend([
-            "", f"**Commit：** `{_escape(h)}`",
+        started = first_valid_time(group.get("round_started_at"), group.get("started_at"))
+        lines = [
+            f"**Commit：** `{_escape(h)}`",
             f"**状态：** {_escape(round_status(group, key))}",
-            f"**测试时间：** {_escape(summary_time(first_valid_time(group.get('round_started_at'), group.get('started_at'))))}",
-        ])
+            f"**测试时间：** {_escape(summary_time(started))}",
+        ]
         if isinstance(test_result, str) and test_result in result_labels:
             lines.extend(["", f"**验收结果：** {result_labels[test_result]}"])
-        if test_details:
-            lines.extend(["", "<details>", "<summary>测试详情</summary>", "",
-                          *test_details, "", "</details>"])
-        lines.extend(["", "### 附件", ""])
-        if items:
-            lines.extend(["| 文件 | 大小 | 上传时间 |", "|---|---:|---|"])
-        notes = []
-        seen_notes = set()
+        valid_items = []
         for item in items:
             if not isinstance(item, dict):
                 continue
-            deleted = bool(item.get("deleted_at") or item.get("status") == "deleted")
-            status = "deleted" if deleted else item.get("status", "pending")
+            if item.get("deleted_at") or item.get("status") == "deleted":
+                continue
+            if item.get("status") == "text" or item.get("evidence_kind") == "note":
+                continue
             filename = item.get("filename")
-            if (not isinstance(filename, str) or not filename.strip()
-                    or re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", filename.strip())):
-                filename = "附件说明" if status == "text" else "附件文件"
-            else:
-                filename = filename.strip()
-            size = item.get("size", "—")
-            if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
-                size = _human_size(size)
-            uploaded_at = summary_time(first_valid_time(item.get("created_at"), item.get("uploaded_at")))
-            if deleted:
-                filename = filename + "（已删除）"
-            download_url = ("" if deleted else
-                            stable_attachment_download_url(item, key, base or upload_base))
-            filename_cell = _escape(filename)
-            if download_url:
-                filename_cell = f"[{filename_cell}](<{download_url}>)"
-            lines.append("| " + " | ".join((
-                filename_cell, _escape(size), _escape(uploaded_at),
-            )) + " |")
-            note = item.get("note") or (item.get("text") if status == "text" else "")
-            if is_internal_test_note(item):
-                note = ""
-            if item.get("evidence_kind") == "note":
-                complete_text_note = False
-                if status == "text" and isinstance(note, str):
-                    try:
-                        note_bytes = note.encode("utf-8")
-                        complete_text_note = (
-                            len(note) <= 5000 and item.get("size") == len(note_bytes)
-                            and isinstance(item.get("sha256"), str)
-                            and hashlib.sha256(note_bytes).hexdigest() == item["sha256"]
-                            and type(item.get("source_comment_id")) is int
-                            and item["source_comment_id"] > 0
-                            and item.get("actor_verified") is True
-                        )
-                    except UnicodeError:
-                        complete_text_note = False
-                if not complete_text_note:
-                    note = ((note.rstrip() + "\n\n") if isinstance(note, str) and note.strip() else "") + \
-                        "[摘要中仅保留备注摘要，完整内容请在附件页查看；内容不完整]"
-            if isinstance(note, str) and note.strip():
-                rendered_note = safe_note_text(note.strip())
-                note_identity = item.get("attachment_id") or item.get("id")
-                if not isinstance(note_identity, (str, int)):
-                    note_identity = filename.casefold()
-                note_key = (note_identity, rendered_note)
-                if note_key not in seen_notes:
-                    seen_notes.add(note_key)
-                    if remaining_note_chars <= 0:
-                        notes_truncated = True
-                        continue
-                    if len(rendered_note) > remaining_note_chars:
-                        rendered_note = rendered_note[:remaining_note_chars] + "…（摘要已截短；完整说明保留在附件记录中）"
-                        notes_truncated = True
-                    remaining_note_chars -= min(len(rendered_note), remaining_note_chars)
-                    notes.append(f"- **{_escape(filename)}：** {_escape(rendered_note)}")
-        if notes:
-            lines.extend(["", "<details>", "<summary>附件说明</summary>", "", *notes, "", "</details>"])
-        if notes_truncated:
-            lines.extend(["", "备注摘要已精简；可打开本轮附件页查看完整内容。"])
-        if historical and items and group.get("attachment_details_unreadable"):
-            lines.append("部分历史附件明细无法读取或校验；此处仅显示通过校验的记录。")
-        if not items:
-            if historical:
-                if group.get("attachment_details_unreadable"):
-                    detail_status = (
-                        "请查看下方原始归档链接。"
-                        if trusted_archive_urls else "可信原始归档链接暂不可用。"
-                    )
-                    lines.append(f"历史附件数据不可读取或校验失败；{detail_status}")
-                elif not group.get("attachment_details_complete"):
-                    detail_status = (
-                        "请查看下方原始归档链接。"
-                        if trusted_archive_urls else "可信原始归档链接暂不可用。"
-                    )
-                    lines.append(f"历史快照未包含附件明细；{detail_status}")
-                elif only_hidden_internal_notes(group, key):
-                    lines.append("内部验收备注已隐藏；该轮未保存可展示附件")
-                else:
-                    lines.append("该轮未保存附件")
-            elif state.get("status") in {"succeeded", "failed"}:
-                lines.append("本轮未保存附件")
-        compact_projection = group.get("_compact_projection") is True
-        if group.get("deployments") and not compact_projection:
-            lines.extend(["", "### 部署记录", "",
-                          _deployment_table(group["deployments"], group.get("components"),
-                                            group.get("machine_groups"))])
-        machine_log_lines = _machine_log_lines(group, key, api, base or upload_base)
-        if machine_log_lines:
-            lines.extend(["", "### 部署日志", ""])
-            lines.extend(machine_log_lines)
-        attachment_page = round_attachment_page_url(key, group)
-        upload_entry_url = (
-            current_upload_entry_url()
-            if key == (head, current_round) else ""
-        )
-        if attachment_page and not upload_entry_url:
-            lines.extend(["", f"[打开附件页](<{attachment_page}>)"])
+            if not isinstance(filename, str) or not filename.strip():
+                continue
+            suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            if suffix not in {"mp4", "webm", "png", "jpg", "jpeg", "webp", "gif"}:
+                continue
+            download_url = stable_attachment_download_url(
+                item, key, base or upload_base)
+            if not download_url:
+                download_url = projection_cos_url(item, key, "cos_download_url")
+            if not download_url:
+                continue
+            preview_url = ""
+            if suffix in {"png", "jpg", "jpeg", "webp", "gif"}:
+                preview_url = stable_attachment_preview_url(
+                    item, key, base or upload_base)
+                if not preview_url:
+                    preview_url = projection_cos_url(item, key, "cos_preview_url")
+                if not preview_url:
+                    continue
+            size = item.get("size")
+            if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+                continue
+            uploaded_at = (
+                "时间未记录"
+                if item.get("_projection_date_only") is True
+                else summary_time(first_valid_time(
+                    item.get("created_at"), item.get("uploaded_at"),
+                ))
+            )
+            valid_items.append((
+                filename.strip(), size, uploaded_at, download_url, preview_url,
+            ))
+        if valid_items:
+            lines.extend([
+                "",
+                "| 文件 | 大小 | 上传时间 |",
+                "|---|---:|---|",
+            ])
+            lines.extend(
+                f"| [{_escape(filename)}](<{download_url}>) | {_human_size(size)} | {_escape(uploaded_at)} |"
+                for filename, size, uploaded_at, download_url, _ in valid_items
+            )
+            for filename, _, _, _, preview_url in valid_items:
+                if preview_url:
+                    lines.extend(["", f"![{_escape(filename)}](<{preview_url}>)"])
         return lines
 
     def round_summary(key, group):
@@ -3467,60 +3385,63 @@ def render_evidence_section(
             group.get("round_started_at"), group.get("started_at"),
         )
         current = key == (head, current_round)
-        label = round_label(group, historical=not current)
         if current:
             round_number = group.get("round_number")
-            label = (f"第 {round_number} 轮（当前轮次）"
-                     if type(round_number) is int and round_number > 0
-                     else "当前轮（当前轮次）")
+            if not (type(round_number) is int and round_number > 0):
+                known_numbers = [
+                    groups[k].get("round_number")
+                    for k in groups
+                    if k != current_key
+                    and type(groups[k].get("round_number")) is int
+                    and groups[k].get("round_number") > 0
+                ]
+                if known_numbers:
+                    round_number = max(known_numbers) + 1
+                else:
+                    historical_count = len([k for k in groups if k != current_key and valid_round_binding(k[0], k[1])])
+                    round_number = historical_count + 1
+            label = f"第 {round_number} 轮（当前轮次）"
+        else:
+            round_number = group.get("round_number")
+            if type(round_number) is int and round_number > 0:
+                label = f"第 {round_number} 轮"
+            else:
+                label = "历史轮次"
         return (f"<summary>{_escape(label)}"
                 f" · {_escape(round_status(group, key))} · {_escape(summary_time(timestamp))}</summary>")
 
     def round_sort_time(key):
         group = groups[key]
         round_number = group.get("round_number")
-        value = first_valid_time(group.get("round_started_at"), group.get("started_at"), group.get("created_at"), group.get("archived_at"), group.get("ended_at"))
+        value = first_valid_time(
+            group.get("round_started_at"), group.get("started_at"),
+            group.get("created_at"), group.get("archived_at"), group.get("ended_at"),
+        )
         trusted_number = round_number if type(round_number) is int and round_number > 0 else 0
         return (trusted_number, sortable_time(value))
-    round_pattern = re.escape(str(head)) + r"-[0-9]+"
-    round_read_context_valid = (
-        re.fullmatch(r"[0-9a-f]{40}", str(head))
-        and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)
-        and state.get("evidence_enabled") is True and bool(api)
-    )
 
-    def round_attachment_page_url(key, group):
-        if not round_read_context_valid:
-            return ""
-        origin = base or upload_base
-        if key == (head, current_round):
-            if state.get("status") == "testing" and state.get("browser_upload_ready") is True:
-                upload_url = page_url_at(state.get("upload_capability"), upload_base)
-                if upload_url:
-                    return upload_url
-            return page_url_at(group.get("capability"), origin)
-        return stable_read_page_url(key, origin)
+    current_key = (head, current_round)
+    round_blocks = []
 
-    def current_upload_entry_url():
-        if (state.get("status") != "testing"
-                or state.get("browser_upload_ready") is not True
-                or not round_read_context_valid):
-            return ""
-        candidate = page_url_at(state.get("upload_capability"), upload_base)
-        return _trusted_upload_page_url(candidate, repo, pr_number)
+    if show_current_round and current_key in groups:
+        summary_line = round_summary(current_key, groups[current_key])
+        round_content = render_round(current_key, groups[current_key], historical=False)
+        content_str = "\n".join(round_content).strip()
+        round_blocks.append(f"<details open>\n{summary_line}\n\n{content_str}\n\n</details>")
+
+    historical_keys = [
+        k for k in groups.keys()
+        if k != current_key and valid_round_binding(k[0], k[1])
+    ]
+    historical_keys.sort(key=round_sort_time, reverse=True)
+    for k in historical_keys:
+        summary_line = round_summary(k, groups[k])
+        round_content = render_round(k, groups[k], historical=True)
+        content_str = "\n".join(round_content).strip()
+        round_blocks.append(f"<details>\n{summary_line}\n\n{content_str}\n\n</details>")
 
     lines = ["<!-- deploy-approval-evidence:start -->"]
-    upload_entry_url = current_upload_entry_url() if state.get("status") == "testing" else ""
-    if state.get("status") == "testing" and not upload_entry_url:
-        lines.extend([
-            "",
-            '<a id="deploy-approval-upload-status"></a>',
-            "上传入口暂时不可用。请刷新 Summary；仍无法访问时联系管理员。",
-        ])
+    if round_blocks:
+        lines.append("\n\n".join(round_blocks))
     lines.append("<!-- deploy-approval-evidence:end -->")
-    if state.get("status") == "testing":
-        if upload_entry_url:
-            lines.extend(["", f"[deploy-approval-upload]: <{upload_entry_url}>"])
-        else:
-            lines.extend(["", "[deploy-approval-upload]: #deploy-approval-upload-status"])
     return "\n".join(lines)

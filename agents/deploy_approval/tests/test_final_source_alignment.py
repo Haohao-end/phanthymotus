@@ -847,7 +847,7 @@ def test_summary_only_next_action_changes_for_lifecycle_states():
         "3. Request deployment",
         "4. Machine Owner approval(s)",
         "5. All required components deployed",
-        "6. Machine Owner uploads evidence",
+        "6. Upload test video/images (optional)",
         "7. Record validation result",
         "8. Deployment accepted",
     ]
@@ -888,7 +888,7 @@ def test_summary_only_next_action_changes_for_lifecycle_states():
     assert "等待部署结果" in deploying_action
     assert "testing" not in deploying_action.casefold()
     testing_action = _summary_next_action(testing)
-    assert "部署已经完成，现在可以开始测试" in testing_action
+    assert "机器已部署，可以开始测试" in testing_action
     assert "`/request_acceptance`" in testing_action
     # The testing builder has no Bound HEAD field in HEAD; retain that layout.
     assert "**Bound HEAD:**" not in testing
@@ -1048,10 +1048,9 @@ def test_testing_next_action_exposes_upload_url_and_actual_reviewers():
         repo, 473, head, evidence_url=upload_url,
     )
     testing_action = _summary_next_action(testing)
-    assert "部署已经完成，现在可以开始测试" in testing_action
-    assert f"[上传测试证据](<{upload_url}>)" in testing_action
-    assert "审批人检查真实开发效果" in testing_action
-    assert "是否通过验收、是否可以合并" in testing_action
+    assert "机器已部署，可以开始测试" in testing_action
+    assert f"[可选上传测试视频或图片](<{upload_url}>)" in testing_action
+    assert "可选上传实际效果视频或图片" in testing_action
     assert "`/request_acceptance`" in testing_action
 
     reviewers = ["reviewer-one", "reviewer-two"]
@@ -1067,5 +1066,6 @@ def test_testing_next_action_exposes_upload_url_and_actual_reviewers():
     assert "负责检查和记录" in pending_action
     assert "`/record_test result=pass`" in pending_action
     assert "`/record_test result=fail`" in pending_action
-    assert f"[补充上传测试证据](<{upload_url}>)" in pending_action
+    assert f"[可选上传测试视频或图片](<{upload_url}>)" in pending_action
+    assert "上传完全可选" in pending_action
     assert "test_reviewers.yaml" not in pending_action

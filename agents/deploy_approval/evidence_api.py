@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import urllib.parse
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
@@ -153,7 +154,8 @@ def _public_attachment(row, *, operation_context=None):
                'display_note_complete', 'evidence_kind', 'round_id', 'head_sha',
                'status', 'created_at', 'updated_at', 'completed_at', 'deleted_at', 'replaces_id',
                'cos_content_verified', 'upload_method', 'download_capability', 'can_delete',
-               'internal_bot_note'}
+               'internal_bot_note', 'github_comment_synced', 'github_comment_state',
+               'github_comment_pending'}
     result = {k: v for k, v in row.items() if k in allowed}
     upload_ref = row.get('upload_ref')
     if (operation_context is not None and isinstance(upload_ref, str)
@@ -318,6 +320,10 @@ async def _dispatch(request, owner, repo, pr, action, **path):
     principal, _ = await evidence_auth.verified_principal(
         request, canonical, pr, write=request.method in ('POST', 'PUT', 'DELETE'),
         purpose=purpose, resource=resource)
+    if request.method in ('POST', 'PUT', 'DELETE'):
+        # Anti-abuse ceiling only: authorization is always the verified principal
+        # above, never the counter.
+        evidence_auth.enforce_write_rate_limit(principal, canonical, pr, action)
     # The EvidenceService reads and validates the live PR before any operation.
     # Do not double-fetch it here: additional GitHub calls delay uploads and
     # turn transient PR reads into misleading 'evidence_pr_unavailable' errors.
@@ -328,8 +334,14 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         # The page capability selects the current round or a specific archived
         # round. The EvidenceService still validates that binding against the
         # trusted lifecycle snapshot before returning any records.
-        payload.setdefault('head_sha', claims.get('head'))
-        payload.setdefault('round_id', claims.get('round'))
+        if claims.get('head') and payload.get('head_sha') and payload['head_sha'] != claims['head']:
+            raise HTTPException(409, detail='evidence_round_changed')
+        if claims.get('round') and payload.get('round_id') and payload['round_id'] != claims['round']:
+            raise HTTPException(409, detail='evidence_round_changed')
+        if claims.get('head'):
+            payload['head_sha'] = claims['head']
+        if claims.get('round'):
+            payload['round_id'] = claims['round']
     if 'upload_id' in payload:
         # The public upload handle is A's durable operation identity, rather
         # than an unauthenticated client-selected COS UploadId.
@@ -349,11 +361,18 @@ async def _dispatch(request, owner, repo, pr, action, **path):
     if action in {'init', 'resume', 'sign_part', 'put_part', 'complete', 'note', 'delete'}:
         if action == 'put_part' and not {'head_sha', 'round_id'} <= payload.keys():
             raise HTTPException(400, detail='evidence_context_required')
-        payload.setdefault('head_sha', claims['head'])
-        payload.setdefault('round_id', claims['round'])
+        if claims.get('head') and payload.get('head_sha') and payload['head_sha'] != claims['head']:
+            raise HTTPException(409, detail='evidence_round_changed')
+        if claims.get('round') and payload.get('round_id') and payload['round_id'] != claims['round']:
+            raise HTTPException(409, detail='evidence_round_changed')
+        if claims.get('head'):
+            payload['head_sha'] = claims['head']
+        if claims.get('round'):
+            payload['round_id'] = claims['round']
         # Compatibility with the current browser UI: a display name is not
         # an identity source. The service records only the verified /user login.
         payload.pop('submitter', None)
+        payload.pop('object_key', None)
     if action in {'download', 'preview', 'log_download', 'machine_log_download'}:
         payload.setdefault('idempotency_key', hashlib.sha256(
             json.dumps([action, path], sort_keys=True).encode()).hexdigest())
@@ -441,10 +460,21 @@ async def _dispatch(request, owner, repo, pr, action, **path):
                   'uploaded_parts': result.get('uploaded_parts', [])}
     if action == 'status':
         # Status is a deliberately small public projection. In particular, a
-        # COS multipart UploadId and signed URLs are never public state.
-        result = {k: result[k] for k in ('status', 'uploaded_parts', 'size', 'filename',
-                                         'head_sha', 'round_id', 'verified', 'sha256',
-                                         'github_record_persisted', 'record_pending') if k in result}
+        # COS multipart UploadId and signed URLs are never public state. The
+        # GitHub display fields must survive this projection: the page uses
+        # them to distinguish "saved but not yet announced" from a failure.
+        result = {k: result[k] for k in (
+            'status', 'uploaded_parts', 'size', 'filename', 'head_sha', 'round_id',
+            'verified', 'sha256', 'attachment_id', 'github_record_persisted',
+            'record_pending', 'github_comment_synced', 'github_comment_state',
+            'github_comment_pending', 'historical') if k in result}
+        # A ready attachment with no recorded display state is reported as
+        # pending, never as synced. It is also never reported as an upload
+        # failure: the file is already saved and verified.
+        if (result.get('status') == 'ready'
+                and result.get('github_comment_synced') is not True
+                and 'github_comment_state' not in result):
+            result['github_comment_pending'] = True
     if action == 'context' and result.get('evidence_degraded') is not True:
         current_logs = {}
         for alias, log in (result.get('deployment_logs', {}) or {}).items():
@@ -625,52 +655,40 @@ async def machine_log_download(request: Request, owner: str, repo: str, pr: int,
 
 @router.get('/evidence/{owner}/{repo}/pulls/{pr}', response_class=HTMLResponse)
 async def page(request: Request, owner: str, repo: str, pr: int):
+    """Permanent per-PR upload address.
+
+    The public URL contains only the configured stable origin, repository and
+    PR number. Upload authority is a short, server-signed session minted from
+    trusted GitHub state on every visit and carried in an HttpOnly cookie; it
+    never appears in the URL. Legacy ``?cap=`` links are redirected to the
+    same fixed path so old Summary links keep working without exposing tokens.
+    """
     headers = {'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
                'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY'}
     canonical = None
-    read_only_view = False
     try:
         evidence_auth.require_enabled(request)
         canonical = _repo(owner, repo, pr)
-        explicit_capability = 'cap' in request.query_params
-        read_view = 'read' in request.query_params.getlist('view')
-        page_cookie = request.cookies.get(evidence_auth.CAPABILITY_COOKIE, '')
-        upload_cookie = request.cookies.get(evidence_auth.UPLOAD_COOKIE, '')
-        page_claims = None
-        if page_cookie:
-            try:
-                page_claims = evidence_auth._verify_page_capability(
-                    request.app.state.config, page_cookie, canonical, pr,
-                )
-            except HTTPException:
-                pass
-        upload_claims = None
-        if upload_cookie:
-            try:
-                upload_claims = evidence_auth._verify_upload_capability(
-                    request.app.state.config, upload_cookie, canonical, pr,
-                )
-            except HTTPException:
-                pass
-        requested_target = _requested_read_target(request)
-        if read_view:
-            # Cookies and request parameters select a possible round only;
-            # each target is revalidated against current Lifecycle or archives.
-            target = requested_target
-            explicit_token = request.query_params.get('cap')
-            if target is None and explicit_capability:
-                hint = evidence_auth.capability_lookup_target(
-                    explicit_token, canonical, pr,
-                )
-                if hint is None:
-                    raise HTTPException(403, detail='invalid_evidence_capability')
-                target = (hint['head'], hint['round'])
-            elif target is None and page_claims is not None:
-                target = (page_claims['head'], page_claims['round'])
-            elif target is None and page_cookie:
-                hint = evidence_auth.capability_lookup_target(page_cookie, canonical, pr)
-                if hint is not None:
-                    target = (hint['head'], hint['round'])
+        if 'cap' in request.query_params:
+            # Never honor, echo or proxy a legacy capability in the public link.
+            clean_path = request.url.path
+            if 'read' in request.query_params.getlist('view'):
+                # Preserve read target if present, but strip cap
+                params = {k: v for k, v in request.query_params.items() if k != 'cap'}
+                clean_path += '?' + urllib.parse.urlencode(params)
+            return RedirectResponse(clean_path, status_code=303,
+                                    headers=headers)
+        if 'read' not in request.query_params.getlist('view') and request.query_params:
+            # The fixed upload page never carries query parameters (no cap, HEAD, round or token).
+            return RedirectResponse(request.url.path, status_code=303,
+                                    headers=headers)
+        from . import evidence_ui
+        if 'read' in request.query_params.getlist('view'):
+            # Historical/read-only round view. Only the target round is resolved
+            # here (current or archived); the fixed path itself grants nothing.
+            if not await _installation_repo_authorized(request, canonical):
+                raise HTTPException(403, detail='repository_not_authorized')
+            target = _requested_read_target(request)
             read_capability = await _trusted_summary_page_capability(
                 request, canonical, pr,
                 target_head=target[0] if target else None,
@@ -678,105 +696,56 @@ async def page(request: Request, owner: str, repo: str, pr: int):
             )
             if not read_capability:
                 raise HTTPException(403, detail='invalid_evidence_capability')
-            redirect = evidence_auth.bind_page_capability(
-                request, canonical, pr,
-                trusted_summary_capability=read_capability, read_only=True,
-            )
-            if redirect is not None:
-                return redirect
             claims = evidence_auth._verify_page_capability(
                 request.app.state.config, read_capability, canonical, pr,
             )
-            read_only_view = True
-        elif explicit_capability:
-            explicit_token = request.query_params.get('cap')
-            upload_claims = None
-            try:
-                upload_claims = evidence_auth._verify_upload_capability(
-                    request.app.state.config, explicit_token, canonical, pr,
-                )
-            except HTTPException:
-                pass
-            if upload_claims is not None:
-                redirect = evidence_auth.bind_page_capability(request, canonical, pr)
-                if redirect is not None:
-                    return redirect
-                claims = upload_claims
-            else:
-                # A page capability, including an expired one, is only a round
-                # lookup hint. A target explicitly supplied by the stable URL
-                # takes precedence; otherwise validate the token's hint.
-                target = requested_target
-                if target is None:
-                    hint = evidence_auth.capability_lookup_target(
-                        explicit_token, canonical, pr,
-                    )
-                    if hint is None:
-                        raise HTTPException(403, detail='invalid_evidence_capability')
-                    target = (hint['head'], hint['round'])
-                read_capability = await _trusted_summary_page_capability(
-                    request, canonical, pr, target_head=target[0],
-                    target_round=target[1],
-                )
-                if not read_capability:
-                    raise HTTPException(403, detail='invalid_evidence_capability')
-                redirect = evidence_auth.bind_page_capability(
-                    request, canonical, pr,
-                    trusted_summary_capability=read_capability, read_only=True,
-                )
-                if redirect is not None:
-                    return redirect
-                claims = evidence_auth._verify_page_capability(
-                    request.app.state.config, read_capability, canonical, pr,
-                )
-                read_only_view = True
-        elif upload_claims is not None:
-            # Signature and expiry establish the page invitation. The service
-            # makes the live PR/HEAD/round/permission decision before any write.
-            redirect = evidence_auth.bind_page_capability(request, canonical, pr)
-            if redirect is not None:
-                return redirect
-            claims = upload_claims
+            response = HTMLResponse(evidence_ui.render_upload_page(
+                canonical, pr, claims['head'], claims['round'],
+                read_only=True,
+            ), headers=headers)
+            evidence_auth.bind_read_session(response, request, read_capability)
+            evidence_auth.drop_upload_session(response, request)
+            return response
+
+        context = await _trusted_page_context(request, canonical, pr)
+        if context['writable']:
+            session = evidence_auth.issue_upload_session(
+                request.app.state.config, canonical, pr,
+                context['head_sha'], context['round_id'],
+            )
+            claims = evidence_auth._verify_upload_capability(
+                request.app.state.config, session, canonical, pr,
+            )
+            response = HTMLResponse(evidence_ui.render_upload_page(
+                canonical, pr, claims['head'], claims['round'],
+                read_only=False,
+            ), headers=headers)
+            evidence_auth.bind_upload_session(response, request, session)
         else:
-            if page_claims is not None:
-                target = (page_claims['head'], page_claims['round'])
-                read_capability = await _trusted_summary_page_capability(
-                    request, canonical, pr,
-                    target_head=target[0], target_round=target[1],
-                )
-                if not read_capability:
-                    raise HTTPException(403, detail='invalid_evidence_capability')
-                redirect = evidence_auth.bind_page_capability(
-                    request, canonical, pr,
-                    trusted_summary_capability=read_capability, read_only=True,
-                )
-                if redirect is not None:
-                    return redirect
-                claims = evidence_auth._verify_page_capability(
-                    request.app.state.config, read_capability, canonical, pr,
-                )
-                read_only_view = True
-            else:
-                summary_capability = await _trusted_summary_page_capability(
-                    request, canonical, pr,
-                )
-                if not summary_capability:
-                    raise HTTPException(403, detail='invalid_evidence_capability')
-                redirect = evidence_auth.bind_page_capability(
-                    request, canonical, pr,
-                    trusted_summary_capability=summary_capability, read_only=True,
-                )
-                if redirect is not None:
-                    return redirect
-                claims = evidence_auth._verify_page_capability(
-                    request.app.state.config, summary_capability, canonical, pr,
-                )
-                read_only_view = True
-        result = {
-            'repo': canonical,
-            'head_sha': claims['head'],
-            'round_id': claims['round'],
-        }
+            if not evidence_auth.public_https_ingress_ready(request.app.state.config):
+                # Upload is optional; a missing public entry must not look like
+                # a failed deployment or a closed PR.
+                raise HTTPException(503, detail='evidence_public_entry_unavailable')
+            # Outside a writable testing round the page is read-only. The read
+            # capability is minted from the trusted Summary only after the
+            # installation/PR/round checks above.
+            read_capability = await _trusted_summary_page_capability(
+                request, canonical, pr,
+                target_head=context['head_sha'],
+                target_round=context['round_id'],
+            )
+            if not read_capability:
+                raise HTTPException(403, detail='invalid_evidence_capability')
+            claims = evidence_auth._verify_page_capability(
+                request.app.state.config, read_capability, canonical, pr,
+            )
+            response = HTMLResponse(evidence_ui.render_upload_page(
+                canonical, pr, claims['head'], claims['round'],
+                read_only=True,
+            ), headers=headers)
+            evidence_auth.bind_read_session(response, request, read_capability)
+            evidence_auth.drop_upload_session(response, request)
+        return response
     except HTTPException as exc:
         # Keep the authorization status and never echo exception detail,
         # capability input, cookies, or backend diagnostics into HTML.
@@ -791,6 +760,7 @@ async def page(request: Request, owner: str, repo: str, pr: int):
             'evidence_pr_status_unavailable': '暂时无法确认 GitHub PR 状态或 HEAD；请稍后重试。',
             'evidence_history_unavailable': '历史附件记录暂时无法读取；请返回当前 PR Summary 查看最新状态，稍后再试历史附件。',
             'evidence_state_unavailable': '暂时无法验证当前 Lifecycle 状态；请稍后重试。',
+            'evidence_public_entry_unavailable': '公共上传入口暂时不可用；测试视频或图片上传完全可选，不影响测试和验收。',
         }
         message = details.get(exc.detail, messages.get(
             exc.status_code, '附件链接暂不可用，请从当前 PR Summary 重新打开。'))
@@ -801,12 +771,72 @@ async def page(request: Request, owner: str, repo: str, pr: int):
                 '<title>附件链接不可用</title><main><h1>附件链接不可用</h1><p>'
                 + message + '</p>' + summary_link + '</main></html>')
         return HTMLResponse(html, status_code=exc.status_code, headers=headers)
-    from . import evidence_ui
-    page_html = evidence_ui.render_upload_page(
-        result['repo'], pr, result['head_sha'], result['round_id'],
-        read_only=read_only_view,
+
+
+async def _installation_repo_authorized(request: Request, repo: str) -> bool:
+    """Verify GitHub App installation access before exposing any PR state."""
+    config = request.app.state.config
+    if (not getattr(config, 'auth_valid', False)
+            or repo not in getattr(config, 'github_repos', [])
+            or repo not in getattr(config, 'active_repos', [])):
+        return False
+    try:
+        authorized = await request.app.state.github.list_installation_repositories()
+    except Exception:
+        raise HTTPException(503, detail='evidence_pr_unavailable') from None
+    return isinstance(authorized, (list, tuple)) and repo in {
+        str(name).casefold() for name in authorized
+    }
+
+
+async def _trusted_page_context(request: Request, repo: str, pr: int) -> dict:
+    """Load PR identity, latest HEAD, current round and Lifecycle from GitHub."""
+    proxy = request.app.state.proxy
+    if not await _installation_repo_authorized(request, repo):
+        raise HTTPException(403, detail='repository_not_authorized')
+    try:
+        current_pr = await proxy.get_pr(repo, pr)
+    except Exception as exc:
+        if getattr(exc, 'status_code', None) == 404:
+            raise HTTPException(404, detail='evidence_pr_not_found') from None
+        raise HTTPException(503, detail='evidence_pr_unavailable') from None
+    if not isinstance(current_pr, dict) or current_pr.get('state') not in {'open', 'closed'}:
+        raise HTTPException(503, detail='evidence_pr_status_unavailable')
+    base = current_pr.get('base')
+    base_repository = base.get('repo') if isinstance(base, dict) else None
+    base_name = base_repository.get('full_name') if isinstance(base_repository, dict) else None
+    if not isinstance(base_name, str) or base_name.casefold() != repo.casefold():
+        raise HTTPException(409, detail='evidence_pr_context_changed')
+    head = current_pr.get('head')
+    head_sha = head.get('sha') if isinstance(head, dict) else None
+    if not isinstance(head_sha, str) or not re.fullmatch(r'[0-9a-f]{40}', head_sha):
+        raise HTTPException(503, detail='evidence_pr_status_unavailable')
+    state = await proxy.read_hidden_state(repo, pr)
+    if not isinstance(state, dict):
+        raise HTTPException(503, detail='evidence_state_unavailable')
+    from .evidence_models import round_id_for_state
+    try:
+        round_id = round_id_for_state(state)
+    except Exception:
+        raise HTTPException(503, detail='evidence_state_unavailable') from None
+    if (state.get('head_sha') != head_sha
+            or not isinstance(round_id, str)
+            or not re.fullmatch(re.escape(head_sha) + r'-[0-9]+', round_id)):
+        raise HTTPException(409, detail='evidence_round_changed')
+    ready = evidence_auth.readiness(
+        request.app.state.config, request.app.state.evidence_service, request=request,
     )
-    return HTMLResponse(page_html, headers=headers)
+    writable = bool(
+        state.get('status') == 'testing'
+        and current_pr.get('state') == 'open'
+        and not current_pr.get('merged') and not current_pr.get('draft')
+        and ready.get('BROWSER_UPLOAD_READY') is True
+        and evidence_auth._configured_https_request(request)
+    )
+    return {
+        'head_sha': head_sha, 'round_id': round_id,
+        'status': state.get('status'), 'writable': writable,
+    }
 
 
 def _requested_read_target(request):

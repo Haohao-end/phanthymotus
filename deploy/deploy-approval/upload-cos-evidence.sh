@@ -107,15 +107,28 @@ else
   fi
 fi
 
+health_json_ok() {
+  python3 -c '
+import json, sys
+try:
+    payload = json.loads(sys.stdin.read())
+except (ValueError, TypeError):
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(payload, dict)
+                 and payload.get("status") == "ok"
+                 and payload.get("service") == "deploy-approval" else 1)
+' <<<"$1"
+}
+
 local_health=
 for _ in {1..15}; do
   local_health=$(curl --noproxy '*' -fsS --max-time 2 http://127.0.0.1:25001/healthz 2>/dev/null || true)
-  if [[ $local_health == '{"status":"ok"}' ]]; then break; fi
+  if health_json_ok "$local_health"; then break; fi
   sleep 1
 done
 controller_health=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes \
   "$ssh_target" 'docker exec deploy-approval curl -fsS --max-time 3 http://127.0.0.1:25001/healthz' 2>/dev/null || true)
-if [[ $local_health != '{"status":"ok"}' || $controller_health != "$local_health" ]]; then
+if ! health_json_ok "$local_health" || ! health_json_ok "$controller_health"; then
   echo "NETWORK_UNREACHABLE: local health check did not match the Controller on the SSH host." >&2
   exit 2
 fi
