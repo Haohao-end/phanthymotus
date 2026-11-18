@@ -46,9 +46,19 @@ _VOLATILE_FIELDS = frozenset({
     "invalidated_at", "archived_at", "ended_at",
 })
 
+# Tencent COS reports a bucket that never enabled versioning as an empty
+# <VersioningConfiguration/>, which the SDK decodes to an explicit None value
+# or an empty dict. Only these values prove versioning has never been enabled.
+_VERSIONING_ENABLED_STATUSES = frozenset({"enabled", "suspended"})
+_VERSIONING_DISABLED_STATUSES = frozenset({"off", "disabled", "none", "not-enabled"})
+
 
 class EvidenceRecordBackendError(Exception):
     """A record could not be persisted or verified with the required guarantees."""
+
+
+# Sentinel distinguishing "field absent" from a legitimate ``None`` value.
+_ABSENT = object()
 
 
 def canonical_evidence_data(data: dict) -> bytes:
@@ -316,6 +326,27 @@ class CosEvidenceRecordBackend:
             stream.close()
         return b"".join(chunks)
 
+    @staticmethod
+    def _versioning_field(fields: dict, name: str):
+        """Resolve one versioning field, stripping an XML namespace prefix.
+
+        ``qcloud_cos`` 1.9.44 decodes the XML with ``xml_to_dict``, which only
+        strips a fixed set of namespace URIs. The COS versioning namespace is
+        not among them, so the same field can arrive either bare or wrapped as
+        ``{<ns>}VersioningConfiguration``. Both spellings mean one field; two
+        different spellings with conflicting values are ambiguous and fail
+        closed.
+        """
+        values = [value for key, value in fields.items()
+                  if isinstance(key, str)
+                  and (key == name or key.rsplit("}", 1)[-1] == name)]
+        if not values:
+            return _ABSENT
+        if any(value != values[0] for value in values[1:]):
+            raise EvidenceRecordBackendError(
+                "bucket versioning response contains conflicting fields")
+        return values[0]
+
     def _verify_bucket_versioning(self):
         if getattr(self, "_versioning_verified", False):
             return
@@ -332,30 +363,62 @@ class CosEvidenceRecordBackend:
         if not isinstance(resp, dict) or not resp:
             raise EvidenceRecordBackendError(
                 "bucket versioning check returned no configuration")
-        status = resp.get("Status")
-        if status is None:
-            versioning_config = resp.get("VersioningConfiguration")
-            if not isinstance(versioning_config, dict):
+
+        # cos-python-sdk-v5 1.9.44 renders a bucket that never enabled
+        # versioning as an explicit ``VersioningConfiguration: None`` (or an
+        # empty dict) because COS answers GET ?versioning with an empty
+        # <VersioningConfiguration/> element. A populated element is hoisted
+        # by the SDK to a flat top-level ``Status`` field. Versioning must be
+        # provably off: once enabled (or suspended) COS ignores the
+        # x-cos-forbid-overwrite header.
+        configuration = self._versioning_field(resp, "VersioningConfiguration")
+        if configuration is not _ABSENT and not isinstance(
+                configuration, (dict, type(None))):
+            raise EvidenceRecordBackendError(
+                "bucket versioning configuration is malformed")
+
+        status = self._versioning_field(resp, "Status")
+        nested_status = (self._versioning_field(configuration, "Status")
+                         if isinstance(configuration, dict) else _ABSENT)
+        if status is _ABSENT:
+            status = nested_status
+        elif nested_status is not _ABSENT and nested_status != status:
+            raise EvidenceRecordBackendError(
+                "bucket versioning response contains conflicting status fields")
+
+        # An explicit status is authoritative: Enabled or Suspended defeats
+        # forbid-overwrite, and any unrecognized value is not proof of "off".
+        if status is not _ABSENT and status is not None:
+            if not isinstance(status, str) or not status.strip():
+                raise EvidenceRecordBackendError(
+                    "bucket versioning check did not confirm an explicit disabled status")
+            normalized_status = status.strip().lower()
+            if normalized_status in _VERSIONING_ENABLED_STATUSES:
+                raise EvidenceRecordBackendError(
+                    f"bucket versioning is {status}; forbid-overwrite semantics require versioning to be off"
+                )
+            if normalized_status not in _VERSIONING_DISABLED_STATUSES:
+                raise EvidenceRecordBackendError(
+                    f"bucket versioning status {status!r} is not a confirmed disabled status")
+            # The status must belong to a present configuration; a bare status
+            # with no VersioningConfiguration is not a trustworthy response.
+            if configuration is _ABSENT:
                 raise EvidenceRecordBackendError(
                     "bucket versioning response omitted VersioningConfiguration")
-            if not versioning_config:
-                # Tencent COS represents a bucket that has never enabled
-                # versioning as an explicitly present empty configuration.
-                self._versioning_verified = True
-                return
-            status = versioning_config.get("Status")
-        if not isinstance(status, str) or not status.strip():
+            self._versioning_verified = True
+            return
+
+        # No usable status. An absent field proves nothing and fails closed;
+        # only a present-but-empty configuration is positive proof that
+        # versioning was never enabled.
+        if configuration is _ABSENT:
             raise EvidenceRecordBackendError(
-                "bucket versioning check did not confirm an explicit disabled status")
-        normalized_status = status.strip().lower()
-        if normalized_status in {"enabled", "suspended"}:
-            raise EvidenceRecordBackendError(
-                f"bucket versioning is {status}; forbid-overwrite semantics require versioning to be off"
-            )
-        if normalized_status not in {"off", "disabled", "none", "not-enabled"}:
-            raise EvidenceRecordBackendError(
-                f"bucket versioning status {status!r} is not a confirmed disabled status")
-        self._versioning_verified = True
+                "bucket versioning response omitted VersioningConfiguration")
+        if configuration is None or not configuration:
+            self._versioning_verified = True
+            return
+        raise EvidenceRecordBackendError(
+            "bucket versioning check did not confirm an explicit disabled status")
 
     def _put_object(self, object_key, body):
         # The ForbidOverwrite parameter maps to x-cos-forbid-overwrite: true
