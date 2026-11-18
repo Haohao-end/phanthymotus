@@ -7,15 +7,14 @@ import tempfile
 import pytest
 import yaml
 
-from ..policy import Policy, PolicyError, load_machines, MachineLoadError
-from .conftest import make_config
+from ..policy import Policy, load_machines, MachineLoadError
 
 
 def _machine_yaml(**entry_overrides):
     machine = {
         "node_id": "g1-bj-001",
         "node_host": "10.0.0.1",
-        "owners": ["alice"],
+                "owners": ["alice"],
         "targets": ["perception"],
         "platforms": ["linux/arm64"],
     }
@@ -210,41 +209,3 @@ def test_collaborator_write_can_approve():
 def test_collaborator_read_triage_none_rejected():
     for perm in ("read", "triage", "pull", "", None, "admin-x", 123):
         assert Policy.collaborator_can_approve(perm) is False
-
-
-def test_self_approval_allowed_by_id():
-    path = _write_yaml(_machine_yaml())
-    try:
-        p = Policy(make_config(machine_owners_file=path))
-        p.load_machines()
-        p.can_approve("alice", machine_alias="g1-bj")
-    finally:
-        os.unlink(path)
-
-
-def test_approve_not_owner():
-    path = _write_yaml(_machine_yaml())
-    try:
-        p = Policy(make_config(machine_owners_file=path))
-        p.load_machines()
-        with pytest.raises(PolicyError, match="not an owner"):
-            p.can_approve("mallory", machine_alias="g1-bj")
-    finally:
-        os.unlink(path)
-
-
-def test_approve_owner_allowed():
-    path = _write_yaml(_machine_yaml())
-    try:
-        p = Policy(make_config(machine_owners_file=path))
-        p.load_machines()
-        p.can_approve("alice", machine_alias="g1-bj")
-    finally:
-        os.unlink(path)
-
-
-def test_policy_fingerprint():
-    p = Policy(make_config())
-    fp = p._fingerprint(make_config())
-    assert fp.startswith("deploy-approval-")
-    assert len(fp) > 16

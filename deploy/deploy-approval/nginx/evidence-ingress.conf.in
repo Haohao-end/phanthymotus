@@ -1,0 +1,64 @@
+# Managed by deploy/deploy-approval/stable-evidence-ingress.sh — do not edit by hand.
+#
+# Loopback-only origin for the Cloudflare Named Tunnel connector.
+# The tunnel container uses host networking and connects to
+#   http://127.0.0.1:__INGRESS_PORT__
+# so this listener must never be bound to a public interface.
+#
+# Only the three Evidence surfaces are forwarded. Everything else is 404.
+# The Controller management surface and webhook stay on 127.0.0.1:25001.
+
+server {
+    listen 127.0.0.1:__INGRESS_PORT__;
+    server_name _;
+    server_tokens off;
+
+    access_log /var/log/nginx/evidence-ingress.access.log;
+    error_log  /var/log/nginx/evidence-ingress.error.log warn;
+
+    # Video parts are 8 MiB by default; leave room for JSON and headers.
+    client_max_body_size 64m;
+    client_body_buffer_size 1m;
+    large_client_header_buffers 4 16k;
+
+    # Static, trusted forwarded headers. Never trust client-supplied
+    # X-Forwarded-* or Host values: both are overwritten below.
+    proxy_http_version 1.1;
+    proxy_set_header Host __EVIDENCE_HOST__;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Host __EVIDENCE_HOST__;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Real-IP $remote_addr;
+    # Do not upgrade to WebSocket; Evidence is plain request/response.
+    proxy_set_header Connection "";
+    proxy_set_header X-Forwarded-Port 443;
+
+    # Stream uploads instead of buffering the whole part on disk.
+    proxy_request_buffering off;
+    proxy_buffering off;
+
+    # Long enough for 512 MiB evidence assembled in 8 MiB parts.
+    proxy_connect_timeout 15s;
+    proxy_send_timeout 300s;
+    proxy_read_timeout 300s;
+    send_timeout 300s;
+
+    location = /healthz {
+        proxy_pass http://127.0.0.1:__UPSTREAM_PORT__/healthz;
+    }
+
+    # Evidence page, static assets and cookie bootstrap.
+    location ^~ /evidence/ {
+        proxy_pass http://127.0.0.1:__UPSTREAM_PORT__;
+    }
+
+    # Authenticated Evidence JSON API (context, upload, download, delete).
+    location ^~ /api/evidence/ {
+        proxy_pass http://127.0.0.1:__UPSTREAM_PORT__;
+    }
+
+    # Anything else — management routes, webhook, probes — is not public.
+    location / {
+        return 404;
+    }
+}

@@ -1,9 +1,9 @@
-"""GitHub-only state proxy for Deploy Approval (pre-merge validation).
+"""GitHub state and immutable evidence proxy for Deploy Approval.
 
 The GitHubStateProxy provides a narrow, read/write boundary for GitHub PR
-state. It is the ONLY module that reads/writes the GitHub lifecycle comment
-and labels. It MUST NOT import or call any Deploy Approval business logic
-(ReviewAgentClient, RegistryClient, AgentCoreClient, CaseRunner, CosClient,
+state and Git Notes evidence records. It is the ONLY module that reads/writes
+the GitHub lifecycle comment and labels. It MUST NOT import or call business logic
+(RegistryClient, AgentCoreClient, CaseRunner, CosClient,
 EvidenceBuilder, DeploymentService internals).
 
 Responsibilities:
@@ -16,21 +16,33 @@ Responsibilities:
 - parse hidden JSON state
 - create/update the ONE lifecycle comment
 - read current labels
-- project status:* label
+- project status:* label with runtime self-heal
 - preserve non-status labels
 - enforce trusted identity on lifecycle hidden state
 - persist cursor while preserving exact visible markdown (no stale state write)
+- persist immutable per-PR evidence in a dedicated Git Notes ref, or in the
+  configured COS record backend when Git Data writes are denied
+- never publish internal evidence records as user-visible PR comments
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import base64
+import hashlib
 import logging
 import re
+import time
+import ipaddress
+from datetime import datetime
+from urllib.parse import parse_qs, urlsplit
 from typing import Any
 
 from .config import Config
-from .github_client import GitHubClient, GitHubError
+from .image_ref import validate_image_ref
+from .github_client import GitHubClient, GitHubError, GitHubRefConflict
+from .comments import beijing_now_str
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +55,9 @@ _ALLOWED_STATUS_LABELS = frozenset({
     "status: reviewing",
     "status: deploy-ready",
     "status: deploy-requested",
+    "status: deploying",
     "status: testing",
+    "status: acceptance-required",
     "status: succeeded",
     "status: failed",
 })
@@ -55,6 +69,57 @@ _MAX_HIDDEN_STATE_BYTES = 8192
 
 # Maximum lifecycle comment body size (64 KB)
 _MAX_COMMENT_BODY_BYTES = 65536
+_MAX_EVIDENCE_DATA_BYTES = 8 * 1024 * 1024
+_EVIDENCE_MAX_PARTS = 512
+# Bounded compare-and-swap attempts for the per-PR Git Notes ref. Each retry
+# re-reads the ref and merges, never overwriting another writer's records.
+_EVIDENCE_GIT_REF_RETRIES = 5
+
+# Maximum visible lifecycle markdown soft budget (48 KiB)
+_MAX_VISIBLE_LIFECYCLE_BYTES = 48 * 1024
+
+# Visible history section markers
+VISIBLE_HISTORY_START_MARKER = "<!-- deploy-approval-visible-history:start -->"
+VISIBLE_HISTORY_END_MARKER = "<!-- deploy-approval-visible-history:end -->"
+
+# History archive marker prefix
+HISTORY_ARCHIVE_MARKER_PREFIX = "<!-- deploy-approval-history:"
+
+# History event delimiter marker
+HISTORY_EVENT_DELIMITER = "<!-- deploy-approval-history-event -->"
+
+
+def _history_archive_marker(repo: str, pr_number: int, page: int) -> str:
+    """Return the exact archive marker string for a given page."""
+    return f"{HISTORY_ARCHIVE_MARKER_PREFIX}{repo}:{pr_number}:{page} -->"
+
+
+def _next_history_archive_page(comments: list[dict], repo: str, pr_number: int) -> int:
+    """Discover the next archive page number from existing comments.
+
+    Parses markers of the form:
+        <!-- deploy-approval-history:<repo>:<pr>:<page> -->
+    Returns the smallest positive integer greater than any existing page.
+    """
+    page_num = 1
+    prefix = f"{HISTORY_ARCHIVE_MARKER_PREFIX}{repo}:{pr_number}:"
+    for c in comments:
+        cbody = c.get("body", "")
+        if not isinstance(cbody, str):
+            continue
+        if prefix not in cbody:
+            continue
+        # Extract page number after the prefix
+        try:
+            after_prefix = cbody.split(prefix, 1)[1]
+            page_str = after_prefix.split(" -->", 1)[0].strip()
+            p = int(page_str)
+            if p >= page_num:
+                page_num = p + 1
+        except (ValueError, IndexError):
+            pass
+    return page_num
+
 
 
 class GitHubStateProxyError(Exception):
@@ -71,6 +136,10 @@ class MalformedHiddenStateError(GitHubStateProxyError):
     pass
 
 
+class _GitNotesPermissionDenied(Exception):
+    """The installation can read but not write the Git Notes ref (HTTP 403)."""
+
+
 class TrustedIdentityRequiredError(GitHubStateProxyError):
     """No trusted lifecycle comment author identity configured."""
     pass
@@ -82,10 +151,101 @@ def _is_valid_full_sha(value: Any) -> bool:
     return bool(re.match(r"^[0-9a-f]{40}$", value))
 
 
-def _is_valid_digest_ref(value: Any) -> bool:
+def _is_valid_image_ref(value: Any) -> bool:
+    """Validate image_ref using the canonical validator.
+
+    Accepts legacy digest or new tag form.
+    Returns True if valid, False otherwise.
+    """
     if not isinstance(value, str):
         return False
-    return bool(re.match(r"^[a-zA-Z0-9._/-]+@sha256:[0-9a-f]{64}$", value))
+    try:
+        validate_image_ref(value)
+        return True
+    except ValueError:
+        return False
+
+
+
+def _validate_review_evidence(data: dict) -> dict:
+    """Strictly validate review_evidence dict. Returns validated data or raises.
+
+    Required provenance fields:
+      build_comment_id, build_comment_updated_at,
+      commit_prefix, resolved_head_sha,
+      test_comment_id, test_comment_updated_at,
+      code_review_comment_id, code_review_comment_updated_at,
+      review_author_id
+
+    New snapshots may also carry the parsed test totals.  They are optional
+    so existing lifecycle comments remain readable during migration.
+    """
+    if not isinstance(data, dict):
+        raise MalformedHiddenStateError("review_evidence is not a dict")
+    required = {
+        "build_comment_id", "build_comment_updated_at",
+        "commit_prefix", "resolved_head_sha",
+        "test_comment_id", "test_comment_updated_at",
+        "code_review_comment_id", "code_review_comment_updated_at",
+        "review_author_id",
+    }
+    optional = {"test_passed", "test_failed", "test_skipped"}
+    extra = set(data.keys()) - required - optional
+    if extra:
+        raise MalformedHiddenStateError(f"extra review_evidence keys: {', '.join(sorted(extra))}")
+    for k in required:
+        if k not in data:
+            raise MalformedHiddenStateError(f"review_evidence missing key: {k!r}")
+    bcid = data["build_comment_id"]
+    if isinstance(bcid, bool) or not isinstance(bcid, int) or bcid <= 0:
+        raise MalformedHiddenStateError("review_evidence.build_comment_id must be a positive int")
+    bcut = data["build_comment_updated_at"]
+    if not isinstance(bcut, str) or not bcut:
+        raise MalformedHiddenStateError("review_evidence.build_comment_updated_at must be non-empty str")
+    cp = data["commit_prefix"]
+    if not isinstance(cp, str) or not re.fullmatch(r"[0-9a-f]{7,40}", cp):
+        raise MalformedHiddenStateError("review_evidence.commit_prefix must be 7-40 lowercase hex")
+    rhs = data["resolved_head_sha"]
+    if not _is_valid_full_sha(rhs):
+        raise MalformedHiddenStateError("review_evidence.resolved_head_sha must be 40 lowercase hex")
+    tcid = data["test_comment_id"]
+    if isinstance(tcid, bool) or not isinstance(tcid, int) or tcid < 0:
+        raise MalformedHiddenStateError("review_evidence.test_comment_id must be a non-negative int")
+    tcut = data["test_comment_updated_at"]
+    if tcid == 0:
+        if tcut:
+            raise MalformedHiddenStateError(
+                "review_evidence.test_comment_updated_at must be empty when test_comment_id is 0"
+            )
+    elif tcid > 0:
+        if not isinstance(tcut, str) or not tcut:
+            raise MalformedHiddenStateError(
+                "review_evidence.test_comment_updated_at must be non-empty when test_comment_id > 0"
+            )
+    crc = data["code_review_comment_id"]
+    if isinstance(crc, bool) or not isinstance(crc, int) or crc <= 0:
+        raise MalformedHiddenStateError("review_evidence.code_review_comment_id must be a positive int")
+    crcut = data["code_review_comment_updated_at"]
+    if not isinstance(crcut, str) or not crcut:
+        raise MalformedHiddenStateError(
+            "review_evidence.code_review_comment_updated_at must be non-empty str"
+        )
+    rai = data["review_author_id"]
+    if not isinstance(rai, str) or not rai or not rai.isdigit():
+        raise MalformedHiddenStateError("review_evidence.review_author_id must be a non-empty numeric string")
+    test_passed = data.get("test_passed", 0)
+    test_failed = data.get("test_failed", 0)
+    test_skipped = data.get("test_skipped", False)
+    for key, value in (("test_passed", test_passed), ("test_failed", test_failed)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise MalformedHiddenStateError(
+                f"review_evidence.{key} must be a non-negative int"
+            )
+    if not isinstance(test_skipped, bool):
+        raise MalformedHiddenStateError(
+            "review_evidence.test_skipped must be a bool"
+        )
+    return data
 
 
 def _validate_hidden_state(data: dict) -> dict:
@@ -94,15 +254,162 @@ def _validate_hidden_state(data: dict) -> dict:
         raise MalformedHiddenStateError("hidden state is not a dict")
 
     allowed_keys = {
-        "version", "head_sha", "status", "review_job_id",
+        "version", "head_sha", "status", "review_evidence",
         "components", "deployments", "approve_attempts", "approve_attempts_total",
         "approve_attempts_truncated",
         "case_results", "test_result", "cos", "command", "last_processed_comment_id",
+        "round_id", "round_started_at", "round_archive",
+        "deployment_logs",
+        "acceptance_request",
+        "runtime_checks",
+        "runtime_redeploy",
     }
     extra_keys = set(data.keys()) - allowed_keys
     if extra_keys:
         raise MalformedHiddenStateError(
             f"extra keys not allowed: {', '.join(sorted(extra_keys))}"
+        )
+
+    if "round_id" in data:
+        from .evidence_models import round_id_for_state
+        try:
+            rid = round_id_for_state(data)
+            if not rid.startswith(str(data.get("head_sha")) + "-"):
+                raise ValueError("round head mismatch")
+        except ValueError as exc:
+            raise MalformedHiddenStateError("invalid round_id") from exc
+    if "round_started_at" in data:
+        from datetime import datetime
+        value = data["round_started_at"]
+        try:
+            if not isinstance(value, str) or datetime.fromisoformat(value.replace("Z", "+00:00")).utcoffset() is None:
+                raise ValueError("timestamp requires timezone")
+        except ValueError as exc:
+            raise MalformedHiddenStateError("invalid round_started_at") from exc
+    if "deployment_logs" in data:
+        logs = data["deployment_logs"]
+        if not isinstance(logs, dict) or len(logs) > 32:
+            raise MalformedHiddenStateError("invalid deployment_logs")
+        for machine, item in logs.items():
+            if (not isinstance(machine, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", machine)
+                    or ".." in machine
+                    or not isinstance(item, dict)
+                    or set(item) != {"head_sha", "round_id", "status", "collected_at", "object_key", "sha256", "size"}
+                    or item.get("head_sha") != data.get("head_sha")
+                    or item.get("round_id") != data.get("round_id")
+                    or not isinstance(item.get("round_id"), str)
+                    or not re.fullmatch(re.escape(str(data.get("head_sha", ""))) + r"-[1-9][0-9]*", item.get("round_id", ""))
+                    or not any(isinstance(dep, dict) and dep.get("machine") == machine
+                               and dep.get("phase") == "deployed"
+                               for dep in data.get("deployments", []))
+                    or item.get("status") not in {"pending", "ready", "unavailable"}
+                    or not isinstance(item.get("collected_at"), str)
+                    or not isinstance(item.get("object_key"), str)
+                    or not isinstance(item.get("sha256"), str)
+                    or type(item.get("size")) is not int or item["size"] < 0):
+                raise MalformedHiddenStateError("invalid deployment_logs entry")
+            if item["status"] == "ready":
+                if (not item["object_key"] or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                        or item["size"] <= 0 or not item["collected_at"]):
+                    raise MalformedHiddenStateError("invalid ready deployment log")
+                from datetime import datetime
+                try:
+                    collected = datetime.fromisoformat(item["collected_at"].replace("Z", "+00:00"))
+                    if collected.utcoffset() is None or collected.utcoffset().total_seconds() != 0:
+                        raise ValueError
+                except (TypeError, ValueError, AttributeError):
+                    raise MalformedHiddenStateError("invalid deployment log collected_at") from None
+                filename = item["object_key"].rsplit("/", 1)[-1]
+                expected = f"evidence-{item['head_sha']}-{item['round_id'].rsplit('-', 1)[1]}-{machine}.log.gz"
+                key_parts = item["object_key"].split("/")
+                if (filename != expected or ".." in item["object_key"] or "\\" in item["object_key"]
+                        or len(key_parts) != 6 or key_parts[0] != "phanthymotus_pr"
+                        or not re.fullmatch(r"[A-Za-z0-9_-]+", key_parts[1])
+                        or not re.fullmatch(r"[0-9]{4}-[0-9]{2}", key_parts[2])
+                        or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", key_parts[3])
+                        or key_parts[2] != key_parts[3][:7]
+                        or not re.fullmatch(r"pr-[1-9][0-9]*", key_parts[4])):
+                    raise MalformedHiddenStateError("deployment log COS key identity mismatch")
+            elif item["object_key"] or item["sha256"] or item["size"]:
+                raise MalformedHiddenStateError("unfinished deployment log has COS metadata")
+    if "round_archive" in data:
+        link = data["round_archive"]
+        legacy_archive = isinstance(link, dict) and set(link) == {"round_id", "comment_id", "url", "sha256"}
+        note_archive = isinstance(link, dict) and set(link) == {"round_id", "sha256"}
+        if (link is not None and (not (legacy_archive or note_archive)
+                or (legacy_archive and (type(link["comment_id"]) is not int or link["comment_id"] <= 0
+                    or not isinstance(link["url"], str) or not link["url"].startswith("https://github.com/")))
+                or not isinstance(link["round_id"], str)
+                or not re.fullmatch(r"[0-9a-f]{40}-[0-9]+", link["round_id"])
+                or not isinstance(link["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", link["sha256"]))):
+            raise MalformedHiddenStateError("invalid round_archive")
+
+    if "acceptance_request" in data:
+        request = data["acceptance_request"]
+        base_fields = {
+            "head_sha", "round_id", "status", "requested_by",
+            "requested_by_id", "comment_id", "requested_at",
+        }
+        completed_fields = base_fields | {
+            "accepted_by", "accepted_by_id", "acceptance_comment_id",
+            "accepted_at", "result", "summary",
+        }
+        if (not isinstance(request, dict)
+                or request.get("status") not in {"pending", "completed"}
+                or set(request) != (base_fields if request.get("status") == "pending"
+                                    else completed_fields)
+                or request.get("head_sha") != data.get("head_sha")
+                or request.get("round_id") != data.get("round_id")
+                or request.get("status") == "pending" and data.get("status") != "testing"
+                or request.get("status") == "completed"
+                and data.get("status") not in {"succeeded", "failed"}):
+            raise MalformedHiddenStateError("invalid acceptance_request")
+
+        def valid_login(value):
+            return (isinstance(value, str)
+                    and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", value)
+                    is not None)
+
+        def valid_timestamp(value):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return isinstance(value, str) and parsed.utcoffset() is not None
+            except (AttributeError, TypeError, ValueError):
+                return False
+
+        if (not valid_login(request.get("requested_by"))
+                or type(request.get("requested_by_id")) is not int
+                or request["requested_by_id"] <= 0
+                or type(request.get("comment_id")) is not int
+                or request["comment_id"] <= 0
+                or not valid_timestamp(request.get("requested_at"))):
+            raise MalformedHiddenStateError("invalid acceptance_request identity")
+        if request.get("status") == "completed":
+            if (not valid_login(request.get("accepted_by"))
+                    or type(request.get("accepted_by_id")) is not int
+                    or request["accepted_by_id"] <= 0
+                    or type(request.get("acceptance_comment_id")) is not int
+                    or request["acceptance_comment_id"] <= 0
+                    or request["acceptance_comment_id"] <= request["comment_id"]
+                    or not valid_timestamp(request.get("accepted_at"))
+                    or request.get("result") not in {"pass", "fail"}
+                    or request.get("result") != data.get("test_result")
+                    or data.get("status") != ("succeeded" if request.get("result") == "pass" else "failed")
+                    or not isinstance(request.get("summary"), str)
+                    or len(request["summary"]) > 5000):
+                raise MalformedHiddenStateError("invalid acceptance_request completion")
+
+    # Explicitly reject unbounded history fields — history must persist
+    # in visible markdown only, never in hidden JSON state.
+    if "history" in data:
+        raise MalformedHiddenStateError(
+            "hidden state must not contain 'history' field; "
+            "history persists in visible lifecycle markdown only"
+        )
+    if "history_events" in data:
+        raise MalformedHiddenStateError(
+            "hidden state must not contain 'history_events' field; "
+            "history persists in visible lifecycle markdown only"
         )
 
     if data.get("version") != 1:
@@ -113,15 +420,17 @@ def _validate_hidden_state(data: dict) -> dict:
     status = data.get("status", "")
     allowed_statuses = {
         "review-required", "reviewing", "deploy-ready",
-        "deploy-requested", "testing", "succeeded",
+        "deploy-requested", "deploying", "testing", "succeeded",
         "failed",
     }
     if status not in allowed_statuses:
         raise MalformedHiddenStateError(f"invalid status: {status!r}")
 
-    review_job_id = data.get("review_job_id", "")
-    if not isinstance(review_job_id, str):
-        raise MalformedHiddenStateError("review_job_id invalid")
+    review_evidence = data.get("review_evidence", {})
+    if not isinstance(review_evidence, dict):
+        raise MalformedHiddenStateError("review_evidence must be a dict")
+    if review_evidence:
+        _validate_review_evidence(review_evidence)
 
     components = data.get("components", [])
     if not isinstance(components, list):
@@ -145,14 +454,15 @@ def _validate_hidden_state(data: dict) -> dict:
         review_image_tag = comp.get("review_image_tag", "")
         if not isinstance(review_image_tag, str) or not review_image_tag:
             raise MalformedHiddenStateError("review_image_tag missing")
-        if comp.get("target") not in {"perception", "actucore", "driver"}:
+        target = comp.get("target")
+        if target not in {"perception", "actucore", "driver", "core"}:
             raise MalformedHiddenStateError(f"invalid component target: {comp.get('target')!r}")
         if not isinstance(comp.get("driver_path"), str):
             raise MalformedHiddenStateError("driver_path must be a string")
         if not isinstance(comp.get("variant"), str):
             raise MalformedHiddenStateError("variant must be a string")
         image_ref = comp.get("image_ref", "")
-        if not _is_valid_digest_ref(image_ref):
+        if not _is_valid_image_ref(image_ref):
             raise MalformedHiddenStateError(f"invalid image_ref: {image_ref!r}")
         resolved_platform = comp.get("resolved_platform", "")
         if not isinstance(resolved_platform, str) or not resolved_platform:
@@ -160,6 +470,20 @@ def _validate_hidden_state(data: dict) -> dict:
         runtime_id = comp.get("runtime_id", "")
         if runtime_id != "" and (not isinstance(runtime_id, str) or not runtime_id):
             raise MalformedHiddenStateError("runtime_id must be an empty or non-empty string")
+        if target == "core":
+            if comp_keys != {
+                "component_id", "target", "driver_path", "variant",
+                "review_image_tag", "image_ref", "resolved_platform", "runtime_id",
+            }:
+                raise MalformedHiddenStateError(
+                    "core component must use the canonical runtime-bound schema"
+                )
+            if comp.get("driver_path") != "":
+                raise MalformedHiddenStateError("core driver_path must be empty")
+            if comp.get("variant") != "":
+                raise MalformedHiddenStateError("core variant must be empty")
+            if runtime_id != "core":
+                raise MalformedHiddenStateError("core runtime_id must be 'core'")
 
     deployments = data.get("deployments", [])
     if not isinstance(deployments, list):
@@ -168,11 +492,18 @@ def _validate_hidden_state(data: dict) -> dict:
     for dep in deployments:
         if not isinstance(dep, dict):
             raise MalformedHiddenStateError("deployment must be a dict")
-        if set(dep.keys()) != {"machine", "component_ids", "phase"}:
+        if set(dep.keys()) not in (
+                {"machine", "component_ids", "phase"},
+                {"machine", "component_ids", "phase", "ip"}):
             raise MalformedHiddenStateError("deployment keys must match the canonical schema")
         machine = dep.get("machine", "")
         if not isinstance(machine, str) or not machine:
             raise MalformedHiddenStateError("deployment must have non-empty machine")
+        if "ip" in dep and (
+                not isinstance(dep["ip"], str) or not dep["ip"]
+                or len(dep["ip"]) > 255
+                or any(ord(char) < 33 or ord(char) == 127 for char in dep["ip"])):
+            raise MalformedHiddenStateError("deployment.ip must be a bounded host value")
         if dep.get("phase") != "deployed":
             raise MalformedHiddenStateError(f"invalid deployment phase: {dep.get('phase')!r}")
         cids = dep.get("component_ids", [])
@@ -188,6 +519,176 @@ def _validate_hidden_state(data: dict) -> dict:
                 raise MalformedHiddenStateError(f"component {cid!r} deployed more than once")
             seen_in_dep.add(cid)
             deployed_cids.add(cid)
+
+    runtime_redeploy = data.get("runtime_redeploy", [])
+    if not isinstance(runtime_redeploy, list) or len(runtime_redeploy) > 32:
+        raise MalformedHiddenStateError("runtime_redeploy must be a bounded list")
+    runtime_redeploy_bindings = set()
+    runtime_redeploy_components = set()
+    for item in runtime_redeploy:
+        if (not isinstance(item, dict)
+                or set(item) != {"machine", "ip", "component_ids"}):
+            raise MalformedHiddenStateError("runtime_redeploy entry is invalid")
+        machine = item.get("machine")
+        ip_value = item.get("ip")
+        component_ids = item.get("component_ids")
+        if (not isinstance(machine, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", machine)
+                or ".." in machine
+                or not isinstance(ip_value, str) or len(ip_value) > 45
+                or not isinstance(component_ids, list) or not component_ids
+                or len(component_ids) > 32):
+            raise MalformedHiddenStateError("runtime_redeploy fields are invalid")
+        try:
+            parsed_ip = ipaddress.ip_address(ip_value)
+        except ValueError:
+            raise MalformedHiddenStateError("runtime_redeploy.ip is invalid") from None
+        if parsed_ip.version != 4 or str(parsed_ip) != ip_value:
+            raise MalformedHiddenStateError("runtime_redeploy.ip must be canonical IPv4")
+        if any(not isinstance(cid, str) or cid not in known_cids
+               for cid in component_ids):
+            raise MalformedHiddenStateError("runtime_redeploy component binding is invalid")
+        if any(cid in deployed_cids for cid in component_ids):
+            raise MalformedHiddenStateError(
+                "runtime_redeploy component must not remain marked deployed",
+            )
+        if len(set(component_ids)) != len(component_ids):
+            raise MalformedHiddenStateError("runtime_redeploy component binding is invalid")
+        for component_id in component_ids:
+            if component_id in runtime_redeploy_components:
+                raise MalformedHiddenStateError(
+                    "runtime_redeploy component is bound more than once",
+                )
+            runtime_redeploy_components.add(component_id)
+            binding = (machine, ip_value, component_id)
+            if binding in runtime_redeploy_bindings:
+                raise MalformedHiddenStateError("duplicate runtime_redeploy binding")
+            runtime_redeploy_bindings.add(binding)
+            if len(runtime_redeploy_bindings) > 32:
+                raise MalformedHiddenStateError(
+                    "runtime_redeploy bindings exceed the bounded limit",
+                )
+
+    if "runtime_checks" in data:
+        runtime_checks = data["runtime_checks"]
+        if not isinstance(runtime_checks, list) or len(runtime_checks) > 32:
+            raise MalformedHiddenStateError("runtime_checks must be a bounded list")
+        component_by_id = {
+            component.get("component_id"): component
+            for component in components if isinstance(component, dict)
+        }
+        deployed_bindings = {
+            (deployment.get("machine"), deployment.get("ip"), component_id)
+            for deployment in deployments if isinstance(deployment, dict)
+            for component_id in deployment.get("component_ids", [])
+        }
+        seen_runtime_checks = set()
+        runtime_check_statuses = {}
+        allowed_runtime_statuses = {
+            "match", "mismatch", "not_running", "unavailable", "identity_changed",
+        }
+        for check in runtime_checks:
+            required = {
+                "machine", "ip", "component_id", "runtime_id", "target_image",
+                "observed_image", "status", "checked_at",
+            }
+            if not isinstance(check, dict) or set(check) != required:
+                raise MalformedHiddenStateError("runtime_check keys are invalid")
+            machine = check.get("machine")
+            ip_value = check.get("ip")
+            component_id = check.get("component_id")
+            runtime_id = check.get("runtime_id")
+            target_image = check.get("target_image")
+            observed_image = check.get("observed_image")
+            status_value = check.get("status")
+            checked_at = check.get("checked_at")
+            if (not isinstance(machine, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", machine)
+                    or ".." in machine
+                    or not isinstance(ip_value, str) or len(ip_value) > 45
+                    or not isinstance(component_id, str)
+                    or not re.fullmatch(r"[0-9a-f]{16}", component_id)
+                    or not isinstance(runtime_id, str) or not runtime_id
+                    or len(runtime_id) > 255
+                    or any(ord(char) < 33 or ord(char) == 127 for char in runtime_id)
+                    or not isinstance(target_image, str) or not target_image
+                    or len(target_image) > 1024
+                    or any(ord(char) < 33 or ord(char) == 127 for char in target_image)
+                    or not isinstance(observed_image, str) or len(observed_image) > 1024
+                    or any(ord(char) < 32 or ord(char) == 127 for char in observed_image)
+                    or not isinstance(status_value, str)
+                    or status_value not in allowed_runtime_statuses
+                    or not isinstance(checked_at, str) or len(checked_at) > 40):
+                raise MalformedHiddenStateError("runtime_check field is invalid")
+            try:
+                parsed_ip = ipaddress.ip_address(ip_value)
+            except ValueError:
+                raise MalformedHiddenStateError("runtime_check.ip is invalid") from None
+            if parsed_ip.version != 4 or str(parsed_ip) != ip_value:
+                raise MalformedHiddenStateError(
+                    "runtime_check.ip must be canonical IPv4",
+                )
+            try:
+                from datetime import datetime as _runtime_datetime
+                checked_time = _runtime_datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+                if checked_time.utcoffset() is None:
+                    raise ValueError("timestamp requires timezone")
+            except (AttributeError, TypeError, ValueError):
+                raise MalformedHiddenStateError("runtime_check.checked_at is invalid") from None
+            binding = (machine, str(parsed_ip), component_id)
+            legacy_alias_binding = (
+                status_value == "identity_changed"
+                and any(isinstance(deployment, dict)
+                        and deployment.get("machine") == machine
+                        and not deployment.get("ip")
+                        and component_id in deployment.get("component_ids", [])
+                        for deployment in deployments)
+            )
+            if (binding not in deployed_bindings
+                    and binding not in runtime_redeploy_bindings
+                    and not legacy_alias_binding):
+                raise MalformedHiddenStateError(
+                    "runtime_check is not bound to a deployed machine/component",
+                )
+            component = component_by_id.get(component_id)
+            if (not isinstance(component, dict)
+                    or target_image != component.get("image_ref")):
+                raise MalformedHiddenStateError(
+                    "runtime_check target image is not bound to its component",
+                )
+            expected_runtime_id = component.get("runtime_id", "")
+            if (expected_runtime_id and runtime_id != expected_runtime_id
+                    and status_value != "identity_changed"):
+                raise MalformedHiddenStateError(
+                    "runtime_check runtime ID is not bound to its component",
+                )
+            expected_observed_image = target_image
+            if component.get("target") == "core":
+                image_ref = component.get("image_ref", "")
+                slash = image_ref.rfind("/")
+                colon = image_ref.rfind(":")
+                expected_observed_image = (
+                    image_ref[colon + 1:] if colon > slash else ""
+                )
+            if status_value == "match" and observed_image != expected_observed_image:
+                raise MalformedHiddenStateError("runtime_check match images differ")
+            if status_value == "mismatch" and observed_image == expected_observed_image:
+                raise MalformedHiddenStateError("runtime_check mismatch images match")
+            identity = (machine, str(parsed_ip), component_id)
+            if identity in seen_runtime_checks:
+                raise MalformedHiddenStateError("duplicate runtime_check binding")
+            seen_runtime_checks.add(identity)
+            runtime_check_statuses[identity] = status_value
+        for binding in runtime_redeploy_bindings:
+            check_status = runtime_check_statuses.get(binding)
+            if check_status not in {"mismatch", "not_running", "unavailable", "identity_changed"}:
+                raise MalformedHiddenStateError(
+                    "runtime_redeploy requires a current non-matching runtime check",
+                )
+        if runtime_redeploy_bindings and data.get("status") in {"testing", "succeeded"}:
+            raise MalformedHiddenStateError(
+                "completed lifecycle must not retain runtime_redeploy bindings",
+            )
 
     approve_attempts = data.get("approve_attempts", [])
     if not isinstance(approve_attempts, list):
@@ -205,7 +706,9 @@ def _validate_hidden_state(data: dict) -> dict:
             val = attempt.get(key, "")
             if not isinstance(val, str) or not val:
                 raise MalformedHiddenStateError(f"approve_attempt.{key} must be a non-empty string")
-        if attempt.get("outcome") not in {"blocked_occupied", "deployed", "failed", "uncertain"}:
+        if attempt.get("outcome") not in {
+                "blocked_occupied", "approval_revoked", "preflight_unavailable",
+                "deployed", "failed", "uncertain"}:
             raise MalformedHiddenStateError("approve_attempt.outcome invalid")
         preflight = attempt.get("preflight", [])
         health = attempt.get("health", [])
@@ -214,16 +717,122 @@ def _validate_hidden_state(data: dict) -> dict:
         for h in health:
             if not isinstance(h, dict):
                 raise MalformedHiddenStateError("approve_attempt health entries must be dicts")
-            if set(h.keys()) != {"component_id", "runtime_id", "running_image", "passed"}:
-                raise MalformedHiddenStateError("approve_attempt health keys must match the canonical schema")
+            # Legacy schema (deprecated but still allowed for backward compat)
+            legacy_keys = {"component_id", "runtime_id", "running_image", "passed"}
+            # New schema — post-deploy verification (verified == True/False)
+            new_schema_keys = {"component_id", "runtime_id", "status", "running_image", "target_image", "verified"}
+            # New schema with optional error (uncertain post-deploy)
+            new_schema_with_error_keys = new_schema_keys | {"error"}
+            # Core self-update verification schema.  Core has no running_image
+            # or driver status; it is verified through update-check current_tag.
+            core_schema_keys = {
+                "component_id", "runtime_id", "current_tag", "target_tag", "verified",
+            }
+            core_schema_optional = {"already_target", "error"}
+            h_keys = set(h.keys())
+            is_core_schema = (
+                core_schema_keys <= h_keys
+                and h_keys - core_schema_keys <= core_schema_optional
+            )
+            if (
+                h_keys != legacy_keys
+                and h_keys not in (new_schema_keys, new_schema_with_error_keys)
+                and not is_core_schema
+            ):
+                raise MalformedHiddenStateError(
+                    f"approve_attempt health keys must match canonical schema, got {h_keys}"
+                )
+            if is_core_schema:
+                component_id = h.get("component_id")
+                if not isinstance(component_id, str) or not component_id:
+                    raise MalformedHiddenStateError(
+                        "core health component_id must be a non-empty string"
+                    )
+                if h.get("runtime_id") != "core":
+                    raise MalformedHiddenStateError(
+                        "core health runtime_id must be 'core'"
+                    )
+                if not isinstance(h.get("current_tag"), str):
+                    raise MalformedHiddenStateError(
+                        "core health current_tag must be a string"
+                    )
+                if not isinstance(h.get("target_tag"), str) or not h.get("target_tag"):
+                    raise MalformedHiddenStateError(
+                        "core health target_tag must be a non-empty string"
+                    )
+                if not isinstance(h.get("verified"), bool):
+                    raise MalformedHiddenStateError(
+                        "core health verified must be a bool"
+                    )
+                if h.get("verified") is True:
+                    if not h.get("current_tag"):
+                        raise MalformedHiddenStateError(
+                            "core health verified=true requires non-empty current_tag"
+                        )
+                    if h.get("current_tag") != h.get("target_tag"):
+                        raise MalformedHiddenStateError(
+                            "core health verified=true requires current_tag==target_tag"
+                        )
+                if "already_target" in h:
+                    if not isinstance(h["already_target"], bool):
+                        raise MalformedHiddenStateError(
+                            "core health already_target must be a bool"
+                        )
+                    if h["already_target"] is True and (
+                        h.get("verified") is not True
+                        or h.get("current_tag") != h.get("target_tag")
+                    ):
+                        raise MalformedHiddenStateError(
+                            "core health already_target=true requires verified target"
+                        )
+                if "error" in h:
+                    if not isinstance(h["error"], str) or not h["error"]:
+                        raise MalformedHiddenStateError(
+                            "core health error must be a non-empty string when present"
+                        )
+                    if h.get("verified") is not False:
+                        raise MalformedHiddenStateError(
+                            "core health error implies verified=false"
+                        )
+                continue
+            if h.get("runtime_id") == "core":
+                raise MalformedHiddenStateError(
+                    "core health must use the canonical update-check schema"
+                )
             if not isinstance(h.get("component_id", ""), str):
                 raise MalformedHiddenStateError("approve_attempt health component_id must be a string")
             if not isinstance(h.get("runtime_id", ""), str):
                 raise MalformedHiddenStateError("approve_attempt health runtime_id must be a string")
             if not isinstance(h.get("running_image", ""), str):
                 raise MalformedHiddenStateError("approve_attempt health running_image must be a string")
-            if not isinstance(h.get("passed"), bool):
+            if "passed" in h and not isinstance(h.get("passed"), bool):
                 raise MalformedHiddenStateError("approve_attempt health passed must be a bool")
+            if "verified" in h and not isinstance(h.get("verified"), bool):
+                raise MalformedHiddenStateError("approve_attempt health verified must be a bool")
+            # Semantic validation for new schema
+            if h_keys in (new_schema_keys, new_schema_with_error_keys):
+                if h.get("verified") is True:
+                    if h.get("status") != "running":
+                        raise MalformedHiddenStateError(
+                            "health verified=true requires status==running"
+                        )
+                    if h.get("running_image") != h.get("target_image"):
+                        raise MalformedHiddenStateError(
+                            "health verified=true requires running_image==target_image"
+                        )
+                    if not h.get("target_image"):
+                        raise MalformedHiddenStateError(
+                            "health verified=true requires non-empty target_image"
+                        )
+                if "error" in h:
+                    if not isinstance(h["error"], str) or not h["error"]:
+                        raise MalformedHiddenStateError(
+                            "health error must be a non-empty string when present"
+                        )
+                    if h.get("verified") is not False:
+                        raise MalformedHiddenStateError(
+                            "health error implies verified=false"
+                        )
     approve_attempts_total = data.get("approve_attempts_total", len(approve_attempts))
     if isinstance(approve_attempts_total, bool) or not isinstance(approve_attempts_total, int):
         raise MalformedHiddenStateError("approve_attempts_total must be a non-negative int")
@@ -257,8 +866,6 @@ def _validate_hidden_state(data: dict) -> dict:
         raise MalformedHiddenStateError("cos must be a dict")
     if set(cos.keys()) != {"object_key", "sha256", "size"}:
         raise MalformedHiddenStateError("cos keys must match the canonical schema")
-    if "signed_url" in cos:
-        raise MalformedHiddenStateError("cos must not contain signed_url")
     object_key = cos.get("object_key", "")
     sha256 = cos.get("sha256", "")
     size = cos.get("size", 0)
@@ -283,7 +890,7 @@ def _validate_hidden_state(data: dict) -> dict:
     comment_id = command.get("comment_id", -1)
     if isinstance(comment_id, bool) or not isinstance(comment_id, int) or comment_id < 0:
         raise MalformedHiddenStateError("command.comment_id must be a non-negative int")
-    if command.get("kind", "") not in {"", "request_deploy", "approve_deploy", "record_test", "deploy_status", "deploy_help"}:
+    if command.get("kind", "") not in {"", "request_deploy", "approve_deploy", "request_acceptance", "record_test", "deploy_status", "deploy_help"}:
         raise MalformedHiddenStateError(f"command.kind invalid: {command.get('kind')!r}")
     if command.get("phase") not in {"completed", "executing", "uncertain"}:
         raise MalformedHiddenStateError(f"command.phase invalid: {command.get('phase')!r}")
@@ -294,17 +901,23 @@ def _validate_hidden_state(data: dict) -> dict:
         machine = args.get("machine", "")
         if not isinstance(machine, str) or not machine:
             raise MalformedHiddenStateError("approve_deploy executing/uncertain requires machine arg")
-    if command.get("phase") == "uncertain" and status != "deploy-requested":
-        raise MalformedHiddenStateError("uncertain command phase requires status deploy-requested")
+    if command.get("phase") == "uncertain" and status not in {"deploying", "deploy-requested"}:
+        raise MalformedHiddenStateError("uncertain command phase requires a pending deployment status")
 
     last_processed = data.get("last_processed_comment_id")
     if isinstance(last_processed, bool) or not isinstance(last_processed, int) or last_processed < 0:
         raise MalformedHiddenStateError("last_processed_comment_id must be a non-negative int")
+    acceptance_request = data.get("acceptance_request")
+    if (isinstance(acceptance_request, dict)
+            and (acceptance_request["comment_id"] > last_processed
+                 or acceptance_request.get("status") == "completed"
+                 and acceptance_request["acceptance_comment_id"] > last_processed)):
+        raise MalformedHiddenStateError("acceptance_request comments exceed the persisted cursor")
 
-    if status in {"deploy-ready", "deploy-requested", "testing", "succeeded", "failed"}:
-        if not review_job_id:
-            raise MalformedHiddenStateError(f"review_job_id must be non-empty for status {status!r}")
-    if status in {"deploy-requested", "testing", "succeeded", "failed"}:
+    if status in {"deploy-ready", "deploy-requested", "deploying", "testing", "succeeded", "failed"}:
+        if not review_evidence:
+            raise MalformedHiddenStateError(f"review_evidence must be non-empty for status {status!r}")
+    if status in {"deploy-requested", "deploying", "testing", "succeeded", "failed"}:
         if not components:
             raise MalformedHiddenStateError(f"components must be non-empty for status {status!r}")
     if status == "succeeded" and test_result != "pass":
@@ -343,9 +956,237 @@ def _build_hidden_state_body(visible_markdown: str, state: dict) -> str:
         )
     hidden_block = f"{HIDDEN_STATE_MARKER}{hidden_json}\n-->"
     if visible_markdown:
-        return visible_markdown.rstrip() + "\n\n" + hidden_block
+        # Collapse all trailing newlines to a single newline before adding
+        # the standard two-newline separator.  This keeps the boundary before
+        # the hidden-state marker perfectly idempotent when persist_cursor
+        # re-reads body[:idx].rstrip() and re-serialises.
+        vm = visible_markdown.rstrip("\n") + "\n"
+        return vm + "\n\n" + hidden_block
     return hidden_block
 
+
+
+# ── Visible history helpers ──────────────────────────────────────────────────
+
+
+def _parse_visible_history(body: str) -> tuple[str, list[dict]]:
+    """Parse visible lifecycle body into (body_without_history, events).
+
+    Returns the body text stripped of the generated history section,
+    plus a list of event dicts (newest first).
+    """
+    start = body.find(VISIBLE_HISTORY_START_MARKER)
+    end = body.find(VISIBLE_HISTORY_END_MARKER)
+    if start < 0 or end < 0 or end <= start:
+        # No generated history section — whole body is visible
+        return body.rstrip(), []
+    # Strip history section from body
+    before = body[:start].rstrip()
+    after = body[end + len(VISIBLE_HISTORY_END_MARKER):].lstrip()
+    clean_body = (before + "\n" + after).strip() + "\n"
+
+    # Parse events from the history section
+    history_section = body[start + len(VISIBLE_HISTORY_START_MARKER):end]
+    events: list[dict] = []
+    # Split by optional delimiter
+    blocks = re.split(r"<!-- deploy-approval-history-event -->", history_section)
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        evt: dict[str, Any] = {}
+        for line in block.splitlines():
+            line = line.strip()
+            # Extract timestamp from header #### 2026-09-24 10:00:00 \u2014 Title
+            ts_match = re.match(r"^####\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+\u2014\s+(.*)$", line)
+            if ts_match:
+                evt["timestamp"] = ts_match.group(1)
+                evt["event"] = ts_match.group(2)
+                continue
+            if line.startswith("**Lifecycle:**"):
+                evt["lifecycle"] = line.replace("**Lifecycle:**", "").strip()
+            elif line.startswith("**Machine:**"):
+                m = re.search(r"`([^`]*)`", line)
+                if m:
+                    evt["machine"] = m.group(1)
+                ip_m = re.search("\u00b7\\s+\\*\\*IP:\\*\\*\\s+`([^`]*)`", line)
+                if ip_m:
+                    evt["ip"] = ip_m.group(1)
+            elif line.startswith("**Components:**"):
+                evt["components"] = line.replace("**Components:**", "").strip()
+            elif line.startswith("**Result:**"):
+                evt["result"] = line.replace("**Result:**", "").strip()
+        if evt:
+            events.append(evt)
+    return clean_body, events
+
+
+def _build_history_block(events: list[dict]) -> str:
+    """Build the generated history block, folded by default in GitHub."""
+    lines = [
+        VISIBLE_HISTORY_START_MARKER,
+        "<details>",
+        "<summary>History · 历史事件</summary>",
+        "",
+    ]
+    for evt in events:
+        ts = evt.get("timestamp", beijing_now_str())
+        title = evt.get("event", "Event")
+        lines.append(f"#### {ts} \u2014 {title}")
+        lines.append("")
+        lifecycle = evt.get("lifecycle", "")
+        if lifecycle:
+            lines.append(f"**Lifecycle:** {lifecycle}")
+            lines.append("")
+        machine = evt.get("machine", "")
+        ip = evt.get("ip", "")
+        if machine or ip:
+            if machine and ip:
+                lines.append(f"**Machine:** `{machine}` \u00b7 **IP:** `{ip}`")
+            elif machine:
+                lines.append(f"**Machine:** `{machine}`")
+            else:
+                lines.append(f"**IP:** `{ip}`")
+            lines.append("")
+        components = evt.get("components", "")
+        if components:
+            lines.append(f"**Components:** {components}")
+            lines.append("")
+        result = evt.get("result", "")
+        if result:
+            lines.append(f"**Result:** {result}")
+            lines.append("")
+        lines.append(HISTORY_EVENT_DELIMITER)
+        lines.append("")
+    lines.extend(["</details>", VISIBLE_HISTORY_END_MARKER])
+    return "\n".join(lines)
+
+
+def _insert_history_into_visible(visible: str, event: dict) -> str:
+    """Insert a new history event into the visible lifecycle markdown.
+
+    Preserves existing generated history section; prepends new event.
+    Ensures exactly one "### History" heading exists.
+    """
+    start = visible.find(VISIBLE_HISTORY_START_MARKER)
+    end = visible.find(VISIBLE_HISTORY_END_MARKER)
+    if start >= 0 and end >= 0 and end > start:
+        # Parse existing events, prepend new event
+        _, existing_events = _parse_visible_history(visible)
+        new_events = [event] + existing_events
+        new_history = _build_history_block(new_events)
+        # Replace existing history section
+        before_history = re.sub(
+            r"(?:^|\n)#{2,6}[ \t]+History[ \t]*\n[ \t]*$", "\n",
+            visible[:start], flags=re.IGNORECASE,
+        )
+        after_history = visible[end + len(VISIBLE_HISTORY_END_MARKER):]
+        return before_history + new_history + after_history
+    else:
+        # No existing history section — append one with "### History" heading
+        existing_events: list[dict] = []
+        new_events = [event] + existing_events
+        new_history = _build_history_block(new_events)
+        return visible.rstrip() + "\n\n" + new_history + "\n"
+
+
+
+
+def _render_history_event(evt: dict) -> str:
+    """Render a single history event dict into markdown lines.
+
+    Used by both _build_history_block (main) and archive creation,
+    ensuring archived events are semantically identical to main history.
+    """
+    lines = []
+    ts = evt.get("timestamp", beijing_now_str())
+    title = evt.get("event", "Event")
+    lines.append(f"#### {ts} — {title}")
+    lines.append("")
+    lifecycle = evt.get("lifecycle", "")
+    if lifecycle:
+        lines.append(f"**Lifecycle:** {lifecycle}")
+        lines.append("")
+    machine = evt.get("machine", "")
+    ip = evt.get("ip", "")
+    if machine or ip:
+        from .comments import _escape
+        if machine and ip:
+            lines.append(f"**Machine:** `{_escape(machine)}` · **IP:** `{ip}`")
+        elif machine:
+            lines.append(f"**Machine:** `{_escape(machine)}`")
+        else:
+            lines.append(f"**IP:** `{ip}`")
+        lines.append("")
+    components = evt.get("components", "")
+    if components:
+        lines.append(f"**Components:** {components}")
+        lines.append("")
+    result = evt.get("result", "")
+    if result:
+        lines.append(f"**Result:** {result}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _count_visible_bytes(visible: str) -> int:
+    """Count UTF-8 encoded bytes of visible lifecycle markdown."""
+    return len(visible.encode("utf-8"))
+
+
+def _truncate_events_to_fit(
+    events: list[dict], target_bytes: int,
+) -> tuple[list[dict], list[dict]]:
+    """Truncate oldest events until total history block fits target_bytes.
+
+    Returns (kept_events, archived_events).
+    Never silently drops events — archived events must be moved to an archive.
+    Every popped event goes into archived; kept + archived == original (no dup, no loss).
+    """
+    # Try keeping all events
+    candidate = _build_history_block(events)
+    if _count_visible_bytes(candidate) <= target_bytes:
+        return events, []
+    # Remove oldest events one by one until it fits
+    kept = list(events)
+    archived: list[dict] = []
+    while kept:
+        removed = kept.pop()  # remove oldest (last in newest-first list)
+        archived.insert(0, removed)
+        candidate = _build_history_block(kept)
+        if _count_visible_bytes(candidate) <= target_bytes:
+            break
+    return kept, archived
+
+
+def _build_archive_body(
+    repo: str,
+    pr_number: int,
+    page_num: int,
+    events: list[dict],
+    extra_text: str = "",
+) -> str:
+    """Build an immutable history archive comment body.
+
+    Always starts with BOT_MARKER + archive marker.
+    """
+    from .comments import BOT_MARKER
+    archive_marker = _history_archive_marker(repo, pr_number, page_num)
+    archive_lines = [
+        BOT_MARKER,
+        archive_marker,
+        f"### Deploy Approval — History Archive Page {page_num}",
+        "",
+    ]
+    if extra_text:
+        archive_lines.append(extra_text)
+        archive_lines.append("")
+    for evt in events:
+        event_text = _render_history_event(evt)
+        archive_lines.append(event_text)
+        archive_lines.append(HISTORY_EVENT_DELIMITER)
+        archive_lines.append("")
+    return "\n".join(archive_lines)
 
 class GitHubStateProxy:
     """GitHub-only state proxy for Deploy Approval.
@@ -358,53 +1199,24 @@ class GitHubStateProxy:
         self,
         config: Config,
         github: GitHubClient,
-        bot_user_id: str = "",
-        bot_login: str = "",
+        github_app_id: str = "",
     ):
+        """Initialize the GitHub state proxy.
+
+        Parameters
+        ----------
+        github_app_id : str
+            The GitHub App ID used for lazy provenance validation of
+            lifecycle comments.  Trust is established per-comment
+            by checking ``performed_via_github_app.id == github_app_id``.
+        """
         self.config = config
         self._github = github
-        self._bot_user_id = ""
-        self._bot_login = ""
-        if bot_user_id or bot_login:
-            self.bind_trusted_identity(bot_user_id, bot_login)
-
-    @staticmethod
-    def _normalize_user_id(user_id: str | int) -> str:
-        if isinstance(user_id, bool):
-            raise TrustedIdentityRequiredError("trusted identity user_id must be numeric")
-        if isinstance(user_id, int):
-            if user_id <= 0:
-                raise TrustedIdentityRequiredError("trusted identity user_id must be numeric")
-            return str(user_id)
-        if not isinstance(user_id, str):
-            raise TrustedIdentityRequiredError("trusted identity user_id must be numeric")
-        raw = user_id.strip()
-        if not raw or not raw.isdigit() or raw == "0":
-            raise TrustedIdentityRequiredError("trusted identity user_id must be numeric")
-        return str(int(raw))
-
-    def bind_trusted_identity(self, user_id: str | int, login: str) -> None:
-        """Bind the authenticated GitHub bot identity.
-
-        The numeric user id is authoritative. Rebinding to a different id fails
-        closed. Rebinding to the same id is idempotent.
-        """
-        normalized_user_id = self._normalize_user_id(user_id)
-        if not isinstance(login, str) or not login.strip():
-            raise TrustedIdentityRequiredError("trusted identity login must be non-empty")
-        normalized_login = login.strip()
-        if self._bot_user_id and self._bot_user_id != normalized_user_id:
-            raise TrustedIdentityRequiredError(
-                "trusted identity already bound to a different user id"
-            )
-        self._bot_user_id = normalized_user_id
-        self._bot_login = normalized_login
-
-    def _require_trusted_identity(self) -> None:
-        if not self._bot_user_id:
-            raise TrustedIdentityRequiredError(
-                "trusted identity is required before reading or writing lifecycle state"
-            )
+        self._github_app_id = github_app_id
+        # Status labels are an optional projection. Cache successful checks
+        # briefly and back off failed projections so a missing label cannot
+        # generate an API request on every watcher pass.
+        self._status_label_projection: dict[tuple[str, int], dict[str, Any]] = {}
 
     # ── GitHub API passthrough ──
 
@@ -431,9 +1243,25 @@ class GitHubStateProxy:
     async def get_issue_labels(self, repo: str, issue_number: int) -> list[str]:
         return await self._github.get_issue_labels(repo, issue_number)
 
-    async def set_issue_labels(self, repo: str, issue_number: int,
-                               labels: list[str]) -> None:
-        await self._github.set_issue_labels(repo, issue_number, labels)
+    async def add_issue_label(
+        self,
+        repo: str,
+        issue_number: int,
+        label: str,
+    ) -> None:
+        await self._github.add_issue_label(
+            repo, issue_number, label,
+        )
+
+    async def remove_issue_label(
+        self,
+        repo: str,
+        issue_number: int,
+        label: str,
+    ) -> None:
+        await self._github.remove_issue_label(
+            repo, issue_number, label,
+        )
 
     async def comment_identity(self, repo: str,
                                comment_id: int) -> tuple[str, str]:
@@ -474,14 +1302,24 @@ class GitHubStateProxy:
     ) -> dict | None:
         """Find the ONE trusted lifecycle comment for this PR.
 
-        A comment is trusted only when BOTH:
+        Lazy provenance: trust is established per-comment by checking
+        ``performed_via_github_app.id == github_app_id``.  No startup
+        bot-identity binding is required.
+
+        A comment is trusted only when ALL of:
         1. body contains the exact deploy-approval state marker
-        2. comment author is the configured bot identity
+        2. performed_via_github_app exists, is dict, id is non-bool positive int
+        3. performed_via_github_app.id == configured github_app_id
+        4. user dict exists with non-bool positive id and non-empty login
+           (if user.type is present, it must be "Bot")
 
         Returns the comment dict, or None if no trusted comment exists.
         Raises MultipleTrustedCommentsError if >1 trusted comments exist.
         """
-        self._require_trusted_identity()
+        if not self._github_app_id:
+            raise TrustedIdentityRequiredError(
+                "github_app_id is required before reading lifecycle state"
+            )
         comments = await self.get_issue_comments(repo, pr_number)
         trusted: list[dict] = []
         for c in comments:
@@ -490,21 +1328,37 @@ class GitHubStateProxy:
                 continue
             if HIDDEN_STATE_MARKER not in body:
                 continue
-            # Check author identity
+            # Check performed_via_github_app provenance
+            pvga = c.get("performed_via_github_app")
+            if not isinstance(pvga, dict):
+                continue
+            app_id = pvga.get("id")
+            if not (isinstance(app_id, int) and not isinstance(app_id, bool) and app_id > 0):
+                continue
+            if str(app_id) != self._github_app_id:
+                logger.warning(
+                    "ignoring state marker from mismatched app id %s",
+                    app_id,
+                )
+                continue
+            # Also validate user dict exists
             user = c.get("user")
             if not isinstance(user, dict):
                 continue
-            author_id = user.get("id", "")
-            if isinstance(author_id, bool) or not isinstance(author_id, int) or author_id <= 0:
+            uid = user.get("id", "")
+            if isinstance(uid, bool) or not isinstance(uid, int) or uid <= 0:
                 continue
-            if str(author_id) == self._bot_user_id:
-                trusted.append(c)
-            else:
-                author_login = str(user.get("login", ""))
+            login = user.get("login", "")
+            if not isinstance(login, str) or not login:
+                continue
+            # If user type is provided, it must be Bot
+            utype = user.get("type")
+            if utype is not None and utype != "Bot":
                 logger.warning(
-                    "ignoring state marker from non-bot user %s/%s",
-                    author_login, author_id,
+                    "ignoring state marker from non-bot user type %r", utype,
                 )
+                continue
+            trusted.append(c)
 
         if len(trusted) > 1:
             raise MultipleTrustedCommentsError(
@@ -534,13 +1388,18 @@ class GitHubStateProxy:
         return _validate_hidden_state(data)
 
     def is_bot_comment(self, comment: dict) -> bool:
-        """Check if a comment is authored by the configured bot."""
-        self._require_trusted_identity()
-        user = comment.get("user") or {}
-        author_id = user.get("id")
-        if isinstance(author_id, bool) or not isinstance(author_id, int) or author_id <= 0:
-            return False
-        return str(author_id) == self._bot_user_id
+        """Check if a comment is authored by the configured GitHub App.
+
+        Only relies on performed_via_github_app.id provenance.
+        """
+        if self._github_app_id:
+            pvga = comment.get("performed_via_github_app")
+            if isinstance(pvga, dict):
+                app_id = pvga.get("id")
+                if isinstance(app_id, int) and not isinstance(app_id, bool):
+                    if str(app_id) == self._github_app_id:
+                        return True
+        return False
 
     async def write_hidden_state(
         self,
@@ -548,13 +1407,24 @@ class GitHubStateProxy:
         pr_number: int,
         visible_markdown: str,
         state: dict,
+        *, expected_comment: tuple[int | None, str | None] | None = None,
     ) -> dict | None:
         """Write hidden state to the trusted lifecycle comment.
 
         If no trusted comment exists, creates a new one.
-        Returns the comment dict, or None on failure.
+        Returns the comment dict, or None on failure. When expected_comment
+        is supplied, require the same ID/body at the final read before PATCH;
+        (None, None) requires that no lifecycle comment exists yet.
+
+        Trust is established per-comment via lazy provenance in
+        find_trusted_lifecycle_comment.  The installation token used
+        to create/update comments is already trusted; we only require
+        that github_app_id is configured for consistency.
         """
-        self._require_trusted_identity()
+        if not self._github_app_id:
+            raise TrustedIdentityRequiredError(
+                "github_app_id is required before writing lifecycle state"
+            )
         # Validate state before writing
         _validate_hidden_state(state)
 
@@ -563,6 +1433,11 @@ class GitHubStateProxy:
             raise GitHubStateProxyError("comment body exceeds max size")
 
         existing = await self.find_trusted_lifecycle_comment(repo, pr_number)
+        if expected_comment is not None:
+            observed = ((existing.get("id"), existing.get("body"))
+                        if existing is not None else (None, None))
+            if observed != expected_comment:
+                raise GitHubStateProxyError("Lifecycle comment changed before persistence")
         if existing is not None:
             comment_id = existing.get("id")
             if isinstance(comment_id, int):
@@ -570,6 +1445,831 @@ class GitHubStateProxy:
                 return existing
         # Create new comment
         result = await self.post_issue_comment(repo, pr_number, body)
+        return result
+
+    def _evidence_repo_guard(self, repo: str) -> None:
+        if (not self.config.auth_valid or repo not in self.config.github_repos
+                or repo not in self.config.active_repos or not self._github_app_id):
+            raise GitHubStateProxyError("Evidence repository is not authorized")
+
+    @staticmethod
+    def _evidence_envelope(comment: dict) -> dict | None:
+        marker = "<!-- deploy-approval-evidence:v1\n"
+        body = comment.get("body", "")
+        if not isinstance(body, str) or marker not in body:
+            return None
+        # Exactly one marker and one terminal envelope are accepted. Visible
+        # Markdown may precede the hidden document; it never contributes data.
+        if body.count(marker) != 1 or not body.endswith("\n-->"):
+            raise GitHubStateProxyError("Malformed trusted evidence envelope")
+        start = body.index(marker) + len(marker)
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON key")
+                result[key] = value
+            return result
+        try:
+            data = json.loads(body[start:-len("\n-->")], object_pairs_hook=unique_object)
+            if not isinstance(data, dict):
+                return None
+            kind = data.get("kind")
+            common = {"repo", "pr_number", "kind", "key", "sha256", "type"}
+            if (not isinstance(data.get("repo"), str) or not data["repo"]
+                    or type(data.get("pr_number")) is not int or data["pr_number"] <= 0
+                    or kind not in {"round", "operation", "attachment"}
+                    or not isinstance(data.get("key"), str) or not data["key"]
+                    or len(data["key"]) > 512
+                    or not isinstance(data.get("sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", data["sha256"]) is None):
+                raise ValueError("invalid evidence envelope identity")
+            envelope_type = data.get("type")
+            if envelope_type == "record":
+                if set(data) != common | {"data"} or not isinstance(data["data"], str):
+                    raise ValueError("invalid single-record envelope")
+            elif envelope_type == "part":
+                if (set(data) != common | {"index", "data"}
+                        or type(data.get("index")) is not int or data["index"] < 0
+                        or not isinstance(data.get("data"), str)):
+                    raise ValueError("invalid evidence part envelope")
+            elif envelope_type == "manifest":
+                ids = data.get("parts")
+                if (set(data) != common | {"parts"} or not isinstance(ids, list)
+                        or not 1 <= len(ids) <= _EVIDENCE_MAX_PARTS
+                        or any(type(cid) is not int or cid <= 0 for cid in ids)
+                        or len(set(ids)) != len(ids)):
+                    raise ValueError("invalid evidence manifest envelope")
+            else:
+                raise ValueError("unknown evidence envelope type")
+            return data
+        except ValueError:
+            raise GitHubStateProxyError("Malformed trusted evidence envelope")
+
+    async def ensure_visible_evidence_archive_comments(
+        self, repo: str, pr_number: int, limit: int = 10,
+    ) -> int:
+        """Keep legacy evidence comments read-only while preserving the call contract."""
+        self._evidence_repo_guard(repo)
+        if type(limit) is not int or limit < 0:
+            raise ValueError("limit must be a non-negative int")
+        return 0
+
+    async def retire_legacy_evidence_link_replies(
+        self, repo: str, pr_number: int,
+        validated_summary_urls: set[str], limit: int = 10,
+    ) -> int:
+        """Retire old manual-link replies only when Summary has a valid COS URL."""
+        if not isinstance(validated_summary_urls, set) or not validated_summary_urls:
+            return 0
+        self._evidence_repo_guard(repo)
+        if type(limit) is not int or limit < 0:
+            raise ValueError("limit must be a non-negative int")
+        if limit == 0:
+            return 0
+        expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
+        replacement_body = "This legacy reply is obsolete. Open the current PR Summary and click the verified COS download link. The link is maintained automatically; no manual command is needed."
+        legacy_expiry_prompt = re.compile(
+            r"(?:expires\s+within\s+900\s+seconds|"
+            r"valid\s+for\s+up\s+to\s+900\s+seconds|"
+            r"after\s+expiry|after\s+it\s+expires)",
+            re.IGNORECASE,
+        )
+        old_command = re.compile(r"/evidence_link\s+id=(?:<attachment_id>|[A-Za-z0-9_-]+)")
+
+        async def current_summary_cos_links() -> set[str]:
+            pr = await self.get_pr(repo, pr_number)
+            state = await self.read_hidden_state(repo, pr_number)
+            lifecycle = await self.find_trusted_lifecycle_comment(repo, pr_number)
+            if (not isinstance(pr, dict) or pr.get("state") != "open"
+                    or pr.get("merged") or pr.get("draft")
+                    or not isinstance(state, dict) or not isinstance(lifecycle, dict)
+                    or (pr.get("head") or {}).get("sha") != state.get("head_sha")):
+                return set()
+            body = lifecycle.get("body", "")
+            if not isinstance(body, str) or HIDDEN_STATE_MARKER not in body:
+                return set()
+            visible = body.split(HIDDEN_STATE_MARKER, 1)[0]
+            urls = set(re.findall(r"<(https://[^<>\s]+)>", visible))
+            bucket = str(getattr(self.config, "cos_bucket", "") or "").strip().lower()
+            region = str(getattr(self.config, "cos_region", "") or "").strip().lower()
+            expected_host = f"{bucket}.cos.{region}.myqcloud.com" if bucket and region else ""
+            valid = set()
+            now = int(time.time())
+            for url in urls:
+                try:
+                    parsed = urlsplit(url)
+                    query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+                    def one(name):
+                        values = query.get(name, [])
+                        return values[0] if len(values) == 1 else ""
+                    signature = one("q-signature")
+                    signed_time = one("q-sign-time")
+                    time_match = re.fullmatch(r"([0-9]+);([0-9]+)", signed_time)
+                    signed_params = {part.lower() for part in one("q-url-param-list").split(";") if part}
+                    if (parsed.scheme != "https" or parsed.hostname != expected_host
+                            or parsed.username is not None or parsed.password is not None
+                            or parsed.port is not None or parsed.fragment or not parsed.path.strip("/")
+                            or not re.fullmatch(r"[0-9a-fA-F]{40,128}", signature)
+                            or len(signature) % 2 or not time_match
+                            or one("q-key-time") != signed_time
+                            or one("q-sign-algorithm") not in {"sha1", "sha256"}
+                            or not one("q-ak")
+                            or one("q-ak") != getattr(self.config, "cos_secret_id", "")
+                            or "response-content-disposition" not in signed_params
+                            or not one("response-content-disposition")):
+                        continue
+                    start, expiry = map(int, time_match.groups())
+                    duration = expiry - start
+                    if (not 31536000 <= duration <= 31536120
+                            or start > now or expiry <= now):
+                        continue
+                    valid.add(url)
+                except (TypeError, ValueError):
+                    continue
+            valid.intersection_update(validated_summary_urls)
+            return valid
+
+        if not await current_summary_cos_links():
+            return 0
+        comments = await self.get_issue_comments(repo, pr_number)
+        retired = 0
+        for listed in comments:
+            if retired >= limit:
+                break
+            body = listed.get("body")
+            comment_id = listed.get("id")
+            if (not self.is_bot_comment(listed) or listed.get("issue_url") != expected_url
+                    or type(comment_id) is not int or not isinstance(body, str)
+                    or not legacy_expiry_prompt.search(body)
+                    or not old_command.search(body)):
+                continue
+            fresh = await self.get_comment(repo, comment_id)
+            listed_app = listed.get("performed_via_github_app")
+            fresh_app = fresh.get("performed_via_github_app") if isinstance(fresh, dict) else None
+            if (not isinstance(fresh, dict) or fresh.get("id") != comment_id
+                    or fresh.get("issue_url") != expected_url or fresh.get("body") != body
+                    or not self.is_bot_comment(fresh)
+                    or not isinstance(listed_app, dict) or not isinstance(fresh_app, dict)
+                    or fresh_app.get("id") != listed_app.get("id")
+                    or not isinstance(listed.get("user"), dict)
+                    or not isinstance(fresh.get("user"), dict)
+                    or fresh["user"].get("id") != listed["user"].get("id")):
+                continue
+            fresh_pr = await self.get_pr(repo, pr_number)
+            if (fresh_pr.get("state") != "open" or fresh_pr.get("merged")
+                    or fresh_pr.get("draft")):
+                return retired
+            if not await current_summary_cos_links():
+                return retired
+            fresh = await self.get_comment(repo, comment_id)
+            if (not isinstance(fresh, dict) or fresh.get("id") != comment_id
+                    or fresh.get("body") != body or fresh.get("issue_url") != expected_url
+                    or not self.is_bot_comment(fresh)
+                    or not isinstance(fresh.get("user"), dict)
+                    or fresh["user"].get("id") != listed["user"].get("id")
+                    or (fresh.get("performed_via_github_app") or {}).get("id")
+                    != listed_app.get("id")):
+                continue
+            self._evidence_repo_guard(repo)
+            await self.update_comment(repo, comment_id, replacement_body)
+            confirmed = await self.get_comment(repo, comment_id)
+            if (not isinstance(confirmed, dict) or confirmed.get("id") != comment_id
+                    or confirmed.get("issue_url") != expected_url
+                    or not self.is_bot_comment(confirmed)
+                    or confirmed.get("body") != replacement_body
+                    or not isinstance(confirmed.get("user"), dict)
+                    or confirmed["user"].get("id") != listed["user"].get("id")
+                    or (confirmed.get("performed_via_github_app") or {}).get("id")
+                    != listed_app.get("id")
+                    or legacy_expiry_prompt.search(confirmed.get("body", ""))
+                    or old_command.search(confirmed.get("body", ""))):
+                raise GitHubStateProxyError("Legacy evidence reply retirement readback failed")
+            retired += 1
+        return retired
+
+    @staticmethod
+    def _evidence_note_ref(pr_number: int) -> str:
+        return f"notes/deploy-approval-evidence-v1/pr-{pr_number}"
+
+    @staticmethod
+    def _canonical_evidence_data(data: dict) -> bytes:
+        return json.dumps(data, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+    @staticmethod
+    def _same_evidence_operation(kind: str, left: dict, right: dict) -> bool:
+        """Ignore retry-only timestamps while comparing immutable business fields."""
+        volatile = {
+            "created_at", "updated_at", "completed_at", "deleted_at",
+            "invalidated_at", "archived_at", "ended_at",
+        }
+        return ({key: value for key, value in left.items() if key not in volatile}
+                == {key: value for key, value in right.items() if key not in volatile})
+
+    @classmethod
+    def _evidence_note_target(cls, kind: str, key: str, data: dict) -> tuple[bytes, str]:
+        raw = cls._canonical_evidence_data({"kind": kind, "key": key, "data": data})
+        git_blob_sha = hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
+        return raw, git_blob_sha
+
+    @staticmethod
+    def _evidence_note_data(repo: str, pr_number: int, payload: dict) -> tuple[bytes, dict]:
+        def unique_object(pairs):
+            result = {}
+            for name, value in pairs:
+                if name in result:
+                    raise ValueError("duplicate JSON key")
+                result[name] = value
+            return result
+
+        if not isinstance(payload, dict):
+            raise GitHubStateProxyError("Malformed Git Notes evidence record")
+        try:
+            envelope = json.loads(json.dumps(payload, ensure_ascii=False),
+                                  object_pairs_hook=unique_object)
+            required = {"version", "repo", "pr_number", "kind", "key", "head_sha",
+                        "round_id", "sha256", "data"}
+            if (set(envelope) != required or type(envelope.get("version")) is not int
+                    or envelope.get("version") != 1):
+                raise ValueError("invalid keys")
+            kind, key, data = envelope["kind"], envelope["key"], envelope["data"]
+            if (envelope["repo"] != repo or type(envelope["pr_number"]) is not int
+                    or envelope["pr_number"] != pr_number
+                    or kind not in {"round", "operation", "attachment"}
+                    or not isinstance(key, str) or not key or len(key) > 512
+                    or not isinstance(data, dict) or data.get("repo") != repo
+                    or type(data.get("pr_number")) is not int or data.get("pr_number") != pr_number):
+                raise ValueError("invalid identity")
+            head_sha, round_id = envelope["head_sha"], envelope["round_id"]
+            if (not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
+                    or not isinstance(round_id, str)
+                    or not re.fullmatch(re.escape(head_sha) + r"-[0-9]+", round_id)
+                    or data.get("head_sha") != head_sha or data.get("round_id") != round_id):
+                raise ValueError("invalid round binding")
+            raw = json.dumps(data, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+            digest = hashlib.sha256(raw).hexdigest()
+            if envelope.get("sha256") != digest:
+                raise ValueError("digest mismatch")
+            return raw, envelope
+        except (TypeError, ValueError, KeyError):
+            raise GitHubStateProxyError("Git Notes evidence identity or SHA256 is invalid") from None
+
+    async def _read_git_note_evidence_records(self, repo: str, pr_number: int) -> list[dict]:
+        ref = self._evidence_note_ref(pr_number)
+        try:
+            ref_data = await self._github.get_git_ref(repo, ref)
+        except GitHubError as exc:
+            status = getattr(exc, "status_code", None)
+            if status == 404:
+                # This PR has no legacy Git Notes ref. Continue reading its
+                # complete trusted GitHub comment history in the caller.
+                return []
+            if status == 403:
+                return await self._read_public_git_note_records(repo, pr_number, ref, allow_missing=True)
+            raise GitHubStateProxyError("Git Notes evidence ref could not be read") from exc
+        target = ref_data.get("object") if isinstance(ref_data, dict) else None
+        commit_sha = target.get("sha") if isinstance(target, dict) else None
+        if (not isinstance(target, dict) or target.get("type") != "commit"
+                or not isinstance(commit_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", commit_sha)):
+            raise GitHubStateProxyError("Git Notes evidence ref is malformed")
+        try:
+            return await self._read_git_note_commit_records(repo, pr_number, commit_sha)
+        except GitHubStateProxyError:
+            # Some installations can read refs but not commit/tree/blob data.
+            # Re-verify the public repository and the same ref anonymously;
+            # ref is known to exist, so allow_missing=False. Never reinterpret failed read as empty history!
+            return await self._read_public_git_note_records(repo, pr_number, ref, allow_missing=False)
+
+    async def _public_git_data(self, repo: str, path: str, *, params: dict | None = None) -> dict:
+        reader = getattr(self._github, "get_public_git_data", None)
+        if not callable(reader):
+            raise GitHubStateProxyError("Public Git Data read interface is unavailable")
+        try:
+            value = await reader(repo, path, params=params)
+        except Exception as exc:
+            raise GitHubStateProxyError("Public Git Data read could not be verified") from exc
+        if not isinstance(value, dict):
+            raise GitHubStateProxyError("Public Git Data response is malformed")
+        return value
+
+    async def _read_public_git_note_records(
+        self, repo: str, pr_number: int, ref: str, *, allow_missing: bool,
+    ) -> list[dict]:
+        self._evidence_repo_guard(repo)
+        if (type(pr_number) is not int or pr_number <= 0
+                or ref != self._evidence_note_ref(pr_number)):
+            raise GitHubStateProxyError("Git Notes evidence ref identity is invalid")
+        if allow_missing:
+            await self._confirm_public_evidence_repository(repo, pr_number)
+        try:
+            ref_data = await self._public_git_data(repo, f"git/ref/{ref}")
+        except GitHubStateProxyError as exc:
+            cause = exc
+            while cause is not None and getattr(cause, "status_code", None) != 404:
+                cause = cause.__cause__
+            if allow_missing and cause is not None and getattr(cause, "status_code", None) == 404:
+                # Recheck visibility after the exact ref lookup too: an
+                # anonymous 404 can also hide a repository that became private.
+                await self._confirm_public_evidence_repository(repo, pr_number)
+                return []
+            raise GitHubStateProxyError("Git Notes evidence ref could not be verified publicly") from exc
+        target = ref_data.get("object") if isinstance(ref_data, dict) else None
+        commit_sha = target.get("sha") if isinstance(target, dict) else None
+        if (not isinstance(target, dict) or target.get("type") != "commit"
+                or not isinstance(commit_sha, str)
+                or re.fullmatch(r"[0-9a-f]{40}", commit_sha) is None):
+            raise GitHubStateProxyError("Public Git Notes evidence ref is malformed")
+        return await self._read_git_note_commit_records(
+            repo, pr_number, commit_sha, public=True,
+        )
+
+    async def _confirm_public_evidence_repository(self, repo: str, pr_number: int) -> None:
+        """Prove anonymous access to this PR's base repository before accepting a 404.
+
+        GitHub's anonymous API also returns 404 for private repositories. A
+        404 from the note-ref request therefore means "missing" only after an
+        authenticated PR snapshot identifies the expected public base repo
+        and an anonymous read confirms one of that repo's real Git objects.
+        """
+        try:
+            pr = await self._github.get_pr(repo, pr_number)
+        except Exception as exc:
+            raise GitHubStateProxyError(
+                "Git Notes evidence repository visibility could not be verified") from exc
+        base = pr.get("base") if isinstance(pr, dict) else None
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        base_sha = base.get("sha") if isinstance(base, dict) else None
+        full_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+        is_private = base_repo.get("private") if isinstance(base_repo, dict) else None
+        if (full_name != repo or is_private is not False
+                or not isinstance(base_sha, str)
+                or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None):
+            raise GitHubStateProxyError(
+                "Git Notes evidence repository is not confirmed public")
+        await self._public_git_data(repo, f"git/commits/{base_sha}")
+
+    async def _read_git_note_commit_records(
+        self, repo: str, pr_number: int, commit_sha: str, *, public: bool = False,
+    ) -> list[dict]:
+        try:
+            if public:
+                commit = await self._public_git_data(repo, f"git/commits/{commit_sha}")
+            else:
+                commit = await self._github.get_git_commit(repo, commit_sha)
+            tree_sha = (commit.get("tree") or {}).get("sha")
+            if not isinstance(tree_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", tree_sha):
+                raise ValueError("invalid tree sha")
+            if public:
+                tree = await self._public_git_data(
+                    repo, f"git/trees/{tree_sha}", params={"recursive": "1"},
+                )
+            else:
+                tree = await self._github.get_git_tree(repo, tree_sha, recursive=True)
+            entries = tree.get("tree")
+            if tree.get("truncated") is not False or not isinstance(entries, list):
+                raise ValueError("truncated or malformed tree")
+            result = []
+            seen_paths = set()
+            seen_identities = {}
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("malformed tree entry")
+                path = entry.get("path")
+                if (not isinstance(path, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", path)
+                        or path in seen_paths or entry.get("type") != "blob"
+                        or entry.get("mode") != "100644"
+                        or not isinstance(entry.get("sha"), str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", entry["sha"])):
+                    raise ValueError("unexpected evidence tree entry")
+                seen_paths.add(path)
+                if public:
+                    blob = await self._public_git_data(
+                        repo, f"git/blobs/{entry['sha']}"
+                    )
+                else:
+                    blob = await self._github.get_git_blob(repo, entry["sha"])
+                if blob.get("encoding") != "base64" or not isinstance(blob.get("content"), str):
+                    raise ValueError("malformed evidence blob")
+                encoded_blob = re.sub(r"\s+", "", blob["content"])
+                raw_blob = base64.b64decode(encoded_blob, validate=True)
+                if len(raw_blob) > _MAX_EVIDENCE_DATA_BYTES:
+                    raise ValueError("oversized evidence blob")
+
+                def unique_object(pairs):
+                    decoded = {}
+                    for name, value in pairs:
+                        if name in decoded:
+                            raise ValueError("duplicate JSON key")
+                        decoded[name] = value
+                    return decoded
+
+                payload = json.loads(raw_blob, object_pairs_hook=unique_object)
+                raw, envelope = self._evidence_note_data(repo, pr_number, payload)
+                _, expected_path = self._evidence_note_target(
+                    envelope["kind"], envelope["key"], envelope["data"])
+                if path != expected_path:
+                    raise ValueError("evidence path does not match identity")
+                identity = (envelope["kind"], envelope["key"])
+                if identity in seen_identities:
+                    raise ValueError("duplicate evidence identity in Git Notes")
+                seen_identities[identity] = raw
+                result.append({"kind": envelope["kind"], "key": envelope["key"],
+                               "data": envelope["data"], "sha256": envelope["sha256"]})
+            return result
+        except GitHubStateProxyError:
+            raise
+        except GitHubError as exc:
+            if getattr(exc, "status_code", None) == 403:
+                raise GitHubStateProxyError(
+                    "Git Notes evidence read denied: Git Data API permission is insufficient"
+                ) from exc
+            raise GitHubStateProxyError("Git Notes evidence integrity validation failed") from exc
+        except Exception as exc:
+            raise GitHubStateProxyError("Git Notes evidence integrity validation failed") from exc
+
+    async def read_evidence_records(self, repo: str, pr_number: int) -> list[dict]:
+        """Merge internal records (Git Notes, COS) with legacy comment records.
+
+        Every source is authoritative: an unreadable source is never treated as
+        empty history, and two records with the same kind+key but different
+        immutable business content fail closed. Legacy comment records keep
+        their ``comment_id`` so existing callers remain unchanged.
+        """
+        self._evidence_repo_guard(repo)
+        if type(pr_number) is not int or pr_number <= 0:
+            raise GitHubStateProxyError("Evidence PR identity is invalid")
+        result: list[dict] = []
+        seen: dict[tuple[str, str], dict] = {}
+        seen_sources: dict[tuple[str, str], str] = {}
+
+        def merge(record: dict, source: str) -> None:
+            identity = (record["kind"], record["key"])
+            previous = seen.get(identity)
+            if previous is not None:
+                if not self._same_evidence_operation(
+                        identity[0], previous["data"], record["data"]):
+                    raise GitHubStateProxyError(
+                        "Conflicting immutable evidence record "
+                        f"{identity[0]}:{identity[1]} between "
+                        f"{seen_sources[identity]} and {source}")
+                if (type(record.get("comment_id")) is int
+                        and type(previous.get("comment_id")) is not int):
+                    # Keep the legacy comment identity on an otherwise
+                    # identical record so old callers see the same shape.
+                    previous.update(comment_id=record["comment_id"],
+                                    url=record.get("url", ""))
+                return
+            seen[identity] = record
+            seen_sources[identity] = source
+            result.append(record)
+
+        for record in await self._read_git_note_evidence_records(repo, pr_number):
+            merge(dict(record), "Git Notes")
+        for record in await self._read_internal_evidence_records(repo, pr_number):
+            merge(record, "COS")
+
+        comments = await self.get_issue_comments(repo, pr_number)
+        expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
+        trusted = {c["id"]: c for c in comments
+                   if type(c.get("id")) is int and c["id"] > 0
+                   and c.get("issue_url") == expected_url and self.is_bot_comment(c)}
+
+        def decode_document(envelope):
+            if (envelope.get("repo") != repo or envelope.get("pr_number") != pr_number):
+                raise GitHubStateProxyError("Evidence document repository mismatch")
+            if (envelope.get("kind") not in {"round", "operation", "attachment"}
+                    or not isinstance(envelope.get("key"), str)
+                    or not envelope["key"] or len(envelope["key"]) > 512):
+                raise GitHubStateProxyError("Evidence document kind or key is invalid")
+            try:
+                raw = base64.b64decode(envelope["data"], validate=True)
+            except (ValueError, KeyError, TypeError):
+                raise GitHubStateProxyError("Invalid evidence document encoding")
+            if (len(raw) > _MAX_EVIDENCE_DATA_BYTES
+                    or hashlib.sha256(raw).hexdigest() != envelope.get("sha256")):
+                raise GitHubStateProxyError("Evidence document integrity mismatch")
+            try:
+                data = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                raise GitHubStateProxyError("Invalid evidence document JSON")
+            if (not isinstance(data, dict) or data.get("repo") != repo
+                    or type(data.get("pr_number")) is not int
+                    or data.get("pr_number") != pr_number):
+                raise GitHubStateProxyError("Evidence record identity mismatch")
+            head_sha, round_id = data.get("head_sha"), data.get("round_id")
+            if (not isinstance(head_sha, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+                    or not isinstance(round_id, str)
+                    or re.fullmatch(re.escape(head_sha) + r"-[0-9]+", round_id) is None):
+                raise GitHubStateProxyError("Evidence record HEAD/round identity is invalid")
+            return raw, data
+
+        def add_record(envelope, comment, raw=None, data=None):
+            if raw is None or data is None:
+                raw, data = decode_document(envelope)
+            merge({"kind": envelope["kind"], "key": envelope["key"], "data": data,
+                   "comment_id": comment["id"], "url": comment.get("html_url", ""),
+                   "sha256": envelope["sha256"]}, "legacy comments")
+
+        for comment in trusted.values():
+            envelope = self._evidence_envelope(comment)
+            if not envelope:
+                continue
+            if envelope["type"] == "record":
+                add_record(envelope, comment)
+                continue
+            if envelope["type"] != "manifest":
+                continue
+            ids = envelope["parts"]
+            chunks = []
+            for index, cid in enumerate(ids):
+                part = self._evidence_envelope(trusted.get(cid, {}))
+                if (not part or part.get("type") != "part" or part.get("index") != index
+                        or any(part.get(k) != envelope.get(k)
+                               for k in ("repo", "pr_number", "kind", "key", "sha256"))):
+                    raise GitHubStateProxyError("Untrusted or incomplete evidence document")
+                try:
+                    chunks.append(base64.b64decode(part["data"], validate=True))
+                except (ValueError, KeyError, TypeError):
+                    raise GitHubStateProxyError("Invalid evidence document encoding")
+            raw = b"".join(chunks)
+            if (len(raw) > _MAX_EVIDENCE_DATA_BYTES
+                    or hashlib.sha256(raw).hexdigest() != envelope.get("sha256")):
+                raise GitHubStateProxyError("Evidence document integrity mismatch")
+            try:
+                data = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                raise GitHubStateProxyError("Invalid evidence document JSON")
+            if (not isinstance(data, dict) or data.get("repo") != repo
+                    or type(data.get("pr_number")) is not int
+                    or data.get("pr_number") != pr_number):
+                raise GitHubStateProxyError("Evidence record identity mismatch")
+            head_sha, round_id = data.get("head_sha"), data.get("round_id")
+            if (not isinstance(head_sha, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+                    or not isinstance(round_id, str)
+                    or re.fullmatch(re.escape(head_sha) + r"-[0-9]+", round_id) is None):
+                raise GitHubStateProxyError("Evidence record HEAD/round identity is invalid")
+            add_record(envelope, comment, raw, data)
+        return sorted(result, key=lambda record: (
+            str(record.get("data", {}).get("updated_at")
+                or record.get("data", {}).get("deleted_at")
+                or record.get("data", {}).get("completed_at")
+                or record.get("data", {}).get("created_at", "")),
+            record.get("comment_id", 0), record["kind"], record["key"],
+        ))
+
+    def _record_backend(self):
+        """Lazily build the COS fallback; nothing is imported at module load."""
+        backend = getattr(self, "_evidence_record_backend", None)
+        if backend is None:
+            from .evidence_record_backend import CosEvidenceRecordBackend
+            backend = CosEvidenceRecordBackend(self.config)
+            self._evidence_record_backend = backend
+        return backend
+
+    async def _read_internal_evidence_records(
+        self, repo: str, pr_number: int,
+    ) -> list[dict]:
+        """Read the COS record backend, if it is configured for this deployment."""
+        from .evidence_record_backend import EvidenceRecordBackendError
+        backend = self._record_backend()
+        if not backend.configured():
+            return []
+        try:
+            return await backend.read(repo, pr_number)
+        except EvidenceRecordBackendError as exc:
+            raise GitHubStateProxyError(
+                "Internal evidence record backend could not be read") from exc
+
+    async def _write_internal_evidence_record(
+        self, repo: str, pr_number: int, kind: str, key: str, data: dict,
+    ) -> dict:
+        """Fallback durability path used only when Git Data writes are denied."""
+        from .evidence_record_backend import EvidenceRecordBackendError
+        backend = self._record_backend()
+        if not backend.configured():
+            raise GitHubStateProxyError(
+                "Git Notes evidence write is denied and no internal record backend is configured")
+        try:
+            return await backend.append(
+                repo=repo, pr_number=pr_number, kind=kind, key=key, data=data)
+        except EvidenceRecordBackendError as exc:
+            raise GitHubStateProxyError(
+                "Internal evidence record persistence failed") from exc
+
+    async def _write_git_note_evidence_record(
+        self, repo: str, pr_number: int, kind: str, key: str, data: dict,
+        *, head_sha: str, round_id: str, digest: str,
+        assert_writable_pr,
+    ) -> dict:
+        """Append one record to the dedicated per-PR Git Notes ref.
+
+        Ref updates are non-forced compare-and-swap. A 409/422 rereads the ref
+        and merges every existing record, so a concurrent writer is never
+        overwritten. The ref, commit, tree and blob identities are verified
+        before the write is reported as stored.
+        """
+        ref = self._evidence_note_ref(pr_number)
+        target_raw, path = self._evidence_note_target(kind, key, data)
+        note_raw = self._canonical_evidence_data({
+            "version": 1, "repo": repo, "pr_number": pr_number, "kind": kind,
+            "key": key, "head_sha": head_sha, "round_id": round_id,
+            "sha256": digest, "data": data,
+        })
+        if len(note_raw) > _MAX_EVIDENCE_DATA_BYTES:
+            raise GitHubStateProxyError("Evidence Git Notes record exceeds safe capacity")
+
+        for _attempt in range(_EVIDENCE_GIT_REF_RETRIES):
+            await assert_writable_pr()
+            try:
+                ref_data = await self._github.get_git_ref(repo, ref)
+            except GitHubError as exc:
+                status = getattr(exc, "status_code", None)
+                if status == 404:
+                    ref_data = None
+                elif status == 403:
+                    raise _GitNotesPermissionDenied() from exc
+                else:
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence ref could not be read") from exc
+            base_commit = base_tree = None
+            if ref_data is not None:
+                target = ref_data.get("object") if isinstance(ref_data, dict) else None
+                base_commit = target.get("sha") if isinstance(target, dict) else None
+                if (not isinstance(target, dict) or target.get("type") != "commit"
+                        or not isinstance(base_commit, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", base_commit)):
+                    raise GitHubStateProxyError("Git Notes evidence ref is malformed")
+                try:
+                    commit = await self._github.get_git_commit(repo, base_commit)
+                except GitHubError as exc:
+                    if getattr(exc, "status_code", None) == 403:
+                        raise _GitNotesPermissionDenied() from exc
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence base commit could not be read") from exc
+                base_tree = (commit.get("tree") or {}).get("sha")
+                if (not isinstance(base_tree, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", base_tree)):
+                    raise GitHubStateProxyError("Git Notes evidence base tree is malformed")
+                for record in await self._read_git_note_commit_records(
+                        repo, pr_number, base_commit):
+                    if (record["kind"], record["key"]) == (kind, key):
+                        if not self._same_evidence_operation(kind, record["data"], data):
+                            raise GitHubStateProxyError("Immutable evidence record conflicts")
+                        return record
+            try:
+                # Creating the identity blob first proves that the canonical
+                # record bytes hash to the tree path this reader requires.
+                target_blob = await self._github.create_git_blob(
+                    repo, target_raw.decode("utf-8"))
+                if not isinstance(target_blob, dict) or target_blob.get("sha") != path:
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence target object was not confirmed")
+                blob = await self._github.create_git_blob(repo, note_raw.decode("utf-8"))
+                blob_sha = blob.get("sha") if isinstance(blob, dict) else None
+                if (not isinstance(blob_sha, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", blob_sha)):
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence blob creation was not confirmed")
+                tree = await self._github.create_git_tree(
+                    repo, [{"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}],
+                    base_tree=base_tree,
+                )
+                tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+                if (not isinstance(tree_sha, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", tree_sha)):
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence tree creation was not confirmed")
+                commit = await self._github.create_git_commit(
+                    repo, "Store Deploy Approval evidence record", tree_sha,
+                    [base_commit] if base_commit else [],
+                )
+                commit_sha = commit.get("sha") if isinstance(commit, dict) else None
+                if (not isinstance(commit_sha, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", commit_sha)):
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence commit creation was not confirmed")
+                await assert_writable_pr()
+                if base_commit:
+                    await self._github.update_git_ref(repo, ref, commit_sha)
+                else:
+                    await self._github.create_git_ref(repo, ref, commit_sha)
+            except GitHubRefConflict:
+                # Another writer advanced the ref. Reread and merge.
+                continue
+            except GitHubError as exc:
+                status = getattr(exc, "status_code", None)
+                if status == 403:
+                    raise _GitNotesPermissionDenied() from exc
+                raise GitHubStateProxyError(
+                    "Git Notes evidence persistence failed") from exc
+            readback = await self._read_git_note_evidence_records(repo, pr_number)
+            result = next((item for item in readback
+                           if item.get("kind") == kind and item.get("key") == key), None)
+            if result is None or result.get("sha256") != digest:
+                raise GitHubStateProxyError("Git Notes evidence write readback failed")
+            return result
+        raise GitHubStateProxyError(
+            "Git Notes evidence ref remained contended after bounded retries")
+
+    async def write_evidence_record(
+        self, repo: str, pr_number: int, kind: str, key: str, data: dict,
+    ) -> dict:
+        """Persist one immutable evidence record outside the PR conversation.
+
+        Records go to the dedicated Git Notes ref. If the GitHub App lacks Git
+        Data write permission they go to the configured COS record backend.
+        Neither path posts an issue comment, so upload phases never appear as
+        user-visible bot comments. The returned dict may omit ``comment_id``
+        when the record was not read from a legacy evidence comment.
+        """
+        self._evidence_repo_guard(repo)
+        if (not isinstance(repo, str) or type(pr_number) is not int or pr_number <= 0
+                or not isinstance(kind, str) or kind not in {"round", "operation", "attachment"}
+                or not isinstance(key, str) or not key or len(key) > 512
+                or not isinstance(data, dict) or data.get("repo") != repo
+                or type(data.get("pr_number")) is not int or data.get("pr_number") != pr_number):
+            raise GitHubStateProxyError("Evidence record identity is invalid")
+        head_sha, round_id = data.get("head_sha"), data.get("round_id")
+        if (not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
+                or not isinstance(round_id, str)
+                or not re.fullmatch(re.escape(head_sha) + r"-[0-9]+", round_id)):
+            raise GitHubStateProxyError("Evidence record HEAD/round identity is invalid")
+
+        def contains_private_material(value):
+            if isinstance(value, dict):
+                for name, child in value.items():
+                    normalized = re.sub(r"[^a-z0-9]", "", str(name).lower())
+                    sensitive_fragments = (
+                        "secret", "authorization", "accesstoken", "githubtoken",
+                        "capability", "signedurl", "presignedurl", "downloadurl",
+                        "clientkey", "filebytes", "videobytes", "assetbytes",
+                        "filebase64", "videobase64", "contentbase64", "objectbody",
+                    )
+                    if (any(fragment in normalized for fragment in sensitive_fragments)
+                            or contains_private_material(child)):
+                        return True
+            elif isinstance(value, list):
+                return any(contains_private_material(child) for child in value)
+            elif isinstance(value, str):
+                return bool(re.search(
+                    r"(?i)(?:q-signature=|x-amz-signature=|x-cos-security-token=|"
+                    r"authorization:\s*bearer\s+|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)",
+                    value,
+                ))
+            return False
+
+        if contains_private_material(data):
+            raise GitHubStateProxyError("Evidence record contains credential or binary payload material")
+        try:
+            raw = self._canonical_evidence_data(data)
+        except (TypeError, ValueError, UnicodeEncodeError):
+            raise GitHubStateProxyError("Evidence record structure is invalid") from None
+        if len(raw) > _MAX_EVIDENCE_DATA_BYTES:
+            raise GitHubStateProxyError("Evidence snapshot exceeds safe archive capacity")
+        digest = hashlib.sha256(raw).hexdigest()
+
+        async def assert_writable_pr() -> None:
+            self._evidence_repo_guard(repo)
+            pr = await self.get_pr(repo, pr_number)
+            if (not isinstance(pr, dict) or pr.get("state") not in {"open", "closed"}
+                    or pr.get("merged") is not False or pr.get("draft") is not False):
+                raise GitHubStateProxyError("Evidence records require a known, unmerged, non-draft PR")
+            if kind != "round" and (pr.get("head") or {}).get("sha") != head_sha:
+                raise GitHubStateProxyError("Evidence record HEAD no longer matches the PR")
+
+        # Legacy Git Notes, internal COS records and old trusted comments are all
+        # read before any write. An unreadable source fails closed rather than
+        # forking a new history that could shadow existing records.
+        for record in await self.read_evidence_records(repo, pr_number):
+            if (record.get("kind"), record.get("key")) == (kind, key):
+                if not self._same_evidence_operation(kind, record.get("data"), data):
+                    raise GitHubStateProxyError("Immutable evidence record conflicts")
+                return record
+
+        await assert_writable_pr()
+        try:
+            result = await self._write_git_note_evidence_record(
+                repo, pr_number, kind, key, data,
+                head_sha=head_sha, round_id=round_id, digest=digest,
+                assert_writable_pr=assert_writable_pr,
+            )
+        except _GitNotesPermissionDenied:
+            # The App can read Git Notes but cannot write Git Data. Persist the
+            # same record to the configured COS backend; never fall back to a
+            # user-visible PR comment.
+            result = await self._write_internal_evidence_record(
+                repo, pr_number, kind, key, data)
+
+        if (not isinstance(result, dict) or result.get("sha256") != digest
+                or self._canonical_evidence_data(result.get("data")) != raw):
+            raise GitHubStateProxyError("Evidence record persistence readback failed")
+        # Old callers only fail when the record itself is missing. Internal
+        # records legitimately have no comment_id; never invent one.
         return result
 
     async def persist_cursor(
@@ -595,37 +2295,89 @@ class GitHubStateProxy:
         This is the ONLY safe way to advance the cursor from the watcher
         without corrupting Controller-persisted business state.
         """
-        self._require_trusted_identity()
+        if not self._github_app_id:
+            raise TrustedIdentityRequiredError(
+                "github_app_id is required before persisting cursor"
+            )
         try:
             comment = await self.find_trusted_lifecycle_comment(repo, pr_number)
             if comment is None:
                 return None
+            first_comment_id = comment.get("id")
             body = comment.get("body", "")
             if not isinstance(body, str):
                 return None
 
-            # Extract existing visible markdown (everything before the marker)
+            # Locate hidden-state block to replace only the JSON payload.
+            # Preserving body[:idx] byte-for-byte so the visible History
+            # markdown is never re-serialised or normalised.
             idx = body.find(HIDDEN_STATE_MARKER)
             if idx < 0:
                 return None
-            visible_markdown = body[:idx].rstrip()
 
-            # Parse fresh hidden state
+            # Parse and validate fresh hidden state from the existing comment.
             fresh_state = _extract_hidden_state(body)
             if fresh_state is None:
                 return None
             fresh_state = _validate_hidden_state(fresh_state)
 
-            # Advance cursor without lowering it
+            # Advance cursor without lowering it — strictly increasing only.
+            # Reject bool (subclass of int) and non-int cursors outright.
+            if not isinstance(comment_id, int) or isinstance(comment_id, bool):
+                logger.warning(
+                    "persist_cursor %s#%s rejected non-int cursor: %r",
+                    repo, pr_number, comment_id,
+                )
+                return fresh_state
             old_cursor = fresh_state.get("last_processed_comment_id", 0)
-            if comment_id > old_cursor:
-                fresh_state["last_processed_comment_id"] = comment_id
+            if comment_id <= old_cursor:
+                # Cursor already at or past target — silent no-op.
+                # Prevents replay of stale commands from lowering the cursor.
+                return fresh_state
+            fresh_state["last_processed_comment_id"] = comment_id
 
-            # Write back with preserved visible markdown
-            await self.write_hidden_state(
-                repo, pr_number, visible_markdown, fresh_state,
+            # Build the new hidden block and splice it into the existing body.
+            hidden_json = json.dumps(
+                fresh_state, ensure_ascii=False, separators=(",", ":"),
             )
-            return fresh_state
+            if len(hidden_json.encode("utf-8")) > _MAX_HIDDEN_STATE_BYTES:
+                raise GitHubStateProxyError(
+                    f"hidden state JSON exceeds {_MAX_HIDDEN_STATE_BYTES} bytes"
+                )
+            new_hidden_block = (
+                f"{HIDDEN_STATE_MARKER}{hidden_json}\n-->"
+            )
+            new_body = body[:idx] + new_hidden_block
+            if len(new_body.encode("utf-8")) > _MAX_COMMENT_BODY_BYTES:
+                raise GitHubStateProxyError("comment body exceeds max size")
+
+            # Update existing comment in-place.
+            # TOCTOU guard (A2-04/A2-05): re-fetch the trusted comment and
+            # verify BOTH comment ID and body have not changed since we read
+            # them above.  If either differs, new_body built from the stale
+            # read would corrupt a concurrently-updated lifecycle comment —
+            # abort safely (fail-closed).  GitHub PATCH has no CAS; we rely
+            # on the single-writer constraint plus this identity check.
+            existing = await self.find_trusted_lifecycle_comment(
+                repo, pr_number,
+            )
+            if existing is not None:
+                existing_id = existing.get("id")
+                existing_body = existing.get("body", "")
+                if (
+                    isinstance(existing_id, int)
+                    and isinstance(existing_body, str)
+                    and existing_id == first_comment_id
+                    and existing_body == body
+                ):
+                    # update_comment raises on HTTP non-2xx / network error;
+                    # returns None on HTTP 2xx success.  No exception =>
+                    # write succeeded.  Do NOT check result is not None.
+                    await self.update_comment(
+                        repo, existing_id, new_body,
+                    )
+                    return fresh_state
+            return None
         except TrustedIdentityRequiredError:
             raise
         except Exception as e:
@@ -640,24 +2392,146 @@ class GitHubStateProxy:
     ) -> None:
         """Project hidden status onto exactly one status:* label.
 
-        Preserves all non-status labels. If label projection fails, hidden
-        state is NOT rolled back.
+        Idempotent runtime self-heal:
+        1. Fresh GET current labels
+        2. If desired already present → skip create/add entirely
+        3. Delete ONLY canonical status:* labels that actually exist on PR
+        4. Add desired label only if not present
+        5. Preserve every non-status label
+
+        If current labels are already exactly the desired state:
+        ZERO label create, ZERO add, ZERO delete.
+
+        Any create/add/remove failure is warning-only; hidden lifecycle state
+        is never rolled back and business flow is never blocked.
+
+        Non-status labels (bug/documentation/enhancement, etc.) are never
+        touched.
         """
         desired_label = f"{STATUS_PREFIX} {hidden_status}"
-        if desired_label not in _ALLOWED_STATUS_LABELS:
+        desired_fold = desired_label.casefold()
+        allowed_folds = {name.casefold() for name in _ALLOWED_STATUS_LABELS}
+        if desired_fold not in allowed_folds:
             logger.warning("unknown status label for %s: %s", hidden_status, desired_label)
             return
-        try:
-            existing_labels = await self.get_issue_labels(repo, issue_number)
-            preserved = [
-                l for l in existing_labels
-                if not l.startswith(STATUS_PREFIX)
-            ]
-            if desired_label not in preserved:
-                all_labels = preserved + [desired_label]
-                await self.set_issue_labels(repo, issue_number, all_labels)
-        except Exception as e:
+        key = (repo, issue_number)
+        now = time.monotonic()
+        cached = self._status_label_projection.get(key)
+        if (cached and cached.get("label") == desired_fold
+                and now < float(cached.get("retry_at", 0.0))):
+            return
+        if cached and cached.get("label") != desired_fold:
+            self._status_label_projection.pop(key, None)
+        projection_deadline = now + 4.0
+
+        async def bounded(awaitable):
+            remaining = projection_deadline - time.monotonic()
+            if remaining <= 0:
+                close = getattr(awaitable, "close", None)
+                if callable(close):
+                    close()
+                raise asyncio.TimeoutError
+            return await asyncio.wait_for(awaitable, timeout=remaining)
+
+        def remember_failure(reason: str) -> None:
+            previous = self._status_label_projection.get(key, {})
+            failures = min(8, int(previous.get("failures", 0)) + 1) \
+                if previous.get("label") == desired_fold else 1
+            delay = min(600.0, 15.0 * (2 ** (failures - 1)))
+            self._status_label_projection.pop(key, None)
+            self._status_label_projection[key] = {
+                "label": desired_fold,
+                "failures": failures,
+                "retry_at": time.monotonic() + delay,
+            }
+            while len(self._status_label_projection) > 4096:
+                self._status_label_projection.pop(next(iter(self._status_label_projection)))
             logger.warning(
-                "label projection failed for %s#%s: %s",
-                repo, issue_number, e,
+                "status label projection deferred repo=%s pr=%s label=%s reason=%s retry_seconds=%.0f",
+                repo, issue_number, desired_label, reason, delay,
             )
+
+        try:
+            current_labels = await bounded(self.get_issue_labels(repo, issue_number))
+            if (not isinstance(current_labels, list)
+                    or any(not isinstance(label, str) for label in current_labels)):
+                remember_failure("invalid_issue_labels_response")
+                return
+        except Exception as exc:
+            remember_failure(f"read_{type(exc).__name__}")
+            return
+
+        desired_existing = next(
+            (label for label in current_labels if label.casefold() == desired_fold),
+            None,
+        )
+        if desired_existing is None:
+            try:
+                repository_label = await bounded(
+                    self._ensure_label_exists(repo, desired_label),
+                )
+                await bounded(self.add_issue_label(
+                    repo, issue_number, repository_label,
+                ))
+                desired_existing = repository_label
+                current_labels = [*current_labels, repository_label]
+            except Exception as add_exc:
+                # Do not issue a second API request after rate limit/transient
+                # failure. The bounded retry begins with a fresh label read, so
+                # an add that succeeded before a lost response remains idempotent.
+                remember_failure(f"add_{type(add_exc).__name__}")
+                return
+
+        # The new status label is now confirmed present. Remove only other
+        # Deploy Approval lifecycle labels, using GitHub's actual spelling;
+        # arbitrary user labels, including other `status:*` labels, survive.
+        removal_failed = False
+        for label in current_labels:
+            folded = label.casefold()
+            if folded in allowed_folds and folded != desired_fold:
+                try:
+                    await bounded(self.remove_issue_label(
+                        repo, issue_number, label,
+                    ))
+                except Exception as exc:
+                    removal_failed = True
+                    logger.warning(
+                        "status label removal deferred repo=%s pr=%s label=%s reason=%s",
+                        repo, issue_number, label, type(exc).__name__,
+                    )
+        if removal_failed:
+            remember_failure("remove_failed")
+            return
+
+        self._status_label_projection.pop(key, None)
+        self._status_label_projection[key] = {
+            "label": desired_fold,
+            "failures": 0,
+            "retry_at": time.monotonic() + 60.0,
+        }
+        while len(self._status_label_projection) > 4096:
+            self._status_label_projection.pop(next(iter(self._status_label_projection)))
+
+    async def _ensure_label_exists(self, repo: str, label: str) -> str:
+        """Return the existing case-insensitive label name or create it."""
+        def equivalent_name(labels) -> str | None:
+            if not isinstance(labels, list):
+                return None
+            for item in labels:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if isinstance(name, str) and name.casefold() == label.casefold():
+                    return name
+            return None
+
+        names = await self._github.list_repository_labels(repo)
+        existing = equivalent_name(names)
+        if existing is not None:
+            return existing
+        # Failure is retried in the bounded projection window; that attempt
+        # first reads and reuses any label created before the response was lost.
+        await self._github.create_repository_label(
+            repo, label, "6cc2dc", "Deploy Approval lifecycle status",
+        )
+        return label

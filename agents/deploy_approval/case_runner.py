@@ -10,17 +10,12 @@ only dictionary keys.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from typing import Any
 
 from .config import Config
 
 logger = logging.getLogger(__name__)
-
-
-class CaseRunnerError(Exception):
-    pass
 
 
 # Fixed case registry: Controller-owned, never user-supplied.
@@ -80,10 +75,6 @@ class CaseRunner:
         self._registry = list(_FIXED_CASES)
         self._core = core
         self._driver_id = driver_id
-
-    def list_cases(self) -> list[dict[str, Any]]:
-        """Return the list of all available fixed cases."""
-        return list(self._registry)
 
     def select_case(self, target: str, variant: str,
                     node_id: str) -> str | None:
@@ -279,7 +270,7 @@ class CaseRunner:
             }
 
         try:
-            image_ref = str(deployment.get("image_ref", "") or "")
+            image_ref = deployment["image_ref"]
 
             try:
                 driver_status = await core.driver_status(driver_id)
@@ -292,8 +283,18 @@ class CaseRunner:
                     "error": f"driver_status failed: {e}",
                 }
 
-            running_image = str(driver_status.get("running_image", "") or "")
-            if not running_image:
+            runtime_status = driver_status.get("status") if isinstance(driver_status, dict) else None
+            if not isinstance(runtime_status, str) or runtime_status != "running":
+                logs.append("FAIL: Runtime status must be 'running'")
+                return {
+                    "passed": False,
+                    "case_id": case_id,
+                    "logs": logs,
+                    "error": "Runtime status must be 'running'",
+                }
+
+            running_image = driver_status.get("running_image")
+            if not isinstance(running_image, str) or not running_image:
                 logs.append("FAIL: Running image is empty")
                 return {
                     "passed": False,

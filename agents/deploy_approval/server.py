@@ -12,15 +12,33 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
-from .config import Config, DEFAULT_GITHUB_REPOS, load_config
+from .config import Config, DEFAULT_GITHUB_REPOS, load_config, validate_repository_names
+from .github_state_proxy import _ALLOWED_STATUS_LABELS
 from .github_client import GitHubClient
+from agents import github_app_auth
 from .github_state_proxy import GitHubStateProxy
 from .github_command_watcher import GitHubCommandWatcher
 from .policy import Policy
-from .registry_client import RegistryClient
-from .review_client import ReviewAgentClient
 from .router_webhook import router as webhook_router
 from .service import DeployController
+from .evidence_api import router as evidence_router
+from .evidence_auth import disabled_reason
+from .evidence_store import CosAttachmentStore
+
+# Install logsafe before any logging to prevent control chars from corrupting container logs.
+# This must run before logging.basicConfig and uvicorn startup.
+try:
+    from agents.deploy_approval import logsafe
+except ImportError:
+    # logsafe.py is a required module for secure logging.
+    # Cannot start without it.
+    raise SystemExit(
+        "logsafe.py is required but not found in agents.deploy_approval. "
+        "Ensure logsafe.py is deployed alongside the server module."
+    )
+# Install logsafe before any logging to prevent control chars from corrupting container logs.
+# This must run before logging.basicConfig and uvicorn startup.
+logsafe.install()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,9 +69,19 @@ _STATUS_LABEL_SPECS = (
         "Deploy Approval: Machine Owner action required",
     ),
     (
+        "status: deploying",
+        "1D76DB",
+        "Deploy Approval: deployment in progress",
+    ),
+    (
         "status: testing",
         "1D76DB",
         "Deploy Approval: deployment complete; human testing required",
+    ),
+    (
+        "status: acceptance-required",
+        "FBCA04",
+        "Deploy Approval: testing complete; independent acceptance required",
     ),
     (
         "status: succeeded",
@@ -68,21 +96,10 @@ _STATUS_LABEL_SPECS = (
 )
 
 
-def _validate_current_user_identity(user: dict) -> tuple[str, str]:
-    user_id = user.get("id")
-    login = user.get("login")
-    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
-        raise ValueError("authenticated GitHub user id must be a positive int")
-    if not isinstance(login, str) or not login.strip():
-        raise ValueError("authenticated GitHub login must be non-empty")
-    return str(user_id), login.strip()
-
-
 def _validate_label_namespace(repo: str, labels: list[dict]) -> dict[str, dict]:
     if not isinstance(labels, list):
         raise ValueError(f"repository {repo}: labels response must be a list")
     exact: dict[str, dict] = {}
-    casefold_seen: dict[str, str] = {}
     for label in labels:
         if not isinstance(label, dict):
             raise ValueError(f"repository {repo}: label record must be an object")
@@ -90,70 +107,190 @@ def _validate_label_namespace(repo: str, labels: list[dict]) -> dict[str, dict]:
         if not isinstance(name, str) or not name.strip():
             raise ValueError(f"repository {repo}: label name must be a non-empty string")
         name = name.strip()
-        lowered = name.casefold()
         if name in exact:
             raise ValueError(
                 f"repository {repo}: duplicate label record {name!r}"
             )
-        existing = casefold_seen.get(lowered)
-        if existing is not None and existing != name:
-            raise ValueError(
-                f"repository {repo}: existing conflicting label {existing!r} "
-                f"conflicts with required exact label {name!r}"
-            )
         exact[name] = label
-        casefold_seen[lowered] = name
+        # GitHub label names are case-insensitive. Keep the first spelling as
+        # the preferred existing name instead of aborting bootstrap when an
+        # older deployment created, for example, "Status: reviewing".
     return exact
 
 
-async def _bootstrap_status_labels(github: GitHubClient) -> None:
-    """Ensure the canonical status labels exist on both supported repos."""
-    namespaces: dict[str, dict[str, dict]] = {}
+_LABEL_SPECS: dict[str, tuple[str, str]] = {
+    "status: review-required": ("D93F0B", "Deploy Approval: current HEAD requires review"),
+    "status: reviewing": ("5319E7", "Deploy Approval: current HEAD is being reviewed"),
+    "status: deploy-ready": ("0E8A16", "Deploy Approval: reviewed HEAD is ready for deploy request"),
+    "status: deploy-requested": ("FBCA04", "Deploy Approval: Machine Owner action required"),
+    "status: deploying": ("1D76DB", "Deploy Approval: deployment in progress"),
+    "status: testing": ("1D76DB", "Deploy Approval: deployment complete; human testing required"),
+    "status: acceptance-required": ("FBCA04", "Deploy Approval: testing complete; independent acceptance required"),
+    "status: succeeded": ("0E8A16", "Deploy Approval: human validation passed"),
+    "status: failed": ("B60205", "Deploy Approval: deployment or validation failed"),
+}
 
-    # Phase A: read/validate both repos before any mutation.
-    for repo in DEFAULT_GITHUB_REPOS:
-        labels = await github.list_repository_labels(repo)
-        namespaces[repo] = _validate_label_namespace(repo, labels)
-        lower_names = {name.casefold(): name for name in namespaces[repo]}
-        for spec_name, _, _ in _STATUS_LABEL_SPECS:
-            conflicting = lower_names.get(spec_name.casefold())
-            if conflicting is not None and conflicting != spec_name:
-                raise ValueError(
-                    f"repository {repo}: existing conflicting label {conflicting!r} "
-                    f"conflicts with required exact label {spec_name!r}"
-                )
 
-    # Phase B: create missing exact labels only, serially, in repo order.
-    for repo in DEFAULT_GITHUB_REPOS:
-        exact = namespaces[repo]
-        for name, color, description in _STATUS_LABEL_SPECS:
+async def _bootstrap_status_labels(github: GitHubClient, repos: list[str] | None = None) -> dict:
+    """Best-effort bootstrap of canonical status labels.
+
+    Label bootstrap is **optional UI projection only**.  Any label API
+    permission failure (403, 404, permission denied, etc.) is logged as a
+    warning and **never** raises or blocks startup.
+
+    Returns a summary dict keyed by repo name.
+    """
+    if repos is None:
+        cfg = getattr(github, "config", None)
+        repos = (list(cfg.active_repos) if cfg.auth_valid else []) if cfg is not None else list(DEFAULT_GITHUB_REPOS)
+    summary: dict = {}
+
+    for repo in repos:
+        repo_summary: dict[str, list] = {"available": [], "missing": [], "errors": []}
+        try:
+            labels = await github.list_repository_labels(repo)
+        except Exception as exc:
+            logger.warning(
+                "label bootstrap list failed for %s: %s",
+                repo, type(exc).__name__,
+            )
+            repo_summary["errors"].append(type(exc).__name__)
+            summary[repo] = repo_summary
+            continue
+
+        try:
+            exact = _validate_label_namespace(repo, labels)
+        except Exception as exc:
+            logger.warning(
+                "label bootstrap validate failed for %s: %s",
+                repo, type(exc).__name__,
+            )
+            repo_summary["errors"].append(type(exc).__name__)
+            summary[repo] = repo_summary
+            continue
+
+        repo_summary["available"] = list(exact.keys())
+        lower_names = {}
+        for name in exact:
+            lower_names.setdefault(name.casefold(), name)
+
+        # Attempt to create any missing labels.
+        for name, (color, description) in _LABEL_SPECS.items():
             if name in exact:
-                logger.info("label bootstrap keep %s %s", repo, name)
+                continue
+            conflicting = lower_names.get(name.casefold())
+            if conflicting is not None:
+                logger.info(
+                    "repository %s: reusing case-insensitive status label %s for %s",
+                    repo, conflicting, name,
+                )
+                repo_summary["available"].append(conflicting)
                 continue
             try:
                 await github.create_repository_label(repo, name, color, description)
+                repo_summary["available"].append(name)
             except Exception as exc:
-                fresh_exact = _validate_label_namespace(
-                    repo, await github.list_repository_labels(repo)
+                # Race-safety: fresh check before giving up.
+                try:
+                    fresh_labels = await github.list_repository_labels(repo)
+                    fresh_exact = _validate_label_namespace(repo, fresh_labels)
+                    fresh_equivalent = next(
+                        (existing_name for existing_name in fresh_exact
+                         if existing_name.casefold() == name.casefold()), None,
+                    )
+                    if fresh_equivalent is not None:
+                        repo_summary["available"].append(fresh_equivalent)
+                        continue
+                except Exception:
+                    pass
+                logger.warning(
+                    "label bootstrap create failed for %s %s: %s",
+                    repo, name, type(exc).__name__,
                 )
-                if name in fresh_exact:
-                    logger.info("label bootstrap race-satisfied %s %s", repo, name)
-                    exact = fresh_exact
-                    continue
-                raise exc
-            exact[name] = {"name": name, "color": color, "description": description}
+                repo_summary["errors"].append(name)
 
-    # Final verification: fresh GET on both repos, exact labels present.
-    for repo in DEFAULT_GITHUB_REPOS:
-        final_exact = _validate_label_namespace(
-            repo, await github.list_repository_labels(repo)
+        # Final check -- missing labels are WARNING only, never raise.
+        known_folds = {name.casefold() for name in exact}
+        known_folds.update(name.casefold() for name in repo_summary["available"])
+        for name in _ALLOWED_STATUS_LABELS:
+            if name.casefold() not in known_folds:
+                if name not in repo_summary["missing"]:
+                    repo_summary["missing"].append(name)
+                logger.warning(
+                    "repository %s: status label %s is missing (label bootstrap is best-effort)",
+                    repo, name,
+                )
+
+        summary[repo] = repo_summary
+
+    return summary
+
+
+async def _resolve_active_repos(
+    github: GitHubClient, desired_repos: list[str], config: Config | None = None,
+) -> list[str]:
+    """Resolve watch and official-policy authorization from one snapshot.
+
+    Installation permissions never expand the PR watch allowlist. The full
+    snapshot is separately intersected with official repositories for policy
+    reads, even when only user-owned forks are watched.
+    """
+    authorized_names = await github.list_installation_repositories()
+    authorized = {
+        name.lower() for name in validate_repository_names(
+            authorized_names,
+            label="installation repositories",
+            allow_empty=True,
         )
-        missing = [name for name, _, _ in _STATUS_LABEL_SPECS if name not in final_exact]
-        if missing:
-            raise ValueError(
-                f"repository {repo}: missing required labels after bootstrap: "
-                + ", ".join(missing)
-            )
+    }
+    desired = validate_repository_names(desired_repos)
+    active = [repo for repo in desired if repo in authorized]
+    policy_active = [
+        repo for repo in DEFAULT_GITHUB_REPOS if repo.lower() in authorized
+    ]
+    target_config = config or getattr(github, "config", None)
+    if target_config is not None:
+        target_config.policy_active_repos = policy_active
+    inactive = [repo for repo in desired_repos if repo.lower() not in active]
+    logger.info("github desired repos: %s", desired_repos)
+    logger.info("github authorized desired repos: %s", active)
+    logger.info("official policy repositories authorized: %s", policy_active)
+    if inactive:
+        logger.info("github inactive desired repos: %s", inactive)
+    return active
+
+
+
+async def _lifespan_cleanup(watcher, controller, github, github_auth):
+    """Best-effort cleanup for every lifespan exit path.
+
+    Each step is independently try/except so that a cleanup failure
+    never masks the original startup or shutdown exception.
+    """
+    try:
+        await watcher.stop()
+    except Exception as exc:
+        logger.warning("lifespan cleanup watcher.stop failed: %s", type(exc).__name__)
+
+    try:
+        close = getattr(controller, "aclose", None)
+        if close is not None:
+            await close()
+    except Exception as exc:
+        logger.warning("lifespan cleanup controller.aclose failed: %s", type(exc).__name__)
+
+    try:
+        http = getattr(github, "http", None)
+        aclose = getattr(http, "aclose", None)
+        if aclose is not None:
+            await aclose()
+    except Exception as exc:
+        logger.warning("lifespan cleanup github http close failed: %s", type(exc).__name__)
+
+    try:
+        await github_auth.close()
+    except Exception as exc:
+        logger.warning("lifespan cleanup github_auth.close failed: %s", type(exc).__name__)
 
 
 def create_app(config: Config | None = None):
@@ -161,59 +298,116 @@ def create_app(config: Config | None = None):
 
     Single writer: only GitHubCommandWatcher is started.
     No Poller, no second mutation loop.
+
+    GitHub App auth is created first, then injected into GitHubClient
+    and GitHubStateProxy.  No startup bot-identity lookup.
     """
     config = config or load_config()
+    config.github_repos = validate_repository_names(config.github_repos)
     policy = Policy(config)
-    policy.load_machines()
-    github = GitHubClient(config)
-    review = ReviewAgentClient(config)
-    registry = RegistryClient(config)
+    # Repository authorization is loaded independently from each official
+    # repository's main branch. Never seed Policy's legacy global list from the
+    # shared local machines.yaml mount when PRs come from user-owned forks.
 
-    proxy = GitHubStateProxy(config, github)
+    # Create shared GitHub App auth provider first
+    github_auth = github_app_auth.create_github_app_auth()
+
+    # GitHubClient MUST receive async token_provider; fail closed if missing
+    github = GitHubClient(
+        config,
+        token_provider=github_auth.get_installation_token,
+    )
+
+    # GitHubStateProxy receives github_app_id for lazy provenance check
+    proxy = GitHubStateProxy(
+        config, github, github_app_id=github_auth.app_id,
+    )
 
     controller = DeployController(
-        config, proxy, policy, github, review, registry,
+        config, proxy, policy, github,
         agent_core_factory=None,
     )
 
+    store = CosAttachmentStore(config)
+    evidence_service = None
+    reason = disabled_reason(config)
+    if not reason:
+        from .evidence_service import EvidenceService
+        evidence_service = EvidenceService(
+            config=config, github=github, proxy=proxy, policy=policy,
+            controller=controller, store=store,
+        )
+        # A's existing serial watcher calls controller.project_evidence().
+        controller.evidence_service = evidence_service
+    else:
+        # C emits stable upload links only with a usable public base. Missing
+        # credentials must not advertise an upload feature that cannot work.
+        config.evidence_public_base_url = ""
+        logger.info("browser evidence disabled: %s", reason)
+
     # Single serial command watcher
-    watcher = GitHubCommandWatcher(config, proxy, controller)
+    watcher = GitHubCommandWatcher(config, proxy, controller, github=github, github_auth=github_auth)
+    if evidence_service is not None:
+        watcher.evidence_service = evidence_service
+        # Ready-attachment reconciliation is scheduled through the single
+        # serial writer. The service only enqueues a bounded repo/PR hint; the
+        # watcher re-reads persisted records and the live lifecycle state
+        # before making any visible change.
+        evidence_service.bind_ready_sync_scheduler(watcher.schedule_evidence_sync)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        current_user = await github.get_current_user()
-        bot_user_id, bot_login = _validate_current_user_identity(current_user)
-        proxy.bind_trusted_identity(bot_user_id, bot_login)
-        await _bootstrap_status_labels(github)
-        watcher.start()
+        # Resolve ACTIVE_REPOS at startup (fresh from installation) — must be inside
+        # lifespan so we can properly await the async function.
+        desired_repos = list(config.github_repos)
+        config.auth_valid = False
+        config.active_repos = []
+        config.policy_active_repos = []
         try:
+            active_repos = await _resolve_active_repos(
+                github, desired_repos, config=config,
+            )
+            # Keep the configured allowlist separate from runtime authorization.
+            config.active_repos = active_repos
+            # _resolve_active_repos stores the formal-policy intersection from
+            # that same complete Installation snapshot in policy_active_repos.
+            config.auth_valid = True
+            watcher.mark_repos_pending_baseline(active_repos)
+            try:
+                await _bootstrap_status_labels(github, repos=active_repos)
+            except Exception as exc:
+                logger.warning(
+                    "label bootstrap failed "
+                    "(best-effort); watcher starting "
+                    "without label projection: %s",
+                    type(exc).__name__,
+                )
+            watcher.start()
             yield
         finally:
-            await watcher.stop()
-            close = getattr(controller, "aclose", None)
-            if close is not None:
-                await close()
-            for client in (github, review, registry):
-                http = getattr(client, "http", None)
-                aclose = getattr(http, "aclose", None)
-                if aclose is not None:
-                    await aclose()
+            await _lifespan_cleanup(
+                watcher,
+                controller,
+                github,
+                github_auth,
+            )
 
     app = FastAPI(title="Deploy Approval Agent", lifespan=lifespan)
     app.state.config = config
     app.state.policy = policy
     app.state.github = github
-    app.state.review = review
-    app.state.registry = registry
     app.state.controller = controller
     app.state.proxy = proxy
     app.state.watcher = watcher
+    app.state.evidence_service = evidence_service
+    app.state.evidence_store = store
 
     @app.get("/healthz")
     async def healthz():
-        return {"status": "ok"}
+        return {"status": "ok", "service": "deploy-approval"}
 
     app.include_router(webhook_router)
+    app.include_router(evidence_router)
     return app
 
 

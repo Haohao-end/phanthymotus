@@ -1,17 +1,28 @@
 """Configuration for the Deploy Approval Agent (pre-merge validation only).
 
 Deploy Approval does not define a new runtime env namespace. It reuses the
-existing upstream GitHub/poll/webhook/registry keys and fixed read-only files
-for machine ownership and COS secrets.
+existing upstream GitHub/poll/webhook keys and fixed read-only files for
+machine ownership, Review Agent trust, Agent Core tokens, and COS secrets.
+
+Review Agent HTTP API is NOT a Deploy Approval dependency.
+Deploy Approval reads Review Agent output from GitHub PR comments.
+
+Per-machine Agent Core CA PEM trust anchors are strictly validated: keys must be
+non-empty machine-alias strings and values must be valid PEM certificate blobs.
+Invalid entries raise ValueError instead of being silently ignored.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import logging
 import os
 import ipaddress
+import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -23,7 +34,96 @@ DEFAULT_GITHUB_REPOS = (
     "4paradigm/phanthymotus-driver",
 )
 
+# Repository policy files are small control-plane inputs, not arbitrary GitHub
+# blobs. Keep a stricter bound than the general API response limit.
+MAX_REPO_POLICY_FILE_BYTES = 1024 * 1024
+
+
+# Compatibility names for the legacy defaults, not runtime authorization gates.
 SUPPORTED_GITHUB_REPOS = frozenset(DEFAULT_GITHUB_REPOS)
+DESIRED_REPOS = DEFAULT_GITHUB_REPOS
+
+
+def is_stable_public_base_url(value: str) -> bool:
+    """Accept only a configured HTTPS origin suitable for persistent links."""
+    try:
+        if (not isinstance(value, str) or not value
+                or any(ord(char) < 33 or ord(char) == 127 for char in value)
+                or '?' in value or '#' in value):
+            return False
+        parsed = urlsplit(value)
+        if (parsed.scheme.lower() != 'https' or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or '@' in parsed.netloc or parsed.query or parsed.fragment
+                or parsed.path not in ('', '/') or parsed.netloc.endswith(':')
+                or any(char.isspace() or ord(char) < 33 or ord(char) == 127
+                       for char in parsed.netloc)):
+            return False
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            return False
+
+        host = parsed.hostname.lower().rstrip('.')
+        if (not host or host == 'localhost' or host.endswith('.localhost')
+                or host == 'local' or host.endswith('.local')
+                or host == 'trycloudflare.com' or host.endswith('.trycloudflare.com')):
+            return False
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            ascii_host = host.encode('idna').decode('ascii')
+            labels = ascii_host.split('.')
+            if (len(ascii_host) > 253 or len(labels) < 2
+                    or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
+                           for label in labels)):
+                return False
+        else:
+            if not address.is_global:
+                return False
+        return True
+    except (UnicodeError, TypeError, ValueError):
+        return False
+
+
+def is_evidence_ingress_url(value: str) -> bool:
+    """Public upload ingress must be the same persistent origin as Summary links.
+
+    Ephemeral quick-tunnel hostnames change on every process restart and cannot
+    back a permanent per-PR upload address, so they are never accepted here.
+    """
+    return is_stable_public_base_url(value)
+
+_OWNER_RE = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+_REPOSITORY_RE = re.compile(rf"{_OWNER_RE}/[A-Za-z0-9_.-]{{1,100}}")
+_LOGIN_RE = re.compile(rf"{_OWNER_RE}(?:\[bot\])?")
+
+
+def validate_repository_names(repos: list[str], *, label: str = "GITHUB_REPOS", allow_empty: bool = False) -> list[str]:
+    """Validate a controlled list and canonicalize GitHub's case-insensitive names."""
+    if not isinstance(repos, list):
+        raise ValueError(f"{label} must be a list")
+    if not repos and not allow_empty:
+        raise ValueError(f"{label} is required")
+    result = []
+    for repo in repos:
+        if (not isinstance(repo, str) or not _REPOSITORY_RE.fullmatch(repo)
+                or repo.split("/")[-1] in (".", "..")
+                or "--" in repo.split("/")[0]):
+            raise ValueError(f"{label} contains an invalid owner/repo")
+        canonical = repo.lower()
+        if canonical in result:
+            raise ValueError(f"{label} must not contain duplicates")
+        result.append(canonical)
+    return result
+
+
+def resolve_authorized_repos(desired: list[str], authorized: list) -> list[str]:
+    """Return exactly the configured allowlist ∩ complete Installation snapshot."""
+    desired = validate_repository_names(desired)
+    if not isinstance(authorized, list):
+        raise ValueError("installation repositories must be a list")
+    names = [entry.get("full_name") if isinstance(entry, dict) else entry for entry in authorized]
+    authorized_set = set(validate_repository_names(names, label="installation repositories", allow_empty=True))
+    return [repo for repo in desired if repo in authorized_set]
 
 
 @dataclass
@@ -31,25 +131,34 @@ class Config:
     host: str = "0.0.0.0"
     port: int = 25001
 
-    github_token: str = ""
     github_api_url: str = "https://api.github.com"
     github_webhook_secret: str = ""
     webhook_enabled: bool = False
     poll_enabled: bool = True
-    poll_interval_seconds: int = 30
+    poll_interval_seconds: int = 10
     github_repos: list[str] = field(
         default_factory=lambda: list(DEFAULT_GITHUB_REPOS)
     )
+    active_repos: list[str] = field(default_factory=list)
+    # Official policy-source authorization is derived from the complete
+    # Installation repository snapshot, independently of the PR watchlist.
+    policy_active_repos: list[str] = field(default_factory=list)
+    auth_valid: bool = False
     github_comment_max_pages: int = 20
     github_comment_max_comments: int = 500
     github_comment_max_bytes: int = 4 * 1024 * 1024
 
-    review_agent_base_url: str = "http://host.docker.internal:25000"
-    review_agent_api_token: str = ""
+    # Review comment trust configuration
+    # Production loads BOTH values exclusively from protected secrets.yaml.
+    # There is no fallback identity or environment override.
+    review_comment_author_id: str = ""
+    review_comment_author_login: str = ""
 
     # Machine owners configuration
     machine_owners_file: str = "/run/deploy-approval/machines.yaml"
     secrets_file: str = "/run/deploy-approval/secrets.yaml"
+    test_reviewers_file: str = "/run/deploy-approval/test_reviewers.yaml"
+    test_reviewers: list[str] = field(default_factory=list)
 
     # Security
     allow_private_http: bool = False
@@ -58,19 +167,45 @@ class Config:
     connect_timeout: float = 10.0
     read_timeout: float = 30.0
     total_timeout: float = 60.0
-    health_poll_interval_seconds: float = 5.0
-    health_timeout_seconds: float = 300.0
 
     # COS evidence storage
     cos_region: str = ""
     cos_bucket: str = ""
     cos_secret_id: str = ""
     cos_secret_key: str = ""
-    cos_session_token: str = ""
-    cos_prefix: str = "deploy-approval"
-    cos_signed_url_ttl_seconds: int = 604800
 
-    registry_auth_host_allowlist: list[str] = field(default_factory=list)
+
+
+    # COS readiness gates the optional backend; browser upload also needs a
+    # separately trusted HTTPS ingress, reported by evidence_auth.readiness().
+    deploy_evidence_enabled: bool = False
+    evidence_public_base_url: str = ""
+    evidence_session_key: str = field(default="", repr=False)
+    evidence_max_file_bytes: int = 512 * 1024 * 1024
+    evidence_max_video_bytes: int = 512 * 1024 * 1024
+    evidence_part_bytes: int = 8 * 1024 * 1024
+    evidence_max_note_bytes: int = 64 * 1024
+    evidence_ingress_port: int = 25002
+    evidence_tunnel_metrics_port: int = 25003
+
+    # Agent Core access tokens keyed by machine alias
+    agent_core_tokens: dict[str, str] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
+    # Explicit deployment environment opt-in; strict never downgrades.
+    agent_core_tls_mode: str = "strict"
+
+    # Per-machine CA PEM trust anchors keyed by machine alias (strict mode)
+    agent_core_ca_pem: dict[str, str] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
+    @property
+    def primary_repo(self) -> str:
+        return validate_repository_names(self.github_repos)[0]
 
 
 def _env_int(name: str, default: int, *, min_val: int = 1, max_val: int | None = None) -> int:
@@ -92,19 +227,6 @@ def _env_int(name: str, default: int, *, min_val: int = 1, max_val: int | None =
     if min_val is not None and val < min_val:
         raise ValueError(f"{name} must be >= {min_val}, got {val!r}")
     return val
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        f = float(raw)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name} must be a real number, got {raw!r}")
-    if f <= 0 or f != f or f in (float("inf"), float("-inf")):
-        raise ValueError(f"{name} must be a positive finite number, got {raw!r}")
-    return f
 
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -145,17 +267,64 @@ def _load_yaml_mapping(path: str) -> dict:
     if not path:
         return {}
     p = Path(path)
+    if p.is_symlink():
+        raise ValueError(f"{path} must be a protected regular file")
     if not p.exists():
         return {}
-    if not p.is_file():
-        raise ValueError(f"{path} must be a regular file")
-    with p.open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
+    # Trust comes from the protected server file, not a comment or environment.
+    # Inspect the opened descriptor so replacing the pathname cannot change
+    # the object whose ownership/permissions were checked.
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise ValueError(f"{path} must be a protected regular file") from exc
+    with os.fdopen(fd, "r", encoding="utf-8") as fh:
+        info = os.fstat(fh.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid())
+                or stat.S_IMODE(info.st_mode) & 0o022):
+            raise ValueError(f"{path} must be a protected regular file")
+        try:
+            data = yaml.safe_load(fh)
+        except yaml.YAMLError:
+            # Parser diagnostics can quote a line containing a token or key.
+            raise ValueError(f"{path} must contain valid protected YAML") from None
     if data is None:
         return {}
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a YAML mapping")
     return data
+
+
+def validate_agent_core_tls_mode(value: str) -> str:
+    if not isinstance(value, str) or value not in ("legacy", "strict"):
+        raise ValueError("AGENT_CORE_TLS_MODE must be legacy or strict")
+    return value
+
+
+def _load_ca_pem_config(secrets: dict) -> dict[str, str]:
+    """Load per-machine CA PEM trust anchors from secrets config."""
+    ca_pem = secrets.get("agent_core_ca_pem", {})
+    if not isinstance(ca_pem, dict):
+        raise ValueError("secrets.yaml agent_core_ca_pem must be a mapping")
+    result = {}
+    for alias, pem in ca_pem.items():
+        if not isinstance(alias, str) or not alias.strip():
+            raise ValueError("agent_core_ca_pem machine aliases must be non-empty strings")
+        alias = alias.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", alias):
+            raise ValueError("agent_core_ca_pem contains an invalid machine alias")
+        if alias in result:
+            raise ValueError("agent_core_ca_pem contains duplicate normalized machine aliases")
+        if not isinstance(pem, str) or not pem.strip():
+            raise ValueError(f"agent_core_ca_pem for machine {alias!r} must be non-empty PEM")
+        try:
+            import ssl
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.load_verify_locations(cadata=pem.strip())
+        except (ssl.SSLError, ValueError, TypeError) as exc:
+            raise ValueError(f"agent_core_ca_pem for machine {alias!r} is invalid") from exc
+        result[alias] = pem.strip()
+    return result
 
 
 def _load_secrets_config(path: str) -> dict:
@@ -170,7 +339,19 @@ def _load_secrets_config(path: str) -> dict:
         cos = {}
     if not isinstance(cos, dict):
         raise ValueError("secrets.yaml cos section must be a mapping")
-    result = {"cos": {}}
+    result = {"cos": {}, "review_comment_trust": {}}
+
+    # The public URL is optional and trusted configuration, never inferred from
+    # request Host headers. Capability keys are derived from existing COS auth.
+    evidence = data.get("evidence", {})
+    evidence_values = {"public_base_url": "", "session_key": ""}
+    if isinstance(evidence, dict):
+        for key in evidence_values:
+            value = evidence.get(key, "")
+            if (isinstance(value, str)
+                    and not any(ord(char) < 32 or ord(char) == 127 for char in value)):
+                evidence_values[key] = value.strip()
+    result["evidence"] = evidence_values
 
     def _coerce_string(key: str, *, required: bool = False, allow_empty: bool = True) -> str:
         if key not in cos:
@@ -184,75 +365,158 @@ def _load_secrets_config(path: str) -> dict:
             raise ValueError(f"secrets.yaml cos.{key} must be a non-empty string")
         return value
 
-    for key in ("region", "bucket", "secret_id", "secret_key", "session_token"):
+    for key in ("region", "bucket", "secret_id", "secret_key"):
         result["cos"][key] = _coerce_string(key)
-    result["cos"]["prefix"] = _coerce_string("prefix", allow_empty=False) or "deploy-approval"
-    ttl = cos.get("signed_url_ttl_seconds", 604800)
-    if isinstance(ttl, bool) or not isinstance(ttl, int):
-        raise ValueError("secrets.yaml cos.signed_url_ttl_seconds must be an integer")
-    if ttl < 1 or ttl > 604800:
-        raise ValueError("secrets.yaml cos.signed_url_ttl_seconds must be 1..604800")
-    result["cos"]["signed_url_ttl_seconds"] = ttl
+    # Review comment trust config
+    rct = data.get("review_comment_trust", {})
+    if rct is None:
+        rct = {}
+    if not isinstance(rct, dict):
+        raise ValueError("secrets.yaml review_comment_trust section must be a mapping")
+    for key in ("author_id", "author_login"):
+        value = rct.get(key, "")
+        if not isinstance(value, str):
+            raise ValueError(f"secrets.yaml review_comment_trust.{key} must be a string")
+        result["review_comment_trust"][key] = value
+    # Supplied CA material remains validated in either mode.
+    result["agent_core_ca_pem"] = _load_ca_pem_config(data)
+    # Agent Core tokens
+    act = data.get("agent_core_tokens")
+    if act is not None:
+        if not isinstance(act, dict):
+            raise ValueError("secrets.yaml agent_core_tokens must be a mapping")
+        result["agent_core_tokens"] = {}
+        for k, v in act.items():
+            if not isinstance(k, str) or not k.strip():
+                raise ValueError("secrets.yaml agent_core_tokens keys must be non-empty strings")
+            if not isinstance(v, str) or not v.strip():
+                raise ValueError("secrets.yaml agent_core_tokens values must be non-empty strings")
+            result["agent_core_tokens"][k.strip()] = v.strip()
+    else:
+        result["agent_core_tokens"] = {}
     return result
+
+
+def _validate_test_reviewers_data(data: object) -> list[str]:
+    """Validate the existing version-1 reviewer allowlist schema."""
+    if not isinstance(data, dict):
+        raise ValueError("test_reviewers YAML must be a mapping")
+    reviewers = data.get("reviewers")
+    if (set(data) != {"version", "reviewers"}
+            or type(data.get("version")) is not int or data.get("version") != 1
+            or not isinstance(reviewers, list) or not reviewers):
+        raise ValueError("test_reviewers YAML has an invalid schema or is empty")
+    normalized = []
+    for login in reviewers:
+        if (not isinstance(login, str) or not _LOGIN_RE.fullmatch(login.strip())
+                or login.strip().lower().endswith("[bot]")
+                or login.strip().lower() in normalized):
+            raise ValueError("test_reviewers YAML contains an invalid reviewer login")
+        normalized.append(login.strip().lower())
+    return normalized
+
+
+def parse_test_reviewers_yaml(content: bytes | str) -> list[str]:
+    """Parse and validate a repository-provided reviewer YAML document.
+
+    This uses the same schema and GitHub-login checks as the protected local
+    file loader while allowing the per-repository GitHub snapshot to be
+    validated before it is installed in memory.
+    """
+    if isinstance(content, bytes):
+        if len(content) > MAX_REPO_POLICY_FILE_BYTES:
+            raise ValueError("test_reviewers YAML exceeds the policy file size limit")
+        try:
+            content = content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("test_reviewers YAML must be UTF-8") from None
+    if not isinstance(content, str):
+        raise ValueError("test_reviewers YAML must be UTF-8 text")
+    if len(content) > MAX_REPO_POLICY_FILE_BYTES:
+        raise ValueError("test_reviewers YAML exceeds the policy file size limit")
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError:
+        # Parser messages may include source lines; keep diagnostics generic.
+        raise ValueError("test_reviewers YAML is malformed") from None
+    return _validate_test_reviewers_data(data)
+
+
+def _load_test_reviewers(path: str) -> list[str]:
+    """Load the legacy local acceptance file; absence always fails closed."""
+    try:
+        data = _load_yaml_mapping(path)
+        if not data:
+            return []
+        return _validate_test_reviewers_data(data)
+    except (OSError, ValueError) as exc:
+        logger.warning("independent acceptance reviewer list unavailable (%s)",
+                       type(exc).__name__)
+        return []
 
 
 def load_config() -> Config:
     secrets = _load_secrets_config("/run/deploy-approval/secrets.yaml")
+    test_reviewers_file = "/run/deploy-approval/test_reviewers.yaml"
     cos = secrets.get("cos", {})
+    evidence = secrets.get("evidence", {})
+    review_trust = secrets.get("review_comment_trust", {})
     cfg = Config(
-        github_token=os.getenv("GITHUB_TOKEN", ""),
         github_api_url="https://api.github.com",
         github_webhook_secret=os.getenv("GITHUB_WEBHOOK_SECRET", ""),
         webhook_enabled=_env_bool("WEBHOOK_ENABLED", False),
         poll_enabled=_env_bool("POLL_ENABLED", True),
-        poll_interval_seconds=_env_int("POLL_INTERVAL_SECONDS", 30),
+        poll_interval_seconds=_env_int("POLL_INTERVAL_SECONDS", 10),
         github_repos=list(
             DEFAULT_GITHUB_REPOS if os.getenv("GITHUB_REPOS") is None
-            else _env_str_list("GITHUB_REPOS")
+            else ([] if not os.environ["GITHUB_REPOS"].strip()
+                  else [repo.strip() for repo in os.environ["GITHUB_REPOS"].split(",")])
         ),
-        review_agent_base_url="http://host.docker.internal:25000",
-        review_agent_api_token="",
+        review_comment_author_id=review_trust.get("author_id", ""),
+        review_comment_author_login=review_trust.get("author_login", ""),
         machine_owners_file="/run/deploy-approval/machines.yaml",
         secrets_file="/run/deploy-approval/secrets.yaml",
+        test_reviewers_file=test_reviewers_file,
+        test_reviewers=_load_test_reviewers(test_reviewers_file),
         allow_private_http=False,
         http_allowed_cidrs=[],
         connect_timeout=10.0,
         read_timeout=30.0,
         total_timeout=60.0,
-        health_poll_interval_seconds=5.0,
-        health_timeout_seconds=300.0,
         cos_region=cos.get("region", ""),
         cos_bucket=cos.get("bucket", ""),
         cos_secret_id=cos.get("secret_id", ""),
         cos_secret_key=cos.get("secret_key", ""),
-        cos_session_token=cos.get("session_token", ""),
-        cos_prefix=cos.get("prefix", "deploy-approval"),
-        cos_signed_url_ttl_seconds=cos.get("signed_url_ttl_seconds", 604800),
-        registry_auth_host_allowlist=[],
+        # Evidence uses the Controller's existing COS credentials and GitHub
+        # App installation; no separate Evidence secret section gates it.
+        deploy_evidence_enabled=all(
+            isinstance(cos.get(name), str) and bool(cos.get(name).strip())
+            for name in ("region", "bucket", "secret_id", "secret_key")
+        ),
+        evidence_public_base_url=evidence.get("public_base_url", "").strip().rstrip("/"),
+        evidence_session_key=evidence.get("session_key", ""),
+        evidence_ingress_port=int(os.getenv("EVIDENCE_INGRESS_PORT", "25002")),
+        evidence_tunnel_metrics_port=int(os.getenv("EVIDENCE_TUNNEL_METRICS_PORT", "25003")),
+        agent_core_tokens=secrets.get("agent_core_tokens", {}),
+        agent_core_tls_mode=validate_agent_core_tls_mode(os.getenv("AGENT_CORE_TLS_MODE", "strict")),
+        agent_core_ca_pem=secrets.get("agent_core_ca_pem", {}),
     )
     validate_config(cfg)
     return cfg
 
 
 def validate_config(cfg: Config) -> None:
-    if not cfg.github_token:
-        raise ValueError("GITHUB_TOKEN is required")
-    if not isinstance(cfg.github_repos, list):
-        raise ValueError("GITHUB_REPOS must be a list")
-    if not cfg.github_repos:
-        raise ValueError("GITHUB_REPOS is required")
+    for name, lower, upper in (("evidence_max_file_bytes", 1, 512 * 1024 * 1024),
+                               ("evidence_max_video_bytes", 1, 512 * 1024 * 1024),
+                               ("evidence_part_bytes", 1024 * 1024, 512 * 1024 * 1024),
+                               ("evidence_max_note_bytes", 1, 64 * 1024)):
+        value = getattr(cfg, name)
+        if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
+            raise ValueError(f"{name} is outside the evidence size bounds")
+    cfg.github_repos = validate_repository_names(cfg.github_repos)
     if not cfg.poll_enabled:
         raise ValueError(
             "Deploy Approval requires polling; webhook does not replace the GitHubCommandWatcher"
-        )
-    for r in cfg.github_repos:
-        if not isinstance(r, str):
-            raise ValueError(f"GITHUB_REPOS member must be a string, got {r!r}")
-    required_repos = set(DEFAULT_GITHUB_REPOS)
-    if len(cfg.github_repos) != len(DEFAULT_GITHUB_REPOS) or set(cfg.github_repos) != required_repos:
-        raise ValueError(
-            "GITHUB_REPOS must contain exactly: "
-            + ", ".join(DEFAULT_GITHUB_REPOS)
         )
     if cfg.webhook_enabled and not cfg.github_webhook_secret:
         raise ValueError(
@@ -264,6 +528,11 @@ def validate_config(cfg: Config) -> None:
         raise ValueError(f"APP_PORT must be 1..65535, got {cfg.port}")
     if not isinstance(cfg.host, str):
         raise ValueError("APP_HOST must be a string")
+    if not isinstance(cfg.test_reviewers_file, str) or not isinstance(cfg.test_reviewers, list):
+        raise ValueError("independent acceptance reviewer configuration is invalid")
+    if any(not isinstance(login, str) or not _LOGIN_RE.fullmatch(login)
+           or login.lower().endswith("[bot]") for login in cfg.test_reviewers):
+        raise ValueError("independent acceptance reviewer configuration is invalid")
     if not isinstance(cfg.http_allowed_cidrs, list):
         raise ValueError("HTTP_ALLOWED_CIDRS must be a list")
     _int_fields = {
@@ -283,17 +552,61 @@ def validate_config(cfg: Config) -> None:
         if not isinstance(r, str):
             raise ValueError(f"HTTP_ALLOWED_CIDRS member must be a string, got {r!r}")
     for name in (
-        "host", "review_agent_base_url", "machine_owners_file", "secrets_file",
-        "github_api_url", "review_agent_api_token",
+        "host", "machine_owners_file", "secrets_file",
+        "github_api_url",
         "cos_region", "cos_bucket", "cos_secret_id", "cos_secret_key",
-        "cos_session_token", "cos_prefix",
+        "review_comment_author_id", "review_comment_author_login",
     ):
         val = getattr(cfg, name)
         if not isinstance(val, str):
             raise ValueError(f"{name} must be a string")
-    if not isinstance(cfg.registry_auth_host_allowlist, list):
-        raise ValueError("REGISTRY_AUTH_HOST_ALLOWLIST must be a list")
-    if cfg.cos_signed_url_ttl_seconds <= 0 or cfg.cos_signed_url_ttl_seconds > 604800:
+    validate_agent_core_tls_mode(cfg.agent_core_tls_mode)
+    # Validate agent_core_tokens
+    act = cfg.agent_core_tokens
+    if not isinstance(act, Mapping):
+        raise ValueError("agent_core_tokens must be a mapping")
+    if not act:
+        raise ValueError("agent_core_tokens must be non-empty")
+    for k, v in act.items():
+        if not isinstance(k, str) or not k.strip():
+            raise ValueError("agent_core_tokens keys must be non-empty strings")
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("agent_core_tokens values must be non-empty strings")
+    ca_map = cfg.agent_core_ca_pem
+    if not isinstance(ca_map, Mapping):
+        raise ValueError("agent_core_ca_pem must be a mapping")
+    # Revalidate direct Config construction as well as secrets.yaml loading.
+    normalized_ca_map = _load_ca_pem_config({"agent_core_ca_pem": ca_map})
+    if len(normalized_ca_map) != len(ca_map):
+        raise ValueError("agent_core_ca_pem contains duplicate normalized machine aliases")
+    cfg.agent_core_ca_pem = normalized_ca_map
+    # ── Production COS guard: reject invalid region, bucket, placeholders ──
+    # This prevents the Controller from starting with obviously wrong or
+    # unfilled-in COS configuration, even if someone bypasses deploy.sh.
+    # No len-based bypass: all values are strictly validated.
+    # No empty/whitespace-only values are allowed.
+    _placeholder_re = re.compile(r"<[^>]+>", re.IGNORECASE)
+    for field_name in ("cos_region", "cos_bucket", "cos_secret_id", "cos_secret_key"):
+        val = getattr(cfg, field_name, "")
+        if not isinstance(val, str) or not val.strip():
+            raise ValueError(
+                f"cos.{field_name} must be a non-empty string"
+            )
+        if _placeholder_re.search(val):
+            raise ValueError(
+                f"cos.{field_name} contains an unreplaced placeholder"
+            )
+    # Region: must match Tencent COS pattern (e.g. "ap-beijing")
+    if not re.fullmatch(r"[a-z]+-[a-z]+[0-9]*", cfg.cos_region.strip()):
         raise ValueError(
-            f"COS_SIGNED_URL_TTL_SECONDS must be 1..604800, got {cfg.cos_signed_url_ttl_seconds}"
+            f"cos.region has invalid format: {cfg.cos_region!r}"
         )
+    # Bucket: must be alphanumeric with hyphens
+    if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", cfg.cos_bucket.strip()):
+        raise ValueError(
+            f"cos.bucket has invalid format: {cfg.cos_bucket!r}"
+        )
+    if not re.fullmatch(r"[1-9][0-9]*", cfg.review_comment_author_id):
+        raise ValueError("review_comment_trust.author_id must be a positive decimal string")
+    if not _LOGIN_RE.fullmatch(cfg.review_comment_author_login):
+        raise ValueError("review_comment_trust.author_login must be a valid GitHub login")

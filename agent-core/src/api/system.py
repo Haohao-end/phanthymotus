@@ -77,17 +77,20 @@ def _check_update_sync() -> dict:
     from api.registry import _build_catalog_sync, _current_channel
 
     current_tag = _get_current_tag()
+    current_image = _get_current_image()
 
     catalog = _build_catalog_sync(_current_channel())
     core_items = catalog.get('core', [])
 
     if not core_items:
-        return {'up_to_date': True, 'current_tag': current_tag, 'latest_tag': '', 'latest_image': ''}
+        return {'up_to_date': True, 'current_tag': current_tag, 'latest_tag': '',
+                'latest_image': '', 'current_image': current_image}
 
     latest_item = core_items[0]
     tags = latest_item.get('tags', [])
     if not tags:
-        return {'up_to_date': True, 'current_tag': current_tag, 'latest_tag': '', 'latest_image': ''}
+        return {'up_to_date': True, 'current_tag': current_tag, 'latest_tag': '',
+                'latest_image': '', 'current_image': current_image}
 
     latest_tag_obj = tags[0]
     latest_tag = latest_tag_obj.get('tag', '')
@@ -103,6 +106,7 @@ def _check_update_sync() -> dict:
         'current_tag': current_tag,
         'latest_tag': latest_tag,
         'latest_image': latest_image,
+        'current_image': current_image,
     }
 
 

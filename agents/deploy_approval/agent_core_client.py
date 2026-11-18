@@ -2,13 +2,18 @@
 
 Covers driver/perception/actucore deploy+status, the MCP ping health check and
 the core ``POST /api/system/update`` adapter. No sockets, no SSH, no shell.
-The only runtime credential is ``ACCESS_TOKEN``.
+The runtime credential is a per-machine Agent Core Bearer token from
+``secrets.yaml``.
+
+HTTPS is mandatory in both migration modes. Strict mode verifies certificate
+identity using a per-machine CA PEM and the target IPv4 SAN, with no system CA
+fallback. Explicit legacy mode supports unverified self-signed certificates only
+for configured RFC1918 machines with per-machine tokens. Strict is the default.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 import httpx
@@ -20,9 +25,46 @@ from .clients_common import (
     require_http_policy,
     stream_request,
 )
-from .config import Config
+from .config import Config, validate_agent_core_tls_mode, _load_ca_pem_config
+from .image_ref import validate_image_ref
+from .models import MachineInfo
 
 logger = logging.getLogger(__name__)
+
+# Control character range: ASCII 0x00-0x1F and 0x7F
+_CONTROL_CHARS = frozenset(chr(i) for i in range(0x00, 0x20)) | {chr(0x7F)}
+
+
+def _validate_api_path_segment(value: Any, label: str) -> str:
+    """Validate a dynamic HTTP path segment (driver_id / mcp_id).
+
+    Returns a sanitized string ready for use in a URL path segment.
+    Raises AgentCoreError on any invalid input — this is a PRE-REQUEST
+    validation failure, not a network outcome.
+    """
+    if not isinstance(value, str):
+        raise AgentCoreError(f"{label} must be a string")
+    stripped = value.strip()
+    if not stripped:
+        raise AgentCoreError(f"{label} must be non-empty after strip")
+    if stripped in {".", ".."}:
+        raise AgentCoreError(f"{label} must not be '.' or '..'")
+    if "/" in stripped:
+        raise AgentCoreError(f"{label} must not contain '/'")
+    if "\\" in stripped:
+        raise AgentCoreError(f"{label} must not contain '\\'")
+    if "?" in stripped:
+        raise AgentCoreError(f"{label} must not contain '?'")
+    if "#" in stripped:
+        raise AgentCoreError(f"{label} must not contain '#'")
+    if "%" in stripped:
+        raise AgentCoreError(f"{label} must not contain '%'")
+    for ch in stripped:
+        if ch in _CONTROL_CHARS:
+            raise AgentCoreError(
+                f"{label} must not contain control characters"
+            )
+    return stripped
 
 
 class AgentCoreError(Exception):
@@ -37,89 +79,185 @@ class AgentCoreClient:
     def __init__(
         self,
         config: Config,
-        base_url: str = "",
-        ca_file: str = "",
+        base_url: str,
+        *,
+        node_host: str,
+        machine_alias: str = "",
+        access_token: str = "",
         http: httpx.AsyncClient | None = None,
-        node_host: str = "",
+        repository_machine: MachineInfo | None = None,
     ):
         self.config = config
+        try:
+            self.tls_mode = validate_agent_core_tls_mode(config.agent_core_tls_mode)
+        except ValueError as exc:
+            raise AgentCoreError(str(exc)) from exc
+        self.legacy_tls = self.tls_mode == "legacy"
+        self._access_token = access_token
         if not base_url:
             raise AgentCoreError(
                 "no Agent Core endpoint: the selected machine node_host endpoint is required"
             )
         if not isinstance(base_url, str) or not base_url.strip():
             raise AgentCoreError(
-                "invalid Agent Core endpoint: must be a non-empty http(s) URL"
+                "invalid Agent Core endpoint: must be a non-empty https URL"
             )
         import ipaddress
         # Defense-in-depth: when node_host is provided, validate it as a
         # literal IP address and confirm the URL scheme/host/port are exact.
-        if node_host:
-            # node_host must be a literal IP address
-            try:
-                parsed_ip = ipaddress.ip_address(node_host)
-            except ValueError as e:
-                raise AgentCoreError(
-                    f"node_host must be a literal IP address, got {node_host!r}"
-                ) from e
-            if parsed_ip.version != 4:
-                raise AgentCoreError(
-                    f"node_host must be an IPv4 address, got {node_host!r}"
-                )
-            # scheme must be http
-            from urllib.parse import urlparse
-            parsed = urlparse(base_url)
-            if parsed.scheme != "http":
-                raise AgentCoreError(
-                    f"Agent Core endpoint scheme must be http, got {parsed.scheme!r}"
-                )
-            # hostname must be canonical node_host
-            if parsed.hostname != node_host:
-                raise AgentCoreError(
-                    f"Agent Core endpoint hostname must match node_host ({node_host}), "
-                    f"got {parsed.hostname!r}"
-                )
-            # port must be exactly 15678
-            if parsed.port != 15678:
-                raise AgentCoreError(
-                    f"Agent Core endpoint port must be 15678, got {parsed.port}"
-                )
-            # No username/password, no path, no query, no fragment
-            if parsed.username or parsed.password:
-                raise AgentCoreError("Agent Core endpoint must not contain userinfo")
-            if parsed.path not in ("", "/"):
-                raise AgentCoreError("Agent Core endpoint must not contain a path")
-            if parsed.query:
-                raise AgentCoreError("Agent Core endpoint must not contain query")
-            if parsed.fragment:
-                raise AgentCoreError("Agent Core endpoint must not contain fragment")
-            expected_base = f"http://{node_host}:15678"
-            if base_url.rstrip("/") != expected_base:
-                raise AgentCoreError(
-                    "Agent Core endpoint must match the selected machine node_host exactly"
-                )
+        if not isinstance(node_host, str) or not node_host.strip():
+            raise AgentCoreError("node_host is required")
+        try:
+            parsed_ip = ipaddress.ip_address(node_host)
+        except ValueError as e:
+            raise AgentCoreError(
+                f"node_host must be a literal IP address, got {node_host!r}"
+            ) from e
+        if parsed_ip.version != 4:
+            raise AgentCoreError(
+                f"node_host must be an IPv4 address, got {node_host!r}"
+            )
+        from urllib.parse import urlparse
+        parsed = urlparse(base_url)
+        if parsed.scheme != "https":
+            raise AgentCoreError(
+                f"Agent Core endpoint scheme must be https, got {parsed.scheme!r}"
+            )
+        if parsed.hostname != node_host:
+            raise AgentCoreError(
+                f"Agent Core endpoint hostname must match node_host ({node_host}), "
+                f"got {parsed.hostname!r}"
+            )
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise AgentCoreError("Agent Core endpoint has an invalid port") from exc
+        if port != 15678:
+            raise AgentCoreError(
+                f"Agent Core endpoint port must be 15678, got {port}"
+            )
+        if parsed.username or parsed.password:
+            raise AgentCoreError("Agent Core endpoint must not contain userinfo")
+        if parsed.path not in ("", "/"):
+            raise AgentCoreError("Agent Core endpoint must not contain a path")
+        if parsed.query:
+            raise AgentCoreError("Agent Core endpoint must not contain query")
+        if parsed.fragment:
+            raise AgentCoreError("Agent Core endpoint must not contain fragment")
+        expected_base = f"https://{node_host}:15678"
+        if base_url.rstrip("/") != expected_base:
+            raise AgentCoreError(
+                "Agent Core endpoint must match the selected machine node_host exactly"
+            )
         self.base_url = base_url.rstrip("/")
         self.node_host = node_host
-        self.ca_file = ca_file
-        self.http = http or httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                config.total_timeout,
-                connect=config.connect_timeout,
-                read=config.read_timeout,
-                write=config.connect_timeout,
-                pool=config.connect_timeout,
-            ),
-            follow_redirects=False,
-            # Never disable TLS verification; use the machine's CA file when
-            # provided, otherwise the system trust store.
-            verify=ca_file if ca_file else True,
-        )
+        self._machine_alias = machine_alias
+        if self.legacy_tls:
+            if not any(parsed_ip in ipaddress.IPv4Network(network) for network in (
+                "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+            )):
+                raise AgentCoreError("legacy TLS requires an RFC1918 IPv4 node_host")
+            if not isinstance(machine_alias, str) or not machine_alias.strip():
+                raise AgentCoreError("machine_alias is required for legacy TLS")
+            configured_token = (config.agent_core_tokens.get(machine_alias)
+                                if isinstance(config.agent_core_tokens, dict) else None)
+            if (not isinstance(access_token, str) or not access_token.strip()
+                    or not isinstance(configured_token, str) or not configured_token.strip()
+                    or access_token != configured_token
+                    or any(char in _CONTROL_CHARS for char in access_token)):
+                raise AgentCoreError("legacy TLS requires the selected machine's configured token")
+            if repository_machine is None:
+                # Preserve the standalone client's legacy local-policy contract.
+                from .policy import load_machines, MachineLoadError
+                from yaml import YAMLError
+                try:
+                    machines = load_machines(config.machine_owners_file)
+                except (MachineLoadError, OSError, ValueError, YAMLError) as exc:
+                    raise AgentCoreError(
+                        "legacy TLS requires a valid configured machine policy"
+                    ) from exc
+                machine = machines.get(machine_alias)
+            elif isinstance(repository_machine, MachineInfo):
+                # The controller supplies this only after selecting a machine
+                # from the authenticated, repository-scoped main-branch policy.
+                # Do not fall back to the unrelated global legacy allowlist.
+                machine = repository_machine
+            else:
+                raise AgentCoreError("invalid repository machine policy binding")
+            if (
+                machine is None
+                or machine.alias != machine_alias
+                or machine.node_host != node_host
+                or not isinstance(machine.node_id, str)
+                or not machine.node_id
+                or not isinstance(machine.owners, list)
+                or not machine.owners
+            ):
+                raise AgentCoreError(
+                    "legacy TLS alias, node identity and host must match the selected machine policy"
+                )
+            try:
+                _load_ca_pem_config({"agent_core_ca_pem": config.agent_core_ca_pem})
+            except ValueError as exc:
+                raise AgentCoreError("legacy TLS supplied CA configuration is invalid") from exc
+        self._owns_http = http is None
+        if http is None:
+            import ssl
+
+            if not isinstance(machine_alias, str) or not machine_alias.strip():
+                raise AgentCoreError("machine_alias is required for Agent Core TLS")
+            _ssl_ctx = None
+            if self.legacy_tls:
+                # The only unverified transport is this explicit, policy-bound mode.
+                verify = False
+            else:
+                _ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ca_map = config.agent_core_ca_pem
+                ca_pem = ca_map.get(machine_alias) if isinstance(ca_map, dict) else None
+                if not isinstance(ca_pem, str) or not ca_pem.strip():
+                    raise AgentCoreError(
+                        f"no valid agent_core_ca_pem configured for machine alias {machine_alias!r}"
+                    )
+                try:
+                    _ssl_ctx.load_verify_locations(cadata=ca_pem)
+                except (ssl.SSLError, ValueError, TypeError) as exc:
+                    raise AgentCoreError(
+                        f"per-machine CA PEM for alias {machine_alias!r} is invalid"
+                    ) from exc
+                if not _ssl_ctx.check_hostname or _ssl_ctx.verify_mode != ssl.CERT_REQUIRED:
+                    raise AgentCoreError("per-machine CA SSL context does not enforce peer identity")
+                verify = _ssl_ctx
+            self.http = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    config.total_timeout,
+                    connect=config.connect_timeout,
+                    read=config.read_timeout,
+                    write=config.connect_timeout,
+                    pool=config.connect_timeout,
+                ),
+                follow_redirects=False,
+                verify=verify,
+                trust_env=False,
+            )
+            self._ssl_ctx = _ssl_ctx
+        else:
+            self.http = http
+            self._ssl_ctx = None
+        if self.legacy_tls:
+            logger.warning("TLS_MODE=legacy LEGACY_TLS_UNVERIFIED=YES TLS_CERT_VERIFIED=NO")
+        else:
+            logger.info("TLS_MODE=strict")
+
+    async def aclose(self) -> None:
+        if self._owns_http:
+            await self.http.aclose()
+        # Clear SSL context reference on close
+        self._ssl_ctx = None
 
     def _headers(self) -> dict:
         h = {}
-        token = os.getenv("ACCESS_TOKEN", "")
-        if token:
-            h["Authorization"] = "Bearer " + token
+        if self._access_token:
+            h["Authorization"] = "Bearer " + self._access_token
         return h
 
     def _check_code(self, data: dict, method: str, path: str) -> None:
@@ -157,6 +295,8 @@ class AgentCoreClient:
             )
         except SecurityError as e:
             raise AgentCoreError(str(e)) from e
+        if self.legacy_tls and method.upper() == "POST":
+            await self.verify()
         resp, data = await self._request_impl(method, path, json, url)
         self._check_code(data, method, path)
         return data
@@ -255,60 +395,6 @@ class AgentCoreClient:
             raise AgentCoreError("agent-core list_drivers data must be a list")
         return drivers
 
-    async def registry_catalog(self) -> dict:
-        """Return the selected Agent Core's host-arch registry catalog facets.
-
-        Calls the read-only ``GET /api/registry/catalog`` and returns a dict
-        containing at least ``data``, ``facets`` and ``filter``:
-
-        {
-          "data": <dict>,
-          "facets": {"cpu_arch": "arm64", "acc_arch": "jetson-jp5"},
-          "filter": <dict-or-empty>,
-        }
-
-        ``facets.cpu_arch`` and ``facets.acc_arch`` are the Agent Core's own
-        host-architecture detection (never PR text). Malformed envelopes fail
-        closed with ``AgentCoreError`` so a node whose host platform cannot be
-        proven is never approved.
-        """
-        response = await self.request("GET", "/api/registry/catalog")
-        catalog_data = response.get("data")
-        if not isinstance(catalog_data, dict):
-            raise AgentCoreError(
-                "agent-core registry_catalog data must be an object"
-            )
-        facets = response.get("facets")
-        if not isinstance(facets, dict):
-            raise AgentCoreError(
-                "agent-core registry_catalog facets must be an object"
-            )
-        cpu = facets.get("cpu_arch")
-        acc = facets.get("acc_arch")
-        if not isinstance(cpu, str) or not cpu.strip():
-            raise AgentCoreError(
-                "agent-core registry_catalog facets.cpu_arch must be a "
-                "non-empty string"
-            )
-        if not isinstance(acc, str) or not acc.strip():
-            raise AgentCoreError(
-                "agent-core registry_catalog facets.acc_arch must be a "
-                "non-empty string"
-            )
-        filt = response.get("filter")
-        if not isinstance(filt, dict):
-            raise AgentCoreError(
-                "agent-core registry_catalog filter must be an object"
-            )
-        return {
-            "data": catalog_data,
-            "facets": {
-                "cpu_arch": cpu.strip(),
-                "acc_arch": acc.strip(),
-            },
-            "filter": filt,
-        }
-
     async def list_mcp(self) -> list:
         data = await self.request("GET", "/api/mcp")
         mcps = data.get("data")
@@ -317,30 +403,26 @@ class AgentCoreClient:
         return mcps
 
     async def deploy_driver(self, driver_id: str, image: str) -> dict:
-        """POST the immutable target image to the selected Agent Core driver.
+        """POST the target image to the selected Agent Core driver.
 
-        ``image`` must already be in the exact immutable form
-        ``<repo>@sha256:<64hex>``; a mutable tag or any other shape is a hard
-        client error so a deploy POST can never carry a user-supplied tag."""
-        if not isinstance(driver_id, str) or not driver_id:
+        Accepts exact image:tag or legacy repo@sha256:<64hex>.
+        The image string is validated but NOT modified — passed verbatim
+        as {"image": image} to Agent Core.
+        """
+        if not isinstance(driver_id, str):
             raise AgentCoreError("deploy_driver requires a non-empty driver id")
-        if not isinstance(image, str) or not image:
-            raise AgentCoreError(
-                "deploy image must be the immutable repo@sha256:<64hex> form"
-            )
-        if "@" not in image:
-            raise AgentCoreError(
-                "deploy image must be the immutable repo@sha256:<64hex> form"
-            )
-        _family, _, _digest = image.rpartition("@")
-        if not (_digest.startswith("sha256:") and len(_digest) == 71):
-            raise AgentCoreError(
-                "deploy image must be the immutable repo@sha256:<64hex> form"
-            )
-        if not all(c in "0123456789abcdefABCDEF" for c in _digest[7:]):
-            raise AgentCoreError(
-                "deploy image must be the immutable repo@sha256:<64hex> form"
-            )
+        if not driver_id:
+            raise AgentCoreError("deploy_driver requires a non-empty driver id")
+        stripped = driver_id.strip()
+        if not stripped:
+            raise AgentCoreError("deploy_driver driver_id must be non-empty after strip")
+        if " " in driver_id or "\t" in driver_id:
+            raise AgentCoreError("deploy_driver driver_id must not contain whitespace")
+        driver_id = _validate_api_path_segment(driver_id, "deploy_driver driver_id")
+        try:
+            validate_image_ref(image)
+        except ValueError as exc:
+            raise AgentCoreError(str(exc)) from exc
         path = f"/api/drivers/{driver_id}/deploy"
         url = self.base_url + path
         try:
@@ -348,19 +430,91 @@ class AgentCoreClient:
                 url, self.config, allow_private=self.config.allow_private_http,
                 agent_core_node=self.node_host,
             )
-            resp, data = await self._request_impl("POST", path, {"image": image}, url)
-            self._check_code(data, "POST", path)
-            return data
         except SecurityError as e:
             raise AgentCoreError(str(e)) from e
-        except AgentCoreDeployOutcomeUncertain:
-            raise
-        except Exception as e:
+        if self.legacy_tls:
+            await self.verify()
+        try:
+            resp = await stream_request(
+                self.http, "POST", url, self.config.max_response_bytes,
+                headers=self._headers(), json={"image": image}, timeout=self.config.total_timeout)
+        except httpx.HTTPError as e:
             raise AgentCoreDeployOutcomeUncertain(
                 f"agent-core deploy outcome uncertain: {e}"
             ) from e
+        except SecurityError as e:
+            raise AgentCoreDeployOutcomeUncertain(str(e)) from e
+        try:
+            require_2xx(resp.status_code, f"agent-core POST {path}")
+        except SecurityError as e:
+            raise AgentCoreDeployOutcomeUncertain(str(e)) from e
+        # Body size check
+        try:
+            resp = await enforce_body_size(resp, self.config.max_response_bytes)
+        except SecurityError as e:
+            raise AgentCoreDeployOutcomeUncertain(str(e)) from e
+        # Parse JSON envelope
+        try:
+            data = resp.json()
+        except ValueError:
+            raise AgentCoreDeployOutcomeUncertain(
+                "agent-core deploy returned non-JSON"
+            )
+        if not isinstance(data, dict):
+            raise AgentCoreDeployOutcomeUncertain(
+                "agent-core deploy returned unexpected payload"
+            )
+        # --- Application-level classification once we have a valid 2xx envelope ---
+        code = data.get("code")
+        if isinstance(code, bool) or not isinstance(code, int):
+            # Malformed envelope => uncertain
+            raise AgentCoreDeployOutcomeUncertain(
+                f"agent-core deploy malformed code {code!r}"
+            )
+        if code not in (0, 200):
+            # Explicit application error (e.g. code=500) => CONFIRMED failure
+            raise AgentCoreError(
+                f"agent-core deploy failed: code={code!r}, message={data.get('message')!r}"
+            )
+        # code is 0 or 200 — inspect data payload
+        inner = data.get("data")
+        if not isinstance(inner, dict):
+            raise AgentCoreDeployOutcomeUncertain(
+                "agent-core deploy: code=200 but data is not an object"
+            )
+        status = inner.get("status")
+        error_msg = inner.get("error", "")
+        skipped = inner.get("skipped", False)
+        if inner.get("status") == "error" or (isinstance(error_msg, str) and error_msg):
+            # data.status=="error" or non-empty data.error => CONFIRMED failure
+            raise AgentCoreError(
+                f"agent-core deploy error: status={inner.get('status')!r}, error={error_msg!r}"
+            )
+        if skipped is True:
+            # skipped classification — must check status for proper outcome
+            if isinstance(status, str) and status == "running":
+                # skipped=true + status=running => known success, idempotent deploy
+                # Still requires post-deploy verification of exact target image
+                pass  # fall through to normal success path
+            elif isinstance(status, str) and status == "deploying":
+                # skipped=true + status=deploying => another deploy in progress, outcome unknown
+                raise AgentCoreDeployOutcomeUncertain(
+                    "agent-core deploy skipped=true, status=deploying"
+                )
+            else:
+                # skipped=true + unknown status => fail closed
+                raise AgentCoreDeployOutcomeUncertain(
+                    f"agent-core deploy skipped=true, unknown status={status!r}"
+                )
+        # Known-success: must have a non-empty status string and no error/skipped
+        if not isinstance(status, str) or not status:
+            raise AgentCoreDeployOutcomeUncertain(
+                "agent-core deploy success response missing status"
+            )
+        return data
 
     async def driver_status(self, driver_id: str) -> dict:
+        driver_id = _validate_api_path_segment(driver_id, "driver_status driver_id")
         data = await self.request("GET", f"/api/drivers/{driver_id}/status")
         inner = data.get("data")
         if not isinstance(inner, dict):
@@ -377,22 +531,37 @@ class AgentCoreClient:
                 raise AgentCoreError(
                     "agent-core driver_status running_image must be a string"
                 )
-            return {"running_image": running}
+            result: dict[str, Any] = {"running_image": running}
+            # Preserve status field — critical for post-deploy verification.
+            # If status is present it MUST be a non-empty string; fail closed otherwise.
+            if "status" in inner:
+                status_val = inner["status"]
+                if not isinstance(status_val, str) or not status_val:
+                    raise AgentCoreError(
+                        "agent-core driver_status status must be a non-empty string when present"
+                    )
+                result["status"] = status_val
+            logs = inner.get("logs")
+            if isinstance(logs, str) and logs:
+                result["logs"] = logs
+            return result
         logs = inner.get("logs")
         if "status" in inner and isinstance(logs, str):
-            return {"running_image": ""}
+            result: dict[str, Any] = {"running_image": ""}
+            if not isinstance(inner["status"], str) or not inner["status"]:
+                raise AgentCoreError(
+                    "agent-core driver_status status must be a non-empty string when present"
+                )
+            result["status"] = inner["status"]
+            return result
         raise AgentCoreError(
             "agent-core driver_status missing running_image for no-container shape"
         )
 
-    async def system_update(self, image: str) -> dict:
-        return await self.request("POST", "/api/system/update", {"image": image})
 
-    async def system_update_status(self) -> dict:
-        data = await self.request("GET", "/api/system/update-status")
-        return data.get("data", {})
 
     async def mcp_ping(self, mcp_id: str) -> dict:
+        mcp_id = _validate_api_path_segment(mcp_id, "mcp_ping mcp_id")
         data = await self.request("POST", f"/api/mcp/{mcp_id}/ping")
         inner = data.get("data")
         if not isinstance(inner, dict):
@@ -420,3 +589,136 @@ class AgentCoreClient:
                 "agent-core mcp_ping tools must be a list or null"
             )
         return inner
+
+    async def core_update_check(self) -> dict:
+        """GET /api/system/update-check — poll core self-update status.
+
+        Returns the parsed ``{code, data, message}`` envelope where
+        ``data`` is a dict containing at least:
+        - current_tag : str  (may be empty during pull/restart)
+        - latest_tag  : str
+        - latest_image: str
+        - up_to_date  : bool
+        """
+        url = self.base_url + "/api/system/update-check"
+        require_http_policy(
+            url, self.config, allow_private=self.config.allow_private_http,
+            agent_core_node=self.node_host,
+        )
+        try:
+            resp = await stream_request(
+                self.http, "GET", url, self.config.max_response_bytes,
+                headers=self._headers(), timeout=self.config.total_timeout)
+        except httpx.HTTPError as e:
+            raise AgentCoreError(f"agent-core update-check request failed: {e}")
+        except SecurityError as e:
+            raise AgentCoreError(str(e)) from e
+        try:
+            require_2xx(resp.status_code, "agent-core GET /api/system/update-check")
+        except SecurityError as e:
+            raise AgentCoreError(str(e)) from e
+        resp = await enforce_body_size(resp, self.config.max_response_bytes)
+        try:
+            data = resp.json()
+        except ValueError:
+            raise AgentCoreError("agent-core update-check returned non-JSON")
+        if not isinstance(data, dict):
+            raise AgentCoreError("agent-core update-check unexpected payload")
+        self._check_code(data, "GET", "/api/system/update-check")
+        inner = data.get("data")
+        if not isinstance(inner, dict):
+            raise AgentCoreError(
+                "agent-core update-check: data is not an object"
+            )
+        # Ensure typed fields — strings may be empty during pull/restart
+        for key in ("current_tag", "latest_tag", "latest_image"):
+            val = inner.get(key)
+            if val is not None and not isinstance(val, str):
+                raise AgentCoreError(
+                    f"agent-core update-check {key} must be str or null, got {val!r}"
+                )
+        up_to_date = inner.get("up_to_date")
+        if up_to_date is not None and not isinstance(up_to_date, bool):
+            raise AgentCoreError(
+                f"agent-core update-check up_to_date must be bool or null, got {up_to_date!r}"
+            )
+        return inner
+
+    async def update_core(self, image: str) -> dict:
+        """POST /api/system/update — trigger Agent Core self-update.
+
+        Requires *exact* ``image`` (already validated by ``validate_image_ref``).
+        HTTP 2xx with an accepted business response => UPDATE_ACCEPTED, NOT deployed.
+
+        Classification:
+        * Validation / security errors BEFORE request is sent:
+          confirmed ``AgentCoreError``
+        * POST transport uncertainty (timeout, connection reset, etc.):
+          ``AgentCoreDeployOutcomeUncertain``
+        * Response received but cannot safely prove update did NOT start:
+         保守按 ``AgentCoreDeployOutcomeUncertain``
+        * Explicit application error (integer code!=0/200,
+          data.status in {"error", "failed"}, or non-empty string data.error):
+          ``AgentCoreError``
+
+        Never classify a possibly-executed self-update as "absolutely not run".
+        """
+        try:
+            validated_image = validate_image_ref(image)
+        except ValueError as exc:
+            raise AgentCoreError(str(exc)) from exc
+        url = self.base_url + "/api/system/update"
+        try:
+            require_http_policy(
+                url, self.config, allow_private=self.config.allow_private_http,
+                agent_core_node=self.node_host,
+            )
+        except SecurityError as e:
+            raise AgentCoreError(str(e)) from e
+        if self.legacy_tls:
+            await self.verify()
+        try:
+            resp = await stream_request(
+                self.http, "POST", url, self.config.max_response_bytes,
+                headers=self._headers(), json={"image": validated_image},
+                timeout=self.config.total_timeout)
+        except httpx.HTTPError as e:
+            raise AgentCoreDeployOutcomeUncertain(
+                f"agent-core update outcome uncertain: {e}"
+            ) from e
+        except SecurityError as e:
+            raise AgentCoreDeployOutcomeUncertain(str(e)) from e
+        try:
+            require_2xx(resp.status_code, "agent-core POST /api/system/update")
+        except SecurityError as e:
+            raise AgentCoreDeployOutcomeUncertain(str(e)) from e
+        resp = await enforce_body_size(resp, self.config.max_response_bytes)
+        try:
+            data = resp.json()
+        except ValueError:
+            raise AgentCoreDeployOutcomeUncertain(
+                "agent-core update returned non-JSON"
+            )
+        if not isinstance(data, dict):
+            raise AgentCoreDeployOutcomeUncertain(
+                "agent-core update returned unexpected payload"
+            )
+        code = data.get("code")
+        if isinstance(code, bool) or not isinstance(code, int):
+            raise AgentCoreDeployOutcomeUncertain(
+                f"agent-core update malformed code {code!r}"
+            )
+        if code not in (0, 200):
+            raise AgentCoreError(
+                f"agent-core update failed: code={code!r}, "
+                f"message={data.get('message')!r}"
+            )
+        inner = data.get("data")
+        if isinstance(inner, dict):
+            error = inner.get("error")
+            if inner.get("status") in ("error", "failed") or (isinstance(error, str) and error):
+                # Explicit business failure is confirmed, unlike POST transport
+                # uncertainty. Never expose the server's potentially sensitive
+                # response details in the exception or controller logs.
+                raise AgentCoreError("agent-core update reported an explicit application failure")
+        return data

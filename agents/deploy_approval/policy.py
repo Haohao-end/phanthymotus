@@ -1,24 +1,26 @@
 """Authority, machine owners, and image policy checks (pre-merge validation).
 
 Pre-merge validation: one approver suffices (collaborator OR machine owner).
-Self-approval is allowed if the PR author is authorized.
+Self-approval is allowed when the actor satisfies machine-owner or collaborator authorization.
 Every decision is fail-closed: an unknown target, user, machine or image is a
 hard error, never a pass.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import ipaddress
-from pathlib import Path
 from typing import Any
 
 import yaml
 
-from .config import Config
+from .config import (
+    Config,
+    MAX_REPO_POLICY_FILE_BYTES,
+    parse_test_reviewers_yaml,
+)
 from .models import MachineInfo
+from .repo_policy import RepositoryPolicyStore
 
 
 class PolicyError(Exception):
@@ -34,7 +36,6 @@ _LEGACY_VARIANTS = {
     "jetson-jp5.11": "5.11",
     "jetson-jp6.1": "6.1",
 }
-
 
 def _normalize_variant(value: str) -> str:
     raw = value.strip()
@@ -59,6 +60,9 @@ def _validate_literal_ip(host: str, alias: str) -> str:
             f"machine {alias!r}: node_host must be an IPv4 address"
         )
     return str(parsed)
+
+
+
 
 
 def _validate_driver_paths(raw: Any, alias: str, *, required: bool) -> list[str] | None:
@@ -124,10 +128,39 @@ def load_machines(path: str) -> dict[str, MachineInfo]:
         raise MachineLoadError(f"machine owners file not found: {path}")
     with open(path, "r") as f:
         raw = yaml.safe_load(f)
+    return _load_machines_data(raw)
+
+
+def parse_machines_yaml(content: bytes | str) -> dict[str, MachineInfo]:
+    """Parse repository-provided machines.yaml with the standard schema checks."""
+    if isinstance(content, bytes):
+        if len(content) > MAX_REPO_POLICY_FILE_BYTES:
+            raise MachineLoadError("machines YAML exceeds the policy file size limit")
+        try:
+            content = content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise MachineLoadError("machines YAML must be UTF-8") from None
+    if not isinstance(content, str):
+        raise MachineLoadError("machines YAML must be UTF-8 text")
+    try:
+        content_size = len(content.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise MachineLoadError("machines YAML must be UTF-8") from None
+    if content_size > MAX_REPO_POLICY_FILE_BYTES:
+        raise MachineLoadError("machines YAML exceeds the policy file size limit")
+    try:
+        raw = yaml.safe_load(content)
+    except yaml.YAMLError:
+        # Parser errors may quote YAML lines; keep untrusted source out of logs.
+        raise MachineLoadError("machines YAML is malformed") from None
+    return _load_machines_data(raw)
+
+
+def _load_machines_data(raw: Any) -> dict[str, MachineInfo]:
     if not isinstance(raw, dict):
         raise MachineLoadError("machines YAML must be a dict at top level")
     version = raw.get("version")
-    if version != 1:
+    if type(version) is not int or version != 1:
         raise MachineLoadError(
             f"machines YAML version must be 1, got {version!r}"
         )
@@ -138,6 +171,7 @@ def load_machines(path: str) -> dict[str, MachineInfo]:
         raise MachineLoadError("machines mapping must not be empty")
     machines: dict[str, MachineInfo] = {}
     node_ids_seen: set[str] = set()
+    node_hosts_seen: dict[str, str] = {}
     for alias, entry in machines_raw.items():
         if not isinstance(alias, str) or not alias.strip():
             raise MachineLoadError("machine alias must be a non-empty string")
@@ -170,6 +204,13 @@ def load_machines(path: str) -> dict[str, MachineInfo]:
                 f"machine {alias!r}: node_host is required and must be non-empty"
             )
         node_host = _validate_literal_ip(node_host, alias)
+        previous_alias = node_hosts_seen.get(node_host)
+        if previous_alias is not None:
+            raise MachineLoadError(
+                f"duplicate node_host {node_host!r}: machines {previous_alias!r} and "
+                f"{alias!r} cannot share one physical IP address"
+            )
+        node_hosts_seen[node_host] = alias
         targets_raw = entry.get("targets")
         if not isinstance(targets_raw, list) or not targets_raw:
             raise MachineLoadError(
@@ -231,20 +272,29 @@ def load_machines(path: str) -> dict[str, MachineInfo]:
 class Policy:
     def __init__(self, config: Config):
         self.config = config
-        self.policy_version = self._fingerprint(config)
         self.machines: dict[str, MachineInfo] = {}
+        self._repository_policies = RepositoryPolicyStore(
+            config,
+            machine_parser=parse_machines_yaml,
+            reviewer_parser=parse_test_reviewers_yaml,
+        )
 
     def load_machines(self) -> None:
         self.machines = load_machines(self.config.machine_owners_file)
 
-    def get_machine_by_node_id(self, node_id: str) -> MachineInfo | None:
-        for m in self.machines.values():
+    def get_machine_by_node_id(
+        self, node_id: str, repo: str | None = None,
+    ) -> MachineInfo | None:
+        machines = self.machines if repo is None else self._repository_policies.machines_for(repo)
+        for m in machines.values():
             if m.node_id == node_id:
                 return m
         return None
 
-    def get_machine(self, alias: str) -> MachineInfo | None:
-        return self.machines.get(alias)
+    def get_machine(self, alias: str, repo: str | None = None) -> MachineInfo | None:
+        if repo is None:
+            return self.machines.get(alias)
+        return self._repository_policies.machine_for(alias, repo)
 
     # GitHub collaborator permissions that may approve.
     COLLABORATOR_WRITE = frozenset({"write", "maintain", "admin"})
@@ -253,49 +303,81 @@ class Policy:
     def collaborator_can_approve(permission: str) -> bool:
         return isinstance(permission, str) and permission in Policy.COLLABORATOR_WRITE
 
+    def get_machines(self, repo: str | None = None) -> list[MachineInfo]:
+        """Return machines, optionally from one isolated repository policy."""
+        machines = self.machines if repo is None else self._repository_policies.machines_for(repo)
+        return list(machines.values())
+
+    def reviewers_for_repo(self, repo: str) -> list[str]:
+        """Return only the verified acceptance allowlist for ``repo``."""
+        return self._repository_policies.reviewers_for_repo(repo)
+
+    def repo_policy_status(self, repo: str) -> dict:
+        """Report whether this repository has independently verified policy."""
+        return self._repository_policies.status(repo)
+
+    async def refresh_if_due(self, repo: str, github_client) -> dict:
+        """Refresh one authorized repository's main-branch policy files."""
+        return await self._repository_policies.refresh_if_due(repo, github_client)
+
     @staticmethod
-    def _fingerprint(config: Config) -> str:
-        payload = {"v": 7}
-        blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        return "deploy-approval-" + hashlib.sha256(blob).hexdigest()[:16]
+    def resolve_machine_selector(selector: str, machines: dict[str, "MachineInfo"]) -> "MachineInfo":
+        """Resolve a machine selector (alias or literal IPv4) to a canonical MachineInfo.
 
-    def can_approve(
-        self,
-        actor: str,
-        *,
-        actor_id: str = "",
-        machine_alias: str = "",
-    ) -> None:
-        """Raise PolicyError unless ``actor`` may approve for the machine.
-
-        Gates:
-        1. actor must be an owner of the selected machine
+        1. Exact alias match first.
+        2. If not found, validate selector as literal IPv4.
+        3. Find machines with node_host == selector.
+        4. Exactly 1 match -> return it.
+        5. 0 matches -> raise PolicyError.
+        6. Multiple matches -> raise PolicyError listing sorted aliases.
+        7. If selector is not a valid IPv4 and not an alias -> raise PolicyError.
         """
-        machine = self.get_machine(machine_alias)
-        if machine is None:
-            raise PolicyError(f"machine {machine_alias!r} not found in machine owners")
-        actor_lower = actor.strip().lower() if actor else ""
-        if actor_lower not in machine.owners:
+        # 1. Exact alias match
+        if selector in machines:
+            return machines[selector]
+
+        # 2. Validate as literal IPv4
+        try:
+            parsed = ipaddress.ip_address(selector)
+        except ValueError:
             raise PolicyError(
-                f"actor {actor!r} is not an owner of machine {machine_alias!r}"
+                f"invalid machine selector {selector!r}: "
+                "not a known alias or valid IPv4 address"
+            )
+        if parsed.version != 4:
+            raise PolicyError(
+                f"invalid machine selector {selector!r}: only IPv4 addresses are supported"
             )
 
-    def can_request(self, requester: str) -> None:
-        return None
+        canonical_ipv4 = str(parsed)
 
-    def build_pinned_ref(self, family: str, digest: str) -> str:
-        return f"{family}@{digest}"
+        # 3. Find machines with matching node_host
+        matches: list[MachineInfo] = []
+        for m in machines.values():
+            if m.node_host == canonical_ipv4:
+                matches.append(m)
 
-    def get_machines(self) -> list:
-        """Return all machines as a list."""
-        return list(self.machines.values())
+        # 4-6. Resolve based on match count
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) == 0:
+            raise PolicyError(f"no machine found with IP {canonical_ipv4!r}")
+        # Multiple matches -> ambiguous
+        sorted_aliases = sorted(m.alias for m in matches)
+        raise PolicyError(
+            f"ambiguous IP {canonical_ipv4!r}: matches machines "
+            f"{', '.join(f'`{a}`' for a in sorted_aliases)}. "
+            "Please use a machine alias instead."
+        )
 
-    def machine_supports_target(self, alias: str, target: str) -> bool:
+    def machine_supports_target(
+        self, alias: str, target: str, repo: str | None = None,
+    ) -> bool:
         """Check if a machine supports a given target based on static config.
 
         Fail closed: targets must be explicit.
         """
-        machine = self.machines.get(alias)
+        machine = self.get_machine(alias, repo=repo)
         if machine is None:
             return False
         if not machine.targets:
