@@ -864,9 +864,9 @@ public_api_status() {
     probe_route "https://${EVIDENCE_HOST}/api/evidence/${PROBE_REPO}/pulls/${PROBE_PR}/context"
 }
 
-# A route is healthy when the Evidence app answered, even with 401/403/409/503.
+# A route is healthy when the Evidence app answered, even with 401/403/409.
 route_healthy() {
-    [[ $1 =~ ^(200|401|403|409|503)\ controller:yes$ ]]
+    [[ $1 =~ ^(200|401|403|409)\ controller:yes$ ]]
 }
 
 public_management_blocked() {

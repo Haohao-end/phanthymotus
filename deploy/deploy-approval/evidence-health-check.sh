@@ -187,9 +187,26 @@ if [[ -n $EVIDENCE_HOST ]]; then
             printf '%s controller:no' "${status:-000}"
         fi
     }
-    page="$(probe "https://${EVIDENCE_HOST}/evidence/${PROBE_REPO}/pulls/${PROBE_PR}")"
-    api="$(probe "https://${EVIDENCE_HOST}/api/evidence/${PROBE_REPO}/pulls/${PROBE_PR}/context")"
-    route_ok() { [[ $1 =~ ^(200|401|403|409|503)[[:space:]]controller:yes$ ]]; }
+    route_ok() { [[ $1 =~ ^(200|401|403|409)[[:space:]]controller:yes$ ]]; }
+    probe_with_retry() {
+        local url="$1" result="" attempt
+        for (( attempt = 1; attempt <= 5; attempt++ )); do
+            result="$(probe "$url")"
+            if route_ok "$result"; then
+                break
+            fi
+            if [[ $result =~ ^503[[:space:]]controller:yes$ ]]; then
+                if (( attempt < 5 )); then
+                    sleep 2
+                fi
+            else
+                break
+            fi
+        done
+        printf '%s' "$result"
+    }
+    page="$(probe_with_retry "https://${EVIDENCE_HOST}/evidence/${PROBE_REPO}/pulls/${PROBE_PR}")"
+    api="$(probe_with_retry "https://${EVIDENCE_HOST}/api/evidence/${PROBE_REPO}/pulls/${PROBE_PR}/context")"
     if route_ok "$page"; then
         add_ok "L6 evidence page route (${page})"
     else
