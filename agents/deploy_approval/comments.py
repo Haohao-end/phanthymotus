@@ -392,6 +392,7 @@ def runtime_image_checks_block(
     existing_commands = existing_commands or set()
     lines = []
     emitted_commands = set()
+    single_machine = len(grouped) == 1
     for key in sorted(grouped):
         row = grouped[key]
         ips = row["ips"]
@@ -465,8 +466,21 @@ def runtime_image_checks_block(
                     f"  - {component}：运行状态无法确认，不能判断当前镜像；不生成审批命令。"
                 )
         for selector in sorted(selectors):
-            command = f"/approve_deploy machine={selector}"
-            if command in existing_commands:
+            selector_ip = ipv4(selector)
+            if single_machine:
+                command = "/approve_deploy"
+            elif selector_ip:
+                command = f"/approve_deploy machine={selector_ip}"
+            else:
+                # Multi-machine recovery commands must identify the real IP.
+                continue
+            same_machine_commands = {
+                f"/approve_deploy machine={selector}",
+                f"/approve_deploy machine={selector_ip}",
+                f"/approve_deploy machine={row['alias']}",
+            }
+            if (command in existing_commands
+                    or same_machine_commands.intersection(existing_commands)):
                 lines.append("    此机器的可执行审批命令已在上方列出。")
                 lines.append("    /request_deploy 可选，不是前置条件。")
                 continue
@@ -636,6 +650,8 @@ def update_runtime_image_checks(
             existing_command_text,
         )
     }
+    if re.search(r"/approve_deploy(?![ \t]+machine=)", existing_command_text):
+        existing_commands.add("/approve_deploy")
     block = runtime_image_checks_block(
         runtime_checks, components, lifecycle_status=lifecycle_status,
         machine_groups=machine_groups, machine_inventory=machine_inventory,
@@ -1188,7 +1204,12 @@ def deploy_ready(
             aliases_by_node_host.setdefault(node_host, set()).add(alias.strip().casefold())
 
     if approval_evidence_ready:
-        seen_commands = set()
+        eligible_machines = []
+        component_by_id = {
+            item.get("component_id"): item for item in components or []
+            if isinstance(item, dict)
+            and isinstance(item.get("component_id"), str)
+        }
         for group in group_rows:
             compatible = group.get("component_ids")
             if not isinstance(compatible, list):
@@ -1197,7 +1218,8 @@ def deploy_ready(
                 component_id for component_id in compatible
                 if isinstance(component_id, str) and component_id
             }
-            if not deployable_ids or not deployable_ids.intersection(compatible_ids):
+            machine_component_ids = deployable_ids.intersection(compatible_ids)
+            if not machine_component_ids:
                 continue
             alias = group.get("alias")
             if (not isinstance(alias, str)
@@ -1261,16 +1283,6 @@ def deploy_ready(
                         continue
                     command_selector = alias
 
-            command = f"/approve_deploy machine={command_selector}"
-            if command in seen_commands:
-                continue
-            seen_commands.add(command)
-            component_by_id = {
-                item.get("component_id"): item for item in components or []
-                if isinstance(item, dict)
-                and isinstance(item.get("component_id"), str)
-            }
-            machine_component_ids = deployable_ids.intersection(compatible_ids)
             component_labels = [
                 _runtime_component_label(component_by_id[component_id])
                 if component_id in component_by_id else component_id
@@ -1279,13 +1291,46 @@ def deploy_ready(
             component_text = "、".join(
                 _escape(label) for label in component_labels if label
             )
+            complete_compatibility = deployable_ids.issubset(compatible_ids)
+            if complete_compatibility:
+                full_machine_aliases.add(alias.casefold())
+            eligible_machines.append({
+                "alias": alias,
+                "primary_ip": primary_ip,
+                "command_selector": command_selector,
+                "ip_command_safe": group.get("ip_command_safe") is True,
+                "ambiguous_ip": ambiguous_ip,
+                "component_text": component_text,
+                "complete": complete_compatibility,
+            })
+
+        seen_commands = set()
+        for machine in eligible_machines:
+            alias = machine["alias"]
+            primary_ip = machine["primary_ip"]
+            command_selector = machine["command_selector"]
+            if machine["complete"] and len(full_machine_aliases) == 1:
+                command = "/approve_deploy"
+            elif machine["complete"] and len(full_machine_aliases) > 1:
+                # A complete machine among multiple candidates is selected by
+                # its verified primary IP, never by a placeholder or alias.
+                if (command_selector != primary_ip
+                        or not machine["ip_command_safe"]
+                        or machine["ambiguous_ip"]):
+                    continue
+                command = f"/approve_deploy machine={primary_ip}"
+            elif command_selector == primary_ip:
+                command = f"/approve_deploy machine={primary_ip}"
+            else:
+                command = f"/approve_deploy machine={alias}"
+            if command in seen_commands:
+                continue
+            seen_commands.add(command)
             commands.append(
                 f"- `{_escape(alias)}`（{primary_ip}）\n"
-                f"  兼容组件：{component_text or '当前部署组件'}\n"
+                f"  兼容组件：{machine['component_text'] or '当前部署组件'}\n"
                 f"  `{command}`"
             )
-            if deployable_ids.issubset(compatible_ids):
-                full_machine_aliases.add(alias.casefold())
 
     lines = [
         BOT_MARKER,
@@ -1328,8 +1373,6 @@ def deploy_ready(
             "",
             "审查或构建结果尚未确认通过，暂不显示可执行部署审批命令。",
         ])
-    if approval_evidence_ready and len(full_machine_aliases) == 1:
-        lines.extend(["", "当前只有一台完整适配机器，也可以直接使用简写 `/approve_deploy`。"])
     if approval_evidence_ready:
         lines.extend([
             "",

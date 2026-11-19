@@ -80,29 +80,16 @@ def _github_failure_reason(exc: Exception) -> str:
     return type(exc).__name__
 
 
-# Exact next command for each supported command kind. Used only in rejection
-# replies so every failure states what failed, why, and which command to run.
-_NEXT_COMMAND = {
-    "request_deploy": "`/request_deploy`（无需任何参数）",
-    "approve_deploy": "使用当前 PR 生命周期和仓库策略生成的审批指导；指导不可用时不要猜测机器。",
-    "record_test": "`/record_test result=pass` 或 `/record_test result=fail`",
-    "request_acceptance": "`/request_acceptance`（无需任何参数）",
-    "deploy_status": "`/deploy_status`（无需任何参数）",
-    "deploy_help": "`/deploy_help`",
-    "evidence_link": "PR Summary 中的稳定附件链接（该命令已弃用）",
-    "submit_evidence": "按 PR Summary 生成的完整 `head=`、`round=` 参数重新提交",
-    "remove_evidence": "按 PR Summary 生成的完整 `head=`、`round=`、`id=` 参数重新提交",
-}
-
 _REJECTION_CODES = {
-    "unknown_argument": "parameter_error",
-    "extra_parameter": "parameter_error",
-    "missing_machine_value": "parameter_error",
-    "invalid_ip_format": "parameter_error",
-    "missing_parameter": "parameter_error",
-    "invalid_parameter": "parameter_error",
-    "duplicate_argument": "parameter_error",
-    "invalid_arguments": "parameter_error",
+    "unknown_argument": "unknown_argument",
+    "extra_parameter": "extra_parameter",
+    "missing_machine_value": "invalid_parameter",
+    "invalid_ip_format": "invalid_parameter",
+    "missing_parameter": "missing_parameter",
+    "invalid_parameter": "invalid_parameter",
+    "duplicate_argument": "duplicate_argument",
+    "invalid_arguments": "invalid_arguments",
+    "parameter_error": "parameter_error",
     "command_not_found": "command_not_found",
     "unknown_command": "command_not_found",
     "machine_not_found": "machine_not_found",
@@ -112,16 +99,17 @@ _REJECTION_CODES = {
     "machine_ambiguous": "machine_not_unique",
     "ambiguous_machine": "machine_not_unique",
     "ambiguous_ip": "machine_not_unique",
-    "machine_not_authorized": "machine_not_authorized",
-    "machine_unauthorized": "machine_not_authorized",
-    "unauthorized_machine": "machine_not_authorized",
-    "machine_permission_denied": "machine_not_authorized",
-    "machine_access_denied": "machine_not_authorized",
-    "machine_authorization_failed": "machine_not_authorized",
-    "owner_not_authorized": "machine_not_authorized",
-    "machine_owner_required": "machine_not_authorized",
-    "machine_owner_not_authorized": "machine_not_authorized",
-    "actor_not_machine_owner": "machine_not_authorized",
+    "permission_denied": "permission_denied",
+    "machine_not_authorized": "permission_denied",
+    "machine_unauthorized": "permission_denied",
+    "unauthorized_machine": "permission_denied",
+    "machine_permission_denied": "permission_denied",
+    "machine_access_denied": "permission_denied",
+    "machine_authorization_failed": "permission_denied",
+    "owner_not_authorized": "permission_denied",
+    "machine_owner_required": "permission_denied",
+    "machine_owner_not_authorized": "permission_denied",
+    "actor_not_machine_owner": "permission_denied",
     "machine_incompatible": "machine_incompatible",
     "incompatible_machine": "machine_incompatible",
     "component_incompatible": "machine_incompatible",
@@ -158,6 +146,36 @@ _REJECTION_TEXT = {
         "参数解析或验证未通过；命令仍按严格参数规则校验，没有执行。",
         "按下方命令格式修正后重新提交。",
     ),
+    "extra_parameter": (
+        "多余参数",
+        "命令包含该形式不支持的位置参数或额外参数；命令没有执行。",
+        "修正命令参数后重新提交。",
+    ),
+    "unknown_argument": (
+        "未知参数",
+        "命令不支持所提供的参数名；命令没有执行。",
+        "移除不支持的参数后重新提交。",
+    ),
+    "missing_parameter": (
+        "缺少参数",
+        "命令缺少必需参数；命令没有执行。",
+        "补齐必需参数后重新提交。",
+    ),
+    "duplicate_argument": (
+        "重复参数",
+        "同一参数不能重复提供；命令没有执行。",
+        "保留一个参数后重新提交。",
+    ),
+    "invalid_parameter": (
+        "参数值无效",
+        "参数值未通过格式或取值验证；命令没有执行。",
+        "按参数要求修正后重新提交。",
+    ),
+    "invalid_arguments": (
+        "参数格式无效",
+        "命令参数无法解析；命令没有执行。",
+        "修正命令格式后重新提交。",
+    ),
     "command_not_found": (
         "命令不存在",
         "当前输入不是 Deploy Approval 支持的命令。",
@@ -173,7 +191,7 @@ _REJECTION_TEXT = {
         "该选择器匹配多个机器，无法安全确定审批目标。",
         "使用当前 PR 指导中的完整 alias 命令，明确选择一台机器。",
     ),
-    "machine_not_authorized": (
+    "permission_denied": (
         "机器无权限",
         "当前用户或该物理机器未获当前仓库机器策略授权；这不是参数格式错误。",
         "请让当前仓库策略列出的该机器 Owner 执行对应命令，或由仓库管理员修复 main 上的机器授权。",
@@ -249,23 +267,47 @@ def _command_kind(cmd) -> str:
     return getattr(cmd, "intent", "") or "unknown"
 
 
-def _command_error_explanation(cmd) -> tuple[str, str]:
+def _command_error_explanation(
+    cmd, error: str | None = None,
+) -> tuple[str, str]:
     """Compatibility helper for strict parse-level error descriptions."""
-    error = getattr(cmd, "error", "") or ""
+    if error is None:
+        error = getattr(cmd, "error", "") or ""
     code = _stable_error_code(error)
     if code in _REJECTION_CODES:
         category = _REJECTION_CODES[code]
         label, why, _ = _REJECTION_TEXT[category]
-        detail = error if error else label
+        value = error.partition(":")[2]
+        if category == "unknown_argument":
+            detail = f"不支持参数 `{value or '?'}=`（{error}）。"
+        elif category == "missing_parameter":
+            detail = f"缺少必需参数 `{value or '?'}=`（{error}）。"
+        elif category == "duplicate_argument":
+            detail = f"参数 `{value or '?'}=` 重复（{error}）。"
+        elif category == "invalid_parameter":
+            if code == "missing_machine_value":
+                detail = f"`machine=` 的值为空（{error}）。"
+            elif code == "invalid_ip_format":
+                detail = f"`machine=` 不是有效 IPv4 地址（{error}）。"
+            else:
+                detail = f"参数 `{value or '?'}=` 无效（{error}）。"
+        elif category == "extra_parameter":
+            detail = f"命令包含多余参数（{error}）。"
+        elif category == "invalid_arguments":
+            detail = f"命令参数无法解析（{error}）。"
+        else:
+            detail = error or label
         return detail, why
+    if error:
+        return f"未识别错误 code `{error}`。", _REJECTION_TEXT["unknown_exception"][1]
     if getattr(cmd, "intent", ""):
         return "command_not_found", _REJECTION_TEXT["command_not_found"][1]
-    return "invalid_arguments", _REJECTION_TEXT["parameter_error"][1]
+    return "invalid_arguments", _REJECTION_TEXT["invalid_arguments"][1]
 
 
 def _command_rejection_message(
     cmd, exc: Exception | None = None, *, current_pr: dict | None = None,
-    current_state: dict | None = None, approval_guidance: str = "",
+    current_state: dict | None = None, lifecycle_guidance: str = "",
 ) -> str:
     """Build a command-bound rejection from the actual failure and live context."""
     kind = _command_kind(cmd)
@@ -282,130 +324,103 @@ def _command_rejection_message(
     else:
         command_text = "/" + kind
 
-    code = _exception_code(exc)
-    code_key = _stable_error_code(code)
-    category = _REJECTION_CODES.get(code_key, "") if code else ""
-    error_code = code
-    if not exc and not category:
-        parsed_error = getattr(cmd, "error", "") or ""
-        code_key = _stable_error_code(parsed_error)
-        category = _REJECTION_CODES.get(code_key, "")
-        error_code = parsed_error
-    if not category and not exc and getattr(cmd, "intent", ""):
-        category = "command_not_found"
-        error_code = "command_not_found"
+    exception_code = _exception_code(exc)
+    parsed_error = getattr(cmd, "error", "") or ""
+    error_code = exception_code or parsed_error
+    code_key = _stable_error_code(error_code)
+    category = _REJECTION_CODES.get(code_key, "") if error_code else ""
 
     pr_status = ""
+    pr_status_code = ""
     if isinstance(current_pr, dict):
         if current_pr.get("merged") is True:
             pr_status = "pr_merged"
+            pr_status_code = "pr_merged"
         elif current_pr.get("state") == "closed":
             pr_status = "pr_closed"
+            pr_status_code = "pr_closed"
         elif current_pr.get("draft") is True:
             pr_status = "pr_draft"
-    pr_head = ((current_pr.get("head") or {}).get("sha")
-               if isinstance(current_pr, dict)
-               and isinstance(current_pr.get("head"), dict) else None)
-    state_head = current_state.get("head_sha") if isinstance(current_state, dict) else None
-    if (not pr_status and isinstance(pr_head, str) and isinstance(state_head, str)
-            and pr_head != state_head):
-        pr_status = "head_changed"
-
-    if category == "parameter_error":
-        pass
-    elif not category and pr_status and not exc:
-        category, error_code = pr_status, pr_status
-    elif not category and (exc or getattr(cmd, "error", "")):
-        category = "unknown_exception"
-        error_code = (
-            f"{type(exc).__name__} (no stable code)" if exc else
-            str(getattr(cmd, "error", "") or "unknown")
-        )
-    elif not category:
-        category = "state_not_allowed"
-        error_code = "state_not_allowed"
-
-    label, default_why, default_next = _REJECTION_TEXT[category]
-    if category == "parameter_error":
-        error = getattr(cmd, "error", "") or error_code or "invalid_arguments"
-        stable_code = _stable_error_code(error)
-        if stable_code == "unknown_argument":
-            detail = f"不支持参数 `{error.partition(':')[2] or '?'}=`（{error}）。"
-        elif stable_code == "missing_parameter":
-            detail = f"缺少必需参数 `{error.partition(':')[2] or '?'}=`（{error}）。"
-        elif stable_code == "invalid_parameter":
-            detail = f"参数 `{error.partition(':')[2] or '?'}=` 无效（{error}）。"
-        elif stable_code == "duplicate_argument":
-            detail = f"参数 `{error.partition(':')[2] or '?'}=` 重复（{error}）。"
-        elif stable_code == "extra_parameter":
-            detail = f"命令包含多余参数（{error}）。"
-        elif stable_code == "missing_machine_value":
-            detail = f"`machine=` 的值为空（{error}）。"
-        elif stable_code == "invalid_ip_format":
-            detail = f"`machine=` 不是有效 IPv4 地址（{error}）。"
-        elif stable_code == "invalid_arguments":
-            detail = f"命令参数无法解析（{error}）。"
+            pr_status_code = "pr_draft"
         else:
-            detail = f"参数验证失败（{error}）。"
+            pr_status = str(current_pr.get("state") or "unknown")
+        pr_head = ((current_pr.get("head") or {}).get("sha")
+                   if isinstance(current_pr.get("head"), dict) else None)
+        state_head = current_state.get("head_sha") if isinstance(current_state, dict) else None
+        if (not pr_status_code and isinstance(pr_head, str)
+                and isinstance(state_head, str) and pr_head != state_head):
+            pr_status_code = "head_changed"
+            pr_status += "/head_changed"
+
+    lifecycle_status = "unknown"
+    if isinstance(current_state, dict):
+        lifecycle_status = str(current_state.get("status") or "unknown")
+
+    if not category:
+        if pr_status_code:
+            category = _REJECTION_CODES.get(pr_status_code, "unknown_exception")
+            error_code = error_code or pr_status_code
+        elif exc or parsed_error:
+            category = "unknown_exception"
+            if not error_code:
+                error_code = type(exc).__name__ if exc else parsed_error
+        elif getattr(cmd, "intent", ""):
+            category = "command_not_found"
+            error_code = "command_not_found"
+        else:
+            category = "state_not_allowed"
+            error_code = "state_not_allowed"
+
+    label, why, _default_next = _REJECTION_TEXT.get(
+        category, _REJECTION_TEXT["unknown_exception"],
+    )
+    if code_key in {
+            "unknown_argument", "extra_parameter", "missing_parameter",
+            "invalid_parameter", "duplicate_argument", "invalid_arguments",
+            "missing_machine_value", "invalid_ip_format", "parameter_error",
+    }:
+        detail, _ = _command_error_explanation(cmd, error_code)
+        why += " 严格参数验证保持不变。"
     elif category == "unknown_exception":
         if exc:
+            exception_detail = str(exc).strip()
             detail = (
-                f"{type(exc).__name__}：稳定错误 code `{error_code}` 未分类。"
-                if code else
+                f"{type(exc).__name__}: {exception_detail}"
+                if exception_detail else
                 f"{type(exc).__name__}：未提供可识别的稳定错误 code。"
             )
+            if exception_code:
+                detail += f"（错误 code：{exception_code}）"
         else:
-            detail = f"未识别错误 code `{error_code}`。"
-        if isinstance(current_pr, dict):
-            if pr_status:
-                default_why += f" 当前 PR 状态为 `{pr_status}`；无法把该异常归因于状态检查。"
-            elif isinstance(current_state, dict):
-                default_why += f" 当前 Lifecycle 状态为 `{current_state.get('status') or 'unknown'}`。"
+            detail = f"未识别错误 code `{error_code or 'unknown'}`。"
+        if isinstance(current_state, dict):
+            why += f" 当前 Lifecycle 状态为 `{lifecycle_status}`。"
+    elif category == "command_not_found":
+        detail = error_code or "command_not_found"
     else:
         detail = error_code or label
+        if exc:
+            exception_detail = str(exc).strip()
+            if exception_detail and exception_detail not in detail:
+                detail += f"（{exception_detail}）"
 
-    recommendation = _NEXT_COMMAND.get(kind, "运行 `/deploy_help` 查看支持的命令。")
-    if category in {"pr_closed", "pr_merged", "pr_draft", "head_changed",
-                    "state_not_allowed", "repository_policy_unavailable"}:
-        recommendation = "运行 `/deploy_status` 查看当前状态；不要在状态未就绪时重试部署。"
-        if approval_guidance.strip():
-            recommendation += "\n" + approval_guidance.strip()
-    elif kind == "approve_deploy":
-        if approval_guidance.strip():
-            recommendation = approval_guidance.strip()
-        elif category in {"pr_closed", "pr_merged", "pr_draft", "head_changed",
-                          "repository_policy_unavailable", "machine_not_found",
-                          "machine_not_unique", "machine_not_authorized",
-                          "machine_incompatible"}:
-            recommendation = "当前没有可确认的机器审批命令；请按下方下一步处理。"
-    elif category == "command_not_found":
-        recommendation = "运行 `/deploy_help` 查看支持的命令。"
+    guidance = lifecycle_guidance.strip() if isinstance(lifecycle_guidance, str) else ""
+    if not guidance:
+        guidance = "无法获取当前 Lifecycle 状态指导；请查看当前 PR Summary，确认状态后再操作。"
 
-    current_status = ""
-    if pr_status:
-        current_status = pr_status
-    elif isinstance(current_pr, dict):
-        current_status = str(current_pr.get("state") or "unknown")
-        if current_pr.get("draft") is True:
-            current_status += "/draft"
-        if current_pr.get("merged") is True:
-            current_status += "/merged"
-    if isinstance(current_state, dict) and current_state.get("status"):
-        current_status += f"；Lifecycle `{current_state['status']}`"
-    status_line = f"\n- 当前 PR 状态：{current_status}" if current_status else ""
-    why = default_why
-    if category == "parameter_error":
-        why += " 不会放宽命令参数验证。"
-    if exc and category != "unknown_exception" and error_code:
-        detail += f"（错误 code：{error_code}）" if error_code not in detail else ""
-    return "\n".join([
-        f"`{command_text}` 未执行。",
-        f"- 失败命令：`{command_text}`",
-        f"- 具体错误：{label}；{detail}",
-        f"- 失败原因：{why}" + status_line,
-        f"- 建议命令：{recommendation}",
-        f"- 下一步：{default_next}",
-    ])
+    lines = [
+        f"执行命令 `/{kind}` 失败。",
+        f"- 原始命令: `{command_text}`",
+        f"- 错误分类: `{category or 'unknown'}`",
+        f"- 具体错误: {label}；{detail}",
+        f"- 失败原因: {why}",
+        f"- 当前 PR 状态: `{pr_status or 'unknown'}`",
+        f"- 当前 Lifecycle 状态: `{lifecycle_status}`",
+        "",
+        "下一步建议:",
+        guidance,
+    ]
+    return "\n".join(lines)
 
 
 # Terminal rejections discovered at the dispatch boundary (after the command
@@ -427,24 +442,47 @@ _BOUNDARY_REJECTIONS = {
 
 
 def _boundary_rejection_message(
-    kind: str, reason: str, *, approval_guidance: str = "",
+    kind: str, reason: str, *, raw: str = "",
+    current_pr: dict | None = None, current_state: dict | None = None,
+    lifecycle_guidance: str = "",
 ) -> str:
     """Build the public 错误/原因/下一步 reply for a dispatch-boundary rejection."""
-    what, why, next_step = _BOUNDARY_REJECTIONS[reason]
-    next_command = (
-        "`/deploy_status` 查看当前状态；审核完成后使用 Lifecycle Summary 中的机器命令。"
-        if kind == "approve_deploy" else
-        _NEXT_COMMAND.get(kind, "运行 `/deploy_help` 查看命令说明")
+    what, why, _ = _BOUNDARY_REJECTIONS[reason]
+    raw_line = raw.strip().splitlines()[0] if isinstance(raw, str) and raw.strip() else f"/{kind}"
+    command_text = raw_line[:300].replace("`", "\\`")
+    if not command_text.startswith("/"):
+        command_text = "/" + command_text
+    pr_status = "unknown"
+    if isinstance(current_pr, dict):
+        if current_pr.get("merged") is True:
+            pr_status = "pr_merged"
+        elif current_pr.get("state") == "closed":
+            pr_status = "pr_closed"
+        elif current_pr.get("draft") is True:
+            pr_status = "pr_draft"
+        else:
+            pr_status = str(current_pr.get("state") or "unknown")
+    lifecycle_status = (
+        str(current_state.get("status") or "unknown")
+        if isinstance(current_state, dict) else "unknown"
     )
-    if kind == "approve_deploy" and approval_guidance.strip():
-        next_command += "\n" + approval_guidance.strip()
-    return "\n".join([
-        f"`/{kind}` 未执行。",
-        f"- 错误：{what}",
-        f"- 原因：{why}",
-        f"- 建议命令：{next_command}",
-        f"- 下一步：{next_step}",
-    ])
+    guidance = lifecycle_guidance.strip() if isinstance(lifecycle_guidance, str) else ""
+    if not guidance:
+        guidance = "无法获取当前 Lifecycle 状态指导；请查看当前 PR Summary，确认状态后再操作。"
+
+    lines = [
+        f"执行命令 `/{kind}` 失败。",
+        f"- 原始命令: `{command_text}`",
+        f"- 错误分类: `boundary_rejection`",
+        f"- 具体错误: {what}",
+        f"- 失败原因: {why}",
+        f"- 当前 PR 状态: `{pr_status}`",
+        f"- 当前 Lifecycle 状态: `{lifecycle_status}`",
+        "",
+        "下一步建议:",
+        guidance,
+    ]
+    return "\n".join(lines)
 
 
 def _needs_initial_comment_baseline(state: dict | None) -> bool:
@@ -1517,14 +1555,15 @@ class GitHubCommandWatcher:
 
     async def _post_boundary_rejection(
         self, repo: str, pr_number: int, comment_id: int, *,
-        kind: str, reason: str,
+        cmd, reason: str,
     ) -> bool:
         """Post one public rejection notice for a dispatch-boundary decision.
 
-        The notice states what failed, why, and the next command to use. It is
+        The notice states what failed, why, and the Lifecycle next action. It is
         idempotent per (command comment, reason) and never re-raises: a failed
         notice must not change the terminal outcome of the command.
         """
+        kind = _command_kind(cmd)
         topic = f"command-rejected-{reason}-{kind}"
         if self._recent_command_notice_posted(repo, pr_number, comment_id, topic):
             return True
@@ -1532,11 +1571,30 @@ class GitHubCommandWatcher:
         if not callable(post_reply):
             return False
         try:
-            approval_guidance = await self._approval_guidance(repo, pr_number) if kind == "approve_deploy" else ""
+            try:
+                current_pr = await self.proxy.get_pr(repo, pr_number)
+            except Exception as exc:
+                current_pr = None
+                logger.warning(
+                    "watcher boundary PR read %s#%s exception=%s",
+                    repo, pr_number, type(exc).__name__,
+                )
+            try:
+                current_state = await self.proxy.read_hidden_state(repo, pr_number)
+            except Exception as exc:
+                current_state = None
+                logger.warning(
+                    "watcher boundary lifecycle read %s#%s exception=%s",
+                    repo, pr_number, type(exc).__name__,
+                )
+            lifecycle_guidance = await self._lifecycle_guidance(repo, pr_number)
             delivered = await post_reply(
                 repo, pr_number, comment_id,
                 _boundary_rejection_message(
-                    kind, reason, approval_guidance=approval_guidance,
+                    kind, reason, raw=getattr(cmd, "raw", ""),
+                    current_pr=current_pr if isinstance(current_pr, dict) else None,
+                    current_state=current_state if isinstance(current_state, dict) else None,
+                    lifecycle_guidance=lifecycle_guidance,
                 ),
                 topic=topic,
             )
@@ -1550,6 +1608,22 @@ class GitHubCommandWatcher:
             return False
         self._mark_recent_command_notice_posted(repo, pr_number, comment_id, topic)
         return True
+
+    async def _lifecycle_guidance(self, repo: str, pr_number: int) -> str:
+        guidance = getattr(self.controller, "_lifecycle_next_action_guidance", None)
+        if not callable(guidance):
+            return "当前控制器无法提供 Lifecycle 状态指导。"
+        try:
+            result = await guidance(repo, pr_number)
+            if isinstance(result, str) and result.strip():
+                return result.strip()
+            return "Lifecycle 状态指导不可用；请查看当前 PR Summary，确认状态后再操作。"
+        except Exception as exc:
+            logger.warning(
+                "watcher lifecycle guidance unavailable %s#%s exception=%s",
+                repo, pr_number, type(exc).__name__,
+            )
+            return "无法获取当前的 Lifecycle 状态指导。"
 
     async def _approval_guidance(self, repo: str, pr_number: int) -> str:
         guidance = getattr(self.controller, "_approval_command_guidance", None)
@@ -1587,13 +1661,13 @@ class GitHubCommandWatcher:
                     "watcher rejection lifecycle read %s#%s exception=%s",
                     repo, pr_number, type(exc).__name__,
                 )
-        guidance = await self._approval_guidance(repo, pr_number) if _command_kind(cmd) == "approve_deploy" else ""
+        guidance = await self._lifecycle_guidance(repo, pr_number)
         return (
             _command_rejection_message(
                 cmd, exc=exc,
                 current_pr=current_pr if isinstance(current_pr, dict) else None,
                 current_state=current_state if isinstance(current_state, dict) else None,
-                approval_guidance=guidance,
+                lifecycle_guidance=guidance,
             ),
             guidance,
         )
@@ -1708,13 +1782,10 @@ class GitHubCommandWatcher:
             kind=_command_kind(cmd), raw=getattr(cmd, "raw", "") or f"/{_command_kind(cmd)}",
         )
         current_state = state if isinstance(state, dict) else None
-        approval_guidance = (
-            await self._approval_guidance(repo, pr_number)
-            if _command_kind(message_cmd) == "approve_deploy" else ""
-        )
+        lifecycle_guidance = await self._lifecycle_guidance(repo, pr_number)
         message = _command_rejection_message(
             message_cmd, current_pr=pr, current_state=current_state,
-            approval_guidance=approval_guidance,
+            lifecycle_guidance=lifecycle_guidance,
         )
         body = "\n".join((comments_mod.BOT_MARKER, marker, "", message))
         try:
@@ -4287,7 +4358,7 @@ class GitHubCommandWatcher:
                 # has been confirmed. A failed post remains safely retryable.
                 posted = await self._post_boundary_rejection(
                     repo, pr_number, comment_id,
-                    kind=_command_kind(cmd), reason="head_changed",
+                    cmd=cmd, reason="head_changed",
                 )
                 if not posted:
                     self._finish_recent_command(
@@ -4576,13 +4647,10 @@ class GitHubCommandWatcher:
                                 pr_status = str(failure_pr.get("state") or "unknown")
                         if isinstance(failure_state, dict) and failure_state.get("status"):
                             pr_status += f"；Lifecycle `{failure_state['status']}`"
-                        approval_guidance = (
-                            await self._approval_guidance(repo, pr_number)
-                            if _command_kind(cmd) == "approve_deploy" else ""
-                        )
+                        lifecycle_guidance = await self._lifecycle_guidance(repo, pr_number)
                         status_and_guidance = f"- 当前 PR 状态：{pr_status}\n"
-                        if approval_guidance:
-                            status_and_guidance += f"- 当前机器审批指导：{approval_guidance}\n"
+                        if lifecycle_guidance:
+                            status_and_guidance += f"- 当前机器审批指导：{lifecycle_guidance}\n"
                         await post_reply(
                             repo, pr_number, comment_id,
                             f"`/{_command_kind(cmd)}` 的执行结果暂时无法确认。\n"

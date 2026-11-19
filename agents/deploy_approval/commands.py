@@ -286,7 +286,8 @@ def parse_command(comment_text: str) -> ParsedCommand:
             name = first_token[1:].strip().lower()
             if name in _KNOWN:
                 return ParsedCommand(
-                    kind=name, raw=raw_line.strip(), error="invalid_arguments",
+                    kind="unknown", intent=name, raw=raw_line.strip(),
+                    error="invalid_arguments",
                 )
             continue
         if not tokens:
@@ -297,27 +298,33 @@ def parse_command(comment_text: str) -> ParsedCommand:
         try:
             positional, kv = _parse_args(tokens[1:])
         except ValueError as exc:
-            return ParsedCommand(kind=name, raw=raw_line.strip(), error=str(exc))
+            return ParsedCommand(
+                kind="unknown", intent=name, raw=raw_line.strip(), error=str(exc),
+            )
         allowed = _ALLOWED_KV[name]
         if any(k not in allowed for k in kv):
             unknown = sorted(set(kv) - allowed)
             return ParsedCommand(
-                kind=name, raw=raw_line.strip(),
+                kind="unknown", intent=name, raw=raw_line.strip(),
                 error=f"unknown_argument:{','.join(unknown)}",
             )
         # request_deploy: reject any positional args or key=value args
         if name == "request_deploy":
-            if positional:
-                return ParsedCommand(kind=name, raw=raw_line.strip(), error="extra_parameter")
+            if positional or kv:
+                return ParsedCommand(kind="unknown", intent="request_deploy", raw=raw_line.strip(), error="extra_parameter")
             return ParsedCommand(kind="request_deploy", raw=raw_line.strip())
         if name == "request_acceptance":
             if positional or kv:
-                return ParsedCommand(kind=name, raw=raw_line.strip(), error="extra_parameter")
+                error = "extra_parameter"
+                if kv:
+                    unknown = sorted(set(kv))
+                    error = f"unknown_argument:{','.join(unknown)}"
+                return ParsedCommand(kind="unknown", intent="request_acceptance", raw=raw_line.strip(), error=error)
             return ParsedCommand(kind="request_acceptance", raw=raw_line.strip())
         parsed = _build_command(name, positional, kv, tokens[1:])
+        parsed.raw = raw_line.strip()
         if parsed.kind == "unknown":
-            parsed.kind = name
-            parsed.raw = raw_line.strip()
+            parsed.intent = name
             parsed.error = parsed.error or "invalid_arguments"
         return parsed
     return ParsedCommand(kind="unknown", raw="")
@@ -395,7 +402,9 @@ def _build_command(name: str, positional: list[str], kv: dict[str, str],
         if positional:
             return ParsedCommand(kind="unknown", raw="", error="extra_parameter")
         machine_alias = kv.get("machine", "")
-        if "machine" in kv:
+        if "machine" in kv and not machine_alias:
+            return ParsedCommand(kind="unknown", raw="", error="missing_machine_value")
+        if machine_alias:
             selector_error = _machine_selector_error(machine_alias)
             if selector_error:
                 return ParsedCommand(kind="unknown", raw="", error=selector_error)
@@ -404,15 +413,15 @@ def _build_command(name: str, positional: list[str], kv: dict[str, str],
         )
     if name == "record_test":
         if positional:
-            return ParsedCommand(kind="unknown", raw="", error="extra_parameter")
+            return ParsedCommand(kind="unknown", intent="record_test", raw=raw, error="extra_parameter")
         # machine= is not a record_test parameter.
         if "machine" in kv:
-            return ParsedCommand(kind="unknown", raw="", error="unknown_argument:machine")
+            return ParsedCommand(kind="unknown", intent="record_test", raw=raw, error="unknown_argument:machine")
         if "result" not in kv:
-            return ParsedCommand(kind="unknown", raw="", error="missing_parameter:result")
+            return ParsedCommand(kind="unknown", intent="record_test", raw=raw, error="missing_parameter:result")
         result = kv.get("result", "")
         if result not in ("pass", "fail"):
-            return ParsedCommand(kind="unknown", raw="", error="invalid_parameter:result")
+            return ParsedCommand(kind="unknown", intent="record_test", raw=raw, error="invalid_parameter:result")
         summary = kv.get("summary", "")
         return ParsedCommand(
             kind="record_test", result=result, summary=summary, raw=raw

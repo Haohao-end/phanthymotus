@@ -18,12 +18,11 @@ def render_upload_page(repo, pr_number, head_sha, round_id, *, read_only=False) 
     return f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="referrer" content="no-referrer"><title>测试证据上传</title>
+<meta name="referrer" content="no-referrer">
 <style>
 *{{box-sizing:border-box}}
 body{{margin:0;background:#f5f5f7;color:#1d1d1f;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}}
 main{{width:min(100% - 32px,680px);margin:48px auto 72px}}
-h1{{margin:0;font-size:clamp(28px,5vw,36px);line-height:1.15;letter-spacing:-.035em}}
 section.panel{{padding:24px;background:#fff;border:1px solid #e5e5ea;border-radius:16px}}
 button,input{{font:inherit}}
 button{{min-height:44px;padding:9px 16px;border:1px solid #0071e3;border-radius:10px;background:#0071e3;color:#fff;font-weight:600;cursor:pointer}}
@@ -35,7 +34,6 @@ fieldset{{min-width:0;margin:0;padding:0;border:0}}
 #dropzone{{display:flex;min-height:132px;align-items:center;justify-content:center;flex-direction:column;gap:8px;padding:20px;border:1px dashed #a1a1a6;border-radius:13px;text-align:center;cursor:pointer}}
 #dropzone.dragging{{border-color:#0071e3;background:#f0f7ff}}
 #dropzone input{{max-width:100%;font-size:14px}}
-.file-hint{{margin:5px 0 0;color:#6e6e73;font-size:13px}}
 .primary-row{{display:flex;justify-content:flex-end;margin-top:14px}}
 .list-heading{{margin:24px 0 8px;font-size:16px}}
 .queue{{list-style:none;margin:0;padding:0}}
@@ -64,16 +62,14 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 </style><script src="/evidence/assets/app.js" defer></script></head>
 <body>
 <main id="app" data-api="{esc(api)}" data-repo="{esc(repo)}" data-pr="{esc(pr_number)}" data-head="{esc(head_sha)}" data-round="{esc(round_id)}" data-read-only="{str(bool(read_only)).lower()}">
-<header><h1>测试证据上传</h1></header>
 <p id="message" role="status" aria-live="polite"></p>
-<h2 class="list-heading" id="next-action-heading">可选上传测试视频或图片，方便验收人了解实际效果</h2>
-<section id="upload-section" class="panel" aria-labelledby="next-action-heading">
+<section id="upload-section" class="panel">
 <fieldset id="writes" disabled hidden>
-<label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><span class="file-hint">上传完全可选 · 最多 20 个文件 · 单个文件最大 512 MiB · 总计最大 10 GiB</span><input id="file" type="file" multiple></label>
+<label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><input id="file" type="file" multiple></label>
 <div class="primary-row"><button id="upload" type="button">上传测试证据</button></div>
 </fieldset>
-<h2 class="list-heading" id="queue-heading" hidden>上传进度</h2><ul id="queue" class="queue" aria-labelledby="queue-heading" aria-live="polite"></ul>
-<h2 class="list-heading" id="completed-heading" hidden>已完成</h2><ul id="completed" class="queue" aria-labelledby="completed-heading" aria-live="polite"></ul>
+<ul id="queue" class="queue" aria-live="polite"></ul>
+<ul id="completed" class="queue" aria-live="polite"></ul>
 </section>
 </main></body></html>'''
 
