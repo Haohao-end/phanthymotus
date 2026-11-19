@@ -14089,7 +14089,6 @@ class DeployController:
             test_only=self._is_test_only_pr(pr_data),
             gate_note=gate_note,
             deployments=self._enrich_deployments_for_render(state.get("deployments", []), repo),
-            display_status=state.get("status", "deploy-requested"),
         )
         if state["status"] == "testing":
             required_component_ids = {
