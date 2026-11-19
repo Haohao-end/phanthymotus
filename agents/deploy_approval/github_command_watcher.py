@@ -1979,8 +1979,7 @@ class GitHubCommandWatcher:
                     continue
                 number = self._recent_comment_pr_number(repo, comment)
                 created_at = self._parse_comment_time(comment.get("created_at"))
-                if (number is None or created_at is None or not isinstance(cutoff, datetime)
-                        or cutoff.tzinfo is None or created_at <= cutoff.astimezone(timezone.utc)):
+                if number is None or created_at is None:
                     continue
                 body = comment.get("body", "")
                 is_command = (
@@ -1988,7 +1987,14 @@ class GitHubCommandWatcher:
                     and (commands_mod.parse_command(body).is_command
                          or bool(commands_mod.detect_deployment_command_intent(body)))
                 )
-                if not is_command and not self._is_trusted_review_completion(comment):
+                is_review_completion = self._is_trusted_review_completion(comment)
+                if not is_command and not is_review_completion:
+                    continue
+                if is_command and not is_review_completion and (
+                        not isinstance(cutoff, datetime)
+                        or cutoff.tzinfo is None
+                        or cutoff.utcoffset() is None
+                        or created_at <= cutoff.astimezone(timezone.utc)):
                     continue
                 comment_id = comment.get("id")
                 was_known = (
@@ -3771,6 +3777,16 @@ class GitHubCommandWatcher:
                 repo, pr_number,
             )
             return False
+        try:
+            await self.controller.reconcile_pr(repo, pr_number)
+        except Exception as exc:
+            # The cursor is already durable. Keep it intact and retry reconcile
+            # on the next scan; never roll the cursor back to replay commands.
+            logger.warning(
+                "watcher post-cursor baseline reconcile failed %s#%s cursor=%s error=%s",
+                repo, pr_number, persisted_cid, type(exc).__name__,
+            )
+            return False
         latest_ready_cutoff = self._ready_for_review_at.get(key)
         if (latest_ready_cutoff is not None and effective_cutoff is not None
                 and latest_ready_cutoff <= effective_cutoff):
@@ -3894,7 +3910,22 @@ class GitHubCommandWatcher:
                 )
                 return
 
-            # Baseline persisted successfully — but DO NOT dispatch commands
+            # Reconcile once more after persisting the baseline. A trusted
+            # Review Completion may have arrived between the first reconcile
+            # and the second comment snapshot, and the baseline must not consume
+            # it without refreshing the lifecycle. This remains reconcile-only:
+            # historical Slash Commands are not dispatched in this cycle.
+            try:
+                await self.controller.reconcile_pr(repo, pr_number)
+            except Exception as e:
+                # Keep the persisted cursor; a later scan retries reconciliation.
+                logger.warning(
+                    "watcher post-baseline reconcile failed %s#%s cursor=%s error=%s",
+                    repo, pr_number, persisted_cid, type(e).__name__,
+                )
+                return
+
+            # Baseline persisted successfully — DO NOT dispatch commands
             # in this cycle. Next cycle will process comments > baseline_id.
             return
 
@@ -4025,6 +4056,16 @@ class GitHubCommandWatcher:
                     state = await self.proxy.persist_cursor(
                         repo, pr_number, comment_id,
                     ) or state
+                continue
+
+            if self._is_trusted_review_completion(fresh_comment_obj):
+                if not await self._consume_comment_cursor(repo, pr_number, comment_id):
+                    return
+                self._finish_recent_command(
+                    repo, pr_number, comment_id,
+                    failure_reason=None,
+                    retryable=False,
+                )
                 continue
 
             if _top_level_command(fresh_body, "authorize_evidence"):

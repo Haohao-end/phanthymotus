@@ -27,12 +27,6 @@ import hashlib
 import json
 import re
 
-try:
-    from qcloud_cos import cos_comm
-    cos_comm.maplist.setdefault("ForbidOverwrite", "x-cos-forbid-overwrite")
-except Exception:
-    pass
-
 _KINDS = frozenset({"round", "operation", "attachment"})
 _RECORD_ROOT = "evidence-records-v1"
 _RECORD_VERSION = 1
@@ -105,20 +99,8 @@ class CosEvidenceRecordBackend:
 
     def _sdk(self):
         if self._client is None:
-            from qcloud_cos import CosConfig, CosS3Client, cos_comm
+            from qcloud_cos import CosConfig, CosS3Client
             import requests
-
-            try:
-                cos_comm.maplist.setdefault("ForbidOverwrite", "x-cos-forbid-overwrite")
-                test_map = cos_comm.mapped({"ForbidOverwrite": "true"})
-                if test_map.get("x-cos-forbid-overwrite") != "true":
-                    raise EvidenceRecordBackendError(
-                        "qcloud_cos SDK mapped() did not map ForbidOverwrite to x-cos-forbid-overwrite: true"
-                    )
-            except Exception as exc:
-                raise EvidenceRecordBackendError(
-                    f"qcloud_cos SDK does not support ForbidOverwrite parameter: {exc}"
-                ) from exc
 
             class RecordSession(requests.Session):
                 def request(self, method, url, **kwargs):
@@ -421,14 +403,14 @@ class CosEvidenceRecordBackend:
             "bucket versioning check did not confirm an explicit disabled status")
 
     def _put_object(self, object_key, body):
-        # The ForbidOverwrite parameter maps to x-cos-forbid-overwrite: true
-        # preventing accidental replacement. Bucket versioning must be off to
-        # preserve forbid-overwrite semantics.
+        # Metadata is copied verbatim to x-cos-forbid-overwrite: true by the
+        # SDK. Bucket versioning must be off to preserve forbid-overwrite
+        # semantics.
         self._verify_bucket_versioning()
         self._sdk().put_object(
             Bucket=self.config.cos_bucket, Key=object_key, Body=body,
             ContentType="application/json",
-            ForbidOverwrite="true",
+            Metadata={"x-cos-forbid-overwrite": "true"},
         )
 
     async def _read_object(self, object_key, repo, pr_number) -> dict:
