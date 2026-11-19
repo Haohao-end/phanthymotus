@@ -23,6 +23,10 @@ from .image_ref import validate_image_ref
 BOT_MARKER = "<!-- deploy-approval-agent -->"
 _BEIJING = ZoneInfo("Asia/Shanghai")
 
+# One user-visible Next action title for every lifecycle state.
+NEXT_ACTION_TITLE = "现在需要做什么"
+_MACHINE_SELECTOR_NOTE = "`machine=` 填写上方机器的别名或主 IP。"
+
 _MAX_VISIBLE_LIFECYCLE_BYTES = 48 * 1024  # 48 KiB soft budget
 
 
@@ -392,7 +396,6 @@ def runtime_image_checks_block(
     existing_commands = existing_commands or set()
     lines = []
     emitted_commands = set()
-    single_machine = len(grouped) == 1
     for key in sorted(grouped):
         row = grouped[key]
         ips = row["ips"]
@@ -418,7 +421,7 @@ def runtime_image_checks_block(
                     f"  - {component}",
                     f"    审批目标：<code>{_escape(item['target'])}</code>",
                     f"    当前运行：<code>{_escape(item['observed'])}</code>",
-                    "    运行镜像与审批目标一致，无需重新部署。",
+                    "    运行镜像与本轮批准镜像一致。",
                 ])
                 continue
             if status == "mismatch":
@@ -429,50 +432,47 @@ def runtime_image_checks_block(
                 ])
                 if not item["images_confirmed"]:
                     lines.append(
-                        "    审批目标或当前运行镜像无法确认，不生成审批命令。"
-                        "/request_deploy 可选，不是前置条件。"
+                        "    审批目标或当前运行镜像暂时无法确认，"
+                        "需要等待自动检查完成后再判断。"
                     )
                 else:
-                    lines.append("    当前镜像与审批目标不一致，需要重新部署。")
+                    lines.append("    镜像不一致，需要重新部署。")
                 if item["selector"] and item["images_confirmed"]:
                     selectors.add(item["selector"])
                 elif item["images_confirmed"]:
                     reason = (
                         "当前仓库尚未确认授权该机器"
                         if item["repo_authorization"] is not True else
-                        "机器身份未能确认"
+                        "机器身份暂时无法确认"
                         if item["identity_confirmed"] is not True else
-                        "机器身份和仓库授权已确认，但组件兼容性或审批条件未确认；"
-                        "机器已识别，但当前不能安全生成审批命令"
+                        "机器身份和仓库授权已经确认，但组件兼容性或审批条件还未确认"
                     )
-                    lines.append(
-                        f"    {reason}，不生成审批命令。"
-                        if (item["repo_authorization"] is not True
-                            or item["identity_confirmed"] is not True)
-                        else f"    {reason}。"
-                    )
-                    lines.append("    /request_deploy 可选，不是前置条件。")
+                    lines.append(f"    {reason}，因此暂时不能生成重新部署命令。")
                 continue
             if status == "identity_changed":
                 lines.append(
-                    f"  - {component}：机器身份绑定发生变化，无法确认审批目标或当前运行镜像；不生成审批命令。"
+                    f"  - {component}：机器身份绑定发生变化，暂时无法确认运行镜像；"
+                    "请等待自动检查重新确认。"
                 )
             elif status == "not_running":
                 lines.append(
-                    f"  - {component}：组件当前未运行，无法确认当前镜像；不生成审批命令。"
+                    f"  - {component}：组件当前未运行，暂时无法确认运行镜像；"
+                    "请等待自动检查重新确认。"
                 )
             else:
                 lines.append(
-                    f"  - {component}：运行状态无法确认，不能判断当前镜像；不生成审批命令。"
+                    f"  - {component}：运行状态暂时无法确认，不能判断镜像是否一致；"
+                    "请等待自动检查完成。"
                 )
         for selector in sorted(selectors):
             selector_ip = ipv4(selector)
-            if single_machine:
-                command = "/approve_deploy"
-            elif selector_ip:
+            if selector_ip:
                 command = f"/approve_deploy machine={selector_ip}"
+            elif re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", selector):
+                # No confirmed IPv4 for this machine; the verified alias is
+                # the only selector that still names exactly this machine.
+                command = f"/approve_deploy machine={selector}"
             else:
-                # Multi-machine recovery commands must identify the real IP.
                 continue
             same_machine_commands = {
                 f"/approve_deploy machine={selector}",
@@ -481,22 +481,28 @@ def runtime_image_checks_block(
             }
             if (command in existing_commands
                     or same_machine_commands.intersection(existing_commands)):
-                lines.append("    此机器的可执行审批命令已在上方列出。")
-                lines.append("    /request_deploy 可选，不是前置条件。")
+                lines.append("    这台机器的重新部署命令已经在上方列出。")
                 continue
             if command in emitted_commands:
                 continue
             emitted_commands.add(command)
             lines.append(f"  - 重新部署命令：<code>{_escape(command)}</code>")
-            lines.append("    /request_deploy 可选，不是前置条件。")
     if not lines:
         return ""
     return "\n".join((_RUNTIME_CHECKS_START, *lines, _RUNTIME_CHECKS_END))
 
 
 def _next_action_body_bounds(markdown: str) -> tuple[int, int] | None:
-    """Return the exact body span of the one existing Next action section."""
-    headings = list(re.finditer(r"(?m)^### Next action[ \t]*\r?$", markdown))
+    """Return the exact body span of the one visible action guidance section.
+
+    Newly rendered Summaries use the Chinese title. A Summary written before
+    the rename still carries the legacy title, so both are accepted; two
+    headings of either form fail closed instead of picking one arbitrarily.
+    """
+    headings = list(re.finditer(
+        r"(?m)^### (?:Next action|" + re.escape(NEXT_ACTION_TITLE)
+        + r")[ \t]*\r?$", markdown,
+    ))
     if len(headings) != 1:
         return None
     heading = headings[0]
@@ -782,17 +788,17 @@ def evidence_upload_comment(
     video_suffixes = {"mp4", "webm"}
     if suffix not in image_suffixes | video_suffixes:
         return ""
-    lines = [
-        "### 测试证据已上传",
-        "",
-        f"已保存：[{label}](<{download_url}>)",
-    ]
-    if suffix in image_suffixes and preview_url:
-        lines.extend(["", f"![{label}](<{preview_url}>)", "", f"[下载图片](<{download_url}>)"])
-    elif suffix in video_suffixes:
+    lines = ["### 测试证据已上传", ""]
+    if suffix in image_suffixes:
+        # The file name is the direct download; the inline image is a preview
+        # served by the same attachment identity, never the upload page.
+        lines.append(f"[{label}](<{download_url}>)")
         if preview_url:
-            lines[-1] = f"已保存：[▶ 预览视频：{label}](<{preview_url}>)"
-        lines.extend(["", f"[下载视频](<{download_url}>)"])
+            lines.extend(["", f"![{label}](<{preview_url}>)"])
+        lines.extend(["", f"[下载图片](<{download_url}>)"])
+    else:
+        # Videos always link straight to the uploaded file for download.
+        lines.append(f"[下载视频：{label}](<{download_url}>)")
     notification_key = hashlib.sha256(
         f"{repo}:{pr_number}:{head_sha}:{round_id}:{attachment_id}".encode("utf-8")
     ).hexdigest()
@@ -838,7 +844,7 @@ def _workflow_lines(
         ("1. Request Review", 0, "review"),
         ("2. Review Agent completed", 1, "reviewed"),
         ("3. Request deployment", 2, "request"),
-        ("4. Machine Owner approval(s)", 3, "approval"),
+        ("4. Machine approval(s)", 3, "approval"),
         ("5. All required components deployed", 4, "deployment"),
         ("6. Upload test video/images (optional)", 4, "evidence"),
         ("7. Record validation result", 5, "result"),
@@ -915,19 +921,68 @@ def _trusted_upload_page_url(value: str, repo: str, pr_number: int) -> str:
     return value
 
 
+_UPLOAD_PAGE_BASE_CACHE: tuple[float, str] | None = None
+
+
+def _configured_evidence_origin() -> str:
+    """Return the configured public evidence origin, cached briefly."""
+    global _UPLOAD_PAGE_BASE_CACHE
+    now = time.monotonic()
+    if (_UPLOAD_PAGE_BASE_CACHE is not None
+            and now - _UPLOAD_PAGE_BASE_CACHE[0] < 60):
+        return _UPLOAD_PAGE_BASE_CACHE[1]
+    try:
+        from .config import load_config
+        base = str(
+            getattr(load_config(), "evidence_public_base_url", "") or "",
+        ).rstrip("/")
+    except Exception:
+        base = ""
+    _UPLOAD_PAGE_BASE_CACHE = (now, base)
+    return base
+
+
+def _configured_upload_page_url(repo: str, pr_number: int) -> str:
+    """Return the configured permanent per-PR upload page for this repository.
+
+    The fixed page is public and carries no per-round capability, so the
+    Summary can always offer it without persisting a signed value. Any
+    configuration or origin problem returns "": the caller then says the link
+    is unavailable instead of showing a URL that cannot be trusted.
+    """
+    if (not isinstance(repo, str) or not repo
+            or type(pr_number) is not int or pr_number <= 0):
+        return ""
+    base = _configured_evidence_origin()
+    path = _evidence_path(repo, pr_number).replace(
+        "/api/evidence/", "/evidence/", 1,
+    )
+    if not base or not path.startswith("/evidence/"):
+        return ""
+    return _trusted_upload_page_url(base + path, repo, pr_number)
+
+
 def _testing_next_action(
     evidence_complete: bool, evidence_url: str = "", *,
     repo: str = "", pr_number: int = 0,
 ) -> str:
+    """Testing guidance for one deployed round (upload is fully optional)."""
     evidence_url = _trusted_upload_page_url(evidence_url, repo, pr_number)
-    lines = [
-        "机器已部署，可以开始测试。",
-        "可选上传实际效果视频或图片，方便验收人查看。",
-    ]
+    if not evidence_url:
+        evidence_url = _configured_upload_page_url(repo, pr_number)
+    lines = ["机器已部署，可以开始测试。"]
     if evidence_url:
-        lines.extend(["", f"[可选上传测试视频或图片](<{evidence_url}>)"])
+        lines.extend([
+            "",
+            "上传测试视频或图片完全可选，不影响验收：",
+            f"[上传测试视频或图片](<{evidence_url}>)",
+        ])
     else:
-        lines.extend(["", "[可选上传测试视频或图片][deploy-approval-upload]"])
+        lines.extend([
+            "",
+            "上传测试视频或图片完全可选，不影响验收；"
+            "固定的 PR 上传链接会在公共上传入口恢复后显示在这里。",
+        ])
     lines.extend(["", "测试完成后执行 `/request_acceptance`。"])
     return "\n".join(lines)
 
@@ -1049,22 +1104,28 @@ def _deploying_next_action(
 
     source_phase = str(source.get("phase") or source.get("status") or "").casefold()
     if outcome_uncertain:
-        lines = [
-            f"部署结果尚未确认；当前目标机器为 {machine_label}，目标镜像如下。",
-            "当前部署尚未完成，请等待结果。",
-        ]
+        if machine_label == "机器信息暂不可用":
+            lines = ["部署结果还在确认中；当前目标机器的信息暂时无法确认，目标镜像如下。"]
+        else:
+            lines = [
+                f"部署结果还在确认中；当前目标机器为 {machine_label}，目标镜像如下。",
+            ]
     elif source_phase == "deployed":
         lines = [
-            f"目标镜像已在机器 {machine_label} 确认；本轮整体部署尚未完成，正在汇总其他组件的结果：",
+            f"目标镜像已在机器 {machine_label} 确认；本轮部署还在汇总其他组件的结果：",
         ]
     elif source:
-        lines = [
-            f"正在向机器 {machine_label} 部署以下目标镜像；当前部署尚未完成：",
-        ]
+        if machine_label == "机器信息暂不可用":
+            lines = ["正在部署以下目标镜像；机器信息暂时无法确认："]
+        else:
+            lines = [f"正在向机器 {machine_label}部署以下目标镜像："]
     else:
-        lines = ["当前部署尚未完成，但机器和目标镜像信息暂不可用。"]
+        lines = ["当前部署还没有完成，机器和目标镜像信息暂时无法确认。"]
     lines.extend(image_lines)
-    lines.extend(["", "请等待部署结果；不要重复执行 `/approve_deploy`。"])
+    if outcome_uncertain:
+        lines.extend(["", "正在等待自动检查确认部署结果；确认之前不会重复提交部署，请勿重复发送部署命令。"])
+    else:
+        lines.extend(["", "正在部署，当前部署尚未完成，请等待部署结果；不要重复提交部署命令。"])
     return lines
 
 
@@ -1107,9 +1168,9 @@ def review_required(
         "",
         _workflow_lines("review-required"),
         "",
-        "### Next action",
+        f"### {NEXT_ACTION_TITLE}",
         "",
-        "请等待当前 HEAD 的 Review 和镜像构建结果。",
+        "等待当前 HEAD 的代码审核和镜像构建完成；完成后这里会列出可以部署的机器。",
         "",
         "### Current Deployment",
         "",
@@ -1133,9 +1194,9 @@ def reviewing(
         "",
         _workflow_lines("reviewing"),
         "",
-        "### Next action",
+        f"### {NEXT_ACTION_TITLE}",
         "",
-        "等待 Review Agent 返回当前 HEAD 的审查与构建结果。",
+        "正在审核当前 HEAD 并构建镜像，完成后会列出可以部署的机器。",
     ])
 
 
@@ -1309,20 +1370,18 @@ def deploy_ready(
             alias = machine["alias"]
             primary_ip = machine["primary_ip"]
             command_selector = machine["command_selector"]
-            if machine["complete"] and len(full_machine_aliases) == 1:
-                command = "/approve_deploy"
-            elif machine["complete"] and len(full_machine_aliases) > 1:
+            if machine["complete"] and len(full_machine_aliases) > 1:
                 # A complete machine among multiple candidates is selected by
                 # its verified primary IP, never by a placeholder or alias.
                 if (command_selector != primary_ip
                         or not machine["ip_command_safe"]
                         or machine["ambiguous_ip"]):
                     continue
-                command = f"/approve_deploy machine={primary_ip}"
-            elif command_selector == primary_ip:
-                command = f"/approve_deploy machine={primary_ip}"
-            else:
-                command = f"/approve_deploy machine={alias}"
+            command = (
+                f"/approve_deploy machine={primary_ip}"
+                if command_selector == primary_ip else
+                f"/approve_deploy machine={alias}"
+            )
             if command in seen_commands:
                 continue
             seen_commands.add(command)
@@ -1345,39 +1404,40 @@ def deploy_ready(
         "",
         _workflow_lines("deploy-ready"),
         "",
-        "### Next action",
+        f"### {NEXT_ACTION_TITLE}",
         "",
-        ("当前 HEAD 的 Review 和镜像构建均已完成，可以部署。"
+        ("当前 HEAD 的审核和镜像构建都已完成，可以部署。"
          if approval_evidence_ready else
-         "当前 HEAD 的代码审查或镜像构建尚未确认通过，暂时不能部署。"),
+         "当前 HEAD 的代码审核或镜像构建尚未完成，暂时还不能部署。"),
     ]
     if commands:
         lines.extend([
             "",
-            "以下为所有当前通过身份、授权和组件兼容性检查的机器及其完整审批命令，可直接执行：",
+            "所有当前可部署的兼容机器：",
             "",
             *commands,
+            "",
+            "由对应机器负责人在 PR 评论中直接执行该机器的命令。",
+            _MACHINE_SELECTOR_NOTE,
         ])
-        if len(commands) > 1:
+        if len(full_machine_aliases) == 1 and len(commands) == 1 and approval_evidence_ready:
             lines.extend([
                 "",
-                "有多台兼容机器，请先选择目标机器，再执行该机器对应的完整命令。",
+                "只有一台机器完整兼容所有组件，也可以直接执行 `/approve_deploy`。",
             ])
+        lines.extend([
+            "",
+            "`/request_deploy` 是可选的，不执行也能直接部署。",
+        ])
     elif approval_evidence_ready:
         lines.extend([
             "",
-            "当前没有通过兼容性、仓库授权和机器身份校验的可执行审批命令。",
+            "当前没有通过机器身份、仓库授权和组件兼容检查的机器，暂时无法部署。",
         ])
     else:
         lines.extend([
             "",
-            "审查或构建结果尚未确认通过，暂不显示可执行部署审批命令。",
-        ])
-    if approval_evidence_ready:
-        lines.extend([
-            "",
-            "可以直接执行上方列出的 `/approve_deploy` 命令；"
-            "`/request_deploy` 是可选操作，不是前置步骤。",
+            "审核或镜像构建尚未完成，这里还不会列出部署命令。",
         ])
     lines.extend(["", "### 构建结果", "", _build_table(builds, components)])
     return _lifecycle_body(lines)
@@ -2450,7 +2510,7 @@ def deploy_requested(
         "",
         _workflow_lines(display_status),
         "",
-        "### Next action",
+        f"### {NEXT_ACTION_TITLE}",
         "",
     ]
     seen_commands = set()
@@ -2471,7 +2531,8 @@ def deploy_requested(
             ),
         ))
     else:
-        lines.append("部署申请已收到。请对应机器负责人批准明确列出的机器和组件：")
+        lines.append("部署申请已经提交，正在等待对应机器负责人审批。")
+        pending_lines = []
         for state in compatible_states:
             alias = state["alias"]
             selector = state["command_selector"]
@@ -2504,17 +2565,22 @@ def deploy_requested(
             owner_text = _owner_label(
                 state["owners"], test_only=test_only, mention=not test_only,
             )
-            lines.append(
-                f"- {owner_text}：请批准 {_escape(alias)}（{_escape(state['ip'] or 'IP 未确认')}）"
-                f"的 {component_text}。命令：<code>{_escape(command)}</code>"
+            pending_lines.append(
+                f"- {_escape(alias)}（{_escape(state['ip'] or '主 IP 未确认')}）"
+                f"· 兼容组件：{component_text}\n"
+                f"  {owner_text}，审批命令：<code>{_escape(command)}</code>"
             )
+        if pending_lines:
+            lines.extend(["", "还未完成审批的机器：", "", *pending_lines])
         if not seen_commands:
             lines.append(
-                "当前没有通过机器身份、仓库授权、连接状态和组件适配确认的可执行审批命令；"
-                "请等待配置或状态同步后刷新 Summary。"
+                "当前没有可执行的审批命令：机器身份、仓库授权、连接状态或组件兼容性"
+                "还没有全部确认，请等待状态同步后刷新。"
             )
-        if len(full_machine_aliases) == 1:
-            lines.append("当前只有一台完整适配剩余组件的机器，也可以执行简写命令：<code>/approve_deploy</code>。")
+        else:
+            lines.extend(["", _MACHINE_SELECTOR_NOTE])
+        if len(full_machine_aliases) == 1 and len(seen_commands) == 1:
+            lines.append("只有一台机器完整兼容所有组件，也可以直接执行 <code>/approve_deploy</code>。")
 
     notes = []
     for note in gate_note or []:
@@ -2575,22 +2641,30 @@ def testing(
         if reviewers:
             waiting_for = "、".join(f"@{_escape(name)}" for name in reviewers)
             next_action = [
-                f"本轮验收由以下账号负责检查和记录：{waiting_for}。",
-                "请上述验收账号检查本轮测试证据和部署效果，然后执行 "
-                "`/record_test result=pass` 或 `/record_test result=fail`。",
+                f"本轮测试已完成，等待验收：{waiting_for}。",
+                "请验收人检查 PR Summary 中的测试证据和实际部署效果，"
+                "然后执行 `/record_test result=pass` 或 `/record_test result=fail`。",
             ]
         else:
             if not acceptance_reviewers_configured:
-                reason = "当前仓库没有可用的验收人，暂时无法验收。请联系仓库管理员配置验收账号。"
+                reason = "当前仓库还没有可用的验收账号，暂时无法验收；请联系仓库维护者配置。"
             else:
-                reason = "当前没有可用的验收人，暂时无法验收。请联系仓库管理员检查验收账号。"
+                reason = "当前没有可用的验收账号，暂时无法验收；请联系仓库维护者检查。"
             next_action = [reason]
         upload_url = _trusted_upload_page_url(evidence_url, repo, pr_number)
-        upload_link = (
-            f"[可选上传测试视频或图片](<{upload_url}>)" if upload_url
-            else "[可选上传测试视频或图片][deploy-approval-upload]"
-        )
-        next_action.extend(["", f"如需补充测试视频或图片，可随时{upload_link}；上传完全可选，不影响验收。"])
+        if not upload_url:
+            upload_url = _configured_upload_page_url(repo, pr_number)
+        if upload_url:
+            next_action.extend([
+                "",
+                f"如需补充测试视频或图片，可随时[上传测试视频或图片](<{upload_url}>)；上传完全可选，不影响验收。",
+            ])
+        else:
+            next_action.extend([
+                "",
+                "如需补充测试视频或图片，上传完全可选，不影响验收；"
+                "固定的 PR 上传链接会在公共上传入口恢复后显示在这里。",
+            ])
     else:
         next_action = _testing_next_action(
             evidence_complete, evidence_url, repo=repo, pr_number=pr_number,
@@ -2613,7 +2687,7 @@ def testing(
             record_test_complete=record_test_complete,
         ),
         "",
-        "### Next action",
+        f"### {NEXT_ACTION_TITLE}",
         "",
         *next_action,
     ]
@@ -2641,9 +2715,9 @@ def succeeded_comment(
         "",
         _workflow_lines("succeeded"),
         "",
-        "### Next action",
+        f"### {NEXT_ACTION_TITLE}",
         "",
-        "无需进一步操作。",
+        "本轮验收已通过，部署完成；可以按仓库流程继续合并 PR。",
         "",
     ]
     lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
@@ -2673,12 +2747,17 @@ def failed_comment(
         "",
         _workflow_lines("failed", failed_stage=failed_stage),
         "",
-        "### Next action",
+        f"### {NEXT_ACTION_TITLE}",
         "",
-        "请查看下方失败原因和部署记录。",
+        "本次部署没有完成。",
     ]
     if error:
         lines.append(f"**Error:** {_escape(error)}")
+    lines.extend([
+        "",
+        "请先按上面的失败原因修复问题，确认机器可以正常读取；"
+        "修复后重新执行 `/approve_deploy` 对应机器的命令，或由 PR 作者重新提交 `/request_deploy`。",
+    ])
     lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
     lines.extend(_attempt_lines(attempt))
     if deployments:
@@ -2703,12 +2782,12 @@ def superseded_comment(
         "",
         _workflow_lines("review-required"),
         "",
-        f"PR HEAD has changed: `{_short(old_head)}` \u2192 `{_short(new_head)}`",
-        "The old deployment is no longer valid.",
+        f"PR 有了新的提交：`{_short(old_head)}` \u2192 `{_short(new_head)}`，"
+        "之前的部署已经失效。",
         "",
-        "### Next action",
+        f"### {NEXT_ACTION_TITLE}",
         "",
-        "请等待当前 HEAD 的 Review 和镜像构建结果。",
+        "请等待当前 HEAD 的代码审核和镜像构建完成；完成后这里会列出可以部署的机器。",
         "",
     ])
 
@@ -2735,7 +2814,7 @@ def uncertain_comment(
         "",
         _workflow_lines("deploying"),
         "",
-        "### Next action",
+        f"### {NEXT_ACTION_TITLE}",
         "",
         *_deploying_next_action(
             deployments, components, attempt, machine_groups=machine_groups,
@@ -2746,6 +2825,40 @@ def uncertain_comment(
     if deployments:
         lines.extend(["### Current Deployment", _deployment_table(deployments, components, machine_groups)])
     return _lifecycle_body(lines)
+
+
+def _status_next_action(
+    status: str, deployments, components, machine_groups, attempt,
+) -> list[str]:
+    """One-sentence guidance for the read-only status view of every state."""
+    if status == "review-required":
+        return ["等待当前 HEAD 的代码审核和镜像构建完成；完成后这里会列出可以部署的机器。"]
+    if status == "reviewing":
+        return ["正在审核当前 HEAD 并构建镜像，完成后会列出可以部署的机器。"]
+    if status == "deploy-ready":
+        return ["当前 HEAD 的审核和镜像构建都已完成，可以按 PR Summary 中的机器命令部署。"]
+    if status == "deploy-requested":
+        return [
+            "部署申请已经提交，正在等待对应机器负责人审批。",
+            "审批完成后会显示部署进度。",
+        ]
+    if status == "deploying":
+        return _deploying_next_action(
+            deployments, components, attempt, machine_groups=machine_groups,
+        )
+    if status == "testing":
+        return [
+            "机器已部署，可以开始测试。",
+            "测试完成后执行 `/request_acceptance`。",
+        ]
+    if status == "succeeded":
+        return ["本轮验收已通过，部署完成；可以按仓库流程继续合并 PR。"]
+    if status == "failed":
+        return [
+            "本次部署没有完成。",
+            "请按失败原因修复问题、确认机器可以正常读取，然后重新提交部署审批。",
+        ]
+    return ["请查看当前部署状态，按 PR Summary 中的提示操作。"]
 
 
 def deploy_status_comment(
@@ -2770,6 +2883,10 @@ def deploy_status_comment(
         "### Workflow",
         "",
         _workflow_lines(status),
+        "",
+        f"### {NEXT_ACTION_TITLE}",
+        "",
+        *_status_next_action(status, deployments, components, machine_groups, attempt),
         "",
     ]
     if components:
@@ -2837,7 +2954,7 @@ def deploy_help_text(topic: str = "") -> str:
             "",
             "用途：审批部署并将其绑定到指定机器。",
             "",
-            "执行人：对应 Machine Owner，或有 write/maintain/admin 权限的协作者。",
+            "执行人：对应机器的负责人，或有 write/maintain/admin 权限的协作者。",
             "阶段：deploy-ready 时可直接审批；deploy-requested 时为常规机器审批阶段。",
             "",
             "请使用 PR Summary 中为兼容机器列出的真实 IP 命令。仅一台机器完全适配时，可使用 `/approve_deploy`；`/request_deploy` 是可选操作。",
@@ -2873,8 +2990,8 @@ def deploy_help_text(topic: str = "") -> str:
         "命令用途、执行人和阶段：",
         "- `/request_bot_review`：触发当前 HEAD 代码审查；PR 作者在开放 PR 的 review-required 阶段执行。",
         "- `/request_deploy`：PR 作者在开放 PR 的 deploy-ready 阶段发起部署请求。",
-        "- 机器审批：对应 Machine Owner 或有 write/maintain/admin 权限的协作者；deploy-ready 时按 Summary 中兼容机器的真实 IP 命令直接审批，仅一台机器完全适配时可使用 `/approve_deploy`；deploy-requested 时按 Summary 的机器 IP 命令常规审批。`/request_deploy` 是可选操作。",
-        "- `/request_acceptance`：本轮实际部署机器的 Machine Owner 在 testing 阶段请求验收；仅更新待验收标记，不结束 testing。",
+        "- 机器审批：对应机器的负责人或有 write/maintain/admin 权限的协作者；deploy-ready 时按 Summary 中兼容机器的真实 IP 命令直接审批，仅一台机器完全适配时可使用 `/approve_deploy`；deploy-requested 时按 Summary 的机器 IP 命令常规审批。`/request_deploy` 是可选操作。",
+        "- `/request_acceptance`：本轮实际部署机器的负责人在 testing 阶段请求验收；仅更新待验收标记，不结束 testing。",
         "- 两个目标仓库分别维护自己的 `test_reviewers.yaml`；部署审批权限不会授予验收权限。",
         "- `/record_test result=pass summary=\"视频播放和附件校验通过\"`：当前仓库验收白名单中的用户在待验收阶段记录成功。",
         "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`：当前仓库验收白名单中的用户在待验收阶段记录失败。",
@@ -3407,6 +3524,7 @@ def render_evidence_section(
             )
             valid_items.append((
                 filename.strip(), size, uploaded_at, download_url, preview_url,
+                suffix in {"mp4", "webm"},
             ))
         if valid_items:
             lines.extend([
@@ -3416,11 +3534,18 @@ def render_evidence_section(
             ])
             lines.extend(
                 f"| [{_escape(filename)}](<{download_url}>) | {_human_size(size)} | {_escape(uploaded_at)} |"
-                for filename, size, uploaded_at, download_url, _ in valid_items
+                for filename, size, uploaded_at, download_url, _, _ in valid_items
             )
-            for filename, _, _, _, preview_url in valid_items:
-                if preview_url:
-                    lines.extend(["", f"![{_escape(filename)}](<{preview_url}>)"])
+            for filename, _, _, download_url, preview_url, is_video in valid_items:
+                lines.append("")
+                if is_video:
+                    # Videos download directly; the upload page is never a
+                    # substitute for the stored file.
+                    lines.append(f"[下载视频：{_escape(filename)}](<{download_url}>)")
+                else:
+                    if preview_url:
+                        lines.append(f"![{_escape(filename)}](<{preview_url}>)")
+                    lines.append(f"[下载图片：{_escape(filename)}](<{download_url}>)")
         return lines
 
     def round_summary(key, group):

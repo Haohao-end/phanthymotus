@@ -223,14 +223,78 @@ class EvidenceService:
         return [comment for comment in comments
                 if self._trusted_upload_notification(comment, marker)]
 
+    def _notification_comment_body_ok(self, body, marker, operation, *, require_link=True):
+        """Reject empty, marker-only or link-less upload notifications.
+
+        A visible success comment is written only when it carries real visible
+        text, exactly one deterministic marker and (for success notifications)
+        at least one trusted direct file link. The fixed upload page is never
+        accepted as a download link.
+        """
+        if (not isinstance(body, str) or not body.strip()
+                or not isinstance(marker, str) or not marker
+                or body.count(marker) != 1):
+            return False
+        visible = re.sub(r'<!--.*?-->', '', body, flags=re.DOTALL).strip()
+        if not visible or 'no description provided' in visible.lower():
+            return False
+        if not require_link:
+            return True
+        repo = operation.get('repo') if isinstance(operation, dict) else None
+        pr_number = operation.get('pr_number') if isinstance(operation, dict) else None
+        if not isinstance(repo, str) or not repo or type(pr_number) is not int:
+            return False
+        from .comments import _evidence_path
+        page_path = _evidence_path(repo, pr_number).replace(
+            '/api/evidence/', '/evidence/', 1,
+        )
+        cos_host = getattr(self.store, 'projection_cos_host', '') if self.store else ''
+        found = False
+        for match in re.finditer(r'<(https://[^<>\s]+)>', body):
+            try:
+                parsed = urlsplit(match.group(1))
+            except (TypeError, ValueError):
+                return False
+            if parsed.scheme != 'https' or not parsed.netloc:
+                return False
+            if page_path and parsed.path == page_path:
+                # The upload page is never an attachment download link.
+                return False
+            if '/attachments/' in parsed.path:
+                found = True
+            elif isinstance(cos_host, str) and cos_host and cos_host in parsed.netloc:
+                found = True
+            else:
+                return False
+        return found
+
     async def _suppress_duplicate_upload_notifications(
         self, repo, matches, marker, keep_comment_id,
     ):
-        """Hide any older duplicate success posts, preserving one trusted comment."""
-        suppressed_body = (
+        """Replace older duplicate posts with one explicit, non-success notice.
+
+        The notice keeps the deterministic marker so later reconciles still
+        find the comment, but it never claims a successful upload and never
+        leaves an empty or marker-only comment behind.
+        """
+        suppression_marker = (
             '<!-- deploy-approval-evidence-upload-duplicate-suppressed:'
             + hashlib.sha256(marker.encode('utf-8')).hexdigest() + ' -->'
         )
+        suppressed_body = '\n'.join([
+            suppression_marker,
+            '该测试证据的重复上传通知已合并，请以上传成功通知中的链接为准。',
+        ])
+        # Only the deterministic upload marker identifies the one authoritative
+        # success comment, so a suppressed duplicate no longer carries it. It
+        # must still have visible text and never be an empty or marker-only post.
+        if not self._notification_comment_body_ok(
+                suppressed_body, suppression_marker,
+                {'repo': repo, 'pr_number': 0}, require_link=False):
+            logger.error(
+                'evidence duplicate suppression body rejected %s', repo,
+            )
+            return False
         for comment in matches:
             comment_id = comment.get('id') if isinstance(comment, dict) else None
             if comment_id == keep_comment_id:
@@ -715,6 +779,14 @@ class EvidenceService:
             return state
         if state != _NOTIFICATION_ELIGIBLE:
             return state
+        if not self._notification_comment_body_ok(body, marker, operation):
+            # Never write an empty, marker-only or link-less success comment.
+            # The verified attachment record is kept for a later automatic sync.
+            logger.warning(
+                'evidence ready notification body rejected %s#%s attachment=%s',
+                repo, pr_number, operation.get('attachment_id'),
+            )
+            return NOTIFICATION_PENDING
 
         try:
             matches = await self._upload_notifications(repo, pr_number, marker)

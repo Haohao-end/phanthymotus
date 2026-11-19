@@ -23,6 +23,8 @@ def render_upload_page(repo, pr_number, head_sha, round_id, *, read_only=False) 
 *{{box-sizing:border-box}}
 body{{margin:0;background:#f5f5f7;color:#1d1d1f;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}}
 main{{width:min(100% - 32px,680px);margin:48px auto 72px}}
+h1{{margin:0 0 4px;font-size:22px;font-weight:700;letter-spacing:-.01em}}
+.subtitle{{margin:0 0 20px;color:#6e6e73;font-size:14px}}
 section.panel{{padding:24px;background:#fff;border:1px solid #e5e5ea;border-radius:16px}}
 button,input{{font:inherit}}
 button{{min-height:44px;padding:9px 16px;border:1px solid #0071e3;border-radius:10px;background:#0071e3;color:#fff;font-weight:600;cursor:pointer}}
@@ -62,14 +64,15 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 </style><script src="/evidence/assets/app.js" defer></script></head>
 <body>
 <main id="app" data-api="{esc(api)}" data-repo="{esc(repo)}" data-pr="{esc(pr_number)}" data-head="{esc(head_sha)}" data-round="{esc(round_id)}" data-read-only="{str(bool(read_only)).lower()}">
+<h1>测试证据上传</h1>
+<p class="subtitle">上传视频或图片是可选的，不影响测试、验收或结果记录。上传进度仅显示本次选中的文件。</p>
 <p id="message" role="status" aria-live="polite"></p>
 <section id="upload-section" class="panel">
 <fieldset id="writes" disabled hidden>
-<label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><input id="file" type="file" multiple></label>
+<label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><input id="file" type="file" multiple accept="video/*,image/*"></label>
 <div class="primary-row"><button id="upload" type="button">上传测试证据</button></div>
 </fieldset>
 <ul id="queue" class="queue" aria-live="polite"></ul>
-<ul id="completed" class="queue" aria-live="polite"></ul>
 </section>
 </main></body></html>'''
 
@@ -94,7 +97,7 @@ _JAVASCRIPT = r'''"use strict";
   // is retried with a bounded backoff and never re-uploads or repeats complete.
   const SYNC_BACKOFF_MS = [2000, 4000, 8000, 15000, 30000];
   const SYNC_MAX_ATTEMPTS = 20;
-  const active = new Set(), jobs = [], renderedSaved = new Set(), syncTimers = new Map(), syncRunning = new Set();
+  const active = new Set(), jobs = [], syncTimers = new Map(), syncRunning = new Set();
   let context = null, stopped = false, pageLeaving = false, busy = false, clientKey = "", savedUploads = {};
   let contextAuthorized = false, resumeRunning = false;
   // Round binding comes from the server-rendered page. The HttpOnly upload
@@ -142,15 +145,21 @@ _JAVASCRIPT = r'''"use strict";
     waiting: "等待恢复", saved: "上传成功", succeeded: "上传成功", failed: "失败", paused: "已暂停"
   }[status] || "处理中");
   function inviteTransportAllowed(target) {
+    // Upload authority is the server-minted upload capability (or the existing
+    // GitHub identity), and it is only usable from this same-origin HTTPS page.
     const invite = context && (context.auth_method === "signed_invite" || context.upload_invite === true);
-    return !!invite && target.origin === window.location.origin &&
+    const github = context && context.actor_verified === true && context.github_user_authenticated === true;
+    return !!(invite || github) && target.origin === window.location.origin &&
       window.location.protocol === "https:" && target.protocol === "https:";
   }
   function writable() {
-    const invite = context && context.upload_invite === true &&
-      context.actor_verified === false && context.github_user_authenticated === false;
+    // `can_write` is computed server-side from the verified GitHub identity or
+    // the scoped upload capability. This page never invents authority and is
+    // not restricted to machine owners or the acceptance reviewer.
+    const uploadAuthority = context && (context.upload_invite === true ||
+      context.actor_verified === true && context.github_user_authenticated === true);
     return contextAuthorized && context && roundMatches(context) && context.enabled !== false && context.evidence_enabled !== false &&
-      context.can_write === true && context.status === "testing" && invite &&
+      context.can_write === true && context.status === "testing" && uploadAuthority &&
       inviteTransportAllowed(new URL(api, window.location.href)) &&
       context.readiness && context.readiness.COS_READY === true &&
       context.readiness.EVIDENCE_BACKEND_READY === true &&
@@ -246,30 +255,33 @@ _JAVASCRIPT = r'''"use strict";
       });
       let value; try { value = await response.json(); } catch (_) { value = {}; }
       if (!response.ok) {
+        // The server returns one short Chinese sentence plus a coarse category
+        // header. Internal error codes, exception text and signatures never
+        // reach this page.
         const detail = typeof value.detail === "string" ? value.detail : typeof value.error === "string" ? value.error : "";
+        const category = response.headers.get("X-Evidence-Code") || "";
+        const message = detail && /[\u4e00-\u9fff]/.test(detail)
+          ? detail : "附件服务暂时不可用，请稍后重试。";
         // Server-declared pacing (seconds) is honored by the sync reconcile so
         // it never hammers a throttled or recovering GitHub/COS backend.
         const retryAfter = Number(response.headers.get("Retry-After") || 0);
         const withPacing = error => {
           if (Number.isFinite(retryAfter) && retryAfter > 0)
             error.retryAfterMs = Math.min(retryAfter, 300) * 1000;
+          error.errorCode = category;
           return error;
         };
-        if (/invalid_evidence_capability|invalid_evidence|evidence_capability/i.test(detail))
-          throw withPacing(new ApiError(response.status, "上传会话无效或已失效。请重新打开 PR Summary 中的固定上传链接。", detail));
-        if (response.status === 401) {
-          const expired = "上传会话可能已过期或失效。请重新打开 PR Summary 中的固定上传链接。";
-          if (path !== "/context") halt(expired);
-          throw withPacing(new ApiError(401, expired, detail));
+        if (category === "session_expired") {
+          if (path !== "/context") halt(message);
+          throw withPacing(new ApiError(401, message, category));
         }
-        if (response.status === 403) throw withPacing(new ApiError(403, "当前链接没有上传权限。请重新打开 PR Summary 中的固定上传链接。", detail));
-        if (response.status === 429) throw withPacing(new ApiError(429, "上传过于频繁，请稍后再试。", detail));
-        if (response.status === 503) throw withPacing(new ApiError(503, "附件或 GitHub 服务暂时无法读取；当前操作未确认完成。请稍后重试，或重新打开 PR Summary 中的固定上传链接。", detail));
-        if (response.status === 409 && ["round_changed", "context_not_writable", "pr_closed",
-          "pr_closed_or_mismatched", "pr_draft", "state_unavailable"].includes(detail))
-          halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请重新打开 PR Summary 中的固定上传链接。");
-        if (response.status === 413) throw withPacing(new ApiError(413, "超过服务端大小限制。 " + detail, detail));
-        throw withPacing(new ApiError(response.status, response.status + ": " + (detail || response.statusText), detail));
+        if (category === "permission_denied") throw withPacing(new ApiError(403, message, category));
+        if (category === "rate_limited") throw withPacing(new ApiError(429, message, category));
+        if (category === "context_changed")
+          halt(message + " 已停止所有写入，请重新打开 PR Summary 中的固定上传链接。");
+        if (category === "too_large") throw withPacing(new ApiError(413, message, category));
+        if (category === "unavailable") throw withPacing(new ApiError(503, message + " 当前操作未确认完成。", category));
+        throw withPacing(new ApiError(response.status, message, category));
       }
       return value;
     } catch (error) {
@@ -333,21 +345,27 @@ _JAVASCRIPT = r'''"use strict";
           const error = new ApiError(503, "同源分片响应结果不明确。", "unclear_upload_result");
           error.resultUnclear = true; return reject(error);
         }
-        const detail = typeof value.detail === "string" ? value.detail : "";
-        if (xhr.status === 401) return reject(new ApiError(401, "上传授权无效或已过期。", detail));
-        if (xhr.status === 403) return reject(new ApiError(403, "上传被服务端拒绝；权限未绕过。", detail));
-        if (xhr.status === 409) {
-          if (["round_changed", "context_not_writable", "pr_closed", "pr_closed_or_mismatched",
-            "pr_draft", "state_unavailable"].includes(detail))
-            halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请刷新当前 PR Summary。");
-          return reject(new ApiError(409, "服务端拒绝该分片；请先核对当前上传状态。", detail));
+        // The server returns one short Chinese sentence plus a coarse category.
+        const detail = typeof value.detail === "string" && /[\u4e00-\u9fff]/.test(value.detail)
+          ? value.detail : "附件服务暂时不可用，请稍后重试。";
+        const category = xhr.getResponseHeader("X-Evidence-Code") || "";
+        if (category === "session_expired" || xhr.status === 401)
+          return reject(new ApiError(401, detail, category));
+        if (category === "permission_denied" || xhr.status === 403)
+          return reject(new ApiError(403, detail, category));
+        if (category === "context_changed") {
+          halt(detail + " 已停止所有写入，请刷新当前 PR Summary。");
+          return reject(new ApiError(409, detail, category));
         }
-        if (xhr.status === 413) return reject(new ApiError(413, "分片超过服务端大小限制。", detail));
-        if (xhr.status === 503) {
-          const error = new ApiError(503, "附件服务暂时不可用；分片状态尚待核对。", detail);
+        if (category === "too_large" || xhr.status === 413)
+          return reject(new ApiError(413, detail, category));
+        if (xhr.status === 409)
+          return reject(new ApiError(409, detail, category));
+        if (category === "unavailable" || xhr.status === 503) {
+          const error = new ApiError(503, detail + " 分片状态尚待核对。", category);
           error.resultUnclear = true; return reject(error);
         }
-        const error = new ApiError(xhr.status || 503, "同源分片上传未确认成功。", detail);
+        const error = new ApiError(xhr.status || 503, detail, category);
         error.resultUnclear = xhr.status === 0 || xhr.status >= 500;
         reject(error);
       };
@@ -378,6 +396,7 @@ _JAVASCRIPT = r'''"use strict";
   }
   function render() {
     const degraded = context && context.evidence_degraded === true;
+    const readOnly = app.dataset.readOnly === "true";
     const pageAvailable = !!context && (roundMatches(context) || typeof context.status === "string");
     if (degraded) {
       message("");
@@ -385,6 +404,8 @@ _JAVASCRIPT = r'''"use strict";
       const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "重试";
       retry.addEventListener("click", () => refresh().catch(refreshFailure));
       $("message").append(label, retry);
+    } else if (readOnly) {
+      message("此页面仅供查看；上传完全可选，不影响测试和验收。");
     } else if (!pageAvailable) {
       message("无法确认当前测试轮次，上传已暂停。请重新打开 PR Summary 中的固定上传链接。");
     } else if (!writable()) {
@@ -392,8 +413,8 @@ _JAVASCRIPT = r'''"use strict";
     } else {
       message("");
     }
-    $("writes").hidden = !pageAvailable || degraded || !writable();
-    $("writes").disabled = !pageAvailable || degraded || !writable();
+    $("writes").hidden = readOnly || !pageAvailable || degraded || !writable();
+    $("writes").disabled = readOnly || !pageAvailable || degraded || !writable();
     controls();
   }
   async function refresh(job, timeoutMs = 20000) {
@@ -405,7 +426,7 @@ _JAVASCRIPT = r'''"use strict";
     contextAuthorized = next.authenticated === true && next.enabled === true;
     if (!roundMatches(next))
       halt("当前 HEAD/round 已变化，已停止写入。请重新打开 PR Summary 中的固定上传链接。");
-    render(); hydrateCompleted(); return next;
+    render(); return next;
   }
   function persist(job) {
     if (!job.fingerprint) return;
@@ -538,41 +559,10 @@ _JAVASCRIPT = r'''"use strict";
       } else if (!busy && job.status !== "succeeded" && job.status !== "saved") runSingle(job);
     };
   }
-  function appendPreview(container, attachmentId, capability, filename) {
-    if (typeof attachmentId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(attachmentId)) return;
-    if (typeof capability !== "string" || !capability) return;
-    const target = new URL(api + "/attachments/" + id(attachmentId) + "/preview", window.location.href);
-    if (target.origin !== window.location.origin) return;
-    target.searchParams.set("cap", capability);
-    const suffix = String(filename || "").split(".").pop().toLowerCase();
-    if (["png", "jpg", "jpeg", "gif", "webp"].includes(suffix)) {
-      const preview = document.createElement("img");
-      preview.src = target.href; preview.alt = "已上传图片预览";
-      preview.loading = "lazy"; preview.referrerPolicy = "no-referrer";
-      container.append(preview);
-    } else if (["mp4", "webm"].includes(suffix)) {
-      // A playable inline preview is the usable entry for a saved video; the
-      // direct link stays as a fallback when the browser cannot play it.
-      const video = document.createElement("video");
-      video.controls = true; video.playsInline = true; video.preload = "metadata";
-      video.src = target.href; video.referrerPolicy = "no-referrer";
-      const link = document.createElement("a");
-      link.href = target.href; link.target = "_blank"; link.rel = "noopener noreferrer";
-      link.referrerPolicy = "no-referrer"; link.textContent = "打开视频预览";
-      container.append(video, link);
-    }
-    const downloadTarget = new URL(api + "/attachments/" + id(attachmentId) + "/download", window.location.href);
-    if (downloadTarget.origin === window.location.origin) {
-      downloadTarget.searchParams.set("cap", capability);
-      const downloadLink = document.createElement("a");
-      downloadLink.href = downloadTarget.href;
-      downloadLink.className = "download-link";
-      downloadLink.textContent = "下载文件";
-      downloadLink.setAttribute("download", filename || "attachment");
-      container.append(downloadLink);
-    }
-  }
   async function showUploadResult(job, attachmentId, syncState = "synced") {
+    // Only this just-uploaded file's status is reported; the page never
+    // renders an attachment history or download list. The durable GitHub
+    // comment/Summary is the place to open the saved file later.
     job.resultNode.replaceChildren();
     const resultText = document.createElement("p");
     resultText.textContent = syncState === "saved"
@@ -580,26 +570,11 @@ _JAVASCRIPT = r'''"use strict";
       : syncState === "server"
         ? "文件与 SHA256 已验证并保存；GitHub 展示由服务端继续同步，无需操作。"
         : syncState === "pending"
-          ? "文件与 SHA256 已验证并保存；持久公网入口就绪后会自动补发一条可见的成功通知。"
+          ? "文件与 SHA256 已验证并保存；公网入口就绪后会自动补发一条可见的成功通知。"
           : syncState === "skipped"
             ? "文件与 SHA256 已验证并保存；该文件类型不生成独立的成功通知。"
             : "文件与 SHA256 已验证，GitHub 上传成功通知已同步。";
     job.resultNode.append(resultText);
-    try {
-      // Do not pass the job here: the saved-file wording must stay visible
-      // while the preview lookup runs in the background.
-      await refresh(null, 15000);
-      const item = Array.isArray(context && context.attachments)
-        ? context.attachments.find(row => row && row.attachment_id === attachmentId &&
-            row.status === "ready" && row.head_sha === bound.head_sha && row.round_id === bound.round_id)
-        : null;
-      if (!item) return;
-      appendPreview(job.resultNode, attachmentId, item.download_capability,
-        job.file && job.file.name || item.filename || "");
-    } catch (_) {
-      // The upload is already confirmed. The comment remains the durable place
-      // to open the attachment if inline preview is unavailable.
-    }
   }
   function makeJob(file, replacesId = "") {
     const row = document.createElement("li"), heading = document.createElement("div"), title = document.createElement("strong");
@@ -614,7 +589,7 @@ _JAVASCRIPT = r'''"use strict";
     detail.className = "job-detail"; action.type = "button"; action.textContent = "重试 / 继续";
     footer.append(status, action); result.className = "job-result";
     row.append(heading, progress, footer, detail, result);
-    $("queue").append(row); refreshHeadings();
+    $("queue").append(row);
     const job = {file, row, progress, statusNode: status, detailNode: detail,
       resultNode: result, actionButton: action,
       requests: new Set(), parts: new Map(), paused: false, running: false, status: "排队中",
@@ -742,18 +717,6 @@ _JAVASCRIPT = r'''"use strict";
     updateJob(job, "上传仍在服务端处理中；稍后可点“重试 / 继续”核对（会先查询状态，不会重复上传）。");
     return false;
   }
-  function moveToCompleted(job) {
-    if (job.attachmentId) renderedSaved.add(job.attachmentId);
-    if (job.row && job.row.parentNode !== $("completed")) $("completed").append(job.row);
-    refreshHeadings();
-  }
-  // Completed uploads leave the progress queue entirely and appear once in the
-  // "已完成" list, with their preview entry already rendered.
-  function refreshHeadings() {
-    const completed = $("completed"), queue = $("queue");
-    $("completed-heading").hidden = completed.children.length === 0;
-    $("queue-heading").hidden = queue.children.length === 0;
-  }
   function finishSaved(job, syncState = "synced") {
     job.progress.value = 100; job.completeUnknown = false;
     job.status = "succeeded";
@@ -763,7 +726,6 @@ _JAVASCRIPT = r'''"use strict";
     dropSavedRecord(job);
     job.syncStopped = true;
     updateJob(job, job.statusText);
-    moveToCompleted(job);
     showUploadResult(job, job.attachmentId, syncState);
     return true;
   }
@@ -775,7 +737,6 @@ _JAVASCRIPT = r'''"use strict";
     job.statusText = "上传成功，正在同步 GitHub 展示";
     persist(job);
     updateJob(job, job.statusText + "；无需操作，后台会自动完成。");
-    moveToCompleted(job);
     showUploadResult(job, job.attachmentId, syncState);
     scheduleSync(job, true);
   }
@@ -818,7 +779,6 @@ _JAVASCRIPT = r'''"use strict";
     job.statusText = detail;
     dropSavedRecord(job);
     updateJob(job, detail);
-    moveToCompleted(job);
     showUploadResult(job, job.attachmentId, syncState);
   }
   async function reconcileSync(job) {
@@ -945,28 +905,21 @@ _JAVASCRIPT = r'''"use strict";
       }
     } finally { resumeRunning = false; }
   }
-  // A reload has no File handle, so the recovered row renders from server
-  // facts only; it never uploads or completes anything. It reuses the row
-  // already rendered by hydrateCompleted so one file appears exactly once.
+  // A reload has no File handle, so a recovered upload renders no row: the page
+  // shows no attachment history. The record is kept only so the display
+  // projection (GitHub comment/Summary) can keep reconciling in the background
+  // without asking the developer to re-upload an already saved file.
   function savedJobFromRow(row, uploadId, attachmentId) {
-    let li = $("completed").querySelector('.job[data-attachment-id="' + attachmentId + '"]');
-    if (!li) {
-      li = completedRow(row);
-      $("completed").append(li);
-    }
-    let status = li.querySelector(".job-state");
-    let detail = li.querySelector(".job-detail");
-    if (!status || !detail) {
-      const footer = document.createElement("div"); footer.className = "job-footer";
-      status = document.createElement("span"); status.className = "job-state";
-      status.setAttribute("aria-live", "polite");
-      detail = document.createElement("span"); detail.className = "job-detail";
-      footer.append(status, detail); li.append(footer);
-    }
-    refreshHeadings();
-    renderedSaved.add(attachmentId);
+    const li = document.createElement("li"); li.className = "job";
+    const footer = document.createElement("div"); footer.className = "job-footer";
+    const status = document.createElement("span"); status.className = "job-state";
+    status.setAttribute("aria-live", "polite");
+    const detail = document.createElement("span"); detail.className = "job-detail";
+    footer.append(status, detail);
+    const result = document.createElement("div"); result.className = "job-result";
+    li.append(footer, result);
     return {file: null, row: li, progress: {value: 100}, statusNode: status,
-      detailNode: detail, resultNode: li.querySelector(".job-result"),
+      detailNode: detail, resultNode: result,
       actionButton: document.createElement("button"), requests: new Set(), parts: new Map(),
       uploadId, attachmentId, paused: false, running: false, status: "saved",
       completeUnknown: false, replacesId: row.replaces_id || "", noteDigest: "",
@@ -977,40 +930,6 @@ _JAVASCRIPT = r'''"use strict";
     job.statusText = "上传成功，正在同步 GitHub 展示";
     updateJob(job, job.statusText + "；无需操作，后台会自动完成。");
     scheduleSync(job, true);
-  }
-  function completedRow(row) {
-    const li = document.createElement("li"); li.className = "job";
-    if (typeof row.attachment_id === "string") li.dataset.attachmentId = row.attachment_id;
-    const heading = document.createElement("div"); heading.className = "job-heading";
-    const title = document.createElement("strong"); title.className = "job-title";
-    title.textContent = row.filename || "已保存的测试证据";
-    const size = document.createElement("span"); size.className = "file-size";
-    size.textContent = formatBytes(row.size);
-    heading.append(title, size);
-    const result = document.createElement("div"); result.className = "job-result";
-    const note = document.createElement("p");
-    note.textContent = "上传成功，文件已保存并通过完整性校验。";
-    result.append(note);
-    appendPreview(result, row.attachment_id, row.download_capability, row.filename);
-    li.append(heading, result);
-    return li;
-  }
-  // On load (including a fresh reload or another tab) the server is the source
-  // of truth: an already-ready file is shown as saved without reselecting it.
-  function hydrateCompleted() {
-    const rows = Array.isArray(context && context.attachments) ? context.attachments : [];
-    for (const row of rows) {
-      if (!row || row.status !== "ready" || row.deleted_at) continue;
-      if (row.head_sha !== bound.head_sha || row.round_id !== bound.round_id) continue;
-      if (isTextRecord(row) || row.internal_bot_note === true) continue;
-      const attachmentId = row.attachment_id;
-      if (typeof attachmentId !== "string" || renderedSaved.has(attachmentId)) continue;
-      // Do not duplicate a still-visible queue row that owns the same file.
-      if (jobs.some(job => job.attachmentId === attachmentId)) continue;
-      renderedSaved.add(attachmentId);
-      $("completed").append(completedRow(row));
-    }
-    refreshHeadings();
   }
   async function startOrRestore(job) {
     job.status = "核对中"; updateJob(job, "正在检查文件并准备上传。");

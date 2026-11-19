@@ -1866,17 +1866,9 @@ class DeployController:
         """Explain why a lifecycle command cannot run for this PR state."""
         state = str(pr_data.get("state", "unknown") or "unknown").casefold()
         if state != "open" or pr_data.get("merged"):
-            reason = "merged" if pr_data.get("merged") else state
-            return (
-                f"`{command}` cannot run because this PR is `{reason}`. "
-                "Lifecycle commands are accepted only for OPEN PRs. For further work, open a new PR, "
-                "wait for Review Agent build and review evidence on its current HEAD, then retry."
-            )
+            return "这个 PR 已经关闭或合并，部署命令不再适用。"
         if pr_data.get("draft"):
-            return (
-                f"`{command}` cannot run while this PR is Draft. Mark the PR ready for review, "
-                "wait for current-HEAD Review Agent build and review evidence, then retry."
-            )
+            return "这个 PR 还是草稿，部署命令暂时不可用。"
         return ""
 
     async def _restore_interrupted_approval_preflight(
@@ -1947,9 +1939,9 @@ class DeployController:
             test_only=self._is_test_only_pr(pr), components=remaining,
         )
         next_step = (
-            "Use a current complete machine command below to submit a new approval after checking the Summary."
+            "请按 PR Summary 中当前显示的机器命令重新审批。"
             if command_lines else
-            "Check the repository machine policy and Agent Core access, then submit a new approval after an executable command is available."
+            "请联系仓库维护者确认机器配置和部署访问，然后按 PR Summary 重新审批。"
         )
         markdown = self._approval_retry_markdown(
             repo, pr_number, restored, groups,
@@ -1957,7 +1949,7 @@ class DeployController:
             deployments=self._enrich_deployments_for_render(
                 restored.get("deployments", []), repo,
             ),
-            gate_note=[reason, "ZERO deploy POST for the pending component.", next_step, *command_lines],
+            gate_note=[reason, next_step, *command_lines],
         )
         written = await self._write_lifecycle_with_history(
             repo, pr_number, restored, markdown,
@@ -1975,12 +1967,10 @@ class DeployController:
             await self._post_command_reply(
                 repo, pr_number, comment_id,
                 "\n".join([
-                    reason, "No deploy POST was sent for the pending component.",
+                    reason,
                     next_step, *command_lines,
                 ]),
                 topic=topic, error=True,
-                next_action=("查看当前 Summary 的最新机器状态与完整审批命令；确认预检阻断原因已解决后，"
-                             "重新发布当前机器的完整 `/approve_deploy machine=...` 命令。"),
             )
         return True
 
@@ -2185,15 +2175,14 @@ class DeployController:
             )
             next_step = (
                 [
-                    "下一步：机器负责人可直接使用以下对应机器命令审批；"
-                    "`/request_deploy` 仍是可选申请。",
+                    "请以下机器负责人直接执行对应审批命令；`/request_deploy` 仍是可选的申请操作。",
                     *command_lines,
                 ]
                 if command_lines else self._machine_blocking_summary(candidate_groups)
             )
             topic = "runtime-redeploy-request-created"
             message = "\n".join([
-                f"已为 HEAD `{_short(head_sha)}` 的本轮 `{round_id_for_state(state)}` 创建镜像漂移部署请求。",
+                "镜像与当前批准版本不一致，已经为本轮创建了重新部署申请。",
                 *next_step,
             ])
         else:
@@ -2206,14 +2195,14 @@ class DeployController:
             )
             next_step = (
                 [
-                    "下一步：部署审批已请求，请上方对应机器负责人执行各自的完整审批命令。",
+                    "请以下机器负责人直接执行对应审批命令，部署完成后即可开始测试。",
                     *command_lines,
                 ]
                 if command_lines else self._machine_blocking_summary(machine_groups)
             )
             topic = "deployment-requested-next-approver"
             message = "\n".join([
-                f"已为 HEAD `{_short(head_sha)}` 的本轮 `{round_id_for_state(state)}` 请求部署审批。",
+                "部署审批申请已经生效。",
                 *next_step,
             ])
         return await self._post_bound_notice(
@@ -2241,7 +2230,7 @@ class DeployController:
             if not comment_author_id:
                 await self._post_error(
                     repo, pr_number,
-                    "Cannot verify `/request_deploy` author identity.",
+                    "无法确认这条命令的发送者，因此没有执行。",
                     comment_id=comment_id,
                 )
                 return True
@@ -2249,13 +2238,13 @@ class DeployController:
             if state is None:
                 await self._post_error(
                     repo, pr_number,
-                    "No deploy approval lifecycle found. Wait for review lifecycle reconciliation first.",
+                    "当前 PR 还没有可用的部署进度信息，这次没有创建部署申请。",
                     comment_id=comment_id,
                 )
                 return True
             pr_head = pr_data.get("head", {}).get("sha", "")
             if not isinstance(pr_head, str) or not re.fullmatch(r"[0-9a-f]{40}", pr_head):
-                await self._post_error(repo, pr_number, "Cannot verify the current PR HEAD.", comment_id=comment_id)
+                await self._post_error(repo, pr_number, "无法确认 PR 的最新提交，这次没有执行。", comment_id=comment_id)
                 return True
             if pr_head != state.get("head_sha", ""):
                 await self._supersede_head_drift(
@@ -2283,8 +2272,7 @@ class DeployController:
                     commands = self._runtime_drift_command_lines(state, repo)
                     if commands:
                         drift_reply = [
-                            "当前漂移轮次已经创建。请机器负责人直接使用对应机器的审批命令；"
-                            "`/request_deploy` 不是前提：",
+                            "镜像与批准版本不一致，本轮重新部署申请已经创建；`/request_deploy` 不是前提。",
                             *(f"`{line}`" for line in commands),
                         ]
                     else:
@@ -2292,9 +2280,9 @@ class DeployController:
                             state.get("runtime_checks", []),
                         )
                         drift_reply = [
-                            "当前漂移轮次已创建，但没有可安全生成的重新审批命令。",
+                            "本轮重新部署申请已经创建，但目前无法生成可用的审批命令。",
                             *unreadable,
-                            "请恢复机器连接与仓库策略，等待下一次状态检查。",
+                            "请恢复机器连接，等待下一次状态检查。",
                         ]
                     await self._post_command_reply(
                         repo, pr_number, comment_id,
@@ -2310,9 +2298,8 @@ class DeployController:
                     unreadable = self._runtime_unreadable_lines(checks)
                     if unreadable:
                         message = "\n".join([
-                            "当前机器运行状态不可读，不能创建漂移重新部署轮次；ZERO deploy POST。",
+                            "目前无法确认机器的运行状态，这次没有创建重新部署申请。",
                             *unreadable,
-                            "请恢复机器连接和本仓库策略，等待状态检查确认后再试。",
                         ])
                         topic = "runtime-redeploy-request-state-unavailable"
                     elif (_current_status in {"testing", "succeeded", "failed"}
@@ -2320,18 +2307,16 @@ class DeployController:
                           and all(isinstance(check, dict)
                                   and check.get("status") == "match"
                                   for check in checks)):
-                        message = "重新检查状态显示当前运行镜像与审批目标一致，无需重新部署；ZERO deploy POST。"
+                        message = "机器上已经在运行本轮批准的镜像，不需要重新部署。"
                         topic = "runtime-redeploy-request-already-matches"
                     elif _current_status == "deploy-requested":
                         message = (
-                            "当前部署请求轮次仍有效，没有已确认的镜像漂移可供重新申请。"
-                            "机器负责人可按 Lifecycle Summary 执行适配机器的审批命令。"
+                            "本轮部署申请仍然有效，没有需要重新申请的镜像差异。"
                         )
                         topic = "request-deploy-already-processed"
                     else:
                         message = (
-                            "当前没有已确认的镜像漂移，不能创建重新部署请求。"
-                            "等待下一次机器状态检查；若镜像已一致则无需重新部署。"
+                            "目前没有确认到需要重新部署的镜像差异，这次没有创建申请。"
                         )
                         topic = "runtime-redeploy-request-no-confirmed-drift"
                     await self._post_command_reply(
@@ -2343,21 +2328,16 @@ class DeployController:
                     "STALE_COMMAND_IGNORED kind=request_deploy comment_id=%s current_status=%s",
                     comment_id, _current_status,
                 )
-                lifecycle_guidance = await self._lifecycle_next_action_guidance(
-                    repo, pr_number,
-                )
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    f"`/request_deploy` was not applied because this round is already `{_current_status}`. "
-                    + "Next step: wait for the in-progress deployment result; do not submit another request.\n"
-                    + lifecycle_guidance,
+                    "部署正在进行，这次没有重复创建部署申请。",
                     topic="request-deploy-already-processed",
                 )
                 return True
             else:
                 await self._post_command_not_ready(
                     repo, pr_number, _current_status,
-                    "Wait for the PR to reach `deploy-ready` status before requesting deployment.",
+                    "当前阶段还不能申请部署。",
                     comment_id=comment_id,
                 )
                 return True
@@ -2366,14 +2346,14 @@ class DeployController:
             if not pr_author_id:
                 await self._post_error(
                     repo, pr_number,
-                    "Cannot verify PR author identity.",
+                    "无法确认 PR 作者身份，这次没有执行。",
                     comment_id=comment_id,
                 )
                 return True
             if comment_author_id != pr_author_id:
                 await self._post_error(
                     repo, pr_number,
-                    "Only the PR author can use `/request_deploy`.",
+                    "只有 PR 作者可以申请部署。",
                     comment_id=comment_id,
                 )
                 return True
@@ -2433,10 +2413,8 @@ class DeployController:
                 if has_current_state:
                     await self._post_command_reply(
                         repo, pr_number, comment_id,
-                        (f"`/request_deploy` 原本绑定 HEAD `{_short(pr_head)}`，"
-                         f"保存期间 PR HEAD 已变化为 `{_short(current_head)}`；旧请求未用于当前 HEAD。"),
+                        "保存部署申请时 PR 出现了新的提交，旧申请没有用于当前代码。",
                         topic="request-deploy-write-head-changed", error=True,
-                        next_action="等待当前 HEAD 的 Review Agent 审核和构建结果；若 Summary 进入 `deploy-ready`，机器负责人可直接执行其中的审批命令。",
                     )
                     return True
                 return await self._post_bound_notice(
@@ -2444,9 +2422,9 @@ class DeployController:
                     round_id=current_round, comment_id=comment_id,
                     topic="request-deploy-write-head-changed",
                     message=(
-                        f"`/request_deploy` 原本绑定 HEAD `{_short(pr_head)}`，"
-                        f"保存期间 PR HEAD 已变化为 `{_short(current_head)}`；旧请求未用于当前 HEAD。"
-                        "等待当前 HEAD 的审核与构建结果，再按 Summary 操作。"
+                        "这条命令没有执行：保存部署申请时 PR 出现了新的提交，"
+                        "旧申请没有用于当前代码。\n\n"
+                        "请等待当前提交的审核和构建结果，再按 PR Summary 操作。"
                     ),
                     allow_missing_state=True,
                 )
@@ -2463,8 +2441,7 @@ class DeployController:
                         )):
                     await self._post_error(
                         repo, pr_number,
-                        "A newer Review Agent protocol comment is not from the configured trusted "
-                        "Review Agent. No deployment request was created.",
+                        "当前出现了无法信任的新审核结果，这次没有创建部署申请。",
                         comment_id=comment_id,
                     )
                     return True
@@ -2479,8 +2456,7 @@ class DeployController:
             if evidence is None:
                 await self._post_error(
                     repo, pr_number,
-                    "No completed review evidence found for this HEAD. "
-                    "Wait for Review Agent to complete.",
+                    "当前提交还没有完成的审核结果，这次没有创建部署申请。",
                     comment_id=comment_id,
                 )
                 return True
@@ -2488,8 +2464,7 @@ class DeployController:
             if not evidence.run_binding_valid:
                 await self._post_error(
                     repo, pr_number,
-                    "Review request, required build matrix or run provenance is missing or ambiguous. "
-                    "No deployment can be requested from unbound review evidence.",
+                    "当前审核结果没有完整绑定构建来源，暂时不能据此部署。",
                     comment_id=comment_id,
                 )
                 return True
@@ -2502,14 +2477,14 @@ class DeployController:
             if components is None:
                 await self._post_error(
                     repo, pr_number,
-                    "Failed to resolve component snapshot for this HEAD.",
+                    "无法确认本次构建包含哪些组件，这次没有创建部署申请。",
                     comment_id=comment_id,
                 )
                 return True
             if not components:
                 await self._post_error(
                     repo, pr_number,
-                    "No deployable builds found for this HEAD.",
+                    "当前提交没有可部署的构建产物，这次没有创建部署申请。",
                     comment_id=comment_id,
                 )
                 return True
@@ -2521,7 +2496,7 @@ class DeployController:
             if resolved_head is None:
                 await self._post_error(
                     repo, pr_number,
-                    "Review evidence commit could not be resolved to the current PR HEAD.",
+                    "审核结果对应的提交与当前最新提交不一致，这次没有创建部署申请。",
                     comment_id=comment_id,
                 )
                 return True
@@ -2540,7 +2515,7 @@ class DeployController:
                         != self._canonical_component_snapshot(persisted_components)):
                     await self._post_error(
                         repo, pr_number,
-                        "当前 HEAD 的审核镜像或 Review Agent 证据已变化。请等待新的 deploy-ready Summary，旧审核结果不会用于创建漂移重部署轮次。",
+                        "当前提交的审核或镜像结果已经变化，这次没有创建重新部署申请。",
                         comment_id=comment_id,
                     )
                     return True
@@ -2559,7 +2534,7 @@ class DeployController:
                         or fresh_state.get("status") != _current_status):
                     await self._post_command_reply(
                         repo, pr_number, comment_id,
-                        "PR 或 Lifecycle 在状态确认期间发生变化。请等待当前 Summary 更新后再申请，未创建新轮次。",
+                        "PR 或部署进度在确认期间发生了变化，这次没有创建重新部署申请。",
                         topic="runtime-redeploy-request-context-changed",
                     )
                     return True
@@ -2569,7 +2544,7 @@ class DeployController:
                         expected_components=fresh_state.get("components", [])):
                     await self._post_command_reply(
                         repo, pr_number, comment_id,
-                        "当前 HEAD 的 Review Agent 证据无法重新确认。请等待可信审核结果后再申请，未创建新轮次。",
+                        "当前提交的审核结果无法重新确认，这次没有创建重新部署申请。",
                         topic="runtime-redeploy-request-review-invalid",
                     )
                     return True
@@ -2580,14 +2555,13 @@ class DeployController:
                         if isinstance(check, dict)
                     }
                     if current_statuses and current_statuses <= {"match"}:
-                        message = "重新检查确认运行镜像已与审批目标一致，无需重新部署；ZERO deploy POST。"
+                        message = "重新检查确认机器上已经在运行本轮批准的镜像，不需要重新部署。"
                         topic = "runtime-redeploy-request-already-matches"
                     else:
                         unreadable = self._runtime_unreadable_lines(fresh_checks)
                         message = "\n".join([
-                            "重新检查未确认镜像漂移；ZERO deploy POST。",
+                            "重新检查仍然无法确认机器上的运行镜像，这次没有创建重新部署申请。",
                             *unreadable,
-                            "请恢复机器连接与仓库策略，等待状态可读后再申请。",
                         ])
                         topic = "runtime-redeploy-request-state-unavailable"
                     await self._post_command_reply(
@@ -2625,7 +2599,7 @@ class DeployController:
                     if group is None:
                         await self._post_command_reply(
                             repo, pr_number, comment_id,
-                            f"机器 `{binding.get('machine', '')}`（`{binding.get('ip', '')}`）已不再完整适配漂移组件，未创建新轮次。请检查当前仓库机器策略；ZERO deploy POST。",
+                            "原来登记的机器已经不能部署这次需要重新部署的组件，这次没有创建重新部署申请。",
                             topic="runtime-redeploy-request-machine-incompatible",
                         )
                         return True
@@ -2633,7 +2607,7 @@ class DeployController:
                 if not machine_groups:
                     await self._post_command_reply(
                         repo, pr_number, comment_id,
-                        "当前没有可验证且适配漂移组件的机器，未创建新部署请求轮次。请检查本仓库机器策略；ZERO deploy POST。",
+                        "目前没有可以部署这些组件的机器，这次没有创建重新部署申请。",
                         topic="runtime-redeploy-request-no-compatible-machine",
                     )
                     return True
@@ -2643,7 +2617,7 @@ class DeployController:
                 if fresh_request_comment is None:
                     await self._post_command_reply(
                         repo, pr_number, comment_id,
-                        "`/request_deploy` 评论已编辑、删除或无法确认 PR 作者身份，未创建新轮次。请由 PR 作者重新发送命令；ZERO deploy POST。",
+                        "这条部署申请已经失效，需要 PR 作者重新发送。",
                         topic="runtime-redeploy-request-comment-invalid",
                     )
                     return True
@@ -2717,9 +2691,7 @@ class DeployController:
                             != self._canonical_component_snapshot(persisted_components))):
                     await self._post_error(
                         repo, pr_number,
-                        "Review evidence changed after this `deploy-ready` snapshot. "
-                        "Read the latest Review Agent result and wait for lifecycle reconciliation. "
-                        "When the current Summary returns to `deploy-ready`, approve directly; `/request_deploy` is optional.",
+                        "当前提交的审核结果在部署就绪之后发生了变化，这次没有创建部署申请。",
                         comment_id=comment_id,
                     )
                     return True
@@ -2838,7 +2810,7 @@ class DeployController:
                         or policy_status.get("machines_configured") is not True):
                     await self._post_command_reply(
                         repo, pr_number, comment_id,
-                        f"当前仓库 `{repo}` 没有已验证的机器策略，无法重新审批。请管理员检查该仓库 main 上的机器配置；当前不会发送部署请求。",
+                        "当前仓库还没有可用的机器配置，因此无法重新审批，这次没有发送部署请求。",
                         topic="runtime-redeploy-policy-unconfigured",
                     )
                     return state, state, False, False, True
@@ -2850,7 +2822,7 @@ class DeployController:
                                repo, type(exc).__name__)
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    "当前仓库机器策略无法验证，不能安全选择重新部署机器。请检查本仓库策略后，使用 Summary 中显示的完整机器命令；ZERO deploy POST。",
+                    "目前无法确认仓库的机器配置，因此不能安全选择重新部署机器，这次没有发送部署请求。",
                     topic="runtime-redeploy-machine-selection-unavailable",
                 )
                 return state, state, False, False, True
@@ -2871,22 +2843,20 @@ class DeployController:
                 commands = self._runtime_drift_command_lines(state, repo)
                 if len(full_groups) > 1:
                     message = (
-                        "多台机器完整适配已确认漂移的组件，必须明确指定机器：\n"
+                        "有多台机器都能部署这次需要重新部署的组件，请在命令中明确指定一台：\n"
                         + ("\n".join(f"`{line}`" for line in commands)
-                           if commands else "当前没有可用的审批命令。")
+                           if commands else "目前没有可用的审批命令。")
                     )
                     topic = "runtime-redeploy-multiple-compatible-machines"
                 elif commands:
                     message = (
-                        "漂移组件没有唯一的完整适配机器，请明确指定机器。"
-                        "只有一台机器完整适配时才可省略 machine 参数：\n"
+                        "这次需要重新部署的组件没有唯一的适配机器，请在命令中明确指定机器：\n"
                         + "\n".join(f"`{line}`" for line in commands)
                     )
                     topic = "runtime-redeploy-requires-machine-ip"
                 else:
                     message = (
-                        "当前没有已确认的镜像漂移机器。请等待下一次只读检查；"
-                        "确认漂移后按 Summary 中的完整机器命令审批。ZERO deploy POST。"
+                        "目前还没有确认到需要重新部署的机器，这次没有发送部署请求。"
                     )
                     topic = "runtime-redeploy-no-confirmed-machine"
                 await self._post_command_reply(
@@ -2900,20 +2870,21 @@ class DeployController:
                     or policy_status.get("machines_configured") is not True):
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    f"当前仓库 `{repo}` 没有已验证的机器策略，无法重新审批。请管理员检查该仓库 main 上的机器配置；当前不会发送部署请求。",
+                    "当前仓库还没有可用的机器配置，因此无法重新审批，这次没有发送部署请求。",
                     topic="runtime-redeploy-policy-unconfigured",
                 )
                 return state, state, False, False, True
             machines = self.policy.get_machines(repo=repo)
             machine_map = {item.alias: item for item in machines}
             machine = Policy.resolve_machine_selector(machine_selector, machine_map)
-        except PolicyError as exc:
+        except PolicyError:
             commands = self._runtime_drift_command_lines(state, repo)
             await self._post_command_reply(
                 repo, pr_number, comment_id,
-                f"找不到当前仓库中与此命令对应的机器：{exc}。请使用以下已确认漂移机器的安全审批命令：\n"
-                + ("\n".join(f"`{line}`" for line in commands)
-                   if commands else "当前没有可安全执行的重新审批命令。"),
+                "找不到你填写的机器，这次没有发送部署请求。\n"
+                + ("请改用下面的机器命令：\n"
+                   + "\n".join(f"`{line}`" for line in commands)
+                   if commands else "目前没有可以执行的重新审批命令。"),
                 topic="runtime-redeploy-machine-not-found",
             )
             return state, state, False, False, True
@@ -2922,7 +2893,7 @@ class DeployController:
                            repo, type(exc).__name__)
             await self._post_command_reply(
                 repo, pr_number, comment_id,
-                "当前仓库机器策略无法验证，不能确认审批目标。请检查本仓库机器策略后重试；ZERO deploy POST。",
+                "目前无法确认仓库的机器配置，因此不能确认审批目标，这次没有发送部署请求。",
                 topic="runtime-redeploy-policy-unavailable",
             )
             return state, state, False, False, True
@@ -2939,9 +2910,9 @@ class DeployController:
             exact_command = f"`/approve_deploy machine={display_selector}`" if display_selector else ""
             await self._post_command_reply(
                 repo, pr_number, comment_id,
-                "镜像漂移重新审批必须使用当前仓库对应的完整机器命令。"
+                "重新部署审批必须使用当前仓库对应的完整机器命令，这次没有发送部署请求。"
                 + (f"请改用 {exact_command}。" if exact_command else
-                   "当前机器没有可确认的安全选择器，请检查仓库机器策略和物理清单。"),
+                   "这台机器没有可确认的审批命令，请联系仓库维护者检查机器配置。"),
                 topic="runtime-redeploy-requires-ip",
             )
             return state, state, False, False, True
@@ -2964,7 +2935,7 @@ class DeployController:
                 or fresh_state.get("head_sha") != state.get("head_sha")):
             await self._post_command_reply(
                 repo, pr_number, comment_id,
-                "PR 已关闭、转为 Draft 或 HEAD 已变化。请等待当前 HEAD 的审查结果；旧审批不会复用，ZERO deploy POST。",
+                "PR 有了新提交或当前不再可部署，之前的审批已不适用，这次没有发送部署请求。",
                 topic="runtime-redeploy-head-changed",
             )
             return state, state, False, False, True
@@ -2976,7 +2947,7 @@ class DeployController:
                 or fresh_command.get("phase") in {"executing", "uncertain"}):
             await self._post_command_reply(
                 repo, pr_number, comment_id,
-                "部署已经开始或结果仍在确认中。请等待当前只读恢复检查完成；本次不会重复发送部署请求。",
+                "部署已经开始或结果还在确认中，这次没有重复提交部署。",
                 topic="runtime-redeploy-deployment-in-progress",
             )
             return fresh_state, fresh_state, False, False, True
@@ -3032,27 +3003,27 @@ class DeployController:
         )
         if not machine_binding_unchanged:
             if not policy_still_authorized:
-                reason = "当前仓库机器授权已变化或无法确认"
+                reason = "当前仓库的机器授权已经变化或无法确认"
                 topic = "runtime-redeploy-policy-changed"
             elif fresh_machine is None:
-                reason = "指定机器已不在当前仓库机器策略中，或 alias 不再唯一"
+                reason = "指定的机器已经不在当前仓库的机器清单中"
                 topic = "runtime-redeploy-machine-removed"
             else:
-                reason = "指定机器的物理身份、node_id、主 IP 或安全命令选择器已变化"
+                reason = "这台机器的登记信息已经变化"
                 topic = "runtime-redeploy-machine-identity-changed"
             try:
                 safe_commands = self._runtime_drift_command_lines(fresh_state, repo)
             except Exception:
                 safe_commands = []
             guidance = (
-                "\n当前仍可安全执行的漂移审批命令：\n"
+                "\n请改用下面的机器命令：\n"
                 + "\n".join(f"`{line}`" for line in safe_commands)
                 if safe_commands else
-                "\n当前没有可安全执行的本机审批命令；请先修复仓库机器策略并等待 Summary 更新。"
+                "\n请联系仓库维护者核对机器配置，然后按 PR Summary 重新审批。"
             )
             await self._post_command_reply(
                 repo, pr_number, comment_id,
-                f"{reason}，本次未创建新轮次，也不会发送部署请求。请使用最新 Summary 中的完整机器命令。"
+                f"{reason}，这次没有发送部署请求。"
                 + guidance,
                 topic=topic,
             )
@@ -3086,7 +3057,7 @@ class DeployController:
             if len(drift_components) != len(current_drift_ids):
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    "最新运行状态引用了 Lifecycle 中不存在的组件，无法确认部署范围。请等待 Summary 更新；ZERO deploy POST。",
+                    "最新运行状态里包含了无法识别的组件，因此无法确认部署范围，这次没有发送部署请求。",
                     topic="runtime-redeploy-component-binding-invalid",
                 )
                 return fresh_state, fresh_state, False, False, True
@@ -3109,47 +3080,42 @@ class DeployController:
                 except Exception:
                     alternative_commands = []
                 alternatives = (
-                    "\n当前仍兼容的漂移机器命令：\n"
+                    "\n请改用下面仍可使用的机器命令：\n"
                     + "\n".join(f"`{line}`" for line in alternative_commands)
                     if alternative_commands else
-                    "\n当前没有其他可安全执行的机器命令。"
+                    "\n目前没有其他可以使用的机器命令。"
                 )
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    "指定机器当前不再兼容这些 MISMATCH 组件："
-                    + ", ".join(sorted(incompatible_ids))
-                    + "。请使用 Summary 中仍兼容机器的完整命令；不能扩大部署范围。"
-                    + alternatives + " ZERO deploy POST。",
+                    "这台机器已经不能部署这次需要重新部署的组件，这次没有发送部署请求。"
+                    + alternatives,
                     topic="runtime-redeploy-component-incompatible",
                 )
                 return fresh_state, fresh_state, False, False, True
         if not current_drift and not current_pending_ids:
             if current_checks and all(check.get("status") == "match" for check in current_checks):
-                message = "重新检查确认运行镜像已与审批目标一致，无需重新部署，ZERO deploy POST。"
+                message = "重新检查确认机器上已经在运行本轮批准的镜像，不需要重新部署。"
                 topic = "runtime-redeploy-already-matches"
             elif any(check.get("status") == "identity_changed" for check in current_checks):
                 message = "\n".join([
-                    "机器 alias/IP 绑定已变化，无法确认当前运行镜像；ZERO deploy POST。",
+                    "机器的登记信息已经变化，暂时无法确认当前运行镜像，这次没有发送部署请求。",
                     *self._runtime_unreadable_lines(current_checks),
-                    "请管理员核对本仓库机器策略后等待重新检查。",
                 ])
                 topic = "runtime-redeploy-identity-changed"
             elif any(check.get("status") == "not_running" for check in current_checks):
                 message = "\n".join([
-                    "指定机器的目标运行时未处于 running 状态，无法确认镜像漂移；ZERO deploy POST。",
+                    "目标组件当前没有运行，暂时无法确认运行镜像，这次没有发送部署请求。",
                     *self._runtime_unreadable_lines(current_checks),
-                    "恢复运行时并等待重新检查。",
                 ])
                 topic = "runtime-redeploy-not-running"
             elif any(check.get("status") == "unavailable" for check in current_checks):
                 message = "\n".join([
-                    "无法连接机器或读取运行状态，不能确认是否需要重新部署；ZERO deploy POST。",
+                    "目前无法连接机器确认运行镜像，这次没有发送部署请求。",
                     *self._runtime_unreadable_lines(current_checks),
-                    "恢复机器访问后等待下一次检查。",
                 ])
                 topic = "runtime-redeploy-unavailable"
             else:
-                message = "当前没有可确认的镜像漂移，请等待机器状态重新检查；ZERO deploy POST。"
+                message = "目前还没有确认到需要重新部署的镜像差异，这次没有发送部署请求。"
                 topic = "runtime-redeploy-no-drift"
             await self._post_command_reply(
                 repo, pr_number, comment_id, message, topic=topic,
@@ -3159,17 +3125,17 @@ class DeployController:
         if not current_drift and current_pending_ids:
             if current_checks and all(
                     check.get("status") == "match" for check in current_checks):
-                message = "重新检查确认运行镜像已与审批目标一致，无需重新部署；ZERO deploy POST。"
+                message = "重新检查确认机器上已经在运行本轮批准的镜像，不需要重新部署。"
                 topic = "runtime-redeploy-already-target"
             elif any(check.get("status") in {"unavailable", "identity_changed"}
                      for check in current_checks):
-                message = "无法确认机器当前运行状态或绑定。请检查机器连接和本仓库策略；ZERO deploy POST。"
+                message = "目前无法确认机器的运行状态，这次没有发送部署请求。"
                 topic = "runtime-redeploy-pending-state-unavailable"
             elif any(check.get("status") == "not_running" for check in current_checks):
-                message = "指定机器的目标运行时未处于 running 状态，不能执行漂移重部署。恢复运行时并等待重新检查；ZERO deploy POST。"
+                message = "目标组件当前没有运行，暂时无法执行重新部署，这次没有发送部署请求。"
                 topic = "runtime-redeploy-pending-not-running"
             else:
-                message = "当前没有新鲜的镜像漂移确认。请等待下一次机器状态检查；ZERO deploy POST。"
+                message = "目前还没有确认到需要重新部署的镜像差异，这次没有发送部署请求。"
                 topic = "runtime-redeploy-pending-state-unconfirmed"
             await self._post_command_reply(
                 repo, pr_number, comment_id, message, topic=topic,
@@ -3220,16 +3186,14 @@ class DeployController:
             except Exception:
                 safe_commands = []
             guidance = (
-                "\n当前仍可安全执行的漂移审批命令：\n"
+                "\n请改用下面仍可使用的机器命令：\n"
                 + "\n".join(f"`{line}`" for line in safe_commands)
                 if safe_commands else
-                "\n当前没有覆盖这些漂移组件的安全审批命令；请检查仓库授权和组件兼容配置，"
-                "再使用最新 Summary 中的完整机器命令。"
+                "\n请联系仓库维护者核对机器授权和组件兼容配置，然后按 PR Summary 重新审批。"
             )
             await self._post_command_reply(
                 repo, pr_number, comment_id,
-                f"机器 `{machine.alias}` 当前未获授权或未完整兼容本次确认漂移的组件，"
-                "本次不会创建新轮次或发送部署请求。"
+                "这台机器目前不能部署这次需要重新部署的组件，这次没有发送部署请求。"
                 + guidance,
                 topic="runtime-redeploy-machine-incompatible",
             )
@@ -3241,7 +3205,7 @@ class DeployController:
                 expected_components=fresh_state.get("components", [])):
             await self._post_command_reply(
                 repo, pr_number, comment_id,
-                "当前 HEAD 的 Review Agent 证据已变化或无法验证。请等待重新审查完成后再审批；ZERO deploy POST。",
+                "当前提交的审核结果已经变化或无法确认，这次没有发送部署请求。",
                 topic="runtime-redeploy-review-evidence-invalid",
             )
             return fresh_state, fresh_state, False, False, True
@@ -3304,14 +3268,18 @@ class DeployController:
             if state is None:
                 await self._post_error(
                     repo, pr_number,
-                    "No trusted lifecycle is available for this HEAD. Wait for `deploy-ready`; then you can approve directly. `/request_deploy` is optional.",
+                    "当前 PR 还没有可用的部署进度信息，因此没有执行部署审批。",
                     comment_id=comment_id,
                 )
                 return True
 
             pr_head = pr_data.get("head", {}).get("sha", "")
             if not isinstance(pr_head, str) or not re.fullmatch(r"[0-9a-f]{40}", pr_head):
-                await self._post_error(repo, pr_number, "Cannot verify the current PR HEAD.", comment_id=comment_id)
+                await self._post_error(
+                    repo, pr_number,
+                    "无法确认 PR 的最新提交，这次没有执行部署审批。",
+                    comment_id=comment_id,
+                )
                 return True
             if pr_head != state.get("head_sha", ""):
                 await self._supersede_head_drift(
@@ -3338,8 +3306,7 @@ class DeployController:
                         )):
                     await self._post_error(
                         repo, pr_number,
-                        "Current HEAD build or Review Agent evidence is missing, stale, or changed. "
-                        "Wait for lifecycle reconciliation to publish trusted `deploy-ready` evidence.",
+                        "当前提交的审核或构建结果还不完整或已经变化，这次没有执行部署审批。",
                         comment_id=comment_id,
                     )
                     return True
@@ -3362,8 +3329,7 @@ class DeployController:
                         and command_args.get("preflight_pending") is True
                         and await self._restore_interrupted_approval_preflight(
                             repo, pr_number,
-                            reason=("A previous machine approval stopped during read-only preflight. "
-                                    "No deploy POST was sent for the pending component; review the current Summary and submit a new approval."),
+                            reason=("上一次审批在部署前检查阶段中断，当时没有发送部署请求，这次也没有重复发送。"),
                             topic="approval-preflight-retry-required",
                             require_stale=True,
                         )):
@@ -3377,13 +3343,11 @@ class DeployController:
                 if (phase == "completed" and isinstance(command_args, dict)
                         and command_args.get("preflight_pending") is True):
                     in_progress_message = (
-                        "The pending component is in read-only preflight; no deploy POST has started for it. "
-                        "Wait for the Lifecycle Summary to update. If the check fails, it will show why and request a fresh approval."
+                        "上一个审批还在部署前检查中，当时没有发送部署请求，这次没有重复提交。"
                     )
                 else:
                     in_progress_message = (
-                        "A deployment POST is in progress or its outcome is being verified. "
-                        "No retry was started; wait for the current deployment status to be confirmed."
+                        "部署正在进行或结果还在确认中，这次没有重复提交部署。"
                     )
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
@@ -3399,19 +3363,16 @@ class DeployController:
                     "STALE_COMMAND_IGNORED kind=approve_deploy comment_id=%s current_status=%s",
                     comment_id, _current_status,
                 )
-                guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    f"`/approve_deploy` was not started because the current round is already `{_current_status}`. "
-                    + f"\n下一步建议：\n{guidance}",
+                    "本轮部署已经结束，这次审批没有执行。",
                     topic="approve-deploy-already-processed",
                 )
                 return True
             else:
-                guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
                 await self._post_command_not_ready(
                     repo, pr_number, _current_status,
-                    guidance,
+                    "当前阶段还不能执行部署审批。",
                     comment_id=comment_id,
                 )
                 return True
@@ -3422,7 +3383,7 @@ class DeployController:
             if pr_state != "open" or pr_merged:
                 await self._post_error(
                     repo, pr_number,
-                    "PR is not open. Deploy only when PR is open and unmerged.",
+                    "这个 PR 已经关闭或合并，部署命令不再适用。",
                     comment_id=comment_id,
                 )
                 return True
@@ -3430,7 +3391,7 @@ class DeployController:
             if pr_data.get("draft") is True:
                 await self._post_error(
                     repo, pr_number,
-                    "Deployment requires PR ready-for-review / non-draft.",
+                    "这个 PR 还是草稿，部署命令暂时不可用。",
                     comment_id=comment_id,
                 )
                 return True
@@ -3482,19 +3443,15 @@ class DeployController:
                     else:
                         if len(full_groups) > 1:
                             explanation = (
-                                "Several fully compatible machines are available. "
-                                "Choose one explicitly:"
+                                "有多台机器都能部署剩余组件，请在命令中明确指定一台："
                             )
                         else:
                             explanation = (
-                                "No single machine covers every remaining component. Choose an adapted "
-                                "machine explicitly for partial deployment:"
+                                "没有单台机器覆盖全部剩余组件，请按下面的命令分批审批："
                             )
                         reply = "\n".join([
                             explanation,
                             *command_lines,
-                            "Use one of the complete machine commands above; "
-                            "no machine was selected automatically.",
                         ])
                     await self._post_command_reply(
                         repo, pr_number, comment_id, reply,
@@ -3506,7 +3463,7 @@ class DeployController:
             try:
                 machine_map = {item.alias: item for item in self.policy.get_machines(repo=repo)}
                 machine = Policy.resolve_machine_selector(machine_alias, machine_map)
-            except PolicyError as e:
+            except PolicyError:
                 deployed_ids = _component_id_set(state.get("deployments", []))
                 remaining_components = [
                     component for component in state.get("components", [])
@@ -3530,13 +3487,14 @@ class DeployController:
                     remaining_groups = []
                     available_commands = []
                 suggestion = (
-                    "\nAvailable compatible commands:\n" + "\n".join(available_commands)
+                    "\n可以改用下面的机器命令：\n" + "\n".join(available_commands)
                     if available_commands else
                     "\n" + "\n".join(self._machine_blocking_summary(remaining_groups))
                 )
                 await self._post_error(
                     repo, pr_number,
-                    f"{e} Choose an exact command from the compatible machine list below.{suggestion}",
+                    "找不到你填写的机器，这次没有执行部署审批。"
+                    + suggestion,
                     comment_id=comment_id,
                 )
                 return True
@@ -3561,8 +3519,7 @@ class DeployController:
                 commands = self._runtime_drift_command_lines(state, repo)
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    "当前 HEAD 有已确认漂移的已部署组件。请先使用对应机器的完整审批命令直接重新审批；"
-                    "`/request_deploy` 可选，不是前提：\n"
+                    "当前还有已部署组件的镜像与批准版本不一致，请先用对应机器的完整命令重新审批：\n"
                     + "\n".join(f"`{line}`" for line in commands),
                     topic="runtime-redeploy-required-before-other-machine",
                 )
@@ -3581,7 +3538,7 @@ class DeployController:
             if not undeployed_components:
                 await self._post_error(
                     repo, pr_number,
-                    f"No remaining components to deploy for machine `{machine_alias}`.",
+                    "这台机器没有剩余需要部署的组件，这次审批没有执行。",
                     comment_id=comment_id,
                 )
                 return True
@@ -3616,11 +3573,11 @@ class DeployController:
                 # Selected machine covers zero remaining components.
                 if not self._machine_is_deployable(machine, repo):
                     selection_problem = (
-                        f"Machine `{machine_alias}` is not deployable because its Agent Core endpoint or access is unavailable."
+                        "这台机器目前无法连接或没有部署访问权限，因此不能部署剩余组件。"
                     )
                 else:
                     selection_problem = (
-                        f"Machine `{machine_alias}` does not match any remaining component's target, platform, variant, and driver path."
+                        "这台机器不能部署本次需要部署的剩余组件。"
                     )
                 # A rejected machine choice must not consume this command or
                 # alter the lifecycle. Report the current compatible options
@@ -3638,8 +3595,8 @@ class DeployController:
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
                     selection_problem + " "
-                    + ("Try one of these commands:\n" + "\n".join(command_lines)
-                       if command_lines else "No compatible machine is configured; check this repository's machine policy."),
+                    + ("请改用下面的机器命令：\n" + "\n".join(command_lines)
+                       if command_lines else "目前没有可以部署这些组件的机器，请联系仓库维护者检查机器配置。"),
                     topic="approve-deploy-incompatible-machine",
                 )
                 return True
@@ -3669,7 +3626,7 @@ class DeployController:
                 preflight_written = await self._write_lifecycle_with_history(
                     repo, pr_number, state,
                     self._deployment_progress_markdown(
-                        repo, pr_number, state, machine, selected_components, "Approval received; checking",
+                        repo, pr_number, state, machine, selected_components, "审批已收到，正在检查",
                         test_only=self._is_test_only_pr(pr_data),
                     ), event=None,
                     expected_lifecycle_state=initial_lifecycle_state,
@@ -3688,10 +3645,11 @@ class DeployController:
                     topic="deployment-started",
                     expected_command_kind="approve_deploy",
                     message="\n".join([
-                        f"机器负责人已接受部署审批，部署流程已开始：机器 `{machine_alias}`（IP `{machine.node_host}`）。",
-                        "本次目标镜像：",
+                        f"部署已经开始：机器 `{machine_alias}`（IP `{machine.node_host}`）。",
+                        "本次部署的镜像：",
                         target_images,
-                        "当前正在进行只读运行时预检；部署结果尚未确认。预检通过后才会发送部署 POST，完成后会更新为 `testing`。",
+                        "",
+                        "不需要重复发送审批，部署完成后即可开始测试。",
                     ]),
                 )
                 if not start_notice_posted:
@@ -3703,12 +3661,6 @@ class DeployController:
             except (AgentCoreError, DeployControllerError, TimeoutError, OSError) as exc:
                 # This try block contains read-only preflight and no deploy POST.
                 self._record_agent_core_health(repo, machine, "unavailable")
-                safe_reason = type(exc).__name__
-                if (isinstance(exc, DeployControllerError)
-                        and ("Agent Core credentials are keyed only by alias" in str(exc)
-                             or "cannot confirm whether alias" in str(exc)
-                             or "cannot confirm machine alias credential scope" in str(exc))):
-                    safe_reason = str(exc)
                 fresh = await self.proxy.read_hidden_state(repo, pr_number)
                 if fresh != state:
                     return False
@@ -3727,12 +3679,12 @@ class DeployController:
                 state["last_processed_comment_id"] = comment_id
                 markdown = self._deployment_progress_markdown(
                     repo, pr_number, state, machine, selected_components,
-                    f"Preflight failed ({safe_reason}); target machine/runtime unavailable or invalid. ZERO deploy POST. Send a NEW approval after recovery.",
+                    "部署前检查没有通过；机器当前无法连接或运行环境不可用，因此没有开始部署。请稍后按当前 PR Summary 重新审批。",
                     test_only=self._is_test_only_pr(pr_data),
                 )
                 preflight_failure_written = await self._write_lifecycle_with_history(
                     repo, pr_number, state, markdown,
-                    event={"event": "Preflight failed: ZERO deploy POST", "machine": machine_alias,
+                    event={"event": "Preflight failed", "machine": machine_alias,
                            "ip": self._runtime_display_identity(machine_alias, repo)[0],
                            "reason": type(exc).__name__,
                            "timestamp": comments_mod.beijing_now_str()},
@@ -3743,8 +3695,7 @@ class DeployController:
                 await self._project_status_best_effort(repo, pr_number, state["status"])
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    f"Deployment did not start because machine `{machine_alias}` failed its read-only preflight ({safe_reason}). "
-                    "No deploy POST was sent. Resolve the machine/runtime issue, then use a current complete machine command from the Lifecycle Summary.",
+                    "机器没有通过部署前检查，因此部署没有开始。",
                     topic="deployment-preflight-check-failed",
                 )
                 return True
@@ -3775,7 +3726,7 @@ class DeployController:
                 if fresh_pr.get("draft") is True:
                     await self._post_error(
                         repo, pr_number,
-                        "Deployment requires PR ready-for-review / non-draft.",
+                        "这个 PR 还是草稿，部署命令暂时不可用。",
                         comment_id=comment_id,
                     )
                 await self._invalidate_review_required(
@@ -3784,7 +3735,7 @@ class DeployController:
                     state,
                     fresh_head or state.get("head_sha", ""),
                     comment_id,
-                    "PR changed after runtime preflight.",
+                    "部署前再次检查时 PR 已经变化，旧的部署准备不再适用。",
                 )
                 return True
 
@@ -3808,7 +3759,7 @@ class DeployController:
                 self._record_approve_attempt(state, approve_attempt)
                 markdown = self._deployment_progress_markdown(
                     repo, pr_number, state, machine, selected_components,
-                    "Approval comment was deleted, edited, or changed; a NEW approval is required. ZERO deploy POST.",
+                    "审批命令已被删除或修改，本次部署没有发送，需要重新审批。",
                     test_only=self._is_test_only_pr(pr_data),
                 )
                 event = {
@@ -3840,7 +3791,7 @@ class DeployController:
                 if final_pr.get("draft") is True:
                     await self._post_error(
                         repo, pr_number,
-                        "Deployment requires PR ready-for-review / non-draft.",
+                        "这个 PR 还是草稿，部署命令暂时不可用。",
                         comment_id=comment_id,
                     )
                 await self._invalidate_review_required(
@@ -3849,7 +3800,7 @@ class DeployController:
                     state,
                     final_head or state.get("head_sha", ""),
                     comment_id,
-                    "PR changed after approval re-validation.",
+                    "审批复核后 PR 状态发生变化，旧的部署准备不再适用。",
                 )
                 return True
 
@@ -3860,7 +3811,7 @@ class DeployController:
                     state,
                     final_head,
                     comment_id,
-                    "HEAD drifted after approval re-validation.",
+                    "审批复核后 PR 出现了新的提交，旧的部署准备不再适用。",
                 )
                 return True
 
@@ -3981,7 +3932,7 @@ class DeployController:
                     repo, pr_number, state,
                     self._deployment_progress_markdown(
                         repo, pr_number, state, machine, [comp],
-                        "Deploying and verifying Core" if comp_target == "core" else "Deploying component",
+                        "正在部署并校验 Core" if comp_target == "core" else "正在部署组件",
                         test_only=self._is_test_only_pr(pr_data),
                     ), event=None,
                     expected_lifecycle_state=persisted_lifecycle_state,
@@ -4009,7 +3960,7 @@ class DeployController:
                     executing_written = await self._write_lifecycle_with_history(
                         repo, pr_number, state,
                         self._deployment_progress_markdown(
-                            repo, pr_number, state, machine, [comp], "Deploying",
+                            repo, pr_number, state, machine, [comp], "正在部署",
                             test_only=self._is_test_only_pr(pr_data),
                         ), event=None,
                         expected_lifecycle_state=persisted_lifecycle_state,
@@ -4111,9 +4062,10 @@ class DeployController:
                         repo, pr_number, head_sha=pr_head, round_id=round_id,
                         comment_id=comment_id, topic="deployment-started",
                         expected_command_kind="approve_deploy",
-                        message=(f"Deployment is in progress for HEAD `{_short(pr_head)}` in round `"
-                                 f"{round_id}`. The Controller is completing final pre-POST checks for "
-                                 f"machine `{machine.alias}`."),
+                        message=(
+                            f"部署正在进行：机器 `{machine.alias}`。"
+                            "部署结果确认后会在 PR Summary 中更新。"
+                        ),
                     )
                     deployment_started_notice_posted = True
 
@@ -4152,8 +4104,7 @@ class DeployController:
                     logger.warning("final deployment PR check unavailable %s#%s", repo, pr_number)
                     restored = await self._restore_interrupted_approval_preflight(
                         repo, pr_number,
-                        reason=(f"The current PR could not be verified ({type(exc).__name__}). "
-                                "No deploy POST was sent for the pending component; retry after GitHub PR state is readable."),
+                        reason="暂时无法确认 PR 的当前状态，这次没有发送部署请求。",
                         topic="deployment-pr-check-unavailable",
                         require_stale=False,
                         expected_comment_id=comment_id,
@@ -4162,8 +4113,7 @@ class DeployController:
                         return True
                     await self._post_command_reply(
                         repo, pr_number, comment_id,
-                        "The current PR state could not be verified, so no deploy POST was sent for the pending component. "
-                        "Wait until GitHub reports this PR as open and non-Draft, then submit a new approval.",
+                        "暂时无法确认 PR 的当前状态，这次没有发送部署请求。",
                         topic="deployment-pr-check-unavailable",
                     )
                     return True
@@ -4173,13 +4123,13 @@ class DeployController:
                         or execution_pr.get("merged")
                         or execution_pr.get("draft") is True):
                     reason = (
-                        "The PR is Draft; mark it ready for review and wait for current-HEAD review evidence."
+                        "这个 PR 还是草稿，部署命令暂时不可用，这次没有发送部署请求。"
                         if isinstance(execution_pr, dict) and execution_pr.get("draft") is True else
-                        "The PR is closed or merged; deployment commands are accepted only for an open PR."
+                        "这个 PR 已经关闭或合并，部署命令不再适用，这次没有发送部署请求。"
                     )
                     await self._post_command_reply(
                         repo, pr_number, comment_id,
-                        f"{reason} No deploy POST was sent for the pending component.",
+                        reason,
                         topic="deployment-pr-no-longer-open",
                     )
                     return True
@@ -4188,13 +4138,12 @@ class DeployController:
                     if isinstance(execution_head, dict) and execution_head.get("sha"):
                         await self._invalidate_review_required(
                             repo, pr_number, state, execution_head["sha"], comment_id,
-                            "HEAD changed during final deployment checks.",
+                            "最终部署检查时 PR 出现了新的提交，旧的部署准备不再适用。",
                         )
                     else:
                         await self._post_command_reply(
                             repo, pr_number, comment_id,
-                            "The current PR HEAD could not be verified, so no deploy POST was sent. "
-                            "Wait for GitHub to report the current HEAD, then submit a new approval.",
+                            "暂时无法确认 PR 的最新提交，这次没有发送部署请求。",
                             topic="deployment-head-check-unavailable",
                         )
                     return True
@@ -4204,7 +4153,7 @@ class DeployController:
                     return await self._block_machine_policy_change(
                         repo, pr_number, persisted_lifecycle_state,
                         persisted_lifecycle_state, comment_id, machine_alias, actor,
-                        "The approval comment changed after final authorization; no deploy POST was sent. Submit a new approval.",
+                        "最终授权后审批命令发生了改变，本次部署没有发送，需要重新审批。",
                     )
                 try:
                     await self._check_approval_permissions(machine, actor, repo)
@@ -4372,8 +4321,8 @@ class DeployController:
                             display_status="deploying",
                             test_only=self._is_test_only_pr(pr_data),
                             gate_note=[
-                                f"Runtime image for `{component_id}` already matches the approved target; no deploy POST was sent.",
-                                "Continue with any remaining component approvals; once all components are confirmed, Lifecycle enters `testing`.",
+                                "这台机器上已经在运行本轮批准的镜像，这次没有重复部署。",
+                                "请继续审批剩余组件；全部确认后即可开始测试。",
                             ],
                             deployments=self._enrich_deployments_for_render(
                                 state["deployments"], repo,
@@ -4448,7 +4397,7 @@ class DeployController:
                     verifying_written = await self._write_lifecycle_with_history(
                         repo, pr_number, state,
                         self._deployment_progress_markdown(
-                            repo, pr_number, state, machine, [comp], "Verifying target image",
+                            repo, pr_number, state, machine, [comp], "正在确认目标镜像",
                             test_only=self._is_test_only_pr(pr_data),
                         ), event=None,
                         expected_lifecycle_state=persisted_lifecycle_state,
@@ -4518,9 +4467,9 @@ class DeployController:
                     test_only=self._is_test_only_pr(pr_data),
                     gate_note=[
                         (runtime_preflight_message
-                         or "Agent Core status could not be confirmed."),
-                        "No POST was sent for the remaining component.",
-                        "Deployment remains pending. Send a NEW approval after status checks recover.",
+                         or "目前无法确认机器上的运行状态。"),
+                        "剩余组件没有部署，这次没有发送部署请求。",
+                        "请在机器恢复后按当前 PR Summary 重新审批。",
                     ],
                     deployments=self._enrich_deployments_for_render(state["deployments"], repo),
                 )
@@ -4544,9 +4493,8 @@ class DeployController:
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
                     (runtime_preflight_message
-                     or "Agent Core preflight could not confirm the target.")
-                    + " The pending component was not deployed. "
-                    "No deploy POST was sent for the pending component; after the machine recovers, post a new approval command.",
+                     or "目前无法确认机器上的运行状态。")
+                    + " 剩余组件没有部署，这次没有发送部署请求。",
                     topic="deployment-preflight-failed",
                 )
                 return True
@@ -4582,11 +4530,9 @@ class DeployController:
                     ], repo),
                     test_only=self._is_test_only_pr(pr_data),
                     gate_note=[
-                        "### Restart Recovery",
-                        "",
-                        "A deploy POST was attempted but its outcome is uncertain.",
-                        "The Controller will periodically verify the target status without repeating the POST.",
-                        "Keep this deployment pending until the exact target is confirmed.",
+                        "已经尝试发送部署请求，但结果还没有确认。",
+                        "控制器会持续只读检查目标状态，不会重复提交部署。",
+                        "在确认实际运行状态之前，请保持等待。",
                     ],
                     deployments=self._enrich_deployments_for_render(state["deployments"], repo),
                     display_status="deploying",
@@ -4606,11 +4552,9 @@ class DeployController:
                 await self._project_status_best_effort(repo, pr_number, "deploying")
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    (f"部署结果尚不确定：机器 `{machine_alias}`（IP `{machine.node_host}`）上的组件 "
-                     f"`{component_id}` 目标镜像为 `{image_ref}`。当前 Lifecycle 为 `deploying`；"
-                     "控制器会只读检查运行状态，不会盲目重试部署。"),
+                    (f"部署结果还没有确认：机器 `{machine_alias}`（IP `{machine.node_host}`）上的组件 "
+                     f"`{component_id}` 目标是镜像 `{image_ref}`。"),
                     topic="deployment-outcome-uncertain", error=True,
-                    next_action="等待 Summary 确认运行状态；不要重发此审批或重试部署 POST。若状态持续不可读，恢复机器连接后等待只读检查更新。",
                 )
                 return True
 
@@ -4633,23 +4577,18 @@ class DeployController:
                 }
                 state["last_processed_comment_id"] = comment_id
 
-                failure_next_step = (
-                    "先根据 Error 修复失败原因并确认目标机器恢复可读。随后由 PR 作者执行 `/request_deploy` 建立新的重试轮次，"
-                    "并按 Lifecycle Summary 给出的机器命令审批；如果后续只读检查明确确认 `MISMATCH`，机器 Owner 也可直接执行对应 `/approve_deploy`，无需 `/request_deploy`。"
-                )
                 failure_component = (
-                    f"`{failed_component_id}`"
-                    + (f"（target `{failed_component_target}`）" if failed_component_target else "")
-                    if failed_component_id else "未知组件"
+                    failed_component_target or failed_component_id
+                    if failed_component_id else "组件"
                 )
                 failure_detail = (
-                    f"机器 `{machine_alias}`（IP `{machine.node_host}`），"
-                    f"失败组件 {failure_component}，原因：{deploy_error}"
+                    f"机器 `{machine_alias}`（IP `{machine.node_host}`）上的 {failure_component} "
+                    f"没有完成部署。"
                 )
                 markdown = comments_mod.failed_comment(
                     repo, pr_number, pr_head, error=failure_detail,
                     failed_stage="deployment",
-                ) + f"\n\n**下一步：** {failure_next_step}"
+                )
                 approve_attempt["outcome"] = "failed"
                 self._record_approve_attempt(state, approve_attempt)
                 event = {
@@ -4675,11 +4614,9 @@ class DeployController:
                 await self._project_status_best_effort(repo, pr_number, "failed")
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    (f"部署失败：HEAD `{_short(pr_head)}`、round `{round_id_for_state(state)}`，"
-                     f"机器 `{machine_alias}`（IP `{machine.node_host}`），组件 {failure_component}。"
-                     f"原因：{deploy_error}。"),
+                    (f"部署没有完成：机器 `{machine_alias}`（IP `{machine.node_host}`）上的 "
+                     f"{failure_component} 没有部署成功。"),
                     topic="deployment-failed", error=True,
-                    next_action=failure_next_step,
                 )
 
                 # One-shot runtime log snapshot for failed path
@@ -4715,7 +4652,7 @@ class DeployController:
                         cos_metadata=cos_metadata,
                         markdown=comments_mod.failed_comment(
                             repo, pr_number, pr_head,
-                            error=deploy_error,
+                            error=failure_detail,
                             cos_object_key=str(cos_metadata.get("object_key", "") or ""),
                             cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
                             cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
@@ -4746,7 +4683,7 @@ class DeployController:
                         cos_metadata=cos_metadata,
                         markdown=comments_mod.failed_comment(
                             repo, pr_number, pr_head,
-                            error=deploy_error,
+                            error=failure_detail,
                             cos_object_key=str(cos_metadata.get("object_key", "") or ""),
                             cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
                             cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
@@ -4821,11 +4758,8 @@ class DeployController:
                     remaining_groups,
                     test_only=self._is_test_only_pr(pr_data),
                     gate_note=[
-                        "### Partial coverage completed",
-                        "",
-                        f"Machine `{machine_alias}` deployed its compatible components.",
-                        f"Remaining components need additional machine approval.",
-                        *(remaining_commands or ["No trusted compatible machine command is available for the remaining components."]),
+                        "这台机器已部署它负责的组件，但还有剩余组件需要其他机器审批。",
+                        *(remaining_commands or ["目前没有可用的机器命令，请联系仓库维护者检查机器配置。"]),
                     ],
                     deployments=self._enrich_deployments_for_render(state["deployments"], repo),
                 )
@@ -4862,9 +4796,9 @@ class DeployController:
                     topic="partial-deployment-next-approver",
                     expected_command_kind="approve_deploy",
                     message="\n".join([
-                        "Partial deployment completed. The remaining components need another machine approval.",
+                        "这台机器负责的组件已经部署完成，剩余组件还需要其他机器审批。",
                         *(
-                            ["下一步：请按以下完整命令审批剩余组件。", *notice_lines]
+                            ["请按下面的命令继续审批：", *notice_lines]
                             if notice_lines else
                             self._machine_blocking_summary(remaining_groups)
                         ),
@@ -4945,32 +4879,43 @@ class DeployController:
                 round_id=round_id_for_state(state), comment_id=comment_id,
                 topic="deployment-complete-testing-next",
                 expected_command_kind="approve_deploy",
-                message=(f"部署已完成，Lifecycle 已进入 `testing`。当前 HEAD 为 `{_short(pr_head)}`，"
-                         f"round 为 `{round_id_for_state(state)}`。现在可以开始测试。\n\n"
+                message=(f"部署已完成，现在可以开始测试。\n\n"
                          f"{upload_message}\n\n"
-                         "测试完成后，请由本轮 Machine Owner 执行 `/request_acceptance`。"),
+                         "测试完成后，请发送 `/request_acceptance` 提交验收。"),
             )
 
             return True
 
         except PolicyError as e:
+            logger.warning(
+                "handle_approve_deploy final authorization blocked %s#%s: %s",
+                repo, pr_number, type(e).__name__,
+            )
             restored = await self._restore_interrupted_approval_preflight(
                 repo, pr_number,
-                reason=(f"Approval was blocked during final authorization ({e}). "
-                        "No deploy POST was sent for the pending component; resolve the permission issue and submit a new approval."),
+                reason=(
+                    "部署前的最终权限检查没有通过，当时没有发送部署请求，"
+                    "这次审批也没有执行。"
+                ),
                 topic="approval-preflight-authorization-blocked",
                 require_stale=False,
                 expected_comment_id=comment_id,
             )
             if restored:
                 return True
-            await self._post_error(repo, pr_number, str(e), comment_id=comment_id)
+            await self._post_error(
+                repo, pr_number,
+                "部署前的最终权限检查没有通过，这次审批没有执行。",
+                comment_id=comment_id,
+            )
             return True
         except Exception as e:
             restored = await self._restore_interrupted_approval_preflight(
                 repo, pr_number,
-                reason=(f"Approval stopped during pre-POST validation ({type(e).__name__}). "
-                        "No deploy POST was sent for the pending component; resolve the issue and submit a new approval."),
+                reason=(
+                    "部署前的最终检查没有通过，当时没有发送部署请求，"
+                    "这次审批也没有执行。"
+                ),
                 topic="approval-preflight-validation-failed",
                 require_stale=False,
                 expected_comment_id=comment_id,
@@ -5311,13 +5256,17 @@ class DeployController:
                     or pr.get("merged") or pr.get("draft")):
                 await self._post_error(
                     repo, pr_number,
-                    "/request_acceptance 仅适用于开放、未合并且非 Draft 的 PR。",
+                    "这个 PR 已经关闭、合并或还是草稿，验收命令暂时不可用。",
                     comment_id=comment_id,
                 )
                 return True
             state = await self.proxy.read_hidden_state(repo, pr_number)
             if not isinstance(state, dict):
-                await self._post_error(repo, pr_number, "当前没有可验收的部署记录。", comment_id=comment_id)
+                await self._post_error(
+                    repo, pr_number,
+                    "当前还没有可验收的部署结果，这次验收申请没有提交。",
+                    comment_id=comment_id,
+                )
                 return True
             state = copy.deepcopy(state)
             head = pr.get("head", {}).get("sha", "")
@@ -5333,7 +5282,7 @@ class DeployController:
                     or not self._all_required_components_deployed(state, repo)):
                 await self._post_command_not_ready(
                     repo, pr_number, state.get("status", "unknown"),
-                    "所有本轮部署完成并进入 testing 后，Machine Owner 才能请求独立验收。",
+                    "本轮部署还没有全部完成，因此还不能提交验收。",
                     comment_id=comment_id,
                 )
                 return True
@@ -5345,7 +5294,7 @@ class DeployController:
                     or not self._is_deployed_machine_owner(actor, state, repo)):
                 await self._post_error(
                     repo, pr_number,
-                    "只有本轮实际部署机器的 Machine Owner 可以执行 /request_acceptance。",
+                    "只有本轮实际部署机器的负责人可以提交验收。",
                     comment_id=comment_id,
                 )
                 return True
@@ -5425,20 +5374,15 @@ class DeployController:
                 acceptance_reviewers=eligible_reviewers,
                 evidence_url=evidence_url,
             )
+            record_test_instruction = (
+                "请由验收账号执行 `/record_test result=pass` 或 `/record_test result=fail`。"
+                if reviewers_configured else
+                "配置有效的验收账号后，验收人才能执行 `/record_test result=pass` 或 `/record_test result=fail`。"
+            )
             if self._is_test_only_pr(pr):
                 reviewer_guidance = self._acceptance_reviewer_guidance(
                     repo, pr, reviewers_configured, eligible_reviewers,
                 )
-                if reviewers_configured:
-                    record_test_instruction = (
-                        "当前仓库所有有效验收白名单成员仍保留输入 "
-                        "`/record_test result=pass` 或 `/record_test result=fail` 的权限。"
-                    )
-                else:
-                    record_test_instruction = (
-                        "提醒对象不改变授权规则；当前仓库没有有效验收白名单。"
-                        "配置有效名单后，名单成员仍按原规则获得 `/record_test` 权限。"
-                    )
                 notice = "\n\n".join((reviewer_guidance, record_test_instruction))
                 if eligible_reviewers:
                     markdown = markdown.rstrip() + "\n\n" + notice
@@ -5479,9 +5423,9 @@ class DeployController:
                 repo, pr, reviewers_configured, eligible_reviewers,
             )
             record_test_instruction = (
-                "当前仓库验收白名单中的获授权账号可执行 `/record_test result=pass` 或 `/record_test result=fail`。"
+                "请由验收账号执行 `/record_test result=pass` 或 `/record_test result=fail`。"
                 if reviewers_configured else
-                "配置有效的当前仓库验收名单后，获授权账号才能执行 `/record_test result=pass` 或 `/record_test result=fail`。"
+                "配置有效的验收账号后，验收人才能执行 `/record_test result=pass` 或 `/record_test result=fail`。"
             )
             evidence_location = (
                 f"本轮测试视频或图片（可选）：[打开固定上传页面](<{evidence_url}>)，"
@@ -5495,11 +5439,14 @@ class DeployController:
                 comment_id=comment_id, topic="acceptance-requested",
                 expected_command_kind="request_acceptance",
                 message="\n".join([
-                    f"本轮测试已完成，当前等待独立验收：`{round_id}`。",
+                    "验收申请已经提交，本轮测试的验收现在开始。",
+                    "",
                     reviewer_notice,
+                    "",
                     evidence_location,
-                    "请检查本轮证据和实际部署效果是否符合 PR 需求、是否存在阻塞问题，并据此判断是否通过验收以及能否合并。",
-                    "下一步请执行 `/record_test result=pass` 或 `/record_test result=fail`。",
+                    "",
+                    "请验收人检查本轮证据和实际部署效果，确认是否符合 PR 需求、是否存在阻塞问题，"
+                    "然后执行 `/record_test result=pass` 或 `/record_test result=fail`。",
                     record_test_instruction,
                 ]),
             )
@@ -5531,7 +5478,7 @@ class DeployController:
             if state is None:
                 await self._post_error(
                     repo, pr_number,
-                    "当前 PR 没有有效的 Deploy Approval Lifecycle。请先查看 PR Summary，等待生命周期状态更新后再记录测试结果。",
+                    "当前 PR 还没有可用的部署进度信息，这次测试结果没有记录。",
                     comment_id=comment_id,
                 )
                 return True
@@ -5540,7 +5487,11 @@ class DeployController:
             state = copy.deepcopy(state)
             pr_head = pr_data.get("head", {}).get("sha", "")
             if not isinstance(pr_head, str) or not re.fullmatch(r"[0-9a-f]{40}", pr_head):
-                await self._post_error(repo, pr_number, "Cannot verify the current PR HEAD.", comment_id=comment_id)
+                await self._post_error(
+                    repo, pr_number,
+                    "无法确认 PR 的最新提交，这次测试结果没有记录。",
+                    comment_id=comment_id,
+                )
                 return True
             if pr_head != state.get("head_sha", ""):
                 if _recovery_comment is not None:
@@ -5576,35 +5527,34 @@ class DeployController:
                 )
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    f"`/record_test` was already finalized for this round. Current status: `{_current_status}`. "
-                    + ("Next step: review the recorded pass result and follow the repository PR merge process."
-                       if _current_status == "succeeded" else
-                       "Next step: fix the reported test issue, update the PR, and wait for Review Agent to validate the new HEAD."),
+                    (
+                        "本轮验收结果已经记录通过，这次命令没有重复处理。"
+                        if _current_status == "succeeded" else
+                        "本轮验收结果已经记录为未通过，这次命令没有重复处理。"
+                    ),
                     topic="record-test-already-processed",
                 )
                 return True
             else:
                 if _current_status in {"review-required", "reviewing"}:
                     not_ready_message = (
-                        "当前 HEAD 尚无完整可信的审核和构建结果，请等待 Review Agent 完成并更新 PR Summary。"
+                        "当前提交的审核和构建结果还没有完成，因此暂时不能记录验收结果。"
                     )
                 elif _current_status == "deploy-ready":
-                    guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
                     not_ready_message = (
-                        f"当前 Lifecycle 状态：`{_current_status}`\n"
-                        f"下一步建议：\n{guidance}"
+                        "当前提交还没有完成部署，因此暂时不能记录验收结果。"
                     )
                 elif _current_status == "deploy-requested":
                     not_ready_message = (
-                        "当前 Lifecycle 为 `deploy-requested`，正在等待机器审批。请查看 PR Summary 中的可执行机器命令并等待部署完成。"
+                        "当前正在等待机器部署，因此暂时不能记录验收结果。"
                     )
                 elif _current_status == "deploying":
                     not_ready_message = (
-                        "当前部署正在执行或确认结果，请等待部署状态更新后再记录测试结果。"
+                        "部署正在进行，因此暂时不能记录验收结果。"
                     )
                 else:
                     not_ready_message = (
-                        f"当前 Lifecycle 状态为 `{_current_status or 'unknown'}`，尚不能记录测试结果。请查看当前 PR Summary。"
+                        "当前阶段还不能记录验收结果。"
                     )
                 await self._post_command_not_ready(
                     repo, pr_number, _current_status,
@@ -5619,7 +5569,7 @@ class DeployController:
             if pr_state != "open" or pr_merged or pr_data.get("draft"):
                 await self._post_error(
                     repo, pr_number,
-                    "PR is not open. Record test only when PR is open and unmerged.",
+                    "这个 PR 已经关闭、合并或还是草稿，验收命令暂时不可用。",
                     comment_id=comment_id,
                 )
                 return True
@@ -5636,8 +5586,7 @@ class DeployController:
                     or not self._all_required_components_deployed(state, repo)):
                 await self._post_error(
                     repo, pr_number,
-                    "Not all components are deployed yet. "
-                    "Complete all machine approvals before recording test result.",
+                    "本轮组件还没有全部部署完成，因此暂时不能记录验收结果。",
                     comment_id=comment_id,
                 )
                 return True
@@ -5745,18 +5694,18 @@ class DeployController:
                 logger.warning("record_test label projection %s#%s exception=%s",
                                repo, pr_number, type(exc).__name__)
             next_step = (
-                "下一步：检查 Summary 中的通过结果，并按当前仓库的 PR 流程完成后续审阅与合并。"
+                "本轮验收已通过，可以按仓库正常的 PR 流程继续审阅和合并。"
                 if result == "pass" else
-                "下一步：根据失败结果修复问题并更新 PR；新 HEAD 需要重新等待 Review Agent 完成审核和构建，"
-                "之后再按新的 Lifecycle Summary 重新部署（测试视频或图片为可选上传）。"
+                "本轮验收未通过。请先修复问题并更新 PR，等新的审核和构建完成后再重新部署和验收。"
             )
             await self._post_bound_notice(
                 repo, pr_number, head_sha=pr_head,
                 round_id=round_id_for_state(state), comment_id=comment_id,
                 topic="test-result-recorded", expected_command_kind="record_test",
-                message=(f"Test result recorded as `{result}` for HEAD `{_short(pr_head)}` "
-                         f"in round `{round_id_for_state(state)}`. Final status: `{state['status']}`. "
-                         f"{next_step}"),
+                message=(
+                    f"验收结果已经记录：{'通过' if result == 'pass' else '未通过'}。\n\n"
+                    f"{next_step}"
+                ),
             )
             # Failures are logged/backed off internally and cannot undo or block
             # consumption of this durably completed business command.
@@ -5781,10 +5730,22 @@ class DeployController:
         """Consume deprecated requests without creating or returning a link."""
         await self._post_command_reply(
             repo, pr_number, comment_id,
-            "`/evidence_link` 已停用，本次没有生成下载链接。请查看当前 Lifecycle Summary 中的有效证据入口；需要查询部署状态时可使用 `/deploy_status`。",
+            "下载链接命令已经停用，这次没有生成链接。",
             topic="evidence-link-deprecated",
         )
         return True
+
+    _DEPLOY_STATUS_LEADS = {
+        "review-required": "当前提交还没有完成审核和构建。",
+        "reviewing": "当前提交正在审核和构建。",
+        "deploy-ready": "当前提交已通过审核和构建，可以开始部署审批。",
+        "deploy-requested": "部署审批已经提交，正在等待机器执行。",
+        "deploying": "本轮部署正在进行。",
+        "testing": "本轮部署已经完成，可以开始测试。",
+        "acceptance-required": "本轮测试已经完成，正在等待验收。",
+        "succeeded": "本轮验收已经通过。",
+        "failed": "本轮没有通过，需要修复后重新开始。",
+    }
 
     async def handle_deploy_status(
         self, repo: str, pr_number: int, comment_id: int,
@@ -5794,48 +5755,36 @@ class DeployController:
             if state is None:
                 await self._post_error(
                     repo, pr_number,
-                    "No deploy approval state found for this PR.",
+                    "当前 PR 还没有可用的部署进度信息。",
                     comment_id=comment_id,
                 )
                 return True
 
-            head_sha = state.get("head_sha", "")
             status = state.get("status", "review-required")
-            components = state.get("components", [])
-            deployments = state.get("deployments", [])
-
-            # Refresh 120s COS URL for terminal states
-            cos_object_key = ""
-            cos_bundle_sha256 = ""
-            cos_bundle_size = 0
-            cos_download_url = ""
-            cos_state = state.get("cos", {})
-            if status in ("succeeded", "failed"):
-                cos_object_key = str(cos_state.get("object_key", "") or "")
-                cos_bundle_sha256 = str(cos_state.get("sha256", "") or "")
-                cos_bundle_size = int(cos_state.get("size", 0) or 0)
-                if cos_object_key:
-                    try:
-                        cos_download_url = self.cos.generate_evidence_download_url(
-                            cos_object_key,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "COS_EVIDENCE_PRESIGN=FAILED repo=%s pr=%s",
-                            repo, pr_number,
-                        )
-
-            markdown = comments_mod.deploy_status_comment(
-                status, head_sha, repo, pr_number,
-                components=components,
-                deployments=deployments,
-                cos_object_key=cos_object_key,
-                cos_bundle_sha256=cos_bundle_sha256,
-                cos_bundle_size=cos_bundle_size,
-                cos_download_url=cos_download_url,
+            lead = self._DEPLOY_STATUS_LEADS.get(
+                status if isinstance(status, str) else "",
+                "当前还没有可确认的部署结果。",
             )
-            await self.proxy.post_issue_comment(
-                repo, pr_number, markdown,
+            cos_state = state.get("cos", {})
+            cos_object_key = (
+                str(cos_state.get("object_key", "") or "")
+                if status in ("succeeded", "failed")
+                else ""
+            )
+            if cos_object_key:
+                try:
+                    cos_download_url = self.cos.generate_evidence_download_url(
+                        cos_object_key,
+                    )
+                except Exception:
+                    cos_download_url = ""
+                if cos_download_url:
+                    lead += (
+                        "\n\n本轮测试证据：[打开证据下载页面]"
+                        f"(<{cos_download_url}>)。"
+                    )
+            await self._post_command_reply(
+                repo, pr_number, comment_id, lead, topic="deploy-status",
             )
             return True
         except Exception as e:
@@ -6499,7 +6448,7 @@ class DeployController:
                 result = "MISMATCH"
             else:
                 result = "UNAVAILABLE；无法确认是否需要重新部署"
-            line = f"- 机器 `{alias}`（主 IP：`{primary_ip or '未记录'}`），Owner：{owner_text}；{result}"
+            line = f"- 机器 `{alias}`（主 IP：`{primary_ip or '未记录'}`），负责人：{owner_text}；{result}"
             if result.startswith("MISMATCH"):
                 if selector:
                     line += (
@@ -8077,21 +8026,24 @@ class DeployController:
             "machine": machine.alias,
             "ip": self._runtime_display_identity(machine.alias, repo)[0] or "主 IP 未记录",
             "component_ids": [c.get("component_id", "") for c in components],
-            "phase": ("preflight" if str(phase).lower().startswith(
-                ("approval received", "preflight failed")) else "deploying"),
+            "phase": ("preflight" if str(phase).startswith(
+                ("审批已收到", "部署前检查")) else "deploying"),
             "timestamp": comments_mod.beijing_now_str(),
         }]
         display_status = (
             "deploying" if state.get("status") == "deploying"
             else self._approval_retry_status(state)
         )
+        display_ip = self._runtime_display_identity(machine.alias, repo)[0] or "未记录"
         return self._approval_retry_markdown(
             repo, pr_number, state,
             self._get_machine_groups_for_components(remaining, repo),
             test_only=test_only,
             deployments=self._enrich_deployments_for_render(display_deployments, repo),
-            gate_note=[f"{phase}: `{machine.alias}` / 主 IP `{self._runtime_display_identity(machine.alias, repo)[0] or '未记录'}`; components: {targets}; "
-                       f"{comments_mod.beijing_now_str()}"],
+            gate_note=[
+                f"{phase}：机器 `{machine.alias}`（主 IP：`{display_ip}`），"
+                f"组件：{targets}。"
+            ],
             display_status=display_status,
         )
 
@@ -10507,10 +10459,8 @@ class DeployController:
         await self.proxy.project_status_label(repo, pr_number, "review-required")
         await self._post_command_reply(
             repo, pr_number, comment_id,
-            (f"HEAD 已变化：旧 HEAD `{_short(old_head)}` 的审核和审批已失效，"
-             f"当前 HEAD 为 `{_short(new_head)}`。Lifecycle 已重置为 `review-required`。"),
+            "PR 有了新提交，之前的审核和审批已不再对应当前代码，这次命令没有执行。",
             topic="pr-head-updated", error=True,
-            next_action="等待 Review Agent 完成新 HEAD 的审核和镜像构建；只有 Summary 回到 `deploy-ready` 后，机器负责人才能执行当前完整审批命令。",
         )
 
     async def _invalidate_review_required(
@@ -10576,9 +10526,8 @@ class DeployController:
         await self.proxy.project_status_label(repo, pr_number, "review-required")
         await self._post_command_reply(
             repo, pr_number, comment_id,
-            f"预部署校验失败：{reason}。当前没有发出新的部署请求。",
+            "部署前的最终检查发现当前代码或审核结果已经变化，这次没有发出部署请求。",
             topic="predeploy-validation-invalidated", error=True,
-            next_action="等待当前 HEAD 的可信 Review Agent 审核和构建证据恢复；查看更新后的 Summary，再使用当前完整机器审批命令。",
         )
 
     async def _current_testing_upload_url(
@@ -10883,22 +10832,20 @@ class DeployController:
             and group.get("approval_available") is True and required_ids
             and required_ids.issubset(set(group.get("component_ids", [])))
         ]
-        message_lines = [
-            f"当前 Commit `{_short(head_sha)}` 的构建和审核已完成，Lifecycle 已进入 `deploy-ready`。",
-        ]
+        message_lines = ["当前提交的构建和审核已经完成，可以开始部署审批。"]
         if command_lines:
-            message_lines.extend(["可执行的机器审批命令：", *command_lines])
+            message_lines.extend(["可以按下面的机器命令审批：", *command_lines])
             if len(full_groups) == 1:
                 message_lines.append(
                     "只有一台机器完整适配全部组件，也可以直接执行 `/approve_deploy`。",
                 )
             elif len(full_groups) > 1:
-                message_lines.append("有多台机器完整适配，请从上方的审批命令中明确选择一台。")
+                message_lines.append("有多台机器完整适配，请用上面的命令明确指定一台。")
             elif required_ids:
-                message_lines.append("没有单台机器覆盖全部组件；可按上面的命令分批审批适配机器。")
+                message_lines.append("没有单台机器覆盖全部组件，请按上面的命令分批审批。")
         else:
             message_lines.extend(self._machine_blocking_summary(groups))
-        message_lines.append("无需先执行 `/request_deploy`；该命令仍可用于显式申请部署。")
+        message_lines.append("`/request_deploy` 是可选的，不是部署审批的前提。")
         body = "\n".join((comments_mod.BOT_MARKER, marker, "", *message_lines))
         if not await context_is_current():
             return False
@@ -10919,6 +10866,166 @@ class DeployController:
             return False
         return bool(isinstance(latest, list) and marker_exists(latest))
 
+    _PARSE_ERROR_REASONS = {
+        "duplicate_argument": "同一个参数填写了不止一次，请只保留一个值。",
+        "invalid_ip_format": "机器选择器的 IP 格式不正确。",
+        "extra_parameter": "这条命令不接受多余的内容，请只发送命令本身。",
+        "missing_machine_value": "机器选择器为空，请选择一个具体机器。",
+        "missing_parameter": "命令缺少必填参数。",
+        "invalid_parameter": "命令中的参数值不可用。",
+        "unknown_argument": "命令包含不支持的参数。",
+        "invalid_arguments": "命令参数格式不正确。",
+        "command_not_found": "无法识别这条部署审批命令。",
+        "machine_not_unique": "这个机器选择器对应多台机器，请明确选择一台。",
+    }
+
+    _TOPIC_REASONS = (
+        ("head_changed", "PR 有了新提交，之前的审核和审批已不再对应当前代码。"),
+        ("pr_head_updated", "PR 有了新提交，之前的审核和审批已不再对应当前代码。"),
+        ("pr_merged", "这个 PR 已经合并，部署命令不再适用。"),
+        ("pr_closed", "这个 PR 已经关闭，部署命令不再适用。"),
+        ("pr_draft", "这个 PR 还是草稿，部署命令暂时不可用。"),
+        ("machine_not_found", "找不到你填写的机器。"),
+        ("permission_denied", "当前账号没有执行这项操作的权限。"),
+        ("authorization", "当前账号没有执行这项操作的权限。"),
+        ("permission", "当前账号没有执行这项操作的权限。"),
+        ("machine_incompatible", "这台机器不能部署本次需要的组件。"),
+        ("incompatible", "这台机器不能部署本次需要的组件。"),
+        ("policy", "目前无法确认仓库的机器配置，因此不能安全执行这条命令。"),
+        ("already_processed", "这一轮已经处理过这项操作。"),
+        ("already_matches", "机器上已经在运行本轮批准的镜像，不需要重新部署。"),
+        ("deployment_failed", "本次部署没有完成。"),
+        ("uncertain", "部署结果还在确认中，这次没有重复提交部署。"),
+        ("already_in_progress", "部署正在进行中，这次没有重复提交部署。"),
+        ("in_progress", "部署正在进行中，这次没有重复提交部署。"),
+        ("preflight", "机器没有通过部署前的安全检查，部署没有继续。"),
+        ("not_ready", "当前阶段还不能执行这项操作。"),
+        ("state_unavailable", "目前无法确认机器运行状态。"),
+        ("unavailable", "目前无法连接机器确认运行状态。"),
+        ("not_running", "目标组件当前没有运行，暂时无法确认运行镜像。"),
+        ("identity_changed", "机器身份或运行时的绑定发生了变化，暂时无法确认。"),
+        ("review", "当前代码的审核或构建证据还不能确认。"),
+        ("evidence", "当前代码的审核或构建证据还不能确认。"),
+        ("comment_invalid", "这条命令已经失效，需要重新发送。"),
+        ("revoked", "这条审批已经失效，需要重新审批。"),
+        ("no_drift", "目前没有确认到需要重新部署的镜像差异。"),
+        ("no_confirmed", "目前没有确认到需要重新部署的镜像差异。"),
+        ("no_compatible", "目前没有可以部署这些组件的机器。"),
+        ("request_deploy", "当前条件不允许创建部署申请。"),
+    )
+
+    _GENERIC_ERROR_REASON = "当前条件下无法执行这项操作。"
+    _FAILURE_PREFIX = "这条命令没有执行："
+
+    @classmethod
+    def _failure_lead(cls, reason: str) -> str:
+        """Prefix a failure reason exactly once with the unified failure lead."""
+        text = reason.strip() if isinstance(reason, str) else ""
+        if not text:
+            text = cls._GENERIC_ERROR_REASON
+        if text.startswith(cls._FAILURE_PREFIX):
+            return text
+        return cls._FAILURE_PREFIX + text
+
+    def _command_error_reason(
+        self, *, command_kind: str = "", parsed_error: str = "",
+        topic: str = "", message: str = "", exception: Exception | None = None,
+    ) -> str:
+        """Return one developer-readable Chinese reason for a failed command.
+
+        This is the single error-to-text entry point. It never echoes internal
+        error codes, exception types, stack traces, YAML/DB names, or the
+        original command text.
+        """
+        topic_text = topic.casefold().replace("-", "_") if isinstance(topic, str) else ""
+        message_text = message.casefold() if isinstance(message, str) else ""
+        code_text = parsed_error if isinstance(parsed_error, str) else ""
+        code = code_text.partition(":")[0].strip().casefold().replace("-", "_")
+        category_match = re.search(
+            r"(?:错误分类|error\s+category)\s*[:：]\s*`?([a-z][a-z0-9_-]*)",
+            message if isinstance(message, str) else "", re.IGNORECASE,
+        )
+        category = (category_match.group(1).casefold().replace("-", "_")
+                    if category_match else "")
+        classification = code or category or (
+            command_kind.casefold().replace("-", "_")
+            if isinstance(command_kind, str) else ""
+        )
+
+        if classification in self._PARSE_ERROR_REASONS:
+            return self._PARSE_ERROR_REASONS[classification]
+        if exception is not None:
+            # Exception type is diagnostic only; never expose its text.
+            exception_text = type(exception).__name__.casefold()
+            message_text = message_text or exception_text
+        if category in self._PARSE_ERROR_REASONS:
+            return self._PARSE_ERROR_REASONS[category]
+
+        if _is_machine_not_found_error(message or "") or any(value in message_text for value in (
+                "unknown machine alias", "no machine found", "machine not found")):
+            return "找不到你填写的机器。"
+        if any(value in message_text for value in (
+                "permission denied", "not authorized", "not a machine owner",
+                "insufficient collaborator", "无权限", "没有权限", "未获授权",
+                "没有验收权限", "only the pr author", "only the", "cannot approve")):
+            return "当前账号没有执行这项操作的权限。"
+        if "test_reviewers" in message_text or "白名单" in message_text:
+            if "没有有效的验收人白名单" in message_text:
+                return "当前仓库还没有可用的验收账号。"
+            return "当前账号没有记录验收结果的权限。"
+
+        # A handler-supplied message that is already user-facing Chinese is
+        # the most precise reason. Only its first line is kept so the
+        # "correct operation" block always comes from lifecycle guidance.
+        raw_message = message.strip() if isinstance(message, str) else ""
+        forbidden = (
+            "HEAD", "round", "Lifecycle", "lifecycle", "yaml", "YAML",
+            "ZERO deploy POST", "MATCH", "MISMATCH", "UNAVAILABLE",
+            "Owner：", "Traceback", "Exception", "数据库", "database",
+        )
+        if raw_message and re.search(r"[\u4e00-\u9fff]", raw_message) \
+                and not any(token in raw_message for token in forbidden):
+            first_line = next(
+                (line.strip() for line in raw_message.splitlines() if line.strip()),
+                "",
+            )
+            if first_line:
+                return first_line
+
+        for prefix, reason in self._TOPIC_REASONS:
+            if prefix in topic_text:
+                return reason
+        for prefix, reason in self._TOPIC_REASONS:
+            if prefix in message_text:
+                return reason
+
+        if "incompatible" in message_text or "不兼容" in message_text or "does not match" in message_text:
+            return "这台机器不能部署本次需要的组件。"
+        if "head changed" in message_text or "head 已变化" in message_text:
+            return "PR 有了新提交，之前的审核和审批已不再对应当前代码。"
+        if "pr is not open" in message_text or "draft" in message_text:
+            return "这个 PR 当前不可部署。"
+        if not topic_text and not message_text and not code_text:
+            return "这条命令当前不能执行。"
+        return self._GENERIC_ERROR_REASON
+
+    @staticmethod
+    def _format_user_reply(lead: str, next_step: str = "") -> str:
+        """Format every command reply as exactly two user-facing blocks.
+
+        ``lead`` states what happened; ``next_step`` states what to do now.
+        No headings, labels, internal values, or trailing explanations.
+        """
+        lead_text = lead.strip() if isinstance(lead, str) else ""
+        next_text = next_step.strip() if isinstance(next_step, str) else ""
+        lead_text = re.sub(r"\n{3,}", "\n\n", lead_text)
+        next_text = re.sub(r"\n{3,}", "\n\n", next_text)
+        if not lead_text:
+            lead_text = "这条命令当前不能执行。"
+        if not next_text:
+            next_text = "请按 PR Summary 中当前显示的机器命令操作。"
+        return f"{lead_text}\n\n{next_text}"
+
     async def _post_command_reply(
         self, repo: str, pr_number: int, comment_id: int, message: str,
         *, topic: str = "command-error", error: bool = False,
@@ -10929,7 +11036,7 @@ class DeployController:
             "runtime-redeploy-", "request-deploy-",
             "approve-deploy-incompatible-machine",
             "approve-deploy-machine-selection", "deployment-preflight-",
-            "command-not-ready", "command-error-",
+            "command-not-ready", "command-error-", "command-rejected-",
         )) or topic in {
             "deployment-already-in-progress",
             "approve-deploy-already-processed",
@@ -10972,161 +11079,20 @@ class DeployController:
             except Exception:
                 origin = None
             source_body = origin.get("body", "") if isinstance(origin, dict) else ""
-            from .commands import (
-                _iter_top_level_command_lines, detect_deployment_command_intent,
-                parse_command,
-            )
+            from .commands import parse_command
             parsed = parse_command(source_body if isinstance(source_body, str) else "")
-            command_input = parsed.raw.strip() if isinstance(parsed.raw, str) else ""
-            if not command_input and isinstance(source_body, str):
-                command_input = next((
-                    line.strip() for line in _iter_top_level_command_lines(source_body)
-                    if line.strip().startswith("/")
-                ), "")
-            command_input = " ".join(command_input.split())[:512]
-            if not command_input:
-                command_input = f"评论 #{comment_id}（原始命令无法读取）"
-            intent = parsed.kind if parsed.kind != "unknown" else detect_deployment_command_intent(
-                source_body if isinstance(source_body, str) else "",
-            )
-            syntax_labels = {
-                "missing_machine_value": "参数缺失：machine 值为空",
-                "invalid_ip_format": "IP 格式错误：machine 必须是有效 IPv4 地址或当前策略中的 alias",
-                "extra_parameter": "参数错误：命令包含不支持的位置参数",
-                "invalid_arguments": "命令参数格式错误",
-            }
             parse_error = parsed.error or ""
-            if parse_error.startswith("duplicate_argument:"):
-                error_label = f"参数重复：{parse_error.split(':', 1)[1]}"
-            elif parse_error.startswith("unknown_argument:"):
-                error_label = f"参数错误：不支持 {parse_error.split(':', 1)[1]}"
-            elif parse_error.startswith("missing_parameter:"):
-                error_label = f"参数缺失：{parse_error.split(':', 1)[1]}"
-            elif parse_error.startswith("invalid_parameter:"):
-                error_label = f"参数值错误：{parse_error.split(':', 1)[1]}"
-            else:
-                topic_error_labels = {
-                    "deployment-already-in-progress": "当前生命周期不允许：部署已在进行或结果待确认",
-                    "approve-deploy-already-processed": "当前生命周期不允许：本轮审批已处理",
-                    "record-test-already-processed": "当前生命周期不允许：本轮验收结果已记录",
-                    "request-deploy-already-processed": "当前生命周期不允许：当前轮次已有部署请求或部署正在进行",
-                    "approve-deploy-machine-selection": "机器选择缺失或有歧义：必须指定一台完整兼容机器",
-                    "approve-deploy-incompatible-machine": "机器不兼容：当前机器不能部署剩余组件",
-                    "deployment-pr-no-longer-open": "PR 状态不允许部署：PR 已关闭、合并或仍为 Draft",
-                    "deployment-pr-check-unavailable": "PR 状态不可读取：无法确认 PR 是否仍可部署",
-                    "deployment-head-check-unavailable": "HEAD 状态不可读取：无法确认审批仍绑定当前提交",
-                    "deployment-outcome-uncertain": "部署结果不确定：禁止盲目重试",
-                    "deployment-failed": "部署失败",
-                    "machine-policy-changed-before-deploy": "机器授权或身份策略已变化",
-                    "pr-head-updated": "HEAD 已变化：旧审核和审批失效",
-                    "predeploy-validation-invalidated": "当前 HEAD 的预部署证据无效或已变化",
-                }
-                error_label = topic_error_labels.get(topic, "")
-                if not error_label and topic.startswith("runtime-redeploy-machine-not-found"):
-                    error_label = "机器不存在。"
-                elif not error_label and topic.startswith((
-                        "runtime-redeploy-machine-incompatible",
-                        "runtime-redeploy-component-incompatible",
-                        "runtime-redeploy-required-before-other-machine")):
-                    error_label = "机器不兼容：当前机器不能安全覆盖本轮漂移组件"
-                elif not error_label and "head-changed" in topic:
-                    error_label = "HEAD 已变化：本次命令未用于新的提交"
-                elif not error_label and topic.startswith("runtime-redeploy-policy"):
-                    error_label = "机器授权不可确认：当前仓库策略未通过校验"
-                elif not error_label and topic.startswith("deployment-preflight-"):
-                    error_label = "机器运行状态不可确认：只读预检未通过"
-                elif not error_label and topic.startswith("runtime-redeploy-"):
-                    error_label = "运行镜像状态不满足重新部署条件"
-                elif not error_label and topic.startswith("request-deploy-"):
-                    error_label = "部署请求未创建：当前请求或 HEAD 校验未通过"
-                if not error_label:
-                    message_lower = message.casefold()
-                    if any(value in message_lower for value in (
-                            "无权限", "没有权限", "not authorized", "only the pr author",
-                            "only the machine owner", "not a machine owner",
-                            "insufficient collaborator", "permission denied",
-                            "没有验收权限", "未获授权")):
-                        error_label = "无权限：当前账号不满足命令授权规则"
-                    elif any(value in message_lower for value in (
-                            "head changed", "head 已变化", "head drift")):
-                        error_label = "HEAD 已变化：旧审核和审批失效"
-                    elif _is_machine_not_found_error(message):
-                        error_label = "机器不存在。"
-                    elif any(value in message_lower for value in (
-                            "incompatible", "不兼容", "不适配", "does not match")):
-                        error_label = "机器不兼容：无法覆盖本次组件"
-                    elif any(value in message_lower for value in (
-                            "uncertain", "不确定", "cannot verify", "无法确认", "无法读取",
-                            "unavailable")):
-                        error_label = "机器或部署状态不可确认"
-                    elif parse_error:
-                        error_label = syntax_labels.get(parse_error, "命令参数格式错误")
-                    elif intent == "unknown":
-                        error_label = "命令错误：无法识别 Deploy Approval 指令"
-                    else:
-                        error_label = "命令未执行：当前生命周期、权限或机器策略条件未满足"
-
-            status = (
-                str(state.get("status", "unknown"))
-                if isinstance(state, dict) else "no-lifecycle"
+            reason = self._command_error_reason(
+                command_kind=parsed.kind if isinstance(parsed.kind, str) else "",
+                parsed_error=parse_error,
+                topic=topic,
+                message=message,
             )
-            if (isinstance(state, dict)
-                    and state.get("head_sha") != head):
-                status = (
-                    f"review-required（HEAD drift：Lifecycle={_short(str(state.get('head_sha', '')))}，"
-                    f"PR={_short(head)}）"
-                )
-            if not next_action:
-                if status == "deploying":
-                    next_action = "等待当前部署结果确认；不要重发审批命令或盲目重试部署 POST。"
-                elif intent == "approve_deploy":
-                    next_action = await self._lifecycle_next_action_guidance(repo, pr_number)
-                elif intent == "request_deploy":
-                    if status in {"deploy-ready", "deploy-requested"}:
-                        next_action = (
-                            "查看当前 Summary 中逐台列出的完整机器命令，并由机器负责人复制对应命令直接审批；"
-                            "`/request_deploy` 是可选操作。"
-                        )
-                    else:
-                        next_action = "等待当前 HEAD 的 Review Agent 审核与镜像构建结果，再按更新后的 Summary 操作。"
-                elif intent == "request_acceptance":
-                    next_action = (
-                        "确认 Lifecycle 为 `testing`，并由本轮实际部署机器 Owner 执行 "
-                        "`/request_acceptance`；测试视频或图片上传完全可选。"
-                    )
-                elif intent == "record_test":
-                    next_action = (
-                        "先确认存在本轮验收请求，再由当前仓库 `test_reviewers.yaml` 授权账号执行 "
-                        "`/record_test result=pass` 或 `/record_test result=fail`。"
-                    )
-                elif status == "testing":
-                    next_action = (
-                        "查看 PR Summary 中的固定上传链接（可选上传测试视频或图片，方便验收人了解实际效果）；"
-                        "测试完成后由本轮机器 Owner 执行 `/request_acceptance`。"
-                    )
-                elif status in {"review-required", "reviewing", "no-lifecycle"}:
-                    next_action = "等待 Review Agent 完成当前 HEAD 的审核和镜像构建，并查看 PR Summary。"
-                else:
-                    next_action = "查看当前 PR Lifecycle Summary，并按其中的可执行命令或阻断原因处理。"
-            detail = message.strip()
-            if detail.startswith(comments_mod.BOT_MARKER):
-                detail = detail[len(comments_mod.BOT_MARKER):].lstrip()
-            detail_lines = detail.splitlines()
-            if detail_lines and detail_lines[0].startswith("### "):
-                detail = "\n".join(detail_lines[1:]).strip()
-            if error_label == "机器不存在。":
-                detail = "当前仓库机器配置中不存在该 alias 或 IP。"
-            message = "\n".join([
-                comments_mod.BOT_MARKER,
-                "### Deploy Approval — Command rejected",
-                "",
-                f"**输入命令：** `{comments_mod._escape(command_input)}`",
-                f"**具体错误：** {error_label}",
-                f"**失败原因：** {detail or '该命令未满足当前生命周期、权限或机器策略条件。'}",
-                f"**当前生命周期：** `{status}`",
-                "**下一步：**",
-                next_action,
-            ])
+            guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
+            message = self._format_user_reply(self._failure_lead(reason), guidance)
+        else:
+            guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
+            message = self._format_user_reply(message, guidance)
         try:
             delivered = await self._post_bound_notice(
                 repo, pr_number, head_sha=head, round_id=round_id,
@@ -11177,72 +11143,48 @@ class DeployController:
         self, repo: str, pr: dict | None, reviewers_configured: bool,
         eligible_reviewers: list[str],
     ) -> str:
-        """Describe repo-scoped acceptance authorization without TEST ONLY leaks."""
-        if self._is_test_only_pr(pr):
-            if reviewers_configured and eligible_reviewers:
-                return (
-                    "[TEST ONLY] 提醒当前仓库 `test_reviewers.yaml` 中的验收人："
-                    + " ".join(f"@{reviewer}" for reviewer in eligible_reviewers)
-                    + "。PR 作者身份不影响名单内人员收到提醒；此提醒不改变 `/record_test` 权限。"
-                )
-            if reviewers_configured:
-                return (
-                    "[TEST ONLY] 当前仓库 `test_reviewers.yaml` 没有有效验收账号，因此未提醒任何人；"
-                    "这不改变原有 `/record_test` 权限。"
-                )
-            return (
-                f"[TEST ONLY] 当前仓库 `{repo}` 没有可确认的有效验收白名单；"
-                "未提醒任何人，也未提醒其他验收人。这不改变原有授权规则；"
-                "当前没有可用的 `/record_test` 授权账号。请检查该仓库 main 分支的 "
-                "`test_reviewers.yaml`。"
-            )
+        """Describe repo-scoped acceptance authorization in user-facing terms."""
         if eligible_reviewers:
-            return "当前仓库有效验收人：" + " ".join(
+            return "验收由这些 GitHub 账号执行：" + " ".join(
                 f"@{reviewer}" for reviewer in eligible_reviewers
             )
         if not reviewers_configured:
-            return (
-                f"当前仓库 `{repo}` 没有可确认的有效验收白名单，请检查该仓库 main 分支的 `test_reviewers.yaml`。"
-            )
-        return f"当前仓库 `{repo}` 的验收白名单中没有可用的 GitHub 账号。"
+            return "目前没有可确认的验收账号，请联系仓库维护者检查验收名单。"
+        return "当前验收名单中没有可用的 GitHub 账号，请联系仓库维护者检查验收名单。"
 
     _MACHINE_BLOCKING_GUIDANCE = (
         ("REPOSITORY_POLICY_MISSING",
-         "当前仓库 main 没有已验证的 machines.yaml：请在该仓库 main 提交有效的 "
-         "machines.yaml（node_id、node_host、owners、targets、platforms、driver_paths），"
-         "等待策略刷新后重试。"),
+         "仓库还没有可用的机器配置，暂时无法生成审批命令；请联系仓库维护者。"),
         ("MACHINE_NOT_AUTHORIZED",
-         "物理机器未获当前仓库授权：请在该仓库 main 的 machines.yaml 中登记该机器，"
-         "alias、node_id 与主 IP 必须与机器身份一致。"),
+         "机器还没有加入当前仓库的可用机器清单；请联系仓库维护者。"),
         ("MACHINE_IDENTITY_MISMATCH",
-         "仓库策略与物理机器身份不一致：请核对 machines.yaml 的 alias、node_host "
-         "与该机器实际主 IP。"),
+         "机器登记信息与机器实际身份不一致；请联系仓库维护者核对。"),
         ("OWNER_NOT_CONFIGURED",
-         "兼容机器没有有效负责人：请在 machines.yaml 的 owners 中填写 GitHub 账号。"),
+         "机器还没有可用的负责人账号；请联系仓库维护者配置。"),
         ("AGENT_CORE_CREDENTIAL_MISSING",
-         "兼容机器缺少 Agent Core 凭证：请为该机器配置 Agent Core token。"),
+         "机器还没有配置部署访问凭证；请联系仓库维护者处理。"),
         ("AGENT_CORE_UNAVAILABLE",
-         "兼容机器的 Agent Core 当前无法连接：请检查机器与 Agent Core 服务。"),
+         "机器暂时无法连接，请稍后重试。"),
         ("AGENT_CORE_UNKNOWN",
-         "兼容机器的 Agent Core 尚未确认：审批会先执行只读预检。"),
+         "机器连接状态还没有确认；审批时会先做一次只读检查。"),
         ("TARGET_UNSUPPORTED",
-         "机器未声明当前组件目标：请在 machines.yaml 的 targets 中加入该目标。"),
+         "机器不支持本次部署的组件类型。"),
         ("PLATFORM_MISMATCH",
-         "构建平台与机器配置不匹配：请核对 machines.yaml 的 platforms 与本次构建平台。"),
+         "本次构建平台与机器不匹配。"),
         ("PLATFORM_UNVERIFIED",
-         "构建平台或机器平台未验证：请确认本次构建平台和 machines.yaml 的 platforms。"),
+         "构建平台或机器平台还没有确认。"),
         ("VARIANT_MISMATCH",
-         "组件 variant 不在机器 variants 中：请核对 machines.yaml 的 variants。"),
+         "机器不支持本次组件的版本。"),
         ("DRIVER_PATH_MISMATCH",
-         "组件 driver_path 不在机器 driver_paths 中：请核对 machines.yaml 的 driver_paths。"),
+         "机器不支持本次组件的驱动路径。"),
         ("PRIMARY_IP_AMBIGUOUS",
-         "主 IP 存在歧义：请确保一个主 IP 只绑定一台物理机器。"),
+         "同一个主 IP 对应了多台机器，暂时无法安全选择。"),
     )
 
     def _machine_blocking_summary(self, groups: list[dict]) -> list[str]:
         """Explain why no approval command exists without dumping every machine."""
         if not groups:
-            return ["当前无法读取物理机器清单，因此不会生成审批命令。"]
+            return ["暂时读取不到机器清单，因此没有生成审批命令。"]
         present: set[str] = set()
         for group in groups:
             if not isinstance(group, dict):
@@ -11251,9 +11193,8 @@ class DeployController:
                 if isinstance(reason, str):
                     present.add(reason)
         if not present:
-            return ["当前没有兼容的机器可提交审批：请检查该仓库 main 的 machines.yaml 和 "
-                    "Agent Core 配置。"]
-        lines = ["当前没有可执行的审批命令。阻断原因和需要检查的配置："]
+            return ["当前没有可以审批的兼容机器；请联系仓库维护者检查机器配置。"]
+        lines = ["当前没有可以执行的审批命令："]
         for reason, guidance in self._MACHINE_BLOCKING_GUIDANCE:
             if reason in present:
                 lines.append(f"- {guidance}")
@@ -11327,18 +11268,20 @@ class DeployController:
                 and group.get("approval_available") is True
                 and bool(group.get("component_ids"))
             )
-            owner_labels = [
-                f"@{owner}" if can_mention_owners else owner
-                for owner in valid_owners
-            ]
-            owner_label = " ".join(owner_labels) if owner_labels else "负责人待配置"
             component_label = self._component_summary_labels(
                 group.get("component_ids", []), components,
             )
             components_note = f"，兼容组件：{component_label}" if component_label else ""
+            requester_note = (
+                "，请 " + " ".join(
+                    f"@{owner}" if can_mention_owners else owner
+                    for owner in valid_owners
+                ) + " 审批"
+                if valid_owners else ""
+            )
             lines.append(
-                f"机器 `{alias}`（主 IP：`{primary_ip}`），Owner：{owner_label}"
-                f"{components_note}"
+                f"机器 `{alias}`（主 IP：`{primary_ip}`）"
+                f"{components_note}{requester_note}"
             )
             lines.append(f"`/approve_deploy machine={selector}`")
         return lines
@@ -11359,17 +11302,17 @@ class DeployController:
             pr = await self.proxy.get_pr(repo, pr_number)
             if (not isinstance(pr, dict) or pr.get("state") != "open"
                     or pr.get("merged") or pr.get("draft")):
-                return "Deployment approval requires an open, unmerged, non-draft PR."
+                return "这个 PR 目前不能部署，审批命令暂时不可用。"
             head = pr.get("head", {}).get("sha", "")
             state = await self.proxy.read_hidden_state(repo, pr_number)
             if (not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
                     or not isinstance(state, dict) or state.get("head_sha") != head):
-                return "The PR HEAD or lifecycle changed; wait for the current Lifecycle Summary to update before retrying."
+                return "PR 的提交或部署进度已经变化，请等 PR Summary 更新后再操作。"
             status = state.get("status", "")
             if status not in {
                     "deploy-ready", "deploy-requested", "testing",
                     "succeeded", "failed"}:
-                return f"Current lifecycle status is `{status or 'unknown'}`; wait until deployment approval is available."
+                return "当前阶段还不能部署审批，请等 PR Summary 更新后再操作。"
             review_evidence = state.get("review_evidence")
             components = state.get("components")
             if (not isinstance(review_evidence, dict) or not isinstance(components, list)
@@ -11377,22 +11320,21 @@ class DeployController:
                         repo, pr_number, head, review_evidence,
                         expected_components=components,
                     )):
-                return "Current HEAD does not have fresh trusted Review Agent evidence; wait for lifecycle reconciliation."
+                return "当前提交的审核和构建结果还不能确认，请等 PR Summary 更新。"
             if status in {"testing", "succeeded", "failed"}:
                 drift_commands = self._runtime_drift_command_lines(state, repo)
                 if drift_commands:
-                    return "已确认运行镜像漂移。机器负责人可直接使用对应机器命令重新审批；`/request_deploy` 可选：\n" + "\n".join(
+                    return "已确认运行镜像需要重新部署，请使用对应机器的审批命令：\n" + "\n".join(
                         f"`{command}`" for command in drift_commands
                     )
                 checks = state.get("runtime_checks", [])
                 unreadable = self._runtime_unreadable_lines(checks)
                 if unreadable:
                     return "\n".join([
-                        "当前机器运行状态不可读，无法判断是否需要重新部署。",
+                        "目前无法确认机器上的运行镜像，暂时不能判断是否需要重新部署。",
                         *unreadable,
-                        "请恢复机器连接和本仓库策略后等待下一次状态检查；此时不生成审批命令。",
                     ])
-                return "当前没有已确认的镜像漂移，若运行镜像已一致则无需重新部署；等待状态检查更新。"
+                return "机器上已经在运行本次批准的镜像，不需要重新部署。"
             if status == "deploy-requested" and state.get("runtime_redeploy"):
                 drift_commands = self._runtime_drift_command_lines(state, repo)
                 if not drift_commands:
@@ -11401,16 +11343,15 @@ class DeployController:
                     )
                     if unreadable:
                         return "\n".join([
-                            "当前漂移机器运行状态不可读，无法生成重新审批命令。",
+                            "目前无法确认机器的运行镜像，因此还不能生成重新审批命令。",
                             *unreadable,
-                            "请恢复机器连接与仓库策略，等待下一次状态检查。",
                         ])
-                    return "当前漂移机器状态无法确认。检查机器连接与仓库策略，等待下一次状态检查。"
-                return "当前部署请求绑定了漂移机器，请直接使用对应机器审批命令；`/request_deploy` 可选：\n" + "\n".join(
+                    return "目前还没有确认到需要重新部署的镜像差异，请等状态更新。"
+                return "这台机器需要重新部署，请使用对应的审批命令：\n" + "\n".join(
                     f"`{command}`" for command in drift_commands
                 )
             if status not in {"deploy-ready", "deploy-requested"}:
-                return f"Current lifecycle status is `{status or 'unknown'}`; wait until deployment approval is available."
+                return "当前阶段还不能部署审批，请等 PR Summary 更新后再操作。"
             deployed_ids = _component_id_set(state.get("deployments", []))
             remaining = [
                 component for component in components
@@ -11424,7 +11365,7 @@ class DeployController:
             )
             if not command_lines:
                 return "\n".join(self._machine_blocking_summary(groups))
-            lines = ["可执行的机器审批命令：", *command_lines]
+            lines = ["可以执行的机器审批命令：", *command_lines]
             required_ids = {
                 component.get("component_id") for component in remaining
                 if isinstance(component, dict) and isinstance(component.get("component_id"), str)
@@ -11441,38 +11382,58 @@ class DeployController:
         except Exception as exc:
             logger.warning("approval guidance unavailable %s#%s exception=%s",
                            repo, pr_number, type(exc).__name__)
-            return "The current machine list could not be verified. Check the Lifecycle Summary before retrying."
+            return "目前无法确认可用的机器，请先查看 PR Summary 再操作。"
 
     async def _lifecycle_next_action_guidance(self, repo: str, pr_number: int) -> str:
-        """Build next action guidance based on current lifecycle state."""
+        """Return the one correct-operation text for the current lifecycle state.
+
+        Every command reply takes its "what to do now" block from here, so the
+        same PR/HEAD/lifecycle/policy always yields identical guidance.
+        """
+        unavailable = (
+            "暂时无法确认 PR 的最新提交和部署进度。"
+            "请稍后刷新 PR Summary；在状态确认前不要重复部署审批。"
+        )
         try:
             pr = await self.proxy.get_pr(repo, pr_number)
             if (not isinstance(pr, dict) or pr.get("state") != "open"
                     or pr.get("merged") or pr.get("draft")):
-                return "Deployment approval requires an open, unmerged, non-draft PR."
+                return "这个 PR 目前不能部署。请在 PR 保持开放、未合并且非草稿时再操作。"
             head = (pr.get("head") or {}).get("sha", "")
             if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
-                return "无法验证最新 PR HEAD；请等待当前 Lifecycle Summary 更新后再操作。"
+                return unavailable
 
             state = await self.proxy.read_hidden_state(repo, pr_number)
             if not isinstance(state, dict):
-                return "Lifecycle state is unavailable; wait for reconciliation."
+                return unavailable
             if state.get("head_sha") != head:
-                return "PR HEAD 已变化；请等待当前 Lifecycle Summary 更新，旧 HEAD 的镜像和部署命令不能使用。"
+                return (
+                    "PR 刚有新的提交，旧的审核、镜像和审批命令都不能再用。"
+                    "请等当前提交的 PR Summary 更新后再操作；PR 作者先执行 `/request_bot_review`。"
+                )
             latest_pr = await self.proxy.get_pr(repo, pr_number)
             latest_head = (latest_pr.get("head") or {}).get("sha", "") \
                 if isinstance(latest_pr, dict) else ""
             if (not isinstance(latest_pr, dict) or latest_pr.get("state") != "open"
                     or latest_pr.get("merged") or latest_pr.get("draft")
                     or latest_head != head):
-                return "PR HEAD 或开放状态已变化；请等待当前 Lifecycle Summary 更新，旧镜像部署命令不能使用。"
+                return (
+                    "PR 状态或最新提交刚刚变化，旧部署命令已经失效。"
+                    "请等待 PR Summary 更新后再操作。"
+                )
             pr = latest_pr
 
             status = state.get("status", "review-required")
             if status == "review-required":
-                return "当前 HEAD 尚未完成审核和构建，请由 PR 作者执行：`/request_bot_review`"
+                return (
+                    "当前提交还没有审核和镜像构建结果。"
+                    "请由 PR 作者执行 `/request_bot_review`，完成后等待 Summary 更新。"
+                )
             if status == "reviewing":
-                return "当前 HEAD 正在审核并构建镜像，请等待 Review Agent 完成；此时不要部署。"
+                return (
+                    "当前提交正在审核并构建镜像，请等待审核和构建完成。"
+                    "这期间不需要、也不能部署。"
+                )
 
             if status in {"deploy-ready", "deploy-requested"}:
                 review_evidence = state.get("review_evidence")
@@ -11482,7 +11443,10 @@ class DeployController:
                             repo, pr_number, head, review_evidence,
                             expected_components=components,
                         )):
-                    return "当前 HEAD 的审核或构建证据已变化或无法确认；请等待 Lifecycle Summary 更新后再使用部署命令。"
+                    return (
+                        "当前提交的审核或构建结果还在确认。"
+                        "请等待 PR Summary 更新后再使用部署审批命令。"
+                    )
 
                 deployed_ids = _component_id_set(state.get("deployments", []))
                 remaining = [
@@ -11491,15 +11455,16 @@ class DeployController:
                     and component.get("component_id") not in deployed_ids
                 ]
                 if not remaining:
-                    return "所有组件均已有部署记录；请等待 Lifecycle 更新确认下一状态。"
+                    return "所有组件都已经部署完成，请等待 PR Summary 更新到测试阶段。"
 
                 groups = (
                     self._runtime_redeploy_machine_groups(state, remaining, repo)
                     if state.get("runtime_redeploy") else
                     self._get_machine_groups_for_components(remaining, repo)
                 )
+                mention_owners = status == "deploy-requested"
                 command_lines = self._machine_notice_lines(
-                    groups, repo, mention_owners=False,
+                    groups, repo, mention_owners=mention_owners,
                     test_only=self._is_test_only_pr(pr), components=remaining,
                 )
                 if not command_lines:
@@ -11516,28 +11481,70 @@ class DeployController:
                     and remaining_ids.issubset(set(group.get("component_ids", [])))
                 ]
                 if status == "deploy-ready":
-                    lines = ["当前 HEAD 可用的兼容机器审批命令：", *command_lines]
+                    lines = ["可以按下面的机器命令审批：", *command_lines]
                     if len(full_groups) == 1:
                         lines.append(
-                            "只有一台机器完整兼容所有未部署组件，可直接执行：`/approve_deploy`。"
+                            "只有一台机器完整适配所有组件，也可以直接执行 `/approve_deploy`。"
                         )
                     elif len(full_groups) > 1:
-                        lines.append("多台机器完整兼容，必须从上方选择并提供 `machine=`；不会随机选机。")
+                        lines.append(
+                            "有多台机器完整适配，请用上面的命令明确指定机器。"
+                        )
                     elif remaining_ids:
-                        lines.append("没有单台机器覆盖所有未部署组件；请按上方命令逐机审批，命令必须提供 `machine=`。")
-                    lines.append("`/request_deploy` 是可选步骤。")
+                        lines.append(
+                            "没有单台机器覆盖全部组件，请按上面的命令分批审批。"
+                        )
+                    lines.append("`/request_deploy` 是可选的，不是部署审批的前提。")
                     return "\n".join(lines)
 
-                return "尚未部署组件的兼容机器及审批命令：\n" + "\n".join(command_lines)
+                return "还需要以下机器完成审批：\n" + "\n".join(command_lines)
 
             if status == "deploying":
-                return "部署正在进行中或结果正在确认；禁止重复提交部署，请等待 Lifecycle 更新。"
+                return (
+                    "部署正在进行或结果正在确认，请不要重复提交审批，也不要重新部署。"
+                    "等待 PR Summary 显示部署结果即可。"
+                )
             if status == "testing":
-                return "部署已经完成，可以开始测试。上传测试视频或图片完全可选。正确命令：`/request_acceptance`"
+                upload_url = ""
+                command = state.get("command", {})
+                approval_comment_id = (
+                    int(command.get("comment_id", 0) or 0)
+                    if isinstance(command, dict) else 0
+                )
+                if approval_comment_id > 0:
+                    upload_url = await self._current_testing_upload_url(
+                        repo, pr_number, head_sha=head,
+                        round_id=round_id_for_state(state),
+                        approval_comment_id=approval_comment_id,
+                    )
+                upload_text = (
+                    f"测试视频或图片可以选择上传：{upload_url}。上传完全可选，不影响验收。"
+                    if upload_url else
+                    "测试视频或图片上传完全可选，不影响验收；上传入口恢复后 PR Summary 中会出现固定链接。"
+                )
+                return (
+                    "部署已完成，可以开始测试。"
+                    f"{upload_text} "
+                    "测试完成后，请由本轮机器的负责人执行 `/request_acceptance`。"
+                )
             if status == "acceptance-required":
-                return "请记录验收结果：\n`/record_test result=pass`\n`/record_test result=fail`"
+                try:
+                    _configured, reviewers = self._eligible_acceptance_reviewers(repo, pr)
+                except Exception:
+                    reviewers = []
+                reviewer_text = (
+                    "请 " + " ".join(f"@{reviewer}" for reviewer in reviewers) + " 验收"
+                    if reviewers else
+                    "当前仓库还没有可用的验收账号，请联系仓库维护者配置"
+                )
+                return (
+                    f"{reviewer_text}。"
+                    "验收人需要检查本轮测试结果和实际效果，然后执行 "
+                    "`/record_test result=pass` 或 `/record_test result=fail`。"
+                )
             if status == "succeeded":
-                return "验收已完成。"
+                return "验收已经通过，本轮部署已经完成。请按仓库 PR 流程继续合并。"
+
             if status == "failed":
                 failure_detail = ""
                 try:
@@ -11552,28 +11559,47 @@ class DeployController:
                 except Exception as exc:
                     logger.warning("failed lifecycle detail unavailable %s#%s: %s",
                                    repo, pr_number, type(exc).__name__)
-                if failure_detail:
-                    if state.get("test_result") == "fail":
-                        return (
-                            f"当前验收失败信息：{failure_detail}\n"
-                            "请按该失败信息修复并更新 PR；新 HEAD 需要重新完成审核和镜像构建，再依据新 Summary 继续。"
-                        )
-                    return (
-                        f"当前失败信息：{failure_detail}\n"
-                        "请先按该原因修复并确认机器/运行时状态可读，再由 PR 作者执行 `/request_deploy` 建立新轮次，"
-                        "并按最新 Summary 的机器命令审批；若只读检查确认镜像 `MISMATCH`，机器 Owner 可直接执行对应 `/approve_deploy`。"
-                    )
                 if state.get("test_result") == "fail":
-                    return (
-                        "当前验收结果为 `fail`。请依据 Lifecycle Summary 中的测试失败信息修复问题；"
-                        "更新 PR 后等待当前 HEAD 的审核和镜像构建，再按新 Summary 操作。"
+                    reason_text = (
+                        f"本轮验收未通过：{failure_detail}。" if failure_detail
+                        else "本轮验收未通过。"
                     )
-                return "部署或验收失败；Lifecycle Summary 未提供可读取的具体 Error。请查看最新 Summary 的失败信息并按其恢复步骤处理。"
+                    return (
+                        f"{reason_text}"
+                        "请按失败信息修复问题并更新 PR；新提交需要重新审核和构建，"
+                        "之后按新的 PR Summary 重新部署和测试。"
+                    )
+                commands = []
+                try:
+                    commands = list(dict.fromkeys(
+                        self._runtime_drift_command_lines(state, repo),
+                    ))
+                except Exception:
+                    commands = []
+                reason_text = (
+                    f"本轮部署失败：{failure_detail}。" if failure_detail
+                    else "本轮部署失败。"
+                )
+                if commands:
+                    return (
+                        f"{reason_text}"
+                        "请先按失败信息修复并确认机器可以正常读取，然后由对应机器负责人执行：\n"
+                        + "\n".join(f"- `{command}`" for command in commands)
+                    )
+                return (
+                    f"{reason_text}"
+                    "请先按失败信息修复并确认机器可以正常读取，"
+                    "再由 PR 作者执行 `/request_deploy`，随后按 PR Summary 中的机器命令审批。"
+                )
 
-            return f"当前状态 `{status}` 暂无明确下一步建议。"
-        except Exception as e:
-            logger.warning("guidance unavailable %s#%s: %s", repo, pr_number, e)
-            return "无法生成下一步建议，请稍后再试。"
+            return (
+                "当前阶段没有可以执行的部署操作。"
+                "请查看 PR Summary 中显示的最新进度后再操作。"
+            )
+        except Exception as exc:
+            logger.warning("guidance unavailable %s#%s: %s",
+                           repo, pr_number, type(exc).__name__)
+            return unavailable
 
     async def _project_status_best_effort(
         self, repo: str, pr_number: int, status: str,
@@ -11634,8 +11660,8 @@ class DeployController:
         markdown = self._approval_retry_markdown(
             repo, pr_number, blocked_state, machine_groups,
             test_only=self._is_test_only_pr(pr),
-            gate_note=[reason, "No deploy POST was sent for the pending component.",
-                       "Review the current machine list and submit a NEW approval command."],
+            gate_note=["部署前检查发现机器配置已经变化，这次没有发送部署请求。",
+                       "请按 PR Summary 中当前的完整机器命令重新审批。"],
             deployments=self._enrich_deployments_for_render(
                 blocked_state.get("deployments", []), repo,
             ),
@@ -11650,20 +11676,10 @@ class DeployController:
         if not written:
             return False
         await self._project_status_best_effort(repo, pr_number, blocked_state["status"])
-        command_lines = self._machine_notice_lines(
-            machine_groups, repo, mention_owners=False,
-            test_only=self._is_test_only_pr(pr), components=remaining,
-        )
-        message_lines = [reason, "No deploy POST was sent for the pending component."]
-        if command_lines:
-            message_lines.extend(["Current compatible commands:", *command_lines])
-        else:
-            message_lines.extend(self._machine_blocking_summary(machine_groups))
         await self._post_command_reply(
-            repo, pr_number, comment_id, "\n".join(message_lines),
+            repo, pr_number, comment_id,
+            "部署前检查发现机器策略已经变化，这次没有发送部署请求。",
             topic="machine-policy-changed-before-deploy", error=True,
-            next_action=("检查当前仓库有效 `machines.yaml`、机器身份、组件兼容性和 Agent Core 状态；"
-                         "确认 Summary 显示最新可执行命令后再重新审批。"),
         )
         return True
 
@@ -11671,46 +11687,53 @@ class DeployController:
         self, repo: str, pr_number: int, current_status: str, next_action_text: str,
         *, comment_id: int = 0,
     ) -> None:
-        """Post a non-error 'command not ready' reply comment."""
-        body = "\n".join([
-            comments_mod.BOT_MARKER,
-            "### Deploy Approval — Command not ready",
-            "",
-            f"Current lifecycle: `{current_status}`",
-            "",
-            "### Next action",
-            "",
-            next_action_text,
-        ])
+        """Post a unified "not ready" reply for a command that cannot run yet."""
+        reason = self._command_error_reason(
+            topic="command-not-ready", message=next_action_text,
+        )
         if comment_id:
             await self._post_command_reply(
-                repo, pr_number, comment_id, body, topic="command-not-ready",
-                error=True, next_action=next_action_text,
+                repo, pr_number, comment_id, reason, topic="command-not-ready",
+                error=True,
             )
-        else:
-            try:
-                await self.proxy.post_issue_comment(repo, pr_number, body)
-            except GitHubError as e:
-                logger.warning("post command not ready comment %s#%s: %s", repo, pr_number, e)
+            return
+        guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
+        try:
+            await self._post_bound_plain_notice(
+                repo, pr_number,
+                self._format_user_reply(self._failure_lead(reason), guidance),
+            )
+        except GitHubError as e:
+            logger.warning("post command not ready comment %s#%s: %s", repo, pr_number, e)
+
+    async def _post_bound_plain_notice(
+        self, repo: str, pr_number: int, message: str,
+    ) -> bool:
+        """Post a formatted reply that has no source command comment to bind to."""
+        payload = message.strip()
+        if not payload:
+            return False
+        body = "\n".join((comments_mod.BOT_MARKER, "", payload))
+        posted = await self.proxy.post_issue_comment(repo, pr_number, body)
+        return bool(isinstance(posted, dict) and posted.get("id"))
 
     async def _post_error(
         self, repo: str, pr_number: int, message: str, *, comment_id: int = 0,
     ) -> None:
-        """Post an error reply comment."""
-        body = "\n".join([
-            comments_mod.BOT_MARKER,
-            "### Deploy Approval \u2014 Error",
-            "",
-            message,
-        ])
+        """Post a unified failure reply for a command that did not execute."""
+        reason = self._command_error_reason(message=message)
+        guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
+        body_text = self._format_user_reply(self._failure_lead(reason), guidance)
         if comment_id:
-            topic = "command-error-" + hashlib.sha256(message.encode("utf-8")).hexdigest()[:12]
+            topic = "command-error-" + hashlib.sha256(
+                body_text.encode("utf-8"),
+            ).hexdigest()[:12]
             await self._post_command_reply(
-                repo, pr_number, comment_id, body, topic=topic, error=True,
+                repo, pr_number, comment_id, message, topic=topic, error=True,
             )
         else:
             try:
-                await self.proxy.post_issue_comment(repo, pr_number, body)
+                await self._post_bound_plain_notice(repo, pr_number, body_text)
             except GitHubError as e:
                 logger.warning("post error comment %s#%s: %s", repo, pr_number, e)
 
@@ -12033,18 +12056,17 @@ class DeployController:
                           and item.get("already_target") is True]
         if not already_target:
             return
-        component_ids = [item.get("component_id", "") for item in already_target]
         primary_ip, _, _ = self._runtime_display_identity(machine.alias, repo)
         display_ip = primary_ip or "主 IP 未记录"
         if len(already_target) == len(health):
             message = (
-                f"重新检查确认机器 `{machine.alias}`（主 IP：`{display_ip}`）上所选组件已运行审批目标镜像，"
-                "无需重新部署；ZERO deploy POST。"
+                f"重新检查确认机器 `{machine.alias}`（主 IP：`{display_ip}`）上已经在运行本次批准的镜像，"
+                "不需要重新部署。"
             )
         else:
             message = (
-                f"重新检查确认机器 `{machine.alias}`（主 IP：`{display_ip}`）上这些组件已运行审批目标镜像，"
-                f"无需对它们重新部署：{', '.join(component_ids)}。这些组件 ZERO deploy POST。"
+                f"重新检查确认机器 `{machine.alias}`（主 IP：`{display_ip}`）上这部分组件已经在运行本次批准的镜像，"
+                "不需要重新部署。"
             )
         await self._post_command_reply(
             repo, pr_number, comment_id, message,
@@ -12722,19 +12744,18 @@ class DeployController:
                 detail_lines = []
                 for check in checks:
                     component = component_map.get(check.get("component_id"))
-                    observed = self._runtime_observed_image_for_display(
-                        check, component,
+                    target_name = (
+                        str(component.get("target", "") or "")
+                        if isinstance(component, dict) else ""
                     )
                     detail_lines.append(
-                        f"- `{check['component_id']}`: target `{check['target_image']}`, "
-                        f"observed `{observed or 'unavailable'}`, "
-                        f"last check `{check.get('checked_at', '')}`"
+                        f"- {target_name or '组件'}"
                     )
                 details = "\n".join(detail_lines)
                 if status_value == "match":
                     message = (
-                        f"机器 `{machine_alias}`（主 IP：`{primary_ip or '未记录'}`），Owner：{owner_text}。\n"
-                        f"{details}\nMATCH：运行镜像已与审批目标一致，无需重新部署。"
+                        f"机器 `{machine_alias}`（主 IP：`{primary_ip or '未记录'}`）"
+                        f"{' 的 ' + details.lstrip('- ') if details else ''}已经在运行本轮批准的镜像，不需要重新部署。"
                     )
                 elif status_value == "mismatch":
                     mismatch_ids = {
@@ -12775,39 +12796,32 @@ class DeployController:
                     if command_selector and eligible_group is not None:
                         owners = list(eligible_group.get("owners", []) or owners)
                         owner_labels = self._runtime_transition_owner_labels(owners)
-                        owner_text = " ".join(owner_labels) if owner_labels else "负责人待配置"
+                        owner_text = " ".join(owner_labels) if owner_labels else ""
                     if command_selector:
                         message = (
-                            f"机器 `{machine_alias}`（主 IP：`{primary_ip}`），Owner：{owner_text}。"
-                            f"\n{details}\n比较状态：MISMATCH（运行镜像与当前审批目标不一致，需要重新部署）。"
-                            f"请机器负责人直接执行 `/approve_deploy machine={command_selector}`。"
-                            "`/request_deploy` 可选，不是前提。审批前会重新只读确认当前镜像；"
-                            "若已一致或无法连接，不会发送部署请求。"
+                            f"机器 `{machine_alias}`（主 IP：`{primary_ip}`）上运行的镜像与本次批准的版本不一致，需要重新部署。"
+                            + (f"\n\n请执行 `/approve_deploy machine={command_selector}`。" if not owner_text
+                               else f"\n\n请 {owner_text} 执行 `/approve_deploy machine={command_selector}`。")
                         )
                     else:
                         message = (
-                            f"机器 `{machine_alias}`（主 IP：`{primary_ip or '未记录'}`），Owner：{owner_text}。"
-                            f"\n{details}\n比较状态：MISMATCH（运行镜像与当前审批目标不一致）。"
-                            "当前仓库策略、机器身份或组件适配未全部确认，暂不提供审批命令；"
-                            "请管理员先检查本仓库机器策略。"
+                            f"机器 `{machine_alias}`（主 IP：`{primary_ip or '未记录'}`）上运行的镜像与本次批准的版本不一致，需要重新部署。"
+                            "\n\n目前还没有可确认的审批命令，请联系仓库维护者核对机器配置。"
                         )
                 elif status_value == "not_running":
                     message = (
-                        f"机器 `{machine_alias}`（主 IP：`{primary_ip or '未记录'}`），Owner：{owner_text}。"
-                        f"\n{details}\n比较状态：UNAVAILABLE（组件当前未运行，无法确认运行镜像是否漂移）。"
-                        "等待组件恢复运行后重新检查；当前不生成重新审批命令，也不会发送部署请求。"
+                        f"机器 `{machine_alias}`（主 IP：`{primary_ip or '未记录'}`）上的组件当前没有运行，"
+                        "暂时无法确认运行镜像。请等待组件恢复运行后重新检查。"
                     )
                 elif status_value == "identity_changed":
                     message = (
-                        f"机器 `{machine_alias}`（主 IP：`{primary_ip or '未记录'}`），Owner：{owner_text}。"
-                        f"\n{details}\n比较状态：UNAVAILABLE（机器身份或运行时绑定无法确认）。"
-                        "请管理员核对本仓库机器策略；确认身份前不生成重新审批命令，也不会发送部署请求。"
+                        f"机器 `{machine_alias}`（主 IP：`{primary_ip or '未记录'}`）的登记信息发生了变化，"
+                        "暂时无法确认运行镜像。请联系仓库维护者核对机器配置。"
                     )
                 else:
                     message = (
-                        f"机器 `{machine_alias}`（主 IP：`{primary_ip or '未记录'}`），Owner：{owner_text}。"
-                        f"\n{details}\n比较状态：UNAVAILABLE（Agent Core 或运行状态暂时不可读）。"
-                        "恢复访问后等待重新检查；当前不生成重新审批命令，也不会发送部署请求。"
+                        f"目前无法连接机器 `{machine_alias}`（主 IP：`{primary_ip or '未记录'}`）确认运行镜像，"
+                        "请等待机器恢复可访问后重新检查。"
                     )
                 transition_identity = repr(sorted(
                     (check.get("component_id", ""), previous_checked_at,
@@ -12914,8 +12928,7 @@ class DeployController:
                     and command_args.get("preflight_pending") is True):
                 restored = await self._restore_interrupted_approval_preflight(
                     repo, pr_number,
-                    reason=("The previous approval was interrupted during read-only preflight. "
-                            "No deploy POST was sent for the pending component; review the current Summary and submit a new approval."),
+                    reason="上一次审批在部署前检查阶段中断，当时没有发送部署请求，这次也没有重复发送。",
                     topic="approval-preflight-retry-required",
                     require_stale=True,
                 )
@@ -13343,8 +13356,7 @@ class DeployController:
         if not self._deployment_request_was_submitted(state):
             markdown = self._mark_request_step_not_submitted(markdown)
         markdown += (
-            "\n\nThe Controller will periodically verify the exact target status. "
-            "It will not repeat the deployment POST."
+            "\n\n部署结果还在确认中，确认之前不会重复提交部署。"
         )
         event = {
             "event": "Deploy outcome uncertain",
@@ -13369,8 +13381,7 @@ class DeployController:
                     round_id=round_id_for_state(state), comment_id=comment_id,
                     topic="deployment-recovery-waiting",
                     expected_command_kind="approve_deploy",
-                    message=("Deployment status is still being verified after restart. "
-                             "No deploy POST will be repeated until the current result is confirmed."),
+                    message="部署结果还在确认中，确认之前不会重复提交部署。",
                 )
             except Exception as exc:
                 logger.warning("uncertain notice %s#%s exception=%s",
@@ -13683,16 +13694,14 @@ class DeployController:
                 self._get_machine_groups_for_components(remaining_components, repo)
             )
             gate_note = ([
-                "### Restart Recovery", "",
-                "A prior deployment is still being verified. No deployment POST will be repeated.",
+                "上一次部署还在确认中，确认之前不会重复提交部署。",
             ] if unresolved else [
-                "### Restart Recovery", "",
-                "The attempted component was verified. Remaining components require a NEW approval.",
+                "上一次部署已经确认完成，剩余组件需要重新审批。",
             ])
             drift_commands = self._runtime_drift_command_lines(refreshed, repo)
             if refreshed.get("runtime_redeploy") and drift_commands:
                 gate_note.extend([
-                    "/request_deploy is optional. Use the confirmed machine command:",
+                    "请使用下面已确认的机器命令：",
                     *drift_commands,
                 ])
             markdown = self._approval_retry_markdown(
@@ -13733,8 +13742,7 @@ class DeployController:
                     comment_id=int(command.get("comment_id", 0) or 0),
                     topic="deployment-recovered-complete",
                     expected_command_kind="approve_deploy",
-                    message=(f"The deployment is confirmed complete for HEAD `{_short(refreshed['head_sha'])}` "
-                             f"in round `{round_id_for_state(refreshed)}`. Next, run testing and upload the test video."),
+                    message=("上一次部署已经确认完成，现在可以开始测试。"),
                 )
             elif recovered_ids and refreshed.get("status") in {"deploy-requested", "deploy-ready"}:
                 remaining = [
@@ -13758,7 +13766,7 @@ class DeployController:
                     topic="deployment-recovered-partial",
                     expected_command_kind="approve_deploy",
                     message="\n".join([
-                        "A partial deployment was confirmed. The remaining components need another approval.",
+                        "部署已经部分完成，剩余组件需要其他机器审批。",
                         *(
                             lines if lines else
                             self._machine_blocking_summary(remaining_groups)
@@ -13892,10 +13900,8 @@ class DeployController:
                 markdown = self._mark_request_step_not_submitted(markdown)
             if machine_alias:
                 markdown += "\n\n" + "\n".join([
-                    "### Restart Recovery",
-                    "",
-                    "Validation facts are temporarily unavailable.",
-                    "当前无法确认安全的机器审批命令；等待恢复验证后，按最新 Summary 中的命令操作，不要重复审批。",
+                    "目前无法确认机器上的运行状态。",
+                    "等待状态可读后按最新 PR Summary 操作，不要重复审批。",
                 ])
             event = {
                 "event": "Restart recovery snapshot unavailable",
@@ -14059,21 +14065,18 @@ class DeployController:
         state.update(updated_state)
 
         gate_note = [
-            "### Restart Recovery",
-            "",
-            "Validation facts were refreshed from the current HEAD.",
+            "当前提交的部署校验信息已经重新确认。",
         ]
         drift_commands = self._runtime_drift_command_lines(state, repo)
         if state.get("runtime_redeploy") and drift_commands:
             gate_note.extend([
-                "/request_deploy is optional. Use the confirmed machine command:",
+                "请使用下面已确认的机器命令：",
                 *drift_commands,
             ])
         elif machine_alias:
             gate_note.append(
-                "旧机器选择不会自动沿用；请按当前 Summary 中的可执行审批命令重新审批。"
+                "之前选择的机器不会自动沿用，请按 PR Summary 中的命令重新审批。"
             )
-        gate_note.append("fresh HEAD + actor -> FINAL PRE-DEPLOY VALIDATION")
         remaining_components = [
             c for c in state.get("components", [])
             if c.get("component_id", "") not in _component_id_set(state.get("deployments", []))
@@ -14360,37 +14363,20 @@ class DeployController:
             )
             await self._post_error(
                 repo, pr_number,
-                "Cannot verify this command's GitHub author, so no action was taken. Check the account identity and post a new command.",
+                "无法确认这条命令的发送者，因此没有执行。",
                 comment_id=comment_id,
             )
             return True
 
         intent = getattr(cmd, "intent", "") or cmd.kind
         if getattr(cmd, "error", "") or getattr(cmd, "intent", ""):
-            guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
-            if intent == "approve_deploy" and getattr(cmd, "error", "") == "missing_machine_value":
-                message = f"`machine=` is empty. \n下一步建议：\n{guidance}"
-            elif intent == "approve_deploy" and getattr(cmd, "error", "") == "invalid_ip_format":
-                message = f"`machine=` is not a valid IPv4 address. \n下一步建议：\n{guidance}"
-            elif intent == "approve_deploy" and str(getattr(cmd, "error", "")).startswith("duplicate_argument:"):
-                duplicate = str(cmd.error).split(":", 1)[1]
-                message = f"`{duplicate}=` was supplied more than once. \n下一步建议：\n{guidance}"
-            elif intent == "approve_deploy" and str(getattr(cmd, "error", "")).startswith("unknown_argument:"):
-                unknown = str(cmd.error).split(":", 1)[1]
-                message = f"Unsupported argument: `{unknown}`. \n下一步建议：\n{guidance}"
-            elif intent == "approve_deploy":
-                message = f"Invalid `/approve_deploy` arguments.\n下一步建议：\n{guidance}"
-            elif intent == "request_deploy":
-                message = f"`/request_deploy` takes no parameters.\n下一步建议：\n{guidance}"
-            elif intent == "request_acceptance":
-                message = f"`/request_acceptance` takes no parameters.\n下一步建议：\n{guidance}"
-            elif intent == "record_test":
-                message = f"`/record_test` requires `result=pass` or `result=fail`.\n下一步建议：\n{guidance}"
-            else:
-                message = f"命令无法执行。下一步建议：\n{guidance}"
-
             await self._post_error(
-                repo, pr_number, message, comment_id=comment_id,
+                repo, pr_number,
+                self._command_error_reason(
+                    command_kind=str(intent or ""),
+                    parsed_error=str(getattr(cmd, "error", "") or ""),
+                ),
+                comment_id=comment_id,
             )
             return True
 
@@ -14412,7 +14398,7 @@ class DeployController:
             if result not in ("pass", "fail"):
                 await self._post_error(
                     repo, pr_number,
-                    "`/record_test` requires `result=pass` or `result=fail`.",
+                    "验收结果只能填写通过或未通过。",
                     comment_id=comment_id,
                 )
                 return True
@@ -14447,7 +14433,7 @@ class DeployController:
             if evidence is None:
                 await self._post_error(
                     repo, pr_number,
-                    "Evidence storage is unavailable; the comment was not accepted.",
+                    "目前无法保存测试证据，这条内容没有被处理。",
                     comment_id=comment_id,
                 )
                 return True
@@ -14463,7 +14449,7 @@ class DeployController:
                 if getattr(exc, "status_code", None) in {400, 403, 404, 409, 410, 413}:
                     await self._post_error(
                         repo, pr_number,
-                        f"Evidence comment rejected: {getattr(exc, 'code', 'invalid_request')}.",
+                        "测试证据没有被接受，请检查上传内容后重新提交。",
                         comment_id=comment_id,
                     )
                     return True

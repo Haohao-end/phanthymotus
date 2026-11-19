@@ -17,6 +17,81 @@ _PREFIX = '/api/evidence/{owner}/{repo}/pulls/{pr}'
 _ID = re.compile(r'[A-Za-z0-9_-]{1,128}')
 _BASE = {'head_sha', 'round_id', 'idempotency_key'}
 
+# Public, user-facing errors. Internal EvidenceError codes never reach the
+# browser as text: each maps to one stable category plus a short Chinese
+# sentence. The category travels in a response header so the page can branch
+# without parsing (and without echoing) internal diagnostics.
+_ERROR_MESSAGES = {
+    'session_expired': '上传会话已失效，请重新打开 PR Summary 中的固定上传链接。',
+    'permission_denied': '当前链接没有上传权限，请从 PR Summary 重新打开固定上传链接。',
+    'context_changed': 'PR 或测试轮次已变化，请刷新 PR Summary 后重新打开上传链接。',
+    'too_large': '文件或分片超过服务端大小限制。',
+    'rate_limited': '上传过于频繁，请稍后再试。',
+    'not_found': '未找到对应的上传或附件记录。',
+    'invalid_request': '请求参数无效，请重新打开上传页面后再试。',
+    'conflict': '上传状态已变化，请刷新页面后重试。',
+    'unavailable': '附件服务暂时不可用，请稍后重试。',
+}
+_CONTEXT_CHANGED_CODES = {
+    'round_changed', 'context_not_writable', 'pr_closed', 'pr_closed_or_mismatched',
+    'pr_draft', 'state_unavailable', 'evidence_round_changed', 'evidence_pr_draft',
+    'evidence_pr_context_changed', 'evidence_pr_context_mismatch',
+}
+_SESSION_CODES = {
+    'invalid_evidence_capability', 'invalid_evidence', 'evidence_capability',
+    'evidence_client_key_required', 'evidence_comment_proof_required',
+    'evidence_comment_proof_not_found', 'evidence_comment_proof_expired',
+    'evidence_comment_proof_invalid', 'evidence_comment_identity_invalid',
+}
+
+
+def _error_category(status_code, code):
+    value = code if isinstance(code, str) else ''
+    if value in _CONTEXT_CHANGED_CODES:
+        return 'context_changed'
+    if status_code == 401 or value in _SESSION_CODES:
+        return 'session_expired'
+    if status_code == 403:
+        return 'permission_denied'
+    if status_code == 429:
+        return 'rate_limited'
+    if status_code == 413:
+        return 'too_large'
+    if status_code == 404:
+        return 'not_found'
+    if status_code == 400:
+        return 'invalid_request'
+    if status_code == 409:
+        return 'conflict'
+    return 'unavailable'
+
+
+def _public_http_error(exc: HTTPException) -> HTTPException:
+    """Translate an internal error into one concise Chinese message.
+
+    The status code is preserved so callers can still react to auth, conflict
+    and size limits. Only a coarse category is exposed (and mirrored in a
+    response header), never the original code, exception text, COS keys or
+    signatures.
+    """
+    status_code = exc.status_code if isinstance(exc.status_code, int) else 503
+    if status_code < 400 or status_code > 599:
+        status_code = 503
+    category = _error_category(status_code, exc.detail)
+    headers = {'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
+               'X-Content-Type-Options': 'nosniff', 'X-Evidence-Code': category}
+    if status_code == 429:
+        headers['Retry-After'] = '30'
+    return HTTPException(status_code, detail=_ERROR_MESSAGES[category], headers=headers)
+
+
+async def _serve(factory):
+    """Run one evidence operation and normalize any error into public wording."""
+    try:
+        return _json(await factory())
+    except HTTPException as exc:
+        raise _public_http_error(exc) from None
+
 
 def _identity(value, label):
     if not isinstance(value, str) or not _ID.fullmatch(value):
@@ -579,78 +654,93 @@ def _json(result):
 
 @router.get(_PREFIX + '/context')
 async def context(request: Request, owner: str, repo: str, pr: int):
-    return _json(await _dispatch(request, owner, repo, pr, 'context'))
+    return await _serve(lambda: _dispatch(request, owner, repo, pr, 'context'))
 
 
 @router.post(_PREFIX + '/uploads')
 async def init(request: Request, owner: str, repo: str, pr: int):
-    return _json(await _dispatch(request, owner, repo, pr, 'init'))
+    return await _serve(lambda: _dispatch(request, owner, repo, pr, 'init'))
 
 
 @router.get(_PREFIX + '/uploads/{upload_id}')
 async def upload_status(request: Request, owner: str, repo: str, pr: int, upload_id: str):
-    return _json(await _dispatch(request, owner, repo, pr, 'status', upload_id=upload_id))
+    return await _serve(lambda: _dispatch(request, owner, repo, pr, 'status', upload_id=upload_id))
 
 
 @router.post(_PREFIX + '/uploads/{upload_id}/resume')
 async def resume(request: Request, owner: str, repo: str, pr: int, upload_id: str):
-    return _json(await _dispatch(request, owner, repo, pr, 'resume', upload_id=upload_id))
+    return await _serve(lambda: _dispatch(request, owner, repo, pr, 'resume', upload_id=upload_id))
 
 
 @router.post(_PREFIX + '/uploads/{upload_id}/parts/{part_number}/url')
 async def sign_part(request: Request, owner: str, repo: str, pr: int, upload_id: str, part_number: int):
-    return _json(await _dispatch(request, owner, repo, pr, 'sign_part', upload_id=upload_id, part_number=part_number))
+    return await _serve(lambda: _dispatch(
+        request, owner, repo, pr, 'sign_part', upload_id=upload_id, part_number=part_number))
 
 
 @router.put(_PREFIX + '/uploads/{upload_id}/parts/{part_number}/data')
 async def upload_part(request: Request, owner: str, repo: str, pr: int, upload_id: str, part_number: int):
-    return _json(await _dispatch(request, owner, repo, pr, 'put_part', upload_id=upload_id, part_number=part_number))
+    return await _serve(lambda: _dispatch(
+        request, owner, repo, pr, 'put_part', upload_id=upload_id, part_number=part_number))
 
 
 @router.post(_PREFIX + '/uploads/{upload_id}/complete')
 async def complete(request: Request, owner: str, repo: str, pr: int, upload_id: str):
-    return _json(await _dispatch(request, owner, repo, pr, 'complete', upload_id=upload_id))
+    return await _serve(lambda: _dispatch(request, owner, repo, pr, 'complete', upload_id=upload_id))
 
 
 @router.post(_PREFIX + '/notes')
 async def note(request: Request, owner: str, repo: str, pr: int):
-    return _json(await _dispatch(request, owner, repo, pr, 'note'))
+    return await _serve(lambda: _dispatch(request, owner, repo, pr, 'note'))
 
 
 @router.delete(_PREFIX + '/attachments/{attachment_id}')
 async def delete(request: Request, owner: str, repo: str, pr: int, attachment_id: str):
-    return _json(await _dispatch(request, owner, repo, pr, 'delete', attachment_id=attachment_id))
+    return await _serve(lambda: _dispatch(
+        request, owner, repo, pr, 'delete', attachment_id=attachment_id))
 
 
 async def _download(request, owner, repo, pr, action, **path):
     result = await _dispatch(request, owner, repo, pr, action, **path)
     url = result.get('url')
     if not isinstance(url, str) or not url.startswith('https://'):
-        raise HTTPException(503, detail='evidence_download_unavailable')
+        raise _public_http_error(HTTPException(503, detail='evidence_download_unavailable'))
     return RedirectResponse(url, status_code=303,
                             headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
 
 
 @router.get(_PREFIX + '/attachments/{attachment_id}/download')
 async def download(request: Request, owner: str, repo: str, pr: int, attachment_id: str):
-    return await _download(request, owner, repo, pr, 'download', attachment_id=attachment_id)
+    try:
+        return await _download(request, owner, repo, pr, 'download', attachment_id=attachment_id)
+    except HTTPException as exc:
+        raise _public_http_error(exc) from None
 
 
 @router.get(_PREFIX + '/attachments/{attachment_id}/preview')
 async def preview(request: Request, owner: str, repo: str, pr: int, attachment_id: str):
-    return await _download(request, owner, repo, pr, 'preview', attachment_id=attachment_id)
+    try:
+        return await _download(request, owner, repo, pr, 'preview', attachment_id=attachment_id)
+    except HTTPException as exc:
+        raise _public_http_error(exc) from None
 
 
 @router.get(_PREFIX + '/rounds/{round_id}/log/download')
 async def log_download(request: Request, owner: str, repo: str, pr: int, round_id: str):
-    return await _download(request, owner, repo, pr, 'log_download', round_id=round_id)
+    try:
+        return await _download(request, owner, repo, pr, 'log_download', round_id=round_id)
+    except HTTPException as exc:
+        raise _public_http_error(exc) from None
 
 
 @router.get(_PREFIX + '/rounds/{round_id}/machines/{machine_alias}/log/download')
 async def machine_log_download(request: Request, owner: str, repo: str, pr: int,
                                round_id: str, machine_alias: str):
-    return await _download(request, owner, repo, pr, 'machine_log_download',
-                           round_id=round_id, machine_alias=machine_alias)
+    try:
+        return await _download(request, owner, repo, pr, 'machine_log_download',
+                               round_id=round_id, machine_alias=machine_alias)
+    except HTTPException as exc:
+        raise _public_http_error(exc) from None
 
 
 @router.get('/evidence/{owner}/{repo}/pulls/{pr}', response_class=HTMLResponse)
