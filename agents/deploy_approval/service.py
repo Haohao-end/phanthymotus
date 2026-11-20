@@ -1964,12 +1964,11 @@ class DeployController:
         await self._project_status_best_effort(repo, pr_number, restored["status"])
         comment_id = int(command.get("comment_id", 0) or 0)
         if comment_id > 0:
+            # The unified failure reply states the reason once and takes the
+            # current correct operation from lifecycle guidance; the machine
+            # commands only belong to the rendered Summary (gate_note).
             await self._post_command_reply(
-                repo, pr_number, comment_id,
-                "\n".join([
-                    reason,
-                    next_step, *command_lines,
-                ]),
+                repo, pr_number, comment_id, reason,
                 topic=topic, error=True,
             )
         return True
@@ -2269,24 +2268,10 @@ class DeployController:
                         )
                     return True
                 if state.get("runtime_redeploy"):
-                    commands = self._runtime_drift_command_lines(state, repo)
-                    if commands:
-                        drift_reply = [
-                            "镜像与批准版本不一致，本轮重新部署申请已经创建；`/request_deploy` 不是前提。",
-                            *(f"`{line}`" for line in commands),
-                        ]
-                    else:
-                        unreadable = self._runtime_unreadable_lines(
-                            state.get("runtime_checks", []),
-                        )
-                        drift_reply = [
-                            "本轮重新部署申请已经创建，但目前无法生成可用的审批命令。",
-                            *unreadable,
-                            "请恢复机器连接，等待下一次状态检查。",
-                        ]
                     await self._post_command_reply(
                         repo, pr_number, comment_id,
-                        "\n".join(drift_reply),
+                        "镜像与批准版本不一致，本轮重新部署申请已经创建，"
+                        "不需要再次申请。",
                         topic="runtime-redeploy-request-already-pending",
                     )
                     return True
@@ -2297,10 +2282,9 @@ class DeployController:
                     checks = state.get("runtime_checks", [])
                     unreadable = self._runtime_unreadable_lines(checks)
                     if unreadable:
-                        message = "\n".join([
-                            "目前无法确认机器的运行状态，这次没有创建重新部署申请。",
-                            *unreadable,
-                        ])
+                        message = (
+                            "目前无法确认机器的运行状态，这次没有创建重新部署申请。"
+                        )
                         topic = "runtime-redeploy-request-state-unavailable"
                     elif (_current_status in {"testing", "succeeded", "failed"}
                           and checks
@@ -2558,11 +2542,10 @@ class DeployController:
                         message = "重新检查确认机器上已经在运行本轮批准的镜像，不需要重新部署。"
                         topic = "runtime-redeploy-request-already-matches"
                     else:
-                        unreadable = self._runtime_unreadable_lines(fresh_checks)
-                        message = "\n".join([
-                            "重新检查仍然无法确认机器上的运行镜像，这次没有创建重新部署申请。",
-                            *unreadable,
-                        ])
+                        message = (
+                            "重新检查仍然无法确认机器上的运行镜像，"
+                            "这次没有创建重新部署申请。"
+                        )
                         topic = "runtime-redeploy-request-state-unavailable"
                     await self._post_command_reply(
                         repo, pr_number, comment_id, message, topic=topic,
@@ -2840,19 +2823,11 @@ class DeployController:
             if len(full_groups) == 1:
                 machine_selector = str(full_groups[0].get("command_selector", "") or "")
             else:
-                commands = self._runtime_drift_command_lines(state, repo)
                 if len(full_groups) > 1:
-                    message = (
-                        "有多台机器都能部署这次需要重新部署的组件，请在命令中明确指定一台：\n"
-                        + ("\n".join(f"`{line}`" for line in commands)
-                           if commands else "目前没有可用的审批命令。")
-                    )
+                    message = "有多台机器都能部署这次需要重新部署的组件，请在命令中明确指定一台。"
                     topic = "runtime-redeploy-multiple-compatible-machines"
-                elif commands:
-                    message = (
-                        "这次需要重新部署的组件没有唯一的适配机器，请在命令中明确指定机器：\n"
-                        + "\n".join(f"`{line}`" for line in commands)
-                    )
+                elif self._runtime_drift_command_lines(state, repo):
+                    message = "这次需要重新部署的组件没有唯一的适配机器，请在命令中明确指定机器。"
                     topic = "runtime-redeploy-requires-machine-ip"
                 else:
                     message = (
@@ -2878,13 +2853,9 @@ class DeployController:
             machine_map = {item.alias: item for item in machines}
             machine = Policy.resolve_machine_selector(machine_selector, machine_map)
         except PolicyError:
-            commands = self._runtime_drift_command_lines(state, repo)
             await self._post_command_reply(
                 repo, pr_number, comment_id,
-                "找不到你填写的机器，这次没有发送部署请求。\n"
-                + ("请改用下面的机器命令：\n"
-                   + "\n".join(f"`{line}`" for line in commands)
-                   if commands else "目前没有可以执行的重新审批命令。"),
+                "找不到你填写的机器，这次没有发送部署请求。",
                 topic="runtime-redeploy-machine-not-found",
             )
             return state, state, False, False, True
@@ -3011,20 +2982,9 @@ class DeployController:
             else:
                 reason = "这台机器的登记信息已经变化"
                 topic = "runtime-redeploy-machine-identity-changed"
-            try:
-                safe_commands = self._runtime_drift_command_lines(fresh_state, repo)
-            except Exception:
-                safe_commands = []
-            guidance = (
-                "\n请改用下面的机器命令：\n"
-                + "\n".join(f"`{line}`" for line in safe_commands)
-                if safe_commands else
-                "\n请联系仓库维护者核对机器配置，然后按 PR Summary 重新审批。"
-            )
             await self._post_command_reply(
                 repo, pr_number, comment_id,
-                f"{reason}，这次没有发送部署请求。"
-                + guidance,
+                f"{reason}，这次没有发送部署请求。",
                 topic=topic,
             )
             return fresh_state, fresh_state, False, False, True
@@ -3073,22 +3033,9 @@ class DeployController:
                 compatible_ids = set()
             incompatible_ids = current_drift_ids - compatible_ids
             if incompatible_ids:
-                try:
-                    alternative_commands = self._runtime_drift_command_lines(
-                        fresh_state, repo,
-                    )
-                except Exception:
-                    alternative_commands = []
-                alternatives = (
-                    "\n请改用下面仍可使用的机器命令：\n"
-                    + "\n".join(f"`{line}`" for line in alternative_commands)
-                    if alternative_commands else
-                    "\n目前没有其他可以使用的机器命令。"
-                )
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    "这台机器已经不能部署这次需要重新部署的组件，这次没有发送部署请求。"
-                    + alternatives,
+                    "这台机器已经不能部署这次需要重新部署的组件，这次没有发送部署请求。",
                     topic="runtime-redeploy-component-incompatible",
                 )
                 return fresh_state, fresh_state, False, False, True
@@ -3097,22 +3044,19 @@ class DeployController:
                 message = "重新检查确认机器上已经在运行本轮批准的镜像，不需要重新部署。"
                 topic = "runtime-redeploy-already-matches"
             elif any(check.get("status") == "identity_changed" for check in current_checks):
-                message = "\n".join([
-                    "机器的登记信息已经变化，暂时无法确认当前运行镜像，这次没有发送部署请求。",
-                    *self._runtime_unreadable_lines(current_checks),
-                ])
+                message = (
+                    "机器的登记信息已经变化，暂时无法确认当前运行镜像，"
+                    "这次没有发送部署请求。"
+                )
                 topic = "runtime-redeploy-identity-changed"
             elif any(check.get("status") == "not_running" for check in current_checks):
-                message = "\n".join([
-                    "目标组件当前没有运行，暂时无法确认运行镜像，这次没有发送部署请求。",
-                    *self._runtime_unreadable_lines(current_checks),
-                ])
+                message = (
+                    "目标组件当前没有运行，暂时无法确认运行镜像，"
+                    "这次没有发送部署请求。"
+                )
                 topic = "runtime-redeploy-not-running"
             elif any(check.get("status") == "unavailable" for check in current_checks):
-                message = "\n".join([
-                    "目前无法连接机器确认运行镜像，这次没有发送部署请求。",
-                    *self._runtime_unreadable_lines(current_checks),
-                ])
+                message = "目前无法连接机器确认运行镜像，这次没有发送部署请求。"
                 topic = "runtime-redeploy-unavailable"
             else:
                 message = "目前还没有确认到需要重新部署的镜像差异，这次没有发送部署请求。"
@@ -3181,20 +3125,9 @@ class DeployController:
                     repo, machine.alias, type(exc).__name__,
                 )
         if compatible_group is None:
-            try:
-                safe_commands = self._runtime_drift_command_lines(fresh_state, repo)
-            except Exception:
-                safe_commands = []
-            guidance = (
-                "\n请改用下面仍可使用的机器命令：\n"
-                + "\n".join(f"`{line}`" for line in safe_commands)
-                if safe_commands else
-                "\n请联系仓库维护者核对机器授权和组件兼容配置，然后按 PR Summary 重新审批。"
-            )
             await self._post_command_reply(
                 repo, pr_number, comment_id,
-                "这台机器目前不能部署这次需要重新部署的组件，这次没有发送部署请求。"
-                + guidance,
+                "这台机器目前不能部署这次需要重新部署的组件，这次没有发送部署请求。",
                 topic="runtime-redeploy-machine-incompatible",
             )
             return fresh_state, fresh_state, False, False, True
@@ -3431,30 +3364,16 @@ class DeployController:
                 else:
                     options = groups
                 if len(options) != 1 or not full_groups:
-                    if not deployment_request_submitted:
-                        options = self._ip_command_machine_groups(options)
-                    command_lines = self._machine_notice_lines(
-                        options, repo, mention_owners=False,
-                        test_only=self._is_test_only_pr(pr_data),
-                        components=remaining_for_selection,
+                    # Let the unified guidance block carry the exact machine
+                    # commands; this reply states only why the bare command
+                    # cannot be executed.
+                    explanation = (
+                        "有多台机器都能部署剩余组件，请在命令中明确指定一台。"
+                        if len(full_groups) > 1 else
+                        "没有单台机器覆盖全部剩余组件，需要分批审批。"
                     )
-                    if not command_lines:
-                        reply = "\n".join(self._machine_blocking_summary(options))
-                    else:
-                        if len(full_groups) > 1:
-                            explanation = (
-                                "有多台机器都能部署剩余组件，请在命令中明确指定一台："
-                            )
-                        else:
-                            explanation = (
-                                "没有单台机器覆盖全部剩余组件，请按下面的命令分批审批："
-                            )
-                        reply = "\n".join([
-                            explanation,
-                            *command_lines,
-                        ])
                     await self._post_command_reply(
-                        repo, pr_number, comment_id, reply,
+                        repo, pr_number, comment_id, explanation,
                         topic="approve-deploy-machine-selection",
                     )
                     return True
@@ -3464,37 +3383,13 @@ class DeployController:
                 machine_map = {item.alias: item for item in self.policy.get_machines(repo=repo)}
                 machine = Policy.resolve_machine_selector(machine_alias, machine_map)
             except PolicyError:
-                deployed_ids = _component_id_set(state.get("deployments", []))
-                remaining_components = [
-                    component for component in state.get("components", [])
-                    if isinstance(component, dict)
-                    and component.get("component_id") not in deployed_ids
-                ]
-                try:
-                    remaining_groups = self._get_machine_groups_for_components(
-                        remaining_components, repo,
-                    )
-                    if not deployment_request_submitted:
-                        remaining_groups = self._ip_command_machine_groups(remaining_groups)
-                    available_commands = self._machine_notice_lines(
-                        remaining_groups, repo, mention_owners=False,
-                        test_only=self._is_test_only_pr(pr_data),
-                        components=remaining_components,
-                    )
-                except Exception as exc:
-                    logger.warning("compatible machine list unavailable %s#%s exception=%s",
-                                   repo, pr_number, type(exc).__name__)
-                    remaining_groups = []
-                    available_commands = []
-                suggestion = (
-                    "\n可以改用下面的机器命令：\n" + "\n".join(available_commands)
-                    if available_commands else
-                    "\n" + "\n".join(self._machine_blocking_summary(remaining_groups))
-                )
+                # Keep the reply to the unified two-block shape: why it failed
+                # plus the current correct operation taken from lifecycle
+                # guidance. Do not append machine diagnostics or a second
+                # command list here.
                 await self._post_error(
                     repo, pr_number,
-                    "找不到你填写的机器，这次没有执行部署审批。"
-                    + suggestion,
+                    "找不到你填写的机器，这次没有执行部署审批。",
                     comment_id=comment_id,
                 )
                 return True
@@ -3516,11 +3411,10 @@ class DeployController:
             pending_drift_ids = self._runtime_redeploy_pending_ids(state)
             if (runtime_drift_checks and not pending_drift_ids
                     and not redeploy_mode):
-                commands = self._runtime_drift_command_lines(state, repo)
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    "当前还有已部署组件的镜像与批准版本不一致，请先用对应机器的完整命令重新审批：\n"
-                    + "\n".join(f"`{line}`" for line in commands),
+                    "当前还有已部署组件的运行镜像与批准版本不一致，"
+                    "这台机器的审批没有执行，需要先重新部署这些镜像。",
                     topic="runtime-redeploy-required-before-other-machine",
                 )
                 return True
@@ -3580,23 +3474,12 @@ class DeployController:
                         "这台机器不能部署本次需要部署的剩余组件。"
                     )
                 # A rejected machine choice must not consume this command or
-                # alter the lifecycle. Report the current compatible options
-                # directly, while keeping the original hidden state untouched.
-                compatible_groups = self._get_machine_groups_for_components(
-                    undeployed_components, repo,
-                )
-                if not deployment_request_submitted:
-                    compatible_groups = self._ip_command_machine_groups(compatible_groups)
-                command_lines = self._machine_notice_lines(
-                    compatible_groups, repo, mention_owners=False,
-                    test_only=self._is_test_only_pr(pr_data),
-                    components=undeployed_components,
-                )
+                # alter the lifecycle. The unified guidance block reports the
+                # current compatible machine commands; this reply only explains
+                # why the chosen machine cannot be used.
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    selection_problem + " "
-                    + ("请改用下面的机器命令：\n" + "\n".join(command_lines)
-                       if command_lines else "目前没有可以部署这些组件的机器，请联系仓库维护者检查机器配置。"),
+                    selection_problem,
                     topic="approve-deploy-incompatible-machine",
                 )
                 return True
@@ -4552,8 +4435,7 @@ class DeployController:
                 await self._project_status_best_effort(repo, pr_number, "deploying")
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    (f"部署结果还没有确认：机器 `{machine_alias}`（IP `{machine.node_host}`）上的组件 "
-                     f"`{component_id}` 目标是镜像 `{image_ref}`。"),
+                    "部署请求已经发出，但还没有确认结果。",
                     topic="deployment-outcome-uncertain", error=True,
                 )
                 return True
@@ -4614,8 +4496,7 @@ class DeployController:
                 await self._project_status_best_effort(repo, pr_number, "failed")
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    (f"部署没有完成：机器 `{machine_alias}`（IP `{machine.node_host}`）上的 "
-                     f"{failure_component} 没有部署成功。"),
+                    f"机器上的 {failure_component} 没有部署成功。",
                     topic="deployment-failed", error=True,
                 )
 
@@ -6444,22 +6325,22 @@ class DeployController:
             owner_text = " ".join(owner_labels) if owner_labels else "负责人待配置"
             statuses = {item.get("status") for item in machine_checks}
             if lifecycle_status == "deploying":
-                result = "DEPLOYING；正在部署，请等待结果"
+                result = "正在部署，请等待结果"
             elif statuses and statuses <= {"match"}:
-                result = "MATCH；无需重新部署"
+                result = "运行镜像与批准版本一致，无需重新部署"
             elif "mismatch" in statuses:
-                result = "MISMATCH"
+                result = "运行镜像与批准版本不一致，需要重新部署"
             else:
-                result = "UNAVAILABLE；无法确认是否需要重新部署"
+                result = "暂时无法确认运行镜像，因此不能判断是否需要重新部署"
             line = f"- 机器 `{alias}`（主 IP：`{primary_ip or '未记录'}`），负责人：{owner_text}；{result}"
-            if result.startswith("MISMATCH"):
+            if "mismatch" in statuses:
                 if selector:
                     line += (
                         f"；直接重新审批：`/approve_deploy machine={selector}`；"
                         "`/request_deploy` 可选，不是前提"
                     )
                 else:
-                    line += "；当前无法确认安全审批命令"
+                    line += "；当前无法确认安全的审批命令，请等待状态检查恢复"
             lines.append(line)
             for check in machine_checks:
                 component = component_by_id.get(check.get("component_id"))
@@ -6472,14 +6353,16 @@ class DeployController:
                     check, component,
                 )
                 image_status = (
-                    "MATCH" if check.get("status") == "match" else
-                    "MISMATCH" if check.get("status") == "mismatch" else
-                    "UNAVAILABLE"
+                    "运行镜像与批准版本一致"
+                    if check.get("status") == "match" else
+                    "运行镜像与批准版本不一致，需要重新部署"
+                    if check.get("status") == "mismatch" else
+                    "暂时无法确认运行镜像"
                 )
                 lines.append(
                     f"  - Core 组件 `{check.get('component_id', '')}`："
-                    f"批准镜像 `{target_image or 'unavailable'}`；"
-                    f"实际运行镜像 `{observed_image or 'unavailable'}`；{image_status}"
+                    f"批准镜像 `{target_image or '未读取'}`；"
+                    f"实际运行镜像 `{observed_image or '未读取'}`；{image_status}"
                 )
         return lines if len(lines) > 1 else []
 
@@ -11002,6 +10885,8 @@ class DeployController:
             "HEAD", "round", "Lifecycle", "lifecycle", "yaml", "YAML",
             "ZERO deploy POST", "MATCH", "MISMATCH", "UNAVAILABLE",
             "Owner：", "Traceback", "Exception", "数据库", "database",
+            "/approve_deploy", "/request_deploy", "/request_acceptance",
+            "/record_test", "machine=",
         )
         if raw_message and re.search(r"[\u4e00-\u9fff]", raw_message) \
                 and not any(token in raw_message for token in forbidden):
@@ -11115,7 +11000,9 @@ class DeployController:
                 topic=topic,
                 message=message,
             )
-            guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
+            guidance = await self._lifecycle_next_action_guidance(
+                repo, pr_number, detail=False,
+            )
             message = self._format_user_reply(self._failure_lead(reason), guidance)
         else:
             guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
@@ -11279,6 +11166,7 @@ class DeployController:
     def _machine_notice_lines(
         self, groups: list[dict], repo: str, *, mention_owners: bool,
         test_only: bool = False, components: list[dict] | None = None,
+        show_components: bool = True,
     ) -> list[str]:
         lines: list[str] = []
         for group in groups:
@@ -11316,16 +11204,18 @@ class DeployController:
                 and group.get("approval_available") is True
                 and bool(group.get("component_ids"))
             )
-            component_label = self._component_summary_labels(
-                group.get("component_ids", []), components,
+            component_label = (
+                self._component_summary_labels(
+                    group.get("component_ids", []), components,
+                ) if show_components else ""
             )
             components_note = f"，兼容组件：{component_label}" if component_label else ""
+            # Owner reminders belong only to a fresh /request_deploy notice.
+            # deploy-ready keeps the machine commands; deploy-requested adds
+            # exact @mentions of the configured machine Owners.
             requester_note = (
-                "，请 " + " ".join(
-                    f"@{owner}" if can_mention_owners else owner
-                    for owner in valid_owners
-                ) + " 审批"
-                if valid_owners else ""
+                "，请 " + " ".join(f"@{owner}" for owner in valid_owners) + " 审批"
+                if can_mention_owners else ""
             )
             lines.append(
                 f"机器 `{alias}`（主 IP：`{primary_ip}`）"
@@ -11378,6 +11268,11 @@ class DeployController:
                 checks = state.get("runtime_checks", [])
                 unreadable = self._runtime_unreadable_lines(checks)
                 if unreadable:
+                    if not detail:
+                        return (
+                            "目前无法确认机器上的运行镜像，因此暂时不能判断是否需要重新部署。"
+                            "请等待下一次状态检查，或联系机器负责人确认机器可以正常读取。"
+                        )
                     return "\n".join([
                         "目前无法确认机器上的运行镜像，暂时不能判断是否需要重新部署。",
                         *unreadable,
@@ -11390,6 +11285,11 @@ class DeployController:
                         state.get("runtime_checks", []),
                     )
                     if unreadable:
+                        if not detail:
+                            return (
+                                "目前无法确认机器的运行镜像，因此还不能生成重新审批命令。"
+                                "请等待下一次状态检查，或联系机器负责人确认机器可以正常读取。"
+                            )
                         return "\n".join([
                             "目前无法确认机器的运行镜像，因此还不能生成重新审批命令。",
                             *unreadable,
@@ -11432,11 +11332,15 @@ class DeployController:
                            repo, pr_number, type(exc).__name__)
             return "目前无法确认可用的机器，请先查看 PR Summary 再操作。"
 
-    async def _lifecycle_next_action_guidance(self, repo: str, pr_number: int) -> str:
+    async def _lifecycle_next_action_guidance(
+        self, repo: str, pr_number: int, *, detail: bool = True,
+    ) -> str:
         """Return the one correct-operation text for the current lifecycle state.
 
         Every command reply takes its "what to do now" block from here, so the
-        same PR/HEAD/lifecycle/policy always yields identical guidance.
+        same PR/HEAD/lifecycle/policy always yields identical guidance. Failure
+        replies call this with ``detail=False`` so that machine diagnostics and
+        Owner mentions never leak into the unified two-block error format.
         """
         unavailable = (
             "暂时无法确认 PR 的最新提交和部署进度。"
@@ -11510,13 +11414,38 @@ class DeployController:
                     if state.get("runtime_redeploy") else
                     self._get_machine_groups_for_components(remaining, repo)
                 )
-                mention_owners = status == "deploy-requested"
+                mention_owners = status == "deploy-requested" and detail
                 command_lines = self._machine_notice_lines(
                     groups, repo, mention_owners=mention_owners,
                     test_only=self._is_test_only_pr(pr), components=remaining,
+                    # deploy-ready lists compatible components; deploy-requested
+                    # only needs the machines still awaiting approval.
+                    show_components=detail and status == "deploy-ready",
                 )
                 if not command_lines:
+                    if not detail:
+                        # Never surface per-machine blocking diagnostics in a
+                        # failure reply; state the wait explicitly instead.
+                        return (
+                            "目前没有可以执行的机器审批命令。"
+                            "请联系仓库维护者检查机器配置，并等待 PR Summary 更新后再操作。"
+                        )
                     return "\n".join(self._machine_blocking_summary(groups))
+
+                if not detail:
+                    # Failure replies only need the exact commands to run now;
+                    # component, Owner, and per-machine diagnostics stay in
+                    # visible notices and rendered summaries.
+                    commands_only = [
+                        line for line in command_lines
+                        if line.startswith("`/approve_deploy")
+                    ]
+                    if not commands_only:
+                        return (
+                            "目前没有可以执行的机器审批命令。"
+                            "请联系仓库维护者检查机器配置，并等待 PR Summary 更新后再操作。"
+                        )
+                    return "请按下面的机器命令操作：\n" + "\n".join(commands_only)
 
                 remaining_ids = {
                     component.get("component_id") for component in remaining
@@ -11545,7 +11474,19 @@ class DeployController:
                     lines.append("`/request_deploy` 是可选的，不是部署审批的前提。")
                     return "\n".join(lines)
 
-                return "还需要以下机器完成审批：\n" + "\n".join(command_lines)
+                if status == "deploy-requested":
+                    # Only the machines still awaiting approval, each with its
+                    # executable approval command and Owner mention.
+                    if not any(
+                            line.startswith("`/approve_deploy")
+                            for line in command_lines):
+                        return (
+                            "还需要其他机器完成审批，但目前无法生成可执行的审批命令。"
+                            "请联系仓库维护者检查机器配置。"
+                        )
+                    return "还需要以下机器完成审批：\n" + "\n".join(command_lines)
+
+                return "请按下面的机器命令操作：\n" + "\n".join(command_lines)
 
             if status == "deploying":
                 return (
@@ -11746,7 +11687,9 @@ class DeployController:
                 error=True,
             )
             return
-        guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
+        guidance = await self._lifecycle_next_action_guidance(
+            repo, pr_number, detail=False,
+        )
         try:
             await self._post_bound_plain_notice(
                 repo, pr_number,
@@ -11771,7 +11714,9 @@ class DeployController:
     ) -> None:
         """Post a unified failure reply for a command that did not execute."""
         reason = self._command_error_reason(message=message)
-        guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
+        guidance = await self._lifecycle_next_action_guidance(
+            repo, pr_number, detail=False,
+        )
         body_text = self._format_user_reply(self._failure_lead(reason), guidance)
         if comment_id:
             topic = "command-error-" + hashlib.sha256(
@@ -12819,6 +12764,25 @@ class DeployController:
                     }
                     mismatch_components = [component_by_id[item] for item in mismatch_ids
                                            if item in component_by_id]
+                    image_lines = []
+                    for check in checks:
+                        if check.get("status") != "mismatch":
+                            continue
+                        component = component_by_id.get(check.get("component_id"))
+                        approved_image = str(
+                            check.get("target_image", "") or
+                            (component.get("image_ref", "")
+                             if isinstance(component, dict) else "") or ""
+                        )
+                        observed_image = self._runtime_observed_image_for_display(
+                            check, component,
+                        )
+                        image_lines.append(
+                            "批准镜像 "
+                            f"`{approved_image or '未读取'}`，实际运行镜像 "
+                            f"`{observed_image or '未读取'}`。"
+                        )
+                    image_detail = "\n\n" + "\n".join(image_lines) if image_lines else ""
                     eligible_group = None
                     if (primary_ip and mismatch_ids
                             and len(mismatch_components) == len(mismatch_ids)):
@@ -12849,12 +12813,14 @@ class DeployController:
                     if command_selector:
                         message = (
                             f"机器 `{machine_alias}`（主 IP：`{primary_ip}`）上运行的镜像与本次批准的版本不一致，需要重新部署。"
+                            f"{image_detail}"
                             + (f"\n\n请执行 `/approve_deploy machine={command_selector}`。" if not owner_text
                                else f"\n\n请 {owner_text} 执行 `/approve_deploy machine={command_selector}`。")
                         )
                     else:
                         message = (
                             f"机器 `{machine_alias}`（主 IP：`{primary_ip or '未记录'}`）上运行的镜像与本次批准的版本不一致，需要重新部署。"
+                            f"{image_detail}"
                             "\n\n目前还没有可确认的审批命令，请联系仓库维护者核对机器配置。"
                         )
                 elif status_value == "not_running":

@@ -27,6 +27,12 @@ _BEIJING = ZoneInfo("Asia/Shanghai")
 NEXT_ACTION_TITLE = "现在需要做什么"
 _MACHINE_SELECTOR_NOTE = "请直接执行上方对应机器的那条命令，不要自行改写命令中的机器。"
 
+# Upload identities that authenticate a file but are not the developer's GitHub
+# account. They are never rendered as "@uploader" in an upload notification.
+_NON_ACCOUNT_UPLOADERS = frozenset({
+    "shared-link", "evidence-capability", "4pd-pr-assistant[bot]",
+})
+
 _MAX_VISIBLE_LIFECYCLE_BYTES = 48 * 1024  # 48 KiB soft budget
 
 
@@ -736,7 +742,7 @@ def evidence_upload_comment(
     repo: str, pr_number: int, head_sha: str, round_id: str,
     attachment_id: str, filename: str, *, download_url: str,
     preview_url: str = "", note: str = "", public_base_url: str = "",
-    cos_url_validator=None,
+    cos_url_validator=None, uploaded_by: str = "",
 ) -> str:
     """Build a safe notification for a ready media file.
 
@@ -810,17 +816,27 @@ def evidence_upload_comment(
     video_suffixes = {"mp4", "webm"}
     if suffix not in image_suffixes | video_suffixes:
         return ""
-    lines = ["### 测试证据已上传", ""]
+    # The real GitHub account that uploaded the file. Internal upload
+    # identities and malformed logins are never rendered as the developer, so
+    # an unknown uploader degrades to an author-less sentence.
+    uploader = ""
+    if isinstance(uploaded_by, str):
+        candidate = uploaded_by.strip().lstrip("@")
+        if (candidate.casefold() not in _NON_ACCOUNT_UPLOADERS
+                and re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}(?:\[bot\])?", candidate)):
+            uploader = "@" + candidate
+    author = f"开发者 {uploader} " if uploader else "开发者"
     if suffix in image_suffixes:
-        # The file name is the direct download; the inline image is a preview
-        # served by the same attachment identity, never the upload page.
-        lines.append(f"[{label}](<{download_url}>)")
+        # The caption names the uploader and the exact file; the inline image is
+        # a preview of this attachment and the link is the direct download.
+        lines = [f"{author}已上传测试图片：{label}", ""]
         if preview_url:
-            lines.extend(["", f"![{label}](<{preview_url}>)"])
-        lines.extend(["", f"[下载图片](<{download_url}>)"])
+            lines.extend([f"![{label}](<{preview_url}>)", ""])
+        lines.append(f"[下载图片](<{download_url}>)")
     else:
         # Videos always link straight to the uploaded file for download.
-        lines.append(f"[下载视频：{label}](<{download_url}>)")
+        lines = [f"{author}已上传测试视频：{label}", "", f"[下载视频](<{download_url}>)"]
     notification_key = hashlib.sha256(
         f"{repo}:{pr_number}:{head_sha}:{round_id}:{attachment_id}".encode("utf-8")
     ).hexdigest()
@@ -1006,7 +1022,8 @@ def _testing_next_action(
     if evidence_url:
         lines.extend([
             "",
-            "上传测试视频或图片是完全可选的，不影响验收；需要时可以从这里上传：",
+            "上传测试视频或图片是完全可选的，不影响验收；"
+            "把测试视频或图片上传到这个固定链接，供验收人检查实际开发效果：",
             f"[上传测试视频或图片](<{evidence_url}>)",
         ])
     else:
@@ -1156,13 +1173,13 @@ def _deploying_next_action(
     if outcome_uncertain:
         lines.extend([
             "",
-            "部署结果还在等待自动检查确认。现在不需要执行任何命令，"
-            "确认之前不会重复提交部署，请不要重复发送部署命令。",
+            "部署结果还在等待自动检查确认。机器正在部署，不需要重复审批或重复提交部署命令，"
+            "确认之前请等待本 Summary 更新。",
         ])
     else:
         lines.extend([
             "",
-            "部署正在进行。现在不需要执行任何命令，请等待部署结果，"
+            "机器正在部署，不需要重复审批。现在不需要执行任何命令，请等待部署结果，"
             "不要重复提交部署命令。",
         ])
     return lines
@@ -1212,8 +1229,8 @@ def review_required(
         f"### {NEXT_ACTION_TITLE}",
         "",
         "当前提交还没有审核和镜像构建结果，现在还不能部署。",
-        "请等待审核和镜像构建完成，完成后这里会列出可以部署的机器和对应命令。",
-        "暂时不需要执行任何命令。",
+        "请由 PR 作者在本 PR 的评论中执行 `/request_bot_review` 触发审核和镜像构建。",
+        "审核和镜像构建完成后，这里会列出可以部署的机器和对应命令。",
         "",
         "### 部署进度",
         "",
@@ -2821,13 +2838,21 @@ def failed_comment(
         lines.append(f"**失败原因：** {_escape(error)}")
     elif failed_stage == "acceptance":
         lines.append("**失败原因：** 验收人记录的结果为不通过。")
-    lines.extend([
-        "",
-        "请先按上面的失败原因修复问题，并确认目标机器可以正常读取。",
-        "修复后由对应机器的负责人重新执行该机器的 `/approve_deploy` 命令，"
-        "或由 PR 作者重新提交 `/request_deploy`。",
-        "在重新部署之前，不需要执行其他命令。",
-    ])
+    lines.append("")
+    if failed_stage == "acceptance":
+        lines.extend([
+            "请先按上面的失败原因修复问题；修复后需要重新部署并重新测试，"
+            "再由验收人重新记录结果。",
+            "重新部署时由对应机器的负责人执行该机器的 `/approve_deploy` 命令，"
+            "或由 PR 作者重新提交 `/request_deploy`。",
+        ])
+    else:
+        lines.extend([
+            "请先按上面的失败原因修复问题，并确认目标机器可以正常读取。",
+            "修复后由对应机器的负责人重新执行该机器的 `/approve_deploy` 命令，"
+            "或由 PR 作者重新提交 `/request_deploy`。",
+        ])
+    lines.append("在重新部署之前，不需要执行其他命令。")
     lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
     if deployments:
         lines.extend(["", "### 部署进度", "", _deployment_table(
@@ -2859,8 +2884,8 @@ def superseded_comment(
         f"### {NEXT_ACTION_TITLE}",
         "",
         "当前提交已经更新，之前提交的审核、镜像和部署审批都不能再使用。",
-        "请等待新提交的审核和镜像构建完成，完成后这里会列出可以部署的机器和对应命令。",
-        "暂时不需要执行任何命令。",
+        "请由 PR 作者在本 PR 的评论中执行 `/request_bot_review` 触发新提交的审核和镜像构建。",
+        "审核和镜像构建完成后，这里会列出可以部署的机器和对应命令。",
         "",
     ])
 
@@ -2908,8 +2933,8 @@ def _status_next_action(
     if status == "review-required":
         return [
             "当前提交还没有审核和镜像构建结果，现在还不能部署。",
-            "请等待审核和镜像构建完成，完成后这里会列出可以部署的机器和对应命令。",
-            "暂时不需要执行任何命令。",
+            "请由 PR 作者在本 PR 的评论中执行 `/request_bot_review` 触发审核和镜像构建。",
+            "审核和镜像构建完成后，这里会列出可以部署的机器和对应命令。",
         ]
     if status == "reviewing":
         return [
@@ -3559,25 +3584,18 @@ def render_evidence_section(
                 suffix in {"mp4", "webm"},
             ))
         if valid_items:
-            lines.extend([
-                "",
-                "| 文件 | 大小 | 上传时间 |",
-                "|---|---:|---|",
-            ])
-            lines.extend(
-                f"| [{_escape(filename)}](<{download_url}>) | {_human_size(size)} | {_escape(uploaded_at)} |"
-                for filename, size, uploaded_at, download_url, _, _ in valid_items
-            )
-            for filename, _, _, download_url, preview_url, is_video in valid_items:
-                lines.append("")
-                if is_video:
-                    # Videos download directly; the upload page is never a
-                    # substitute for the stored file.
-                    lines.append(f"[下载视频：{_escape(filename)}](<{download_url}>)")
-                else:
-                    if preview_url:
-                        lines.append(f"![{_escape(filename)}](<{preview_url}>)")
-                    lines.append(f"[下载图片：{_escape(filename)}](<{download_url}>)")
+            # One card per file actually uploaded in this exact PR/HEAD/round:
+            # the name is the direct file link, images additionally show their
+            # own preview. Nothing is repeated and no upload page is linked.
+            for filename, size, uploaded_at, download_url, preview_url, is_video in valid_items:
+                link_label = "下载视频" if is_video else "下载图片"
+                lines.extend([
+                    "",
+                    (f"**`{_escape(filename)}`** · {_human_size(size)} · "
+                     f"{_escape(uploaded_at)} · [{link_label}](<{download_url}>)"),
+                ])
+                if not is_video and preview_url:
+                    lines.append(f"![{_escape(filename)}](<{preview_url}>)")
         return lines
 
     def round_summary(key, group):
@@ -3600,7 +3618,7 @@ def render_evidence_section(
                 else:
                     historical_count = len([k for k in groups if k != current_key and valid_round_binding(k[0], k[1])])
                     round_number = historical_count + 1
-            label = f"第 {round_number} 轮（当前轮次）"
+            label = f"第 {round_number} 轮"
         else:
             round_number = group.get("round_number")
             if type(round_number) is int and round_number > 0:

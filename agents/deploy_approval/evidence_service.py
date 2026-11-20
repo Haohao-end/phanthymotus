@@ -683,6 +683,15 @@ class EvidenceService:
         if PurePosixPath(filename).suffix.lower() not in _COMMENTABLE_MEDIA_SUFFIXES:
             return NOTIFICATION_SKIPPED, '', ''
 
+        actor_login = operation.get('actor_login')
+        actor_verified = operation.get('actor_verified') is True
+        github_user_authenticated = operation.get('github_user_authenticated') is True
+        uploaded_by = (
+            actor_login.strip()
+            if actor_verified and github_user_authenticated and isinstance(actor_login, str)
+            else ''
+        )
+
         from . import comments as comments_mod, evidence_auth
         from .config import is_stable_public_base_url
         public_base = getattr(self.config, 'evidence_public_base_url', '')
@@ -712,6 +721,7 @@ class EvidenceService:
                     repo, pr_number, head_sha, round_id, attachment_id, filename,
                     download_url=download_url, preview_url=preview_url,
                     public_base_url=public_base,
+                    uploaded_by=uploaded_by,
                 )
             else:
                 temporary = await self._temporary_cos_notification_links(
@@ -724,6 +734,7 @@ class EvidenceService:
                     repo, pr_number, head_sha, round_id, attachment_id, filename,
                     download_url=download_url, preview_url=preview_url,
                     public_base_url='', cos_url_validator=validator,
+                    uploaded_by=uploaded_by,
                 )
         except Exception as exc:
             logger.warning(
