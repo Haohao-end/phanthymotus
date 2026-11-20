@@ -23,9 +23,9 @@ from .image_ref import validate_image_ref
 BOT_MARKER = "<!-- deploy-approval-agent -->"
 _BEIJING = ZoneInfo("Asia/Shanghai")
 
-# One user-visible Next action title for every lifecycle state.
+# One user-visible action section title for every lifecycle state.
 NEXT_ACTION_TITLE = "现在需要做什么"
-_MACHINE_SELECTOR_NOTE = "`machine=` 填写上方机器的别名或主 IP。"
+_MACHINE_SELECTOR_NOTE = "请直接执行上方对应机器的那条命令，不要自行改写命令中的机器。"
 
 _MAX_VISIBLE_LIFECYCLE_BYTES = 48 * 1024  # 48 KiB soft budget
 
@@ -110,10 +110,27 @@ def _lifecycle_body(lines: list[str]) -> str:
     return "\n".join([*lines, "<!-- deploy-approval-history -->"])
 
 
+_DEPLOYMENT_PHASE_LABELS = {
+    "deployed": "已部署",
+    "deploying": "部署中",
+    "executing": "部署中",
+    "preflight": "准备中",
+    "pending": "等待中",
+    "failed": "部署失败",
+    "cancelled": "已取消",
+    "uncertain": "结果待确认",
+}
+
+
 def _deployment_table(deployments=None, components=None, machine_groups=None) -> str:
     snapshots = {c.get("component_id"): c for c in components or [] if isinstance(c, dict)}
-    machines = {m.get("alias"): m.get("ip", "") for m in machine_groups or [] if isinstance(m, dict)}
-    lines = ["| Machine | IP | Component | Variant/Path | Image | Result |",
+    machines = {
+        m.get("alias"): (
+            m.get("ip") or m.get("primary_ip") or m.get("node_host") or ""
+        )
+        for m in machine_groups or [] if isinstance(m, dict)
+    }
+    lines = ["| 机器 | IP | 组件 | 变体/路径 | 镜像 | 结果 |",
              "|---|---|---|---|---|---|"]
     count = 0
     for dep in deployments or []:
@@ -130,15 +147,17 @@ def _deployment_table(deployments=None, components=None, machine_groups=None) ->
                 local[c.get("component_id")] = c
                 if c.get("component_id"):
                     snapshot_ids.append(c["component_id"])
-        machine = dep.get("machine", dep.get("alias", "?"))
-        ip = dep.get("ip") or machines.get(machine) or "—"
-        phase = dep.get("phase") or dep.get("result") or dep.get("status") or "unknown"
-        result = _safe_display_text(phase)
+        machine = dep.get("machine") or dep.get("alias") or "机器未提供"
+        ip = dep.get("ip") or machines.get(machine) or "IP 未提供"
+        phase = dep.get("phase") or dep.get("result") or dep.get("status") or ""
+        result = _DEPLOYMENT_PHASE_LABELS.get(
+            str(phase).strip().casefold(), "状态未确认",
+        )
         if dep.get("error"):
-            result += ": " + _safe_display_text(dep["error"])
+            result += "：" + _safe_display_text(dep["error"])
         if dep.get("updated_at") or dep.get("timestamp"):
             result += " · " + str(dep.get("updated_at") or dep.get("timestamp"))
-        ids = dep.get("component_ids") or ([dep["component_id"]] if dep.get("component_id") else snapshot_ids or ["unknown"])
+        ids = dep.get("component_ids") or ([dep["component_id"]] if dep.get("component_id") else snapshot_ids or ["组件未提供"])
         for cid in ids:
             c = local.get(cid, dep if dep.get("component_id") == cid else {})
             values = tuple(_safe_display_text(value) for value in (
@@ -150,8 +169,7 @@ def _deployment_table(deployments=None, components=None, machine_groups=None) ->
             count += 1
     if count:
         return "\n".join(lines)
-    return ("Deployment records exist; details unavailable." if deployments else
-            "No deployment has been performed yet.")
+    return ("部署信息暂时不可用。" if deployments else "还没有发起部署。")
 
 
 _RUNTIME_CHECKS_START = "<!-- deploy-approval-runtime-action:start -->"
@@ -163,8 +181,9 @@ _LEGACY_RUNTIME_CHECKS_END = "<!-- deploy-approval-runtime-checks:end -->"
 def _runtime_component_label(component: dict) -> str:
     target = str(component.get("target", "") or "")
     if target == "driver":
-        return "driver " + str(component.get("driver_path", "") or "—")
-    variant = str(component.get("variant", "") or "")
+        path = str(component.get("driver_path", "") or "").strip()
+        return f"driver {path}" if path else "driver"
+    variant = str(component.get("variant", "") or "").strip()
     return f"{target} {variant}" if variant else target
 
 
@@ -486,7 +505,10 @@ def runtime_image_checks_block(
             if command in emitted_commands:
                 continue
             emitted_commands.add(command)
-            lines.append(f"  - 重新部署命令：<code>{_escape(command)}</code>")
+            # The selector is an IPv4 address or a verified alias limited to
+            # [A-Za-z0-9_.-], so the command can be shown verbatim; HTML
+            # escaping would mangle the underscore into ``&#95;``.
+            lines.append(f"  - 重新部署命令：<code>{command}</code>")
     if not lines:
         return ""
     return "\n".join((_RUNTIME_CHECKS_START, *lines, _RUNTIME_CHECKS_END))
@@ -858,6 +880,9 @@ def _workflow_lines(
         "deploy-requested": 3,
         "deploying": 4,
         "testing": 5,
+        # Awaiting independent acceptance is still the testing step; only the
+        # record-result step stays open.
+        "acceptance-required": 5,
         "succeeded": 7,
     }
     # A failed run must never claim steps it cannot prove: ``failed`` marks the
@@ -868,8 +893,12 @@ def _workflow_lines(
         "deployment": 4,
         "evidence": 5,
         "validation": 7,
+        # Acceptance happens after the test result is recorded, so only the
+        # final "Deployment accepted" step stays open.
+        "acceptance": 7,
     }.get(failed_stage or "", 0)
     current_level = status_levels.get(status, 0)
+    test_like = status in {"testing", "acceptance-required"}
 
     lines = []
     next_marked = False
@@ -878,12 +907,12 @@ def _workflow_lines(
             checked = index < failed_first_pending
         else:
             checked = current_level > required_level
-            if status == "testing" and step == "deployment":
+            if test_like and step == "deployment":
                 # An unset flag means the caller did not assert incompleteness.
                 checked = deployments_complete is not False
-            if status == "testing" and step == "evidence":
+            if test_like and step == "evidence":
                 checked = bool(evidence_complete)
-            if status == "testing" and step == "result":
+            if test_like and step == "result":
                 checked = bool(record_test_complete)
         mark = "[x]" if checked else "[ ]"
         line = f"- {mark} {label}"
@@ -970,20 +999,22 @@ def _testing_next_action(
     evidence_url = _trusted_upload_page_url(evidence_url, repo, pr_number)
     if not evidence_url:
         evidence_url = _configured_upload_page_url(repo, pr_number)
-    lines = ["机器已部署，可以开始测试。"]
+    lines = [
+        "机器已经部署，现在可以开始测试。",
+        "请自行验证实际效果；测试完成后由本轮部署机器的负责人执行 `/request_acceptance` 提交验收。",
+    ]
     if evidence_url:
         lines.extend([
             "",
-            "上传测试视频或图片完全可选，不影响验收：",
+            "上传测试视频或图片是完全可选的，不影响验收；需要时可以从这里上传：",
             f"[上传测试视频或图片](<{evidence_url}>)",
         ])
     else:
         lines.extend([
             "",
-            "上传测试视频或图片完全可选，不影响验收；"
+            "上传测试视频或图片是完全可选的，不影响验收；"
             "固定的 PR 上传链接会在公共上传入口恢复后显示在这里。",
         ])
-    lines.extend(["", "测试完成后执行 `/request_acceptance`。"])
     return "\n".join(lines)
 
 def _deploying_next_action(
@@ -1112,7 +1143,7 @@ def _deploying_next_action(
             ]
     elif source_phase == "deployed":
         lines = [
-            f"目标镜像已在机器 {machine_label} 确认；本轮部署还在汇总其他组件的结果：",
+            f"目标镜像已在机器 {machine_label}确认；本轮部署还在汇总其他组件的结果：",
         ]
     elif source:
         if machine_label == "机器信息暂不可用":
@@ -1123,9 +1154,17 @@ def _deploying_next_action(
         lines = ["当前部署还没有完成，机器和目标镜像信息暂时无法确认。"]
     lines.extend(image_lines)
     if outcome_uncertain:
-        lines.extend(["", "正在等待自动检查确认部署结果；确认之前不会重复提交部署，请勿重复发送部署命令。"])
+        lines.extend([
+            "",
+            "部署结果还在等待自动检查确认。现在不需要执行任何命令，"
+            "确认之前不会重复提交部署，请不要重复发送部署命令。",
+        ])
     else:
-        lines.extend(["", "正在部署，当前部署尚未完成，请等待部署结果；不要重复提交部署命令。"])
+        lines.extend([
+            "",
+            "部署正在进行。现在不需要执行任何命令，请等待部署结果，"
+            "不要重复提交部署命令。",
+        ])
     return lines
 
 
@@ -1137,14 +1176,16 @@ def _archives_link_block(archives: list[dict]) -> str:
     if not archives:
         return ""
 
+    # The heading text is matched verbatim by the service when it preserves
+    # published archive links, so only the visible entries are localized.
     lines = ["### Archived history", ""]
     for arch in archives:
         page = arch.get("page", 1)
         url = arch.get("url", "")
         if url:
-            lines.append(f"- [History Archive Page {page}]({url})")
+            lines.append(f"- [第 {page} 页历史归档]({url})")
         else:
-            lines.append(f"- History Archive Page {page}")
+            lines.append(f"- 第 {page} 页历史归档")
     lines.append("")
     return "\n".join(lines)
 
@@ -1170,11 +1211,13 @@ def review_required(
         "",
         f"### {NEXT_ACTION_TITLE}",
         "",
-        "等待当前 HEAD 的代码审核和镜像构建完成；完成后这里会列出可以部署的机器。",
+        "当前提交还没有审核和镜像构建结果，现在还不能部署。",
+        "请等待审核和镜像构建完成，完成后这里会列出可以部署的机器和对应命令。",
+        "暂时不需要执行任何命令。",
         "",
-        "### Current Deployment",
+        "### 部署进度",
         "",
-        "No deployment has been requested yet.",
+        "还没有发起部署。",
     ])
 
 
@@ -1196,7 +1239,9 @@ def reviewing(
         "",
         f"### {NEXT_ACTION_TITLE}",
         "",
-        "正在审核当前 HEAD 并构建镜像，完成后会列出可以部署的机器。",
+        "当前提交正在审核并构建镜像，现在还不能部署。",
+        "请等待审核和镜像构建完成，完成后这里会列出可以部署的机器和对应命令。",
+        "暂时不需要执行任何命令。",
     ])
 
 
@@ -1377,11 +1422,17 @@ def deploy_ready(
                         or not machine["ip_command_safe"]
                         or machine["ambiguous_ip"]):
                     continue
-            command = (
-                f"/approve_deploy machine={primary_ip}"
-                if command_selector == primary_ip else
-                f"/approve_deploy machine={alias}"
-            )
+            if command_selector == primary_ip:
+                # The normal case: the command names the real machine IP.
+                command = f"/approve_deploy machine={primary_ip}"
+            elif (command_selector == alias
+                  and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", alias or "")):
+                # Only a verified alias is available (its IP selector would be
+                # unsafe). The alias is a real, unique machine name, so the
+                # reader never sees a placeholder such as <alias-or-ip>.
+                command = f"/approve_deploy machine={alias}"
+            else:
+                continue
             if command in seen_commands:
                 continue
             seen_commands.add(command)
@@ -1406,18 +1457,17 @@ def deploy_ready(
         "",
         f"### {NEXT_ACTION_TITLE}",
         "",
-        ("当前 HEAD 的审核和镜像构建都已完成，可以部署。"
+        ("当前提交的代码审核和镜像构建都已完成，可以部署。"
          if approval_evidence_ready else
-         "当前 HEAD 的代码审核或镜像构建尚未完成，暂时还不能部署。"),
+         "当前提交的代码审核或镜像构建还没有完成，现在还不能部署。"),
     ]
     if commands:
         lines.extend([
             "",
-            "所有当前可部署的兼容机器：",
+            "请由对应机器的负责人在本 PR 的评论中执行该机器的命令：",
             "",
             *commands,
             "",
-            "由对应机器负责人在 PR 评论中直接执行该机器的命令。",
             _MACHINE_SELECTOR_NOTE,
         ])
         if len(full_machine_aliases) == 1 and len(commands) == 1 and approval_evidence_ready:
@@ -1427,17 +1477,19 @@ def deploy_ready(
             ])
         lines.extend([
             "",
-            "`/request_deploy` 是可选的，不执行也能直接部署。",
+            "`/request_deploy` 是可选的；不执行也可以直接按上面的命令部署。",
         ])
     elif approval_evidence_ready:
         lines.extend([
             "",
-            "当前没有通过机器身份、仓库授权和组件兼容检查的机器，暂时无法部署。",
+            "当前还没有通过机器身份、仓库授权和组件兼容检查的机器，暂时无法部署。",
+            "请等待状态同步后刷新本 Summary；确认前不要执行部署命令。",
         ])
     else:
         lines.extend([
             "",
-            "审核或镜像构建尚未完成，这里还不会列出部署命令。",
+            "审核或镜像构建还没有完成，这里还不会列出部署命令。",
+            "请等待本 Summary 更新，暂时不需要执行任何命令。",
         ])
     lines.extend(["", "### 构建结果", "", _build_table(builds, components)])
     return _lifecycle_body(lines)
@@ -2531,7 +2583,7 @@ def deploy_requested(
             ),
         ))
     else:
-        lines.append("部署申请已经提交，正在等待对应机器负责人审批。")
+        lines.append("部署申请已经提交，现在等待对应机器的负责人审批。")
         pending_lines = []
         for state in compatible_states:
             alias = state["alias"]
@@ -2566,21 +2618,27 @@ def deploy_requested(
                 state["owners"], test_only=test_only, mention=not test_only,
             )
             pending_lines.append(
-                f"- {_escape(alias)}（{_escape(state['ip'] or '主 IP 未确认')}）"
-                f"· 兼容组件：{component_text}\n"
-                f"  {owner_text}，审批命令：<code>{_escape(command)}</code>"
+                f"- `{_escape(alias)}`（`{_escape(state['ip'] or '主 IP 未确认')}`）\n"
+                f"  负责审批：{owner_text}\n"
+                f"  兼容组件：{component_text}\n"
+                f"  审批命令：`{command}`"
             )
         if pending_lines:
-            lines.extend(["", "还未完成审批的机器：", "", *pending_lines])
+            lines.extend(["", "等待下列机器的负责人审批：", "", *pending_lines])
         if not seen_commands:
             lines.append(
-                "当前没有可执行的审批命令：机器身份、仓库授权、连接状态或组件兼容性"
-                "还没有全部确认，请等待状态同步后刷新。"
+                "暂时还没有可以执行的审批命令。请等待状态同步后刷新本 Summary，"
+                "刷新前不需要执行任何命令。"
             )
         else:
-            lines.extend(["", _MACHINE_SELECTOR_NOTE])
+            lines.extend([
+                "",
+                "审批完成后本 Summary 会自动更新为部署进度；审批前不需要其他操作。",
+            ])
         if len(full_machine_aliases) == 1 and len(seen_commands) == 1:
-            lines.append("只有一台机器完整兼容所有组件，也可以直接执行 <code>/approve_deploy</code>。")
+            lines.append(
+                "只有一台机器完整兼容所有组件，负责人也可以直接执行 `/approve_deploy`。"
+            )
 
     notes = []
     for note in gate_note or []:
@@ -2612,7 +2670,6 @@ def deploy_requested(
         _deployment_table(
             deployments, all_components or component_snapshot or components, group_rows,
         ),
-        *_attempt_lines(attempt),
     ])
     body = _lifecycle_body(lines)
     return body.replace("@", "＠") if test_only else body
@@ -2641,15 +2698,22 @@ def testing(
         if reviewers:
             waiting_for = "、".join(f"@{_escape(name)}" for name in reviewers)
             next_action = [
-                f"本轮测试已完成，等待验收：{waiting_for}。",
-                "请验收人检查 PR Summary 中的测试证据和实际部署效果，"
-                "然后执行 `/record_test result=pass` 或 `/record_test result=fail`。",
+                f"机器已经部署，本轮测试也已完成，现在等待验收：{waiting_for}。",
+                "请由上述验收人检查本 Summary 中的测试证据和实际部署效果，然后再记录结果：",
+                "`/record_test result=pass`（通过）或 `/record_test result=fail`（不通过）。",
+                "在验收人记录结果之前，PR 作者不需要执行其他命令。",
             ]
         else:
             if not acceptance_reviewers_configured:
-                reason = "当前仓库还没有可用的验收账号，暂时无法验收；请联系仓库维护者配置。"
+                reason = (
+                    "机器已经部署，本轮测试也已完成；但当前仓库还没有可用的验收账号，"
+                    "暂时无法验收。请联系仓库维护者配置验收账号。"
+                )
             else:
-                reason = "当前没有可用的验收账号，暂时无法验收；请联系仓库维护者检查。"
+                reason = (
+                    "机器已经部署，本轮测试也已完成；但当前没有可用的验收账号，"
+                    "暂时无法验收。请联系仓库维护者检查验收账号。"
+                )
             next_action = [reason]
         upload_url = _trusted_upload_page_url(evidence_url, repo, pr_number)
         if not upload_url:
@@ -2717,7 +2781,8 @@ def succeeded_comment(
         "",
         f"### {NEXT_ACTION_TITLE}",
         "",
-        "本轮验收已通过，部署完成；可以按仓库流程继续合并 PR。",
+        "本轮验收已经通过，部署完成。",
+        "现在不需要执行部署或测试命令；可以按仓库流程继续合并这个 PR。",
         "",
     ]
     lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
@@ -2749,19 +2814,25 @@ def failed_comment(
         "",
         f"### {NEXT_ACTION_TITLE}",
         "",
-        "本次部署没有完成。",
+        ("本轮验收没有通过。" if failed_stage == "acceptance"
+         else "本次部署没有完成。"),
     ]
     if error:
-        lines.append(f"**Error:** {_escape(error)}")
+        lines.append(f"**失败原因：** {_escape(error)}")
+    elif failed_stage == "acceptance":
+        lines.append("**失败原因：** 验收人记录的结果为不通过。")
     lines.extend([
         "",
-        "请先按上面的失败原因修复问题，确认机器可以正常读取；"
-        "修复后重新执行 `/approve_deploy` 对应机器的命令，或由 PR 作者重新提交 `/request_deploy`。",
+        "请先按上面的失败原因修复问题，并确认目标机器可以正常读取。",
+        "修复后由对应机器的负责人重新执行该机器的 `/approve_deploy` 命令，"
+        "或由 PR 作者重新提交 `/request_deploy`。",
+        "在重新部署之前，不需要执行其他命令。",
     ])
     lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
-    lines.extend(_attempt_lines(attempt))
     if deployments:
-        lines.extend(["### Deployment records", _deployment_table(deployments, components, machine_groups)])
+        lines.extend(["", "### 部署进度", "", _deployment_table(
+            deployments, components, machine_groups,
+        )])
     return _lifecycle_body(lines)
 
 
@@ -2787,7 +2858,9 @@ def superseded_comment(
         "",
         f"### {NEXT_ACTION_TITLE}",
         "",
-        "请等待当前 HEAD 的代码审核和镜像构建完成；完成后这里会列出可以部署的机器。",
+        "当前提交已经更新，之前提交的审核、镜像和部署审批都不能再使用。",
+        "请等待新提交的审核和镜像构建完成，完成后这里会列出可以部署的机器和对应命令。",
+        "暂时不需要执行任何命令。",
         "",
     ])
 
@@ -2821,26 +2894,39 @@ def uncertain_comment(
             outcome_uncertain=True,
         ),
     ]
-    lines.extend(_attempt_lines(attempt))
     if deployments:
-        lines.extend(["### Current Deployment", _deployment_table(deployments, components, machine_groups)])
+        lines.extend(["", "### 部署进度", "", _deployment_table(
+            deployments, components, machine_groups,
+        )])
     return _lifecycle_body(lines)
 
 
 def _status_next_action(
     status: str, deployments, components, machine_groups, attempt,
 ) -> list[str]:
-    """One-sentence guidance for the read-only status view of every state."""
+    """Same structure for every state: what happens, what to do, whether to wait."""
     if status == "review-required":
-        return ["等待当前 HEAD 的代码审核和镜像构建完成；完成后这里会列出可以部署的机器。"]
+        return [
+            "当前提交还没有审核和镜像构建结果，现在还不能部署。",
+            "请等待审核和镜像构建完成，完成后这里会列出可以部署的机器和对应命令。",
+            "暂时不需要执行任何命令。",
+        ]
     if status == "reviewing":
-        return ["正在审核当前 HEAD 并构建镜像，完成后会列出可以部署的机器。"]
+        return [
+            "当前提交正在审核并构建镜像，现在还不能部署。",
+            "请等待审核和镜像构建完成，完成后这里会列出可以部署的机器和对应命令。",
+            "暂时不需要执行任何命令。",
+        ]
     if status == "deploy-ready":
-        return ["当前 HEAD 的审核和镜像构建都已完成，可以按 PR Summary 中的机器命令部署。"]
+        return [
+            "当前提交的代码审核和镜像构建都已完成，可以部署。",
+            "请由对应机器的负责人在本 PR 的评论中执行本 Summary 里该机器对应的命令；"
+            "`/request_deploy` 是可选的。",
+        ]
     if status == "deploy-requested":
         return [
-            "部署申请已经提交，正在等待对应机器负责人审批。",
-            "审批完成后会显示部署进度。",
+            "部署申请已经提交，现在等待对应机器的负责人审批。",
+            "审批完成后这里会显示部署进度；审批前不需要其他操作。",
         ]
     if status == "deploying":
         return _deploying_next_action(
@@ -2848,17 +2934,29 @@ def _status_next_action(
         )
     if status == "testing":
         return [
-            "机器已部署，可以开始测试。",
-            "测试完成后执行 `/request_acceptance`。",
+            "机器已经部署，现在可以开始测试。",
+            "测试完成后由本轮部署机器的负责人执行 `/request_acceptance` 提交验收。",
+        ]
+    if status == "acceptance-required":
+        return [
+            "机器已经部署，本轮测试也已完成，现在等待验收。",
+            "请由本 Summary 中列出的验收人记录结果："
+            "`/record_test result=pass`（通过）或 `/record_test result=fail`（不通过）。",
+            "在验收人记录结果之前，PR 作者不需要执行其他命令。",
         ]
     if status == "succeeded":
-        return ["本轮验收已通过，部署完成；可以按仓库流程继续合并 PR。"]
+        return [
+            "本轮验收已经通过，部署完成。",
+            "现在不需要执行部署或测试命令；可以按仓库流程继续合并这个 PR。",
+        ]
     if status == "failed":
         return [
             "本次部署没有完成。",
-            "请按失败原因修复问题、确认机器可以正常读取，然后重新提交部署审批。",
+            "请先按失败原因修复问题，确认目标机器可以正常读取，"
+            "再由对应机器的负责人重新执行 `/approve_deploy`，"
+            "或由 PR 作者重新提交 `/request_deploy`。",
         ]
-    return ["请查看当前部署状态，按 PR Summary 中的提示操作。"]
+    return ["请查看当前部署状态，按本 Summary 中的提示操作。"]
 
 
 def deploy_status_comment(
@@ -2888,15 +2986,10 @@ def deploy_status_comment(
         "",
         *_status_next_action(status, deployments, components, machine_groups, attempt),
         "",
+        "### 部署进度",
+        "",
+        _deployment_table(deployments, components, machine_groups),
     ]
-    if components:
-        lines.append("Components:")
-        for c in components:
-            target = c.get("target", "")
-            lines.append(f"- {_escape(target)}")
-        lines.append("")
-    lines.extend(["### Current Deployment", "", _deployment_table(deployments, components, machine_groups), ""])
-    lines.extend(_attempt_lines(attempt))
     lines.extend(_cos_evidence_block(
         cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url,
     ))
@@ -2966,9 +3059,9 @@ def deploy_help_text(topic: str = "") -> str:
             "",
             "用途：记录本轮部署验证结果。",
             "",
-            "两个目标仓库分别维护各自的 `test_reviewers.yaml`；执行 `/record_test` 只使用当前仓库的验收名单。",
-            "执行人：当前仓库验收名单中的 GitHub 用户。部署审批权限与最终验收权限相互独立。",
-            "请求验收后，Summary 会显示当前仓库有效的 `@账号`；只有这些验收白名单账号可以执行 `/record_test`。",
+            "执行人：当前仓库验收名单中的 GitHub 用户；执行 `/record_test` 只使用当前仓库的验收名单。",
+            "部署审批权限与最终验收权限相互独立。",
+            "请求验收后，Summary 会显示当前仓库有效的 `@账号`；只有这些验收名单账号可以执行 `/record_test`。",
             "阶段：本轮已在 testing 阶段请求验收后。",
             "",
             "参数：",
@@ -2992,9 +3085,9 @@ def deploy_help_text(topic: str = "") -> str:
         "- `/request_deploy`：PR 作者在开放 PR 的 deploy-ready 阶段发起部署请求。",
         "- 机器审批：对应机器的负责人或有 write/maintain/admin 权限的协作者；deploy-ready 时按 Summary 中兼容机器的真实 IP 命令直接审批，仅一台机器完全适配时可使用 `/approve_deploy`；deploy-requested 时按 Summary 的机器 IP 命令常规审批。`/request_deploy` 是可选操作。",
         "- `/request_acceptance`：本轮实际部署机器的负责人在 testing 阶段请求验收；仅更新待验收标记，不结束 testing。",
-        "- 两个目标仓库分别维护自己的 `test_reviewers.yaml`；部署审批权限不会授予验收权限。",
-        "- `/record_test result=pass summary=\"视频播放和附件校验通过\"`：当前仓库验收白名单中的用户在待验收阶段记录成功。",
-        "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`：当前仓库验收白名单中的用户在待验收阶段记录失败。",
+        "- 当前仓库单独维护自己的验收名单；部署审批权限不会授予验收权限。",
+        "- `/record_test result=pass summary=\"视频播放和附件校验通过\"`：当前仓库验收名单中的用户在待验收阶段记录成功。",
+        "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`：当前仓库验收名单中的用户在待验收阶段记录失败。",
         "- 请求验收后，Summary 会标出当前仓库有效的 `@账号`；只有这些账号可以执行 `/record_test`。",
         "- `/deploy_status`：只读查询当前部署状态，可在任意阶段使用。",
         "- `/deploy_help record_test`：查看验收命令说明；可在任意阶段使用。",
@@ -3003,22 +3096,6 @@ def deploy_help_text(topic: str = "") -> str:
         "",
         "详细帮助：`/deploy_help request_bot_review`、`/deploy_help request_deploy`、`/deploy_help approve_deploy`、`/deploy_help record_test`。",
     ])
-
-
-def _attempt_lines(attempt: dict | None) -> list[str]:
-    if not attempt:
-        return []
-    values = {
-        "Machine": attempt.get("machine") or attempt.get("alias") or "unknown",
-        "IP": attempt.get("ip") or "unknown",
-        "Components": attempt.get("component_ids") or attempt.get("components") or attempt.get("args", {}).get("pending_component_ids") or "unknown",
-        "Phase": attempt.get("phase") or "unknown",
-        "Time": attempt.get("timestamp") or attempt.get("updated_at") or attempt.get("started_at") or "unknown",
-        "Error": _safe_display_text(attempt.get("error") or "—"),
-    }
-    return ["", "### Deployment attempt", "", *[
-        f"- **{label}:** {_escape(value)}" for label, value in values.items()
-    ]]
 
 
 def _public_base(value: str) -> str:
@@ -3080,51 +3157,6 @@ def _trusted_github_attachment_url(item: dict) -> str:
                 parsed.path)):
         return ""
     return value
-
-
-def _machine_log_lines(group, key, api, origin):
-    machine_logs = group.get("deployment_logs", {})
-    deployed_machines = {
-        deployment.get("machine") for deployment in group.get("deployments", [])
-        if isinstance(deployment, dict) and deployment.get("phase") == "deployed"
-        and isinstance(deployment.get("machine"), str)
-    }
-    valid_log_statuses = {"pending", "ready", "unavailable"}
-    if isinstance(machine_logs, dict):
-        deployed_machines.update(
-            machine for machine, record in machine_logs.items()
-            if isinstance(machine, str) and isinstance(record, dict)
-            and record.get("head_sha") == key[0]
-            and record.get("round_id") == key[1]
-            and record.get("status") in valid_log_statuses
-        )
-    deployed_machines = sorted(deployed_machines)
-    if not deployed_machines:
-        return []
-    lines = []
-    for machine in deployed_machines:
-        record = machine_logs.get(machine) if isinstance(machine_logs, dict) else None
-        if (not isinstance(record, dict)
-                or record.get("head_sha") != key[0]
-                or record.get("round_id") != key[1]
-                or record.get("status") not in valid_log_statuses):
-            record = None
-        status = record.get("status") if record is not None else "missing"
-        capability = record.get("capability") if record is not None else None
-        if status == "ready" and origin and isinstance(capability, str) and capability:
-            path = api + "/rounds/" + urllib.parse.quote(key[1], safe="")
-            path += "/machines/" + urllib.parse.quote(machine, safe="") + "/log/download"
-            url = origin + path + "?" + urllib.parse.urlencode({"cap": capability})
-            lines.append(f"- `{_escape(machine)}`：[下载部署日志](<{url}>)")
-        elif status == "ready":
-            lines.append(f"- `{_escape(machine)}`：已归档，下载链接暂不可用")
-        elif status == "pending":
-            lines.append(f"- `{_escape(machine)}`：正在保存部署日志")
-        elif status == "unavailable":
-            lines.append(f"- `{_escape(machine)}`：记录包不可用")
-        else:
-            lines.append(f"- `{_escape(machine)}`：未归档")
-    return lines
 
 
 def render_evidence_section(

@@ -1066,6 +1066,32 @@ class GitHubCommandWatcher:
         except (TypeError, ValueError):
             return None
 
+    def _is_foreign_bot_comment(self, comment: dict) -> bool:
+        """Detect any bot-authored comment that is not our own App comment.
+
+        ``proxy.is_bot_comment`` deliberately matches only the configured App,
+        because that provenance is what lifecycle writes trust. Command
+        parsing needs the wider complement: another GitHub App or bot can post
+        text that happens to look like a command, and it must never be read as
+        a human instruction. Only an explicit ``type == "Bot"`` user or a
+        ``performed_via_github_app`` block counts here, so ordinary human
+        comments (which never carry either field) are unaffected.
+        """
+        if not isinstance(comment, dict):
+            return False
+        # The configured review-agent account is a trusted protocol author.
+        # Its terminal Build/Code Review comment must still reach reconcile,
+        # even when GitHub also attributes it to a Bot user or another App, so
+        # this exemption is checked before the generic bot detection below.
+        if self._is_trusted_review_completion(comment):
+            return False
+        if self.proxy.is_bot_comment(comment):
+            return True
+        user = comment.get("user")
+        if isinstance(user, dict) and user.get("type") == "Bot":
+            return True
+        return isinstance(comment.get("performed_via_github_app"), dict)
+
     def _is_trusted_review_completion(self, comment: dict) -> bool:
         """Recognize review completion hints without trusting Markdown alone."""
         user = comment.get("user")
@@ -1236,6 +1262,61 @@ class GitHubCommandWatcher:
         notices.add(topic)
         record["posted_notices"] = sorted(notices)
 
+    @staticmethod
+    def _is_error_notice_topic(topic) -> bool:
+        return isinstance(topic, str) and topic.startswith((
+            "command-error-", "command-not-ready", "command-rejected-",
+        ))
+
+    def _recent_command_error_replied(self, repo, pr_number, comment_id) -> bool:
+        """Whether this source comment already received one error reply.
+
+        Every error entry point (parser rejection, boundary, terminal PR,
+        handler failure) writes an error topic. The first confirmed notice wins:
+        a later retry that reaches a different entry point must not post a
+        second visible reply for the same source comment.
+        """
+        record = self._recent_command_records.get((repo, pr_number, comment_id))
+        if not isinstance(record, dict):
+            return False
+        return any(
+            self._is_error_notice_topic(topic)
+            for topic in (record.get("posted_notices") or ())
+        )
+
+    async def _post_command_error_notice(
+        self, repo, pr_number, comment_id, cmd, topic,
+    ) -> bool:
+        """Post the single bound error reply for one source command comment.
+
+        Returns ``True`` when this source comment has a confirmed error reply —
+        either just delivered now or already recorded earlier in this process,
+        in which case no second visible comment is posted. A missing API or an
+        unconfirmed POST returns ``False`` without advancing any cursor, so the
+        caller can retry safely.
+        """
+        if self._recent_command_error_replied(repo, pr_number, comment_id):
+            return True
+        post_reply = getattr(self.controller, "_post_command_reply", None)
+        if not callable(post_reply):
+            return False
+        try:
+            delivered = await post_reply(
+                repo, pr_number, comment_id, "", topic=topic, error=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "watcher command error notice failed repo=%s pr=%s comment_id=%s reason=%s",
+                repo, pr_number, comment_id, _github_failure_reason(exc),
+            )
+            return False
+        if delivered is not True:
+            return False
+        self._mark_recent_command_notice_posted(
+            repo, pr_number, comment_id, topic,
+        )
+        return True
+
     async def _post_boundary_rejection(
         self, repo: str, pr_number: int, comment_id: int, *,
         cmd, reason: str,
@@ -1252,26 +1333,9 @@ class GitHubCommandWatcher:
         code = _stable_error_code(reason)
         topic = (f"command-error-{code}-{kind}" if code
                  else f"command-error-{kind}")
-        if self._recent_command_notice_posted(repo, pr_number, comment_id, topic):
-            return True
-        post_reply = getattr(self.controller, "_post_command_reply", None)
-        if not callable(post_reply):
-            return False
-        try:
-            delivered = await post_reply(
-                repo, pr_number, comment_id, "",
-                topic=topic, error=True,
-            )
-        except Exception as exc:
-            logger.warning(
-                "watcher boundary rejection notice failed repo=%s pr=%s comment_id=%s reason=%s",
-                repo, pr_number, comment_id, _github_failure_reason(exc),
-            )
-            return False
-        if delivered is not True:
-            return False
-        self._mark_recent_command_notice_posted(repo, pr_number, comment_id, topic)
-        return True
+        return await self._post_command_error_notice(
+            repo, pr_number, comment_id, cmd, topic,
+        )
 
     @staticmethod
     def _terminal_pr_reason(pr: dict | None) -> str:
@@ -1336,7 +1400,7 @@ class GitHubCommandWatcher:
                 or origin.get("created_at") != source_comment.get("created_at")
                 or origin.get("updated_at") != source_comment.get("updated_at")
                 or origin.get("created_at") != origin.get("updated_at")
-                or self.proxy.is_bot_comment(origin)):
+                or self._is_foreign_bot_comment(origin)):
             return False
         expected_user = source_comment.get("user")
         actual_user = origin.get("user")
@@ -1353,24 +1417,9 @@ class GitHubCommandWatcher:
         if (author_id != str(expected_user["id"])
                 or author_login != expected_user["login"]):
             return False
-        post_reply = getattr(self.controller, "_post_command_reply", None)
-        if not callable(post_reply):
-            return False
-        try:
-            posted = await post_reply(
-                repo, pr_number, comment_id, "",
-                topic=topic, error=True,
-            )
-        except Exception as exc:
-            logger.warning(
-                "watcher terminal rejection post outcome unclear %s#%s comment_id=%s exception=%s",
-                repo, pr_number, comment_id, type(exc).__name__,
-            )
-            return False
-        if posted is not True:
-            return False
-        self._mark_recent_command_notice_posted(repo, pr_number, comment_id, topic)
-        return True
+        return await self._post_command_error_notice(
+            repo, pr_number, comment_id, cmd, topic,
+        )
 
     async def _handle_terminal_pr_commands(
         self, repo: str, pr_number: int, current_pr: dict, expected_status: str,
@@ -1401,7 +1450,9 @@ class GitHubCommandWatcher:
             key=lambda item: item["id"],
         )
         for listed in candidates:
-            if self.proxy.is_bot_comment(listed):
+            if self._is_foreign_bot_comment(listed):
+                # Foreign bots never author deploy commands; skip before any
+                # parse so their PR comments cannot trigger a reply.
                 continue
             created = self._parse_comment_time(listed.get("created_at"))
             if (created is None or created <= cutoff.astimezone(timezone.utc)
@@ -1535,6 +1586,10 @@ class GitHubCommandWatcher:
             cutoff = self._repo_baseline_cutoff_utc.get(repo)
             for comment in comments[:100]:
                 if not isinstance(comment, dict):
+                    continue
+                if self._is_foreign_bot_comment(comment):
+                    # Never let another bot's text enqueue a PR for command
+                    # processing.
                     continue
                 number = self._recent_comment_pr_number(repo, comment)
                 created_at = self._parse_comment_time(comment.get("created_at"))
@@ -3160,6 +3215,8 @@ class GitHubCommandWatcher:
                     comment_id = candidate.get("id")
                     if comment_id <= old_cursor:
                         continue
+                    if self._is_foreign_bot_comment(candidate):
+                        continue
                     body = candidate.get("body", "")
                     if (not isinstance(body, str) or not body.strip()
                             or commands_mod.command_starts_line_any(body)
@@ -3190,7 +3247,7 @@ class GitHubCommandWatcher:
                     if (not isinstance(fresh_comment, dict)
                             or fresh_comment.get("id") != comment_id):
                         return False
-                    if self.proxy.is_bot_comment(fresh_comment):
+                    if self._is_foreign_bot_comment(fresh_comment):
                         continue
                     fresh_body = fresh_comment.get("body", "")
                     if (not isinstance(fresh_body, str) or not fresh_body.strip()
@@ -3592,8 +3649,13 @@ class GitHubCommandWatcher:
                 )
                 return
 
-            if self.proxy.is_bot_comment(fresh_comment_obj):
-                # Use cursor-only persistence to preserve lifecycle markdown
+            if self._is_foreign_bot_comment(fresh_comment_obj):
+                # Another GitHub App or bot may post text that resembles a
+                # command. Its comment is ordinary history: never parse it as
+                # an instruction and never treat its attachments as test
+                # evidence. Only the configured App's own comments and a
+                # trusted human author can drive this watcher. A trusted
+                # review-completion comment is exempted inside the helper.
                 if state.get("head_sha"):
                     state = await self.proxy.persist_cursor(
                         repo, pr_number, comment_id,
@@ -4015,27 +4077,10 @@ class GitHubCommandWatcher:
                         failure_reason="rejection_author_identity_mismatch",
                     )
                     return
-                post_reply = getattr(self.controller, "_post_command_reply", None)
-                if not callable(post_reply):
-                    self._finish_recent_command(
-                        repo, pr_number, comment_id,
-                        failure_reason="rejection_notice_api_unavailable",
-                        retryable=True,
-                    )
-                    return
-                try:
-                    posted = await post_reply(
-                        repo, pr_number, comment_id, "",
-                        topic=f"command-error-{_command_kind(cmd)}",
-                        error=True,
-                    )
-                except Exception as exc:
-                    self._finish_recent_command(
-                        repo, pr_number, comment_id,
-                        failure_reason=f"rejection_notice_{_github_failure_reason(exc)}",
-                        retryable=True,
-                    )
-                    return
+                posted = await self._post_command_error_notice(
+                    repo, pr_number, comment_id, cmd,
+                    f"command-error-{_command_kind(cmd)}",
+                )
                 if posted is not True:
                     self._finish_recent_command(
                         repo, pr_number, comment_id,
@@ -4097,23 +4142,12 @@ class GitHubCommandWatcher:
                         repo, pr_number, comment_id,
                         failure_reason="command_handler_returned_unfinished",
                     )
-                    post_reply = getattr(self.controller, "_post_command_reply", None)
-                    if callable(post_reply):
-                        try:
-                            # Same reason text and current-state guidance as
-                            # every other error entry: the Service formatter
-                            # derives both from the shared topic.
-                            await post_reply(
-                                repo, pr_number, comment_id, "",
-                                topic=f"command-error-uncertain-{_command_kind(cmd)}",
-                                error=True,
-                            )
-                        except Exception as reply_error:
-                            logger.warning(
-                                "unfinished command notice failed repo=%s pr=%s comment_id=%s reason=%s",
-                                repo, pr_number, comment_id,
-                                _github_failure_reason(reply_error),
-                            )
+                    # Same reason text and current-state guidance as every
+                    # other error entry; at most one error reply per comment.
+                    await self._post_command_error_notice(
+                        repo, pr_number, comment_id, cmd,
+                        f"command-error-uncertain-{_command_kind(cmd)}",
+                    )
                 # False means unfinished work (including COS failure). Never
                 # consume a later comment past it; retry from fresh state next poll.
                 return
@@ -4142,20 +4176,10 @@ class GitHubCommandWatcher:
                         retryable=not consumed,
                     )
                     return
-                post_reply = getattr(self.controller, "_post_command_reply", None)
-                try:
-                    posted = await post_reply(
-                        repo, pr_number, comment_id, "",
-                        topic=f"command-error-{_command_kind(cmd)}",
-                        error=True,
-                    ) if callable(post_reply) else False
-                except Exception as reply_error:
-                    logger.warning(
-                        "command rejection notice failed repo=%s pr=%s comment_id=%s reason=%s",
-                        repo, pr_number, comment_id,
-                        _github_failure_reason(reply_error),
-                    )
-                    posted = False
+                posted = await self._post_command_error_notice(
+                    repo, pr_number, comment_id, cmd,
+                    f"command-error-{_command_kind(cmd)}",
+                )
                 if posted is not True:
                     self._finish_recent_command(
                         repo, pr_number, comment_id,
@@ -4195,20 +4219,10 @@ class GitHubCommandWatcher:
                             retryable=not consumed,
                         )
                         return
-                    post_reply = getattr(self.controller, "_post_command_reply", None)
-                    try:
-                        posted = await post_reply(
-                            repo, pr_number, comment_id, "",
-                            topic=f"command-error-{_command_kind(cmd)}",
-                            error=True,
-                        ) if callable(post_reply) else False
-                    except Exception as reply_error:
-                        logger.warning(
-                            "command rejection notice failed repo=%s pr=%s comment_id=%s reason=%s",
-                            repo, pr_number, comment_id,
-                            _github_failure_reason(reply_error),
-                        )
-                        posted = False
+                    posted = await self._post_command_error_notice(
+                        repo, pr_number, comment_id, cmd,
+                        f"command-error-{_command_kind(cmd)}",
+                    )
                     if posted is not True:
                         self._finish_recent_command(
                             repo, pr_number, comment_id,
@@ -4238,21 +4252,13 @@ class GitHubCommandWatcher:
                 # failing. Keep automatic replay suppressed and route the note
                 # through the same Service formatter used by every other
                 # error entry, so the reason and current-state guidance are
-                # identical for the same Lifecycle state.
-                post_reply = getattr(self.controller, "_post_command_reply", None)
-                if callable(post_reply):
-                    try:
-                        await post_reply(
-                            repo, pr_number, comment_id, "",
-                            topic=f"command-error-uncertain-{_command_kind(cmd)}",
-                            error=True,
-                        )
-                    except Exception as reply_error:
-                        logger.warning(
-                            "command outcome notice failed repo=%s pr=%s comment_id=%s reason=%s",
-                            repo, pr_number, comment_id,
-                            _github_failure_reason(reply_error),
-                        )
+                # identical for the same Lifecycle state. A failed notice is
+                # not fatal here: the outcome is unknown either way, and the
+                # per-comment dedupe keeps any retry from double-posting.
+                await self._post_command_error_notice(
+                    repo, pr_number, comment_id, cmd,
+                    f"command-error-uncertain-{_command_kind(cmd)}",
+                )
                 # Transient error — do NOT advance cursor, stop processing this PR
                 return
 

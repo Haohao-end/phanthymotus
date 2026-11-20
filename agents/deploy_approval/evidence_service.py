@@ -70,10 +70,13 @@ class EvidenceService:
         normalized = ' '.join(
             unicodedata.normalize('NFKC', note).replace('\u200b', '').split(),
         ).casefold()
-        templates = (
-            'server-side cos multipart acceptance',
-            'server-side 20mb h.264 cos transport acceptance',
-            '自动保存的内部证据记录（无需操作）',
+        templates = tuple(
+            unicodedata.normalize('NFKC', template).casefold()
+            for template in (
+                'server-side cos multipart acceptance',
+                'server-side 20mb h.264 cos transport acceptance',
+                '自动保存的内部证据记录（无需操作）',
+            )
         )
         return any(normalized == template or
                    normalized.startswith(template) and
@@ -228,8 +231,9 @@ class EvidenceService:
 
         A visible success comment is written only when it carries real visible
         text, exactly one deterministic marker and (for success notifications)
-        at least one trusted direct file link. The fixed upload page is never
-        accepted as a download link.
+        at least one direct file link bound to this exact attachment. The fixed
+        upload page is never accepted as a download link, and unrelated links
+        or another attachment's link invalidate the whole comment.
         """
         if (not isinstance(body, str) or not body.strip()
                 or not isinstance(marker, str) or not marker
@@ -242,17 +246,33 @@ class EvidenceService:
             return True
         repo = operation.get('repo') if isinstance(operation, dict) else None
         pr_number = operation.get('pr_number') if isinstance(operation, dict) else None
-        if not isinstance(repo, str) or not repo or type(pr_number) is not int:
+        attachment_id = operation.get('attachment_id') if isinstance(operation, dict) else None
+        filename = operation.get('filename') if isinstance(operation, dict) else None
+        if (not isinstance(repo, str) or not repo or type(pr_number) is not int
+                or not isinstance(attachment_id, str) or not attachment_id
+                or not isinstance(filename, str) or not filename.strip()):
             return False
+        suffix = PurePosixPath(filename).suffix.lower()
+        if suffix not in _COMMENTABLE_MEDIA_SUFFIXES:
+            return False
+
         from .comments import _evidence_path
         page_path = _evidence_path(repo, pr_number).replace(
             '/api/evidence/', '/evidence/', 1,
         )
         cos_host = getattr(self.store, 'projection_cos_host', '') if self.store else ''
-        found = False
-        for match in re.finditer(r'<(https://[^<>\s]+)>', body):
+        # A public comment link may only point at the one persistent origin or
+        # at the configured COS bucket host; any other host (for example a
+        # Quick Tunnel) is not a usable file link.
+        from .config import is_stable_public_base_url
+        stable_netloc = ''
+        configured_base = getattr(self.config, 'evidence_public_base_url', '')
+        if is_stable_public_base_url(configured_base):
+            stable_netloc = urlsplit(configured_base).netloc.lower()
+        download_links = 0
+        for match in re.finditer(r'<(?P<url>https://[^<>\s]+)>', body):
             try:
-                parsed = urlsplit(match.group(1))
+                parsed = urlsplit(match.group('url'))
             except (TypeError, ValueError):
                 return False
             if parsed.scheme != 'https' or not parsed.netloc:
@@ -260,13 +280,40 @@ class EvidenceService:
             if page_path and parsed.path == page_path:
                 # The upload page is never an attachment download link.
                 return False
-            if '/attachments/' in parsed.path:
-                found = True
-            elif isinstance(cos_host, str) and cos_host and cos_host in parsed.netloc:
-                found = True
+            if isinstance(cos_host, str) and cos_host and (
+                    parsed.netloc == cos_host or parsed.netloc.endswith('.' + cos_host)):
+                # A signed COS URL must address this attachment's own object
+                # directory, not just any object in the bucket.
+                if f'/attachments/{attachment_id}/' not in parsed.path:
+                    return False
+                download_links += 1
+            elif '/attachments/' in parsed.path:
+                if not stable_netloc or parsed.netloc.lower() != stable_netloc:
+                    # Only the persistent configured origin may serve the
+                    # Controller attachment route.
+                    return False
+                if parsed.path.endswith(f'/attachments/{attachment_id}/download'):
+                    download_links += 1
+                elif parsed.path.endswith(f'/attachments/{attachment_id}/preview'):
+                    # A preview for this exact attachment is the only accepted
+                    # non-download route.
+                    continue
+                else:
+                    # Another attachment's route (or a partial one) must never
+                    # appear in this attachment's success notification.
+                    return False
             else:
+                # An unrelated host or the upload page is not a file link.
                 return False
-        return found
+        if download_links < 1:
+            return False
+        if suffix in {'.png', '.jpg', '.jpeg', '.gif', '.webp'}:
+            # Images must render inline from this attachment's preview.
+            if '![' not in visible:
+                return False
+        elif '下载视频' not in visible:
+            return False
+        return True
 
     async def _suppress_duplicate_upload_notifications(
         self, repo, matches, marker, keep_comment_id,
@@ -639,6 +686,12 @@ class EvidenceService:
         from . import comments as comments_mod, evidence_auth
         from .config import is_stable_public_base_url
         public_base = getattr(self.config, 'evidence_public_base_url', '')
+        # Only the one persistent HTTPS origin may back a comment link; a Quick
+        # Tunnel or ephemeral origin is never used here. Reachability of that
+        # origin is enforced where the link is actually consumed — the upload
+        # page, the Summary projection and ``_current_testing_upload_url`` all
+        # require a fresh ``public_https_ingress_ready`` probe — so a dropped
+        # ingress never produces a fresh dead upload entry point.
         try:
             if is_stable_public_base_url(public_base):
                 capability = evidence_auth.issue_capability(
@@ -684,11 +737,19 @@ class EvidenceService:
                 repo, pr_number,
             )
             return NOTIFICATION_PENDING, '', ''
-        marker = next((line for line in body.splitlines()
-                       if re.fullmatch(
-                           r'<!-- deploy-approval-evidence-upload:[0-9a-f]{64} -->', line,
-                       )), '')
-        if not marker:
+        # The marker must be the deterministic one for this exact
+        # repo/PR/HEAD/round/attachment identity. A comment whose marker does
+        # not bind those fields can never dedupe to the right attachment. It is
+        # built from the same ``repo`` value handed to the renderer below, so
+        # the generated body and this lookup always agree.
+        marker = self._notification_marker_for(
+            repo, pr_number, head_sha, round_id, attachment_id,
+        )
+        if not marker or marker not in body.splitlines():
+            logger.error(
+                'evidence ready notification marker mismatch %s#%s attachment=%s',
+                repo, pr_number, attachment_id,
+            )
             return NOTIFICATION_FAILED, '', ''
         if f'(<{download_url}>)' not in body:
             logger.error(
@@ -696,11 +757,13 @@ class EvidenceService:
                 repo, pr_number, attachment_id,
             )
             return NOTIFICATION_FAILED, '', ''
-        visible_text = re.sub(r'<!--.*?-->', '', body, flags=re.DOTALL).strip()
-        if not visible_text or "no description provided" in visible_text.lower():
+        # Final gate: only a body with visible text and this attachment's own
+        # direct link may be posted. This never runs a POST for an empty or
+        # marker-only comment and never accepts the upload page as the file.
+        if not self._notification_comment_body_ok(body, marker, operation):
             logger.warning(
-                'evidence ready notification skipped %s#%s: body lacks visible description',
-                repo, pr_number,
+                'evidence ready notification body rejected %s#%s attachment=%s',
+                repo, pr_number, attachment_id,
             )
             return NOTIFICATION_FAILED, '', ''
         return _NOTIFICATION_ELIGIBLE, marker, body
@@ -984,8 +1047,21 @@ class EvidenceService:
         return await self._backfill_ready_notifications_once(repo, pr_number)
 
     @staticmethod
+    def _notification_marker_for(repo, pr_number, head_sha, round_id, attachment_id):
+        """Return the marker for exactly these five identity fields."""
+        key = hashlib.sha256(
+            f"{repo}:{pr_number}:{head_sha}:{round_id}:{attachment_id}".encode('utf-8')
+        ).hexdigest()
+        return f'<!-- deploy-approval-evidence-upload:{key} -->'
+
+    @staticmethod
     def _upload_notification_marker(operation):
-        """Return the deterministic visible-comment marker for one attachment."""
+        """Return the deterministic visible-comment marker for one attachment.
+
+        Derived from exactly the five fields passed to
+        ``comments.evidence_upload_comment`` so the generated body and the
+        expected marker always agree, including repository casing.
+        """
         if not isinstance(operation, dict):
             return ''
         repo, pr_number = operation.get('repo'), operation.get('pr_number')
@@ -997,10 +1073,9 @@ class EvidenceService:
                 or not isinstance(round_id, str) or not round_id
                 or not isinstance(attachment_id, str) or not attachment_id):
             return ''
-        key = hashlib.sha256(
-            f"{repo}:{pr_number}:{head_sha}:{round_id}:{attachment_id}".encode('utf-8')
-        ).hexdigest()
-        return f'<!-- deploy-approval-evidence-upload:{key} -->'
+        return EvidenceService._notification_marker_for(
+            repo, pr_number, head_sha, round_id, attachment_id,
+        )
 
     @staticmethod
     def _summary_contains_attachment(visible, operation):

@@ -5422,10 +5422,14 @@ class DeployController:
             reviewer_notice = self._acceptance_reviewer_guidance(
                 repo, pr, reviewers_configured, eligible_reviewers,
             )
-            record_test_instruction = (
-                "请由验收账号执行 `/record_test result=pass` 或 `/record_test result=fail`。"
+            next_action = (
+                "请验收人检查本轮证据和实际部署效果，确认是否符合 PR 需求、"
+                "是否存在阻塞问题，然后执行 `/record_test result=pass` 或 "
+                "`/record_test result=fail`。"
                 if reviewers_configured else
-                "配置有效的验收账号后，验收人才能执行 `/record_test result=pass` 或 `/record_test result=fail`。"
+                "当前仓库还没有可用的验收账号，请联系仓库维护者配置；"
+                "配置后验收人即可执行 `/record_test result=pass` 或 "
+                "`/record_test result=fail`。"
             )
             evidence_location = (
                 f"本轮测试视频或图片（可选）：[打开固定上传页面](<{evidence_url}>)，"
@@ -5438,17 +5442,14 @@ class DeployController:
                 repo, pr_number, head_sha=head, round_id=round_id,
                 comment_id=comment_id, topic="acceptance-requested",
                 expected_command_kind="request_acceptance",
-                message="\n".join([
-                    "验收申请已经提交，本轮测试的验收现在开始。",
-                    "",
-                    reviewer_notice,
-                    "",
-                    evidence_location,
-                    "",
-                    "请验收人检查本轮证据和实际部署效果，确认是否符合 PR 需求、是否存在阻塞问题，"
-                    "然后执行 `/record_test result=pass` 或 `/record_test result=fail`。",
-                    record_test_instruction,
-                ]),
+                message=self._format_user_reply(
+                    "\n\n".join((
+                        "验收申请已经提交，本轮测试的验收现在开始。",
+                        reviewer_notice,
+                        evidence_location,
+                    )),
+                    next_action,
+                ),
             )
             return True
         except PolicyError as exc:
@@ -5765,6 +5766,8 @@ class DeployController:
                 status if isinstance(status, str) else "",
                 "当前还没有可确认的部署结果。",
             )
+            if status == "testing" and self._acceptance_request_is_pending(state):
+                lead = "本轮测试已经完成，正在等待验收。"
             cos_state = state.get("cos", {})
             cos_object_key = (
                 str(cos_state.get("object_key", "") or "")
@@ -5799,8 +5802,8 @@ class DeployController:
     ) -> bool:
         try:
             markdown = comments_mod.deploy_help_text(topic)
-            await self.proxy.post_issue_comment(
-                repo, pr_number, markdown,
+            await self._post_command_reply(
+                repo, pr_number, comment_id, markdown, topic="deploy-help",
             )
             return True
         except Exception as e:
@@ -7105,24 +7108,23 @@ class DeployController:
             return
         selector = self._machine_ip_command_selector(machine.alias, repo)
         next_step = (
-            f" Ask a configured Machine Owner to run `/approve_deploy machine={selector}` from the current Lifecycle Summary."
+            f"\n\n请让这台机器配置的负责人执行 `/approve_deploy machine={selector}`。"
             if selector else
-            " Ask a configured Machine Owner to use the current Lifecycle Summary approval command."
+            "\n\n请让这台机器配置的负责人按 PR Summary 中的审批命令操作。"
         )
 
         # Fresh collaborator permission check
         try:
             permission = await self.proxy.collaborator_permission(repo, actor)
-        except Exception as e:
+        except Exception:
             raise PolicyError(
-                f"Cannot verify collaborator permission for {actor}: {e}.{next_step}"
+                "暂时无法确认当前账号的仓库权限，因此没有执行这次审批。" + next_step
             )
 
         if not Policy.collaborator_can_approve(permission):
             raise PolicyError(
-                f"Actor {actor} is not a machine owner and has insufficient "
-                f"collaborator permission ({permission}). "
-                "Write, maintain, or admin access required." + next_step
+                "当前账号既不是这台机器的负责人，也没有足够的仓库权限（需要写入、维护或管理员权限）。"
+                + next_step
             )
 
     def _is_deployed_machine_owner(self, actor: str, state: dict, repo: str) -> bool:
@@ -7154,13 +7156,13 @@ class DeployController:
         } if isinstance(reviewers, list) else set()
         if not valid_reviewers:
             raise PolicyError(
-                f"当前仓库 `{repo}` 没有有效的验收人白名单，已拒绝记录测试结果。"
-                f"请检查该仓库 main 分支的 `test_reviewers.yaml`；不会使用其他仓库的名单。"
+                f"当前仓库 `{repo}` 还没有配置可用的验收账号，已拒绝记录测试结果。"
+                "请联系仓库维护者在默认分支的验收名单中配置。"
             )
         actor_lower = actor.strip().casefold() if isinstance(actor, str) else ""
         if not actor_lower or actor_lower not in valid_reviewers:
             raise PolicyError(
-                f"只有当前仓库 `{repo}` 的 `test_reviewers.yaml` 白名单用户可以执行 `/record_test`。"
+                f"只有当前仓库 `{repo}` 验收名单中的账号可以执行 `/record_test`。"
             )
         request = state.get("acceptance_request")
         try:
@@ -7919,7 +7921,7 @@ class DeployController:
             reasons = []
             for reason in group.get("blocking_reasons", []):
                 reasons.append({
-                    "REPOSITORY_POLICY_MISSING": "当前仓库 main 缺少有效的 machines.yaml。",
+                    "REPOSITORY_POLICY_MISSING": "当前仓库还没有可用的机器配置。",
                     "MACHINE_NOT_AUTHORIZED": "当前仓库 main 未授权这台机器。",
                     "OWNER_NOT_CONFIGURED": "当前仓库机器负责人待配置。",
                     "MACHINE_IDENTITY_MISMATCH": "当前仓库机器策略中的 alias、node_id 或主 IP 缺失或重复。",
@@ -10712,6 +10714,12 @@ class DeployController:
         payload = message.strip()
         if payload.startswith(comments_mod.BOT_MARKER):
             payload = payload[len(comments_mod.BOT_MARKER):].lstrip()
+        if not payload:
+            # Never publish a marker-only comment: a reply without text cannot
+            # tell the developer what happened or what to do next.
+            logger.warning("notice payload empty %s#%s topic=%s",
+                           repo, pr_number, topic)
+            return False
         body = "\n".join((comments_mod.BOT_MARKER, marker, "", payload))
         try:
             posted = await self.proxy.post_issue_comment(repo, pr_number, body)
@@ -10875,8 +10883,10 @@ class DeployController:
         "invalid_parameter": "命令中的参数值不可用。",
         "unknown_argument": "命令包含不支持的参数。",
         "invalid_arguments": "命令参数格式不正确。",
+        "parameter_error": "命令参数格式不正确。",
         "command_not_found": "无法识别这条部署审批命令。",
         "machine_not_unique": "这个机器选择器对应多台机器，请明确选择一台。",
+        "machine_selector_not_found": "找不到你填写的机器。",
     }
 
     _TOPIC_REASONS = (
@@ -10912,6 +10922,16 @@ class DeployController:
         ("no_confirmed", "目前没有确认到需要重新部署的镜像差异。"),
         ("no_compatible", "目前没有可以部署这些组件的机器。"),
         ("request_deploy", "当前条件不允许创建部署申请。"),
+        ("state_not_allowed", "当前阶段还不能执行这项操作。"),
+    )
+
+    # The watcher posts some rejections with only the command name in the
+    # topic. Explain those in terms of the command the developer actually sent.
+    _COMMAND_FALLBACK_REASONS = (
+        ("approve_deploy", "这次部署审批没有执行。"),
+        ("request_deploy", "这次部署申请没有创建。"),
+        ("request_acceptance", "这次验收申请没有提交。"),
+        ("record_test", "这次验收结果没有记录。"),
     )
 
     _GENERIC_ERROR_REASON = "当前条件下无法执行这项操作。"
@@ -11005,6 +11025,13 @@ class DeployController:
             return "PR 有了新提交，之前的审核和审批已不再对应当前代码。"
         if "pr is not open" in message_text or "draft" in message_text:
             return "这个 PR 当前不可部署。"
+        if not message_text and not code_text and not category:
+            # The watcher identifies some rejections only by the command name;
+            # keep the explanation rooted in what the developer actually sent.
+            command_hint = topic_text or classification
+            for command_name, reason in self._COMMAND_FALLBACK_REASONS:
+                if command_name in command_hint:
+                    return reason
         if not topic_text and not message_text and not code_text:
             return "这条命令当前不能执行。"
         return self._GENERIC_ERROR_REASON
@@ -11113,6 +11140,27 @@ class DeployController:
     def _is_test_only_pr(pr: dict | None) -> bool:
         title = pr.get("title", "") if isinstance(pr, dict) else ""
         return isinstance(title, str) and "[TEST ONLY]" in title.upper()
+
+    @staticmethod
+    def _acceptance_request_is_pending(state: dict | None) -> bool:
+        """Report whether this round is waiting for an independent acceptance.
+
+        ``request_acceptance`` stores the wait in ``acceptance_request`` while
+        the Lifecycle status stays ``testing``; every reply must read both so
+        the wait step never asks for a second ``/request_acceptance``.
+        """
+        if not isinstance(state, dict):
+            return False
+        request = state.get("acceptance_request")
+        if (not isinstance(request, dict)
+                or request.get("status") != "pending"
+                or request.get("head_sha") != state.get("head_sha")):
+            return False
+        try:
+            expected_round = round_id_for_state(state)
+        except Exception:
+            return False
+        return request.get("round_id") == expected_round
 
     def _eligible_acceptance_reviewers(
         self, repo: str, pr: dict | None,
@@ -11504,7 +11552,8 @@ class DeployController:
                     "部署正在进行或结果正在确认，请不要重复提交审批，也不要重新部署。"
                     "等待 PR Summary 显示部署结果即可。"
                 )
-            if status == "testing":
+            acceptance_pending = self._acceptance_request_is_pending(state)
+            if status == "testing" and not acceptance_pending:
                 upload_url = ""
                 command = state.get("command", {})
                 approval_comment_id = (
@@ -11527,7 +11576,7 @@ class DeployController:
                     f"{upload_text} "
                     "测试完成后，请由本轮机器的负责人执行 `/request_acceptance`。"
                 )
-            if status == "acceptance-required":
+            if status in {"testing", "acceptance-required"}:
                 try:
                     _configured, reviewers = self._eligible_acceptance_reviewers(repo, pr)
                 except Exception:
@@ -11538,7 +11587,7 @@ class DeployController:
                     "当前仓库还没有可用的验收账号，请联系仓库维护者配置"
                 )
                 return (
-                    f"{reviewer_text}。"
+                    f"验收申请已经提交，正在等待验收。{reviewer_text}。"
                     "验收人需要检查本轮测试结果和实际效果，然后执行 "
                     "`/record_test result=pass` 或 `/record_test result=fail`。"
                 )
@@ -11763,13 +11812,13 @@ class DeployController:
             ip_text = str(check.get("ip", "") or "主 IP 未记录")
             component_text = f"`{component_id}`" if component_id else "未知组件"
             reason = {
-                "identity_changed": "机器身份或运行时绑定无法确认",
-                "not_running": "组件当前未运行，运行镜像不可读",
-                "unavailable": "Agent Core 或运行状态不可读",
+                "identity_changed": "机器身份或运行时绑定暂时无法确认",
+                "not_running": "组件当前没有运行，运行镜像不可读",
+                "unavailable": "暂时无法连接机器读取运行状态",
             }[status]
             lines.append(
-                f"- 机器 `{alias}`（{ip_text}），组件 {component_text}：{reason}；状态不可读，"
-                "未生成审批命令。"
+                f"- 机器 `{alias}`（{ip_text}），组件 {component_text}：{reason}；"
+                "暂时不能生成审批命令。"
             )
         return lines
 
@@ -14457,6 +14506,11 @@ class DeployController:
             return True
 
         logger.warning("on_command: unknown kind %s", cmd.kind)
+        await self._post_error(
+            repo, pr_number,
+            self._PARSE_ERROR_REASONS["command_not_found"],
+            comment_id=comment_id,
+        )
         return True
 
 
