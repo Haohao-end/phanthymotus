@@ -113,10 +113,30 @@ class CosAttachmentStore:
                     if CosAttachmentStore._requires_forbid_overwrite(
                             request.method, request.url):
                         header_value = request.headers.get('x-cos-forbid-overwrite')
-                        if not isinstance(header_value, str) or header_value.lower() != 'true':
+                        if isinstance(header_value, (bytes, bytearray)):
+                            header_value = header_value.decode('utf-8', errors='replace')
+                        if not isinstance(header_value, str) or header_value.strip().lower() != 'true':
                             raise EvidenceOverwriteProtectionError(
                                 'COS outgoing write omitted x-cos-forbid-overwrite: true',
                             )
+                        auth = request.headers.get('Authorization')
+                        if isinstance(auth, (bytes, bytearray)):
+                            auth = auth.decode('utf-8', errors='replace')
+                        if isinstance(auth, str) and 'q-header-list=' in auth:
+                            auth_params = dict(
+                                part.split('=', 1)
+                                for part in auth.split('&')
+                                if '=' in part
+                            )
+                            signed_headers = {
+                                h.strip().lower()
+                                for h in auth_params.get('q-header-list', '').split(';')
+                                if h.strip()
+                            }
+                            if 'x-cos-forbid-overwrite' not in signed_headers:
+                                raise EvidenceOverwriteProtectionError(
+                                    'x-cos-forbid-overwrite was not included in request signature',
+                                )
                     return super().send(request, **kwargs)
 
             session = EvidenceSession()
@@ -149,12 +169,13 @@ class CosAttachmentStore:
             from qcloud_cos.cos_comm import maplist
         except Exception:
             raise EvidenceStoreError(
-                'installed COS SDK does not expose ForbidOverwrite support',
+                'installed COS SDK does not expose header mapping support',
             ) from None
-        if (not isinstance(maplist, dict)
-                or maplist.get('ForbidOverwrite') != 'x-cos-forbid-overwrite'):
+        if not isinstance(maplist, dict) or (
+            'Metadata' not in maplist and maplist.get('ForbidOverwrite') != 'x-cos-forbid-overwrite'
+        ):
             raise EvidenceStoreError(
-                'installed COS SDK does not support the ForbidOverwrite request parameter',
+                'installed COS SDK does not support forbid-overwrite request headers',
             )
         client = self._sdk()
         session = getattr(client, '_session', None)
@@ -546,6 +567,8 @@ class CosAttachmentStore:
                 except (ValueError, EvidenceStoreError):
                     raise
                 except Exception as exc:
+                    if isinstance(getattr(exc, '__context__', None), EvidenceStoreError):
+                        raise exc.__context__ from None
                     ambiguous = self._cos_failure_is_ambiguous(exc)
                     if not ambiguous or attempt + 1 == attempts:
                         error = EvidenceStoreError('COS operation unavailable')
@@ -691,7 +714,7 @@ class CosAttachmentStore:
             await self._io(client.complete_multipart_upload,
                 Bucket=self.config.cos_bucket, Key=key, UploadId=upload_id,
                 MultipartUpload={'Part': [{'PartNumber': p['part_number'], 'ETag': p['etag']} for p in parts]},
-                ForbidOverwrite='true')
+                Metadata={'x-cos-forbid-overwrite': 'true'})
         except EvidenceOverwriteProtectionError:
             raise
         except EvidenceStoreError:
@@ -719,10 +742,11 @@ class CosAttachmentStore:
             pass
         body.seek(0)
         client = self._forbid_overwrite_client()
+        metadata_to_send = {**self._metadata(metadata), 'x-cos-forbid-overwrite': 'true'}
         try:
             await self._io(client.put_object, Bucket=self.config.cos_bucket,
                 Key=key, Body=body, ContentLength=str(size), ContentType='application/octet-stream',
-                Metadata=self._metadata(metadata), ForbidOverwrite='true')
+                Metadata=metadata_to_send)
         except EvidenceOverwriteProtectionError:
             raise
         except EvidenceStoreError:
@@ -900,10 +924,11 @@ class CosAttachmentStore:
             if len(body) != size or (sha and sha != actual):
                 raise EvidenceStoreError('note identity mismatch')
             client = self._forbid_overwrite_client()
+            metadata_to_send = {**self._metadata(metadata), 'x-cos-forbid-overwrite': 'true'}
             try:
                 await self._io(client.put_object, Bucket=self.config.cos_bucket,
                     Key=key, Body=body, ContentType='application/octet-stream',
-                    Metadata=self._metadata(metadata), ForbidOverwrite='true')
+                    Metadata=metadata_to_send)
             except EvidenceOverwriteProtectionError:
                 raise
             except EvidenceStoreError:
