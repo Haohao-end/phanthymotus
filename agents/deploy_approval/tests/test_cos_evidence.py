@@ -10,9 +10,11 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from ..comments import evidence_upload_comment
 from ..cos_client import CosClient, CosError, EVIDENCE_MAX_ARCHIVE_BYTES
 from ..evidence_builder import EvidenceBuilder
 from ..evidence_service import NOTIFICATION_SKIPPED, NOTIFICATION_SYNCED
+from ..evidence_store import EvidenceStoreError, build_attachment_key
 from .conftest import make_config
 
 
@@ -39,34 +41,116 @@ def test_internal_evidence_record_has_no_visible_chinese_summary():
     assert not EvidenceService._is_internal_bot_note({**record, "actor_verified": False})
 
 
+APP_BOT_LOGIN = "4pd-pr-assistant[bot]"
+APP_BOT_USER = {"id": 41898282, "login": APP_BOT_LOGIN, "type": "Bot"}
+NOTIFICATION_REPO = "Haohao-end/phanthymotus"
+NOTIFICATION_PR = 7
+NOTIFICATION_UPLOADED_AT = "2026-09-18T03:55:54Z"
+
+
 class _EvidenceNotificationProxy:
+    """Offline proxy that models the App-comment contract the service relies on.
+
+    Mirrors the real ``GitHubCommentProxy`` surface used by
+    ``EvidenceService._notify_ready_attachment``: App-authored comments carry a
+    positive comment id, PATCHes mutate the stored comment in place, and
+    ``write_evidence_record`` returns the persisted record so restore markers
+    can be read back. No real GitHub API call is possible here.
+    """
+
     def __init__(self):
         self.comments = []
+        self.records = {}
+        self._next_comment_id = 900
 
     async def get_issue_comments(self, _repo, _pr_number):
-        return list(self.comments)
+        return [dict(comment) for comment in self.comments]
 
     def is_bot_comment(self, comment):
         user = comment.get("user") if isinstance(comment, dict) else None
-        return isinstance(user, dict) and user.get("login") == "4pd-pr-assistant[bot]"
+        return isinstance(user, dict) and user.get("login") == APP_BOT_LOGIN
 
     async def post_issue_comment(self, _repo, _pr_number, body):
-        comment = {
-            "body": body,
-            "user": {"id": 1, "login": "4pd-pr-assistant[bot]", "type": "Bot"},
-        }
+        self._next_comment_id += 1
+        comment = {"id": self._next_comment_id, "body": body, "user": dict(APP_BOT_USER)}
         self.comments.append(comment)
-        return comment
+        return dict(comment)
+
+    async def update_comment(self, _repo, comment_id, body):
+        for comment in self.comments:
+            if comment["id"] == comment_id:
+                comment["body"] = body
+                return dict(comment)
+        raise AssertionError(f"unknown comment id {comment_id}")
+
+    async def write_evidence_record(self, _repo, _pr_number, kind, key, record):
+        self.records[key] = {"kind": kind, "data": dict(record)}
+        return {"kind": kind, "data": dict(record)}
+
+
+class FakeCosStore:
+    """Offline stand-in for ``CosAttachmentStore`` read verification.
+
+    Only the verification contract used by ready-attachment notifications is
+    modelled: a HEAD that must agree on size and every ``x-cos-meta-*``
+    identity header, followed by a content read whose digest must equal the
+    persisted sha256. A record that does not match the stored object fails
+    closed exactly like the production store. No COS SDK or network path exists
+    here, so these tests can never reach the real bucket.
+
+    Also returns the persisted sha256/object key so the caller-side identity
+    re-check (size, sha256, object_key) is exercised for real.
+    """
+
+    _IDENTITY_FIELDS = ("repo", "pr_number", "head_sha", "round_id", "attachment_id")
+
+    def __init__(self):
+        self.objects = {}
+        self.head_calls = []
+        self.get_calls = []
+
+    def put_object(self, key, *, size, sha256, metadata):
+        """Register an object whose COS metadata is derived like production."""
+        self.objects[key] = {
+            "size": size,
+            "sha256": sha256,
+            "metadata": {
+                "x-cos-meta-" + name.replace("_", "-"): str(metadata[name])
+                for name in self._IDENTITY_FIELDS
+            },
+        }
+
+    async def verify_object(self, *, key, size, metadata, sha256=None):
+        self.head_calls.append({"key": key, "size": size, "metadata": dict(metadata)})
+        stored = self.objects.get(key)
+        if stored is None:
+            raise EvidenceStoreError("object missing")
+        if stored["size"] != size:
+            raise EvidenceStoreError("object size mismatch")
+        expected = {
+            "x-cos-meta-" + name.replace("_", "-"): str(metadata[name])
+            for name in self._IDENTITY_FIELDS
+        }
+        if any(stored["metadata"].get(name) != value for name, value in expected.items()):
+            raise EvidenceStoreError("object identity mismatch")
+        self.get_calls.append(key)
+        if sha256 is not None and stored["sha256"] != sha256:
+            raise EvidenceStoreError("object digest mismatch")
+        return {
+            "verified": True,
+            "object_key": key,
+            "size": stored["size"],
+            "sha256": stored["sha256"],
+        }
 
 
 def _ready_attachment(**overrides):
     operation = {
-        "repo": "haohao-end/phanthymotus",
-        "pr_number": 7,
+        "repo": NOTIFICATION_REPO,
+        "pr_number": NOTIFICATION_PR,
         "status": "ready",
         "cos_content_verified": True,
         "evidence_kind": "media",
-        "object_key": "private/evidence/screen",
         "size": 10,
         "sha256": "b" * 64,
         "head_sha": HEAD,
@@ -75,115 +159,207 @@ def _ready_attachment(**overrides):
         "filename": "screen.png",
         "actor_verified": True,
         "actor_login": "real-user",
+        "github_user_authenticated": True,
+        "completed_at": NOTIFICATION_UPLOADED_AT,
     }
     operation.update(overrides)
+    # Use the real persisted object layout so metadata/HEAD identity checks are
+    # exercised against the same key the service reads back.
+    operation["object_key"] = build_attachment_key(
+        operation["repo"], operation["pr_number"], operation["head_sha"],
+        operation["round_id"], operation["attachment_id"],
+        NOTIFICATION_UPLOADED_AT, operation["filename"],
+    )
     return operation
 
 
-def _notification_service(proxy):
+def _notification_fixture(**overrides):
+    """Build proxy + FakeCosStore + service for one ready-attachment record."""
+    proxy = _EvidenceNotificationProxy()
+    store = FakeCosStore()
+    operation = _ready_attachment(**overrides)
+    store.put_object(
+        operation["object_key"],
+        size=operation["size"],
+        sha256=operation["sha256"],
+        metadata={
+            name: operation[name]
+            for name in FakeCosStore._IDENTITY_FIELDS
+        },
+    )
     from agents.deploy_approval.evidence_service import EvidenceService
     config = make_config(
         evidence_public_base_url="https://evidence.example",
         cos_secret_key="test-cos-secret",
     )
-    return EvidenceService(
+    service = EvidenceService(
         config=config, github=None, proxy=proxy, policy=None,
-        controller=SimpleNamespace(), store=None,
+        controller=SimpleNamespace(), store=store,
     )
+    return proxy, store, service, operation
 
 
-def test_chinese_internal_bot_note_does_not_post_comment():
-    proxy = _EvidenceNotificationProxy()
-    service = _notification_service(proxy)
-    operation = _ready_attachment(
-        actor_login="4pd-pr-assistant[bot]",
+@pytest.mark.asyncio
+async def test_chinese_internal_bot_note_does_not_post_comment():
+    proxy, _store, service, operation = _notification_fixture(
+        actor_login=APP_BOT_LOGIN,
         note="自动保存的内部证据记录（无需操作）",
     )
 
-    assert asyncio.run(service._notify_ready_attachment(
-        "haohao-end/phanthymotus", 7, operation,
-    )) == NOTIFICATION_SKIPPED
+    assert await service._notify_ready_attachment(
+        NOTIFICATION_REPO, NOTIFICATION_PR, operation,
+    ) == NOTIFICATION_SKIPPED
     assert proxy.comments == []
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("note", [
     "server-side cos multipart acceptance",
     "server-side 20mb h.264 cos transport acceptance",
 ])
-def test_existing_english_internal_bot_notes_do_not_post_comment(note):
-    proxy = _EvidenceNotificationProxy()
-    service = _notification_service(proxy)
-    operation = _ready_attachment(
-        actor_login="4pd-pr-assistant[bot]",
+async def test_existing_english_internal_bot_notes_do_not_post_comment(note):
+    proxy, _store, service, operation = _notification_fixture(
+        actor_login=APP_BOT_LOGIN,
         note=note,
     )
 
-    assert asyncio.run(service._notify_ready_attachment(
-        "haohao-end/phanthymotus", 7, operation,
-    )) == NOTIFICATION_SKIPPED
+    assert await service._notify_ready_attachment(
+        NOTIFICATION_REPO, NOTIFICATION_PR, operation,
+    ) == NOTIFICATION_SKIPPED
     assert proxy.comments == []
 
 
-def test_internal_bot_note_flag_does_not_post_comment():
-    proxy = _EvidenceNotificationProxy()
-    service = _notification_service(proxy)
+@pytest.mark.asyncio
+async def test_internal_bot_note_flag_does_not_post_comment():
+    proxy, _store, service, operation = _notification_fixture(internal_bot_note=True)
 
-    assert asyncio.run(service._notify_ready_attachment(
-        "haohao-end/phanthymotus", 7,
-        _ready_attachment(internal_bot_note=True),
-    )) == NOTIFICATION_SKIPPED
+    assert await service._notify_ready_attachment(
+        NOTIFICATION_REPO, NOTIFICATION_PR, operation,
+    ) == NOTIFICATION_SKIPPED
     assert proxy.comments == []
 
 
-def test_real_user_image_posts_comment():
-    proxy = _EvidenceNotificationProxy()
-    service = _notification_service(proxy)
+@pytest.mark.asyncio
+async def test_real_user_image_posts_comment():
+    proxy, store, service, operation = _notification_fixture(filename="screen.png")
 
-    assert asyncio.run(service._notify_ready_attachment(
-        "haohao-end/phanthymotus", 7,
-        _ready_attachment(filename="screen.png"),
-    )) == NOTIFICATION_SYNCED
+    assert await service._notify_ready_attachment(
+        NOTIFICATION_REPO, NOTIFICATION_PR, operation,
+    ) == NOTIFICATION_SYNCED
     assert len(proxy.comments) == 1
-    assert "![screen.png]" in proxy.comments[0]["body"]
+    body = proxy.comments[0]["body"]
+    # The uploaded object was read back (HEAD + content digest) before posting.
+    assert store.get_calls == [operation["object_key"]]
+    assert f"![screen.png](<https://evidence.example/api/evidence/{NOTIFICATION_REPO}/pulls/{NOTIFICATION_PR}/attachments/attachment_1/preview?cap=" in body
+    assert f"[下载图片](<https://evidence.example/api/evidence/{NOTIFICATION_REPO}/pulls/{NOTIFICATION_PR}/attachments/attachment_1/download?cap=" in body
+    assert "@real-user" in body
 
 
-def test_real_user_video_posts_comment():
-    proxy = _EvidenceNotificationProxy()
-    service = _notification_service(proxy)
+@pytest.mark.asyncio
+async def test_real_user_video_posts_comment():
+    proxy, _store, service, operation = _notification_fixture(filename="capture.mp4")
 
-    assert asyncio.run(service._notify_ready_attachment(
-        "haohao-end/phanthymotus", 7,
-        _ready_attachment(filename="capture.mp4"),
-    )) == NOTIFICATION_SYNCED
+    assert await service._notify_ready_attachment(
+        NOTIFICATION_REPO, NOTIFICATION_PR, operation,
+    ) == NOTIFICATION_SYNCED
     assert len(proxy.comments) == 1
-    assert "capture.mp4" in proxy.comments[0]["body"]
+    body = proxy.comments[0]["body"]
+    assert "capture.mp4" in body
+    assert "[下载视频](<https://evidence.example/api/evidence/" in body
+    assert "/attachments/attachment_1/download?cap=" in body
+    # A video is never rendered as an inline image.
+    assert "![capture.mp4]" not in body
 
 
-def test_repeated_upload_does_not_duplicate_comment():
-    proxy = _EvidenceNotificationProxy()
-    service = _notification_service(proxy)
-    operation = _ready_attachment(filename="capture.mp4")
+@pytest.mark.asyncio
+async def test_repeated_upload_does_not_duplicate_comment():
+    proxy, _store, service, operation = _notification_fixture(filename="capture.mp4")
 
-    assert asyncio.run(service._notify_ready_attachment(
-        "haohao-end/phanthymotus", 7, operation,
-    )) == NOTIFICATION_SYNCED
-    assert asyncio.run(service._notify_ready_attachment(
-        "haohao-end/phanthymotus", 7, operation,
-    )) == NOTIFICATION_SYNCED
+    assert await service._notify_ready_attachment(
+        NOTIFICATION_REPO, NOTIFICATION_PR, operation,
+    ) == NOTIFICATION_SYNCED
+    assert await service._notify_ready_attachment(
+        NOTIFICATION_REPO, NOTIFICATION_PR, operation,
+    ) == NOTIFICATION_SYNCED
     assert len(proxy.comments) == 1
+    assert proxy.comments[0]["body"].count("deploy-approval-evidence-upload:") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ["size", "sha256", "metadata"])
+async def test_unverified_object_never_posts_a_comment(tamper):
+    """A record that no longer matches its COS object must fail closed.
+
+    The FakeStore models HEAD (size + ``x-cos-meta-*`` identity) and the
+    content digest read; tampering with any of them must reproduce the real
+    store's rejection and must never produce a user-visible comment.
+    """
+    from ..evidence_service import NOTIFICATION_RESTORE_PENDING
+
+    proxy, store, service, operation = _notification_fixture()
+    key = operation["object_key"]
+    if tamper == "size":
+        store.objects[key]["size"] += 1
+    elif tamper == "sha256":
+        store.objects[key]["sha256"] = "c" * 64
+    else:
+        store.objects[key]["metadata"]["x-cos-meta-attachment-id"] = "attachment_2"
+
+    assert await service._notify_ready_attachment(
+        NOTIFICATION_REPO, NOTIFICATION_PR, operation,
+    ) == NOTIFICATION_RESTORE_PENDING
+    assert proxy.comments == []
+    assert store.head_calls, "object must have been HEAD-verified"
+    if tamper == "sha256":
+        # The digest can only be checked after the content read.
+        assert store.get_calls == [key]
+    else:
+        # A HEAD identity/size mismatch rejects before any content is read.
+        assert store.get_calls == []
 
 
 def test_ready_attachment_posts_one_idempotent_comment_with_media_links():
     from agents.deploy_approval.comments import evidence_upload_comment
+    route = "/api/evidence/team/repo/pulls/1/attachments/attachment_1"
     body = evidence_upload_comment(
         "team/repo", 1, HEAD, HEAD + "-1", "attachment_1", "screen.png",
-        download_url="https://evidence.example/api/attachments/attachment_1/download?cap=token",
-        preview_url="https://evidence.example/api/attachments/attachment_1/preview?cap=token",
+        download_url=f"https://evidence.example{route}/download?cap=token",
+        preview_url=f"https://evidence.example{route}/preview?cap=token",
         public_base_url="https://evidence.example",
     )
     assert "![screen.png]" in body
     assert "下载图片" in body
+    assert f"(<https://evidence.example{route}/preview?cap=token>)" in body
+    assert f"(<https://evidence.example{route}/download?cap=token>)" in body
     assert body.count("deploy-approval-evidence-upload:") == 1
+
+    video = evidence_upload_comment(
+        "team/repo", 1, HEAD, HEAD + "-1", "attachment_2", "capture.mp4",
+        download_url="/api/evidence/team/repo/pulls/1/attachments/attachment_2/download?cap=token",
+        preview_url="",
+        public_base_url="https://evidence.example",
+    )
+    assert video == ""
+
+    video = evidence_upload_comment(
+        "team/repo", 1, HEAD, HEAD + "-1", "attachment_2", "capture.mp4",
+        download_url="https://evidence.example/api/evidence/team/repo/pulls/1/"
+                     "attachments/attachment_2/download?cap=token",
+        preview_url="",
+        public_base_url="https://evidence.example",
+    )
+    assert video.count("deploy-approval-evidence-upload:") == 1
+    assert "[下载视频](<https://evidence.example/api/evidence/team/repo/pulls/1/" \
+           "attachments/attachment_2/download?cap=token>)" in video
+
+    # A foreign origin must never be rendered as a trusted attachment link.
+    assert evidence_upload_comment(
+        "team/repo", 1, HEAD, HEAD + "-1", "attachment_1", "screen.png",
+        download_url="https://evil.example/api/evidence/team/repo/pulls/1/"
+                     "attachments/attachment_1/download?cap=token",
+        preview_url="",
+        public_base_url="https://evidence.example",
+    ) == ""
 
 HEAD = "a" * 40
 

@@ -566,7 +566,7 @@ class EvidenceService:
             return False
         if (not isinstance(saved, dict) or not isinstance(saved.get('data'), dict)
                 or saved['data'].get('attachment_id') != operation.get('attachment_id')
-                or saved['data'].get('cos_restore_pending') is pending):
+                or saved['data'].get('cos_restore_pending') is not pending):
             logger.error(
                 'ready evidence restore marker readback failed %s#%s attachment=%s pending=%s',
                 repo, pr_number, operation.get('attachment_id'), pending,

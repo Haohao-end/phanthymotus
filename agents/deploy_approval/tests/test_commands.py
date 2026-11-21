@@ -11,9 +11,16 @@ class TestRequestDeploy:
         assert cmd.is_command
 
     def test_rejects_build_parameter(self):
+        # ``build=`` is not a supported argument. The parse fails closed with a
+        # stable code, but the recognised deployment intent must still surface
+        # so the Bot answers with an error reply instead of staying silent.
         cmd = parse_command("/request_deploy build=0")
         assert cmd.kind == "unknown"
-        assert not cmd.is_command
+        assert cmd.intent == "request_deploy"
+        assert "unknown_argument" in cmd.error
+        assert cmd.is_command
+        # An unknown-argument parse is never a runnable deployment command.
+        assert cmd.kind != "request_deploy"
 
     def test_rejects_machine_parameter(self):
         cmd = parse_command("/request_deploy machine=x")
@@ -43,9 +50,17 @@ class TestApproveDeploy:
         assert cmd.is_command
         assert cmd.machine_alias == "g1-bj-wifi"
 
-    def test_rejects_without_machine(self):
+    def test_allows_omitted_machine(self):
+        # ``machine=`` is optional at parse time. When exactly one machine is
+        # fully compatible with every component the Controller executes the
+        # bare command; with several candidates it refuses to pick one. Both
+        # are execution-time checks, so parsing must succeed with an empty
+        # selector and must never invent a machine alias.
         cmd = parse_command("/approve_deploy")
-        assert cmd.kind == "unknown"
+        assert cmd.kind == "approve_deploy"
+        assert cmd.is_command
+        assert cmd.machine_alias == ""
+        assert cmd.error == ""
 
     def test_rejects_positional(self):
         cmd = parse_command("/approve_deploy dpl_x machine=x")
