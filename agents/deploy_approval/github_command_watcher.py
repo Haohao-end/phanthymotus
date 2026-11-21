@@ -47,6 +47,9 @@ EVIDENCE_SYNC_RETRY_BASE_SECONDS = 30.0
 EVIDENCE_SYNC_RETRY_MAX_SECONDS = 300.0
 EVIDENCE_SYNC_QUEUE_MAX = 128
 EVIDENCE_SYNC_STARTUP_SEED_PER_REPO = 32
+# Bounded bookkeeping for recent-command notices, so a long-running watcher
+# never grows these sets without limit.
+RECENT_COMMAND_NOTICE_MAX = 1024
 CANONICAL_STATUS_LABELS = frozenset({
     "status: review-required",
     "status: reviewing",
@@ -307,11 +310,13 @@ class GitHubCommandWatcher:
             "priority_retry": 0,
         }
         self._priority_item_failures: dict[tuple[str, int], int] = {}
-        self._posted_error_replies: set[tuple[str, int, int]] = set()
+        # Insertion-ordered maps used as bounded sets: the oldest entry is
+        # evicted first so a long-running watcher never grows without limit.
+        self._posted_error_replies: dict[tuple[str, int, int], None] = {}
         # Commands that arrived before the fixed authorization baseline. They
         # must never execute, but they are not silently dropped: each one gets
         # exactly one rejection notice after its PR baseline completes.
-        self._pending_baseline_notices: set[tuple[str, int, int]] = set()
+        self._pending_baseline_notices: dict[tuple[str, int, int], None] = {}
         self._recent_discovery_at: dict[str, str] = {}
         self._recent_discovery_monotonic: dict[str, float] = {}
         self._recent_discovery_last_failure: dict[str, str | None] = {}
@@ -1215,7 +1220,15 @@ class GitHubCommandWatcher:
                 self._latest_recent_command_key = key
             self._log_recent_command_diagnostic("discovered", record)
             if len(self._recent_command_records) > 512:
-                oldest = min(self._recent_command_records,
+                # A record that still owes a one-time rejection notice must
+                # survive eviction, otherwise the pre-baseline command would be
+                # dropped without notice. Fall back to plain oldest-first only
+                # if every record is pending.
+                evictable = [
+                    item for item in self._recent_command_records
+                    if item not in self._pending_baseline_notices
+                ] or list(self._recent_command_records)
+                oldest = min(evictable,
                              key=lambda item: self._recent_command_records[item].get(
                                  "_discovered_monotonic", 0.0))
                 self._recent_command_records.pop(oldest, None)
@@ -1380,7 +1393,9 @@ class GitHubCommandWatcher:
             return False
         if delivered is not True:
             return False
-        self._posted_error_replies.add((repo, pr_number, comment_id))
+        self._posted_error_replies[(repo, pr_number, comment_id)] = None
+        while len(self._posted_error_replies) > RECENT_COMMAND_NOTICE_MAX:
+            self._posted_error_replies.pop(next(iter(self._posted_error_replies)))
         self._mark_recent_command_notice_posted(
             repo, pr_number, comment_id, topic,
         )
@@ -1602,13 +1617,13 @@ class GitHubCommandWatcher:
             key = (repo, pr_number, comment_id)
             record = self._recent_command_records.get(key)
             if not isinstance(record, dict):
-                self._pending_baseline_notices.discard(key)
+                self._pending_baseline_notices.pop(key, None)
                 continue
             if record.get("status") in {"handled", "already_processed"}:
-                self._pending_baseline_notices.discard(key)
+                self._pending_baseline_notices.pop(key, None)
                 continue
             if self._recent_command_error_replied(repo, pr_number, comment_id):
-                self._pending_baseline_notices.discard(key)
+                self._pending_baseline_notices.pop(key, None)
                 self._finish_recent_command(
                     repo, pr_number, comment_id,
                     failure_reason="baseline_rejected_pre_authorization",
@@ -1617,7 +1632,7 @@ class GitHubCommandWatcher:
                 continue
             if self._recent_command_notice_posted(
                     repo, pr_number, comment_id, "baseline-rejected"):
-                self._pending_baseline_notices.discard(key)
+                self._pending_baseline_notices.pop(key, None)
                 self._finish_recent_command(
                     repo, pr_number, comment_id,
                     failure_reason="baseline_rejected_pre_authorization",
@@ -1652,7 +1667,10 @@ class GitHubCommandWatcher:
                 ok = False
                 continue
             self._mark_recent_command_notice_posted(repo, pr_number, comment_id, topic)
-            self._pending_baseline_notices.discard(key)
+            self._posted_error_replies[key] = None
+            while len(self._posted_error_replies) > RECENT_COMMAND_NOTICE_MAX:
+                self._posted_error_replies.pop(next(iter(self._posted_error_replies)))
+            self._pending_baseline_notices.pop(key, None)
             self._recent_discovery_stats["baseline_rejection_notices"] += 1
             self._finish_recent_command(
                 repo, pr_number, comment_id,
@@ -1811,7 +1829,7 @@ class GitHubCommandWatcher:
                 if is_filtered_by_cutoff:
                     if observed.get("status") in {"handled", "already_processed"}:
                         # Rejection already delivered (or command consumed).
-                        self._pending_baseline_notices.discard(key)
+                        self._pending_baseline_notices.pop(key, None)
                         continue
                     observed["failure_reason"] = "baseline_cutoff_filtered"
                     observed["last_failure_reason"] = "baseline_cutoff_filtered"
@@ -1827,9 +1845,10 @@ class GitHubCommandWatcher:
                     # Clearly inside the pre-authorization window: never
                     # execute. Queue its PR so the fixed baseline completes and
                     # the one-time rejection notice can be delivered after it.
-                    self._pending_baseline_notices.add(key)
-                    while len(self._pending_baseline_notices) > 1024:
-                        self._pending_baseline_notices.pop()
+                    self._pending_baseline_notices[key] = None
+                    while len(self._pending_baseline_notices) > RECENT_COMMAND_NOTICE_MAX:
+                        self._pending_baseline_notices.pop(
+                            next(iter(self._pending_baseline_notices)))
                     logger.info(
                         "watcher recent command registered for pre-baseline rejection repo=%s pr=%s comment_id=%s created_at=%s cutoff=%s",
                         repo, number, comment.get("id"), comment.get("created_at"),
@@ -1926,6 +1945,7 @@ class GitHubCommandWatcher:
                 self._priority_pr_enqueued_at.pop(oldest_recent, None)
                 self._priority_pr_sources.pop(oldest_recent, None)
                 self._clear_priority_baseline_retry(oldest_recent)
+                self._clear_priority_item_retry(oldest_recent)
             webhook_count = sum(
                 self._priority_pr_sources.get(queued) == "webhook"
                 for queued in self._priority_pr_queue
@@ -2337,10 +2357,14 @@ class GitHubCommandWatcher:
                 baseline_succeeded = False
         else:
             self._current_scan_stage = "command_reconcile_and_dispatch"
+            # Pending pre-baseline notices are strictly older than anything this
+            # cycle may dispatch, so deliver them first. That keeps the visible
+            # conversation ordered: a later command never appears to overtake an
+            # earlier command that still owes a rejection.
+            await self._flush_pending_baseline_notices(repo, pr_number)
             await self._process_pr(repo, pr_number, yield_for_priority=not priority_path)
-            # Baseline for this PR was already completed in this generation.
-            # Deliver any one-time rejection notices for commands that were
-            # sent before the fixed authorization boundary.
+            # A comment may have been registered during _process_pr itself;
+            # flush again so it is not delayed until the next cycle.
             await self._flush_pending_baseline_notices(repo, pr_number)
         if (self.config.auth_valid is not True or repo not in self.config.active_repos
                 or repo not in self.config.github_repos):
@@ -4080,13 +4104,16 @@ class GitHubCommandWatcher:
                 ).is_command or commands_mod.detect_deployment_command_intent(
                         fresh_body if isinstance(fresh_body, str) else ""
                 ):
-                    self._observe_recent_command(
+                    observed_key = self._observe_recent_command(
                         repo, pr_number, fresh_comment_obj,
                         created_utc.astimezone(timezone.utc),
                     )
-                    self._pending_baseline_notices.add((repo, pr_number, comment_id))
-                    while len(self._pending_baseline_notices) > 1024:
-                        self._pending_baseline_notices.pop()
+                    if observed_key is not None:
+                        self._pending_baseline_notices[observed_key] = None
+                        while (len(self._pending_baseline_notices)
+                               > RECENT_COMMAND_NOTICE_MAX):
+                            self._pending_baseline_notices.pop(
+                                next(iter(self._pending_baseline_notices)))
                 await self._consume_comment_cursor(repo, pr_number, comment_id)
                 return
             self._observe_recent_command(

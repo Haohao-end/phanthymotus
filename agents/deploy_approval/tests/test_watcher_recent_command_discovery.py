@@ -480,3 +480,99 @@ async def test_same_pr_commands_processed_in_comment_id_order():
     # later one must wait for a subsequent cycle, never jump ahead.
     assert dispatched == [7037100000]
     assert state["last_processed_comment_id"] == 7037100000
+
+
+@pytest.mark.asyncio
+async def test_pre_baseline_rejection_precedes_later_dispatch():
+    """The visible rejection for an older command must not follow a newer one."""
+    config = _config()
+    pre_baseline = _r03_comment(
+        id=7036900000, body="/request_deploy",
+        created_at="2026-11-20T09:40:00Z", updated_at="2026-11-20T09:40:00Z",
+    )
+    post_baseline = _r03_comment(body="/request_deploy")  # R03, 10:25:13Z, after CUTOFF
+    state = {"head_sha": HEAD, "status": "deploy-ready",
+             "last_processed_comment_id": R02_ID}
+    proxy = MagicMock()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.get_pr = AsyncMock(return_value={
+        "number": PR, "state": "open", "merged": False, "draft": False,
+        "head": {"sha": HEAD},
+        "base": {"repo": {"full_name": REPO}},
+    })
+    proxy.get_issue_comments = AsyncMock(return_value=[pre_baseline, post_baseline])
+    proxy.get_comment = AsyncMock(side_effect=lambda _repo, cid: (
+        pre_baseline if cid == pre_baseline["id"] else post_baseline
+    ))
+    proxy.is_bot_comment = MagicMock(return_value=False)
+    proxy.comment_identity = AsyncMock(return_value=("4242", "dev-actor"))
+    proxy.persist_cursor = AsyncMock(side_effect=lambda _r, _p, cid: (
+        state.update(last_processed_comment_id=cid) or state
+    ))
+
+    order = []
+    controller = MagicMock()
+    controller.reconcile_pr = AsyncMock()
+    controller.policy = None
+    controller.github = None
+    controller.begin_command_reply_tracking = MagicMock()
+    controller.take_command_reply_delivery = MagicMock(return_value=True)
+    controller.on_command = AsyncMock(
+        side_effect=lambda cmd, _repo, _pr, cid: order.append(("dispatch", cid)) or True,
+    )
+
+    async def post_reply(_repo, _pr, cid, _msg, *, topic, error):
+        order.append((topic, cid))
+        return True
+
+    controller._post_command_reply = AsyncMock(side_effect=post_reply)
+    watcher = GitHubCommandWatcher(config, proxy, controller)
+    watcher._repo_baseline_cutoff_utc[REPO] = CUTOFF
+    watcher._baseline_progress[REPO] = {PR}
+    watcher._pending_baseline_notices[(REPO, PR, pre_baseline["id"])] = None
+    watcher._observe_recent_command(
+        REPO, PR, pre_baseline,
+        datetime(2026, 11, 20, 9, 40, 0, tzinfo=timezone.utc),
+    )
+
+    # Cycle 1: the older pre-baseline command is consumed as history (one
+    # business action per PR cycle) and its rejection is delivered.
+    await watcher._process_scheduled_pr(REPO, PR)
+    # Cycle 2: the post-baseline command may now dispatch, never earlier.
+    await watcher._process_scheduled_pr(REPO, PR)
+
+    assert order, "expected at least one user-visible action"
+    assert order[0] == ("baseline-rejected", pre_baseline["id"])
+    assert order.index(("baseline-rejected", pre_baseline["id"])) < order.index(
+        ("dispatch", post_baseline["id"]),
+    )
+    assert sum(1 for entry in order
+               if entry == ("dispatch", post_baseline["id"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_pre_baseline_rejection_is_delivered_only_once():
+    config = _config()
+    proxy = MagicMock()
+    proxy.get_pr = AsyncMock(return_value={
+        "number": PR, "state": "open", "merged": False, "draft": False,
+        "head": {"sha": HEAD},
+        "base": {"repo": {"full_name": REPO}},
+    })
+    controller = MagicMock()
+    controller._post_command_reply = AsyncMock(return_value=True)
+    watcher = _watcher(config, proxy=proxy, controller=controller)
+    comment = _r03_comment(created_at="2026-11-20T09:30:00Z",
+                           updated_at="2026-11-20T09:30:00Z")
+    key = (REPO, PR, comment["id"])
+    watcher._observe_recent_command(
+        REPO, PR, comment, datetime(2026, 11, 20, 9, 30, 0, tzinfo=timezone.utc),
+    )
+    watcher._pending_baseline_notices[key] = None
+
+    assert await watcher._flush_pending_baseline_notices(REPO, PR) is True
+    assert await watcher._flush_pending_baseline_notices(REPO, PR) is True
+
+    controller._post_command_reply.assert_awaited_once()
+    assert key not in watcher._pending_baseline_notices
+    assert watcher.recent_discovery_stats["baseline_rejection_notices"] == 1
