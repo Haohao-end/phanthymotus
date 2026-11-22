@@ -70,6 +70,40 @@ class MockCosResponse(requests.Response):
         self.raw = io.BytesIO(content)
 
 
+class StubCosTransport(requests.adapters.BaseAdapter):
+    """Offline transport stand-in: records PreparedRequests, opens no socket."""
+
+    def __init__(self, headers=None):
+        super().__init__()
+        self._headers = headers or {}
+        self.requests = []
+
+    def send(self, request, **kwargs):
+        self.requests.append(request)
+        response = MockCosResponse(200, headers=self._headers)
+        response.request = request
+        response.url = request.url
+        return response
+
+    def close(self):
+        pass
+
+
+def _signed_headers(request):
+    """Return the lower-cased q-header-list COS signed for this request."""
+    auth = request.headers.get("Authorization", "")
+    if isinstance(auth, (bytes, bytearray)):
+        auth = auth.decode("utf-8", errors="replace")
+    params = dict(
+        part.split("=", 1) for part in auth.split("&") if "=" in part
+    )
+    return {
+        item.strip().lower()
+        for item in params.get("q-header-list", "").split(";")
+        if item.strip()
+    }
+
+
 def test_put_native_file_prepared_request_has_forbid_overwrite_header():
     """SDK-generated PreparedRequest for PUT contains x-cos-forbid-overwrite: true."""
     async def run():
@@ -100,11 +134,10 @@ def test_put_native_file_prepared_request_has_forbid_overwrite_header():
                         return MockCosResponse(404)
                     return MockCosResponse(200, headers=expected_head_headers)
                 if request.method == "PUT":
-                    res = super().send(request, **kwargs)
                     return MockCosResponse(200, headers={"ETag": '"test-etag"'})
                 if request.method == "GET":
                     return MockCosResponse(200, headers=expected_head_headers, content=payload)
-                return super().send(request, **kwargs)
+                raise AssertionError(f"unexpected {request.method} {request.url}")
 
         session = InterceptingSession()
         session._evidence_forbid_overwrite_guard = True
@@ -130,6 +163,8 @@ def test_put_native_file_prepared_request_has_forbid_overwrite_header():
         if isinstance(header_val, bytes):
             header_val = header_val.decode("utf-8")
         assert header_val == "true"
+        # The header must be part of the signed header list, not bolted on later.
+        assert "x-cos-forbid-overwrite" in _signed_headers(put_req)
 
     asyncio.run(run())
 
@@ -149,6 +184,10 @@ def test_header_must_enter_before_signature_late_injection_rejected():
 
         cheating_session = CheatingLateInjectionSession()
         cheating_session._evidence_forbid_overwrite_guard = True
+        cheating_session.trust_env = False
+        transport = StubCosTransport()
+        cheating_session.mount("https://", transport)
+        cheating_session.mount("http://", transport)
         client._session = cheating_session
 
         with pytest.raises((EvidenceOverwriteProtectionError, CosClientError)) as exc_info:
@@ -177,6 +216,10 @@ def test_put_object_missing_header_fails_closed():
 
         session = InterceptingSession()
         session._evidence_forbid_overwrite_guard = True
+        session.trust_env = False
+        transport = StubCosTransport()
+        session.mount("https://", transport)
+        session.mount("http://", transport)
         client._session = session
 
         with pytest.raises((EvidenceOverwriteProtectionError, CosClientError)) as exc_info:
@@ -247,9 +290,10 @@ def test_complete_multipart_upload_carries_header_and_is_signed():
                         return MockCosResponse(200, content=list_parts_xml)
                     return MockCosResponse(200, headers=expected_head_headers, content=payload)
                 if request.method == "POST":
-                    res = super().send(request, **kwargs)
-                    return MockCosResponse(200, headers={"ETag": '"final-etag"'}, content=complete_xml)
-                return super().send(request, **kwargs)
+                    return MockCosResponse(
+                        200, headers={"ETag": '"final-etag"'}, content=complete_xml,
+                    )
+                raise AssertionError(f"unexpected {request.method} {request.url}")
 
         session = InterceptingSession()
         session._evidence_forbid_overwrite_guard = True
@@ -277,31 +321,28 @@ def test_complete_multipart_upload_carries_header_and_is_signed():
         if isinstance(header_val, bytes):
             header_val = header_val.decode("utf-8")
         assert header_val == "true"
-
-        auth = complete_req.headers.get("Authorization", "")
-        assert "x-cos-forbid-overwrite" in auth
+        assert "x-cos-forbid-overwrite" in _signed_headers(complete_req)
 
     asyncio.run(run())
 
 
 def test_multipart_part_upload_does_not_require_forbid_overwrite():
-    """upload_part (PUT with uploadId & partNumber) is excluded from forbid-overwrite guard."""
+    """upload_part (PUT with uploadId & partNumber) is excluded from forbid-overwrite guard.
+
+    Only the HTTP transport is replaced: the real COS SDK still builds and signs
+    the PreparedRequest, so method, query parameters, and the signed header list
+    are exactly what production would put on the wire.
+    """
     async def run():
         config = _make_config()
         store = CosAttachmentStore(config)
         client = store._sdk()
 
-        captured_requests = []
-
-        class InterceptingSession(client._session.__class__):
-            def send(self, request, **kwargs):
-                captured_requests.append(request)
-                res = super().send(request, **kwargs)
-                return MockCosResponse(200, headers={"ETag": '"part-etag"'})
-
-        session = InterceptingSession()
-        session._evidence_forbid_overwrite_guard = True
-        client._session = session
+        transport = StubCosTransport(headers={"ETag": '"part-etag"'})
+        session = client._session
+        session.trust_env = False
+        session.mount("https://", transport)
+        session.mount("http://", transport)
 
         resp = client.upload_part(
             Bucket=config.cos_bucket,
@@ -310,13 +351,16 @@ def test_multipart_part_upload_does_not_require_forbid_overwrite():
             PartNumber=1,
             Body=b"part-data",
         )
+
         assert resp["ETag"] == '"part-etag"'
-        assert len(captured_requests) == 1
-        req = captured_requests[0]
+        assert len(transport.requests) == 1
+        req = transport.requests[0]
         assert req.method == "PUT"
-        assert "partNumber=1" in req.url
-        assert "uploadId=test-upload-id" in req.url
+        parsed = dict(parse_qsl(urlsplit(req.url).query))
+        assert parsed.get("uploadId") == "test-upload-id"
+        assert parsed.get("partNumber") == "1"
         assert "x-cos-forbid-overwrite" not in req.headers
+        assert "x-cos-forbid-overwrite" not in _signed_headers(req)
 
     asyncio.run(run())
 
@@ -356,7 +400,7 @@ def test_retry_cannot_overwrite_existing_object():
                         409,
                         content=b"<Error><Code>FileAlreadyExists</Code><Message>Object already exists</Message></Error>",
                     )
-                return super().send(request, **kwargs)
+                raise AssertionError(f"unexpected {request.method} {request.url}")
 
         session = InterceptingSession()
         session._evidence_forbid_overwrite_guard = True
@@ -422,7 +466,7 @@ def test_network_error_read_back_validates_full_object_identity():
                     raise requests.ConnectionError("Connection reset by peer after sending body")
                 if request.method == "GET":
                     return MockCosResponse(200, headers=matching_head_headers, content=payload)
-                return super().send(request, **kwargs)
+                raise AssertionError(f"unexpected {request.method} {request.url}")
 
         session_a = LandedSession()
         session_a._evidence_forbid_overwrite_guard = True
@@ -446,7 +490,7 @@ def test_network_error_read_back_validates_full_object_identity():
                     return MockCosResponse(404)
                 if request.method == "PUT":
                     raise requests.ConnectionError("Connection aborted before server write")
-                return super().send(request, **kwargs)
+                raise AssertionError(f"unexpected {request.method} {request.url}")
 
         session_b = NotLandedSession()
         session_b._evidence_forbid_overwrite_guard = True
@@ -502,11 +546,10 @@ def test_note_dispatch_carries_forbid_overwrite_and_verifies_identity():
                 if request.method == "HEAD":
                     return MockCosResponse(200, headers=matching_head_headers)
                 if request.method == "PUT":
-                    res = super().send(request, **kwargs)
                     return MockCosResponse(200, headers={"ETag": '"note-etag"'})
                 if request.method == "GET":
                     return MockCosResponse(200, headers=matching_head_headers, content=note_bytes)
-                return super().send(request, **kwargs)
+                raise AssertionError(f"unexpected {request.method} {request.url}")
 
         session = NoteSession()
         session._evidence_forbid_overwrite_guard = True
@@ -528,5 +571,6 @@ def test_note_dispatch_carries_forbid_overwrite_and_verifies_identity():
         if isinstance(header_val, bytes):
             header_val = header_val.decode("utf-8")
         assert header_val == "true"
+        assert "x-cos-forbid-overwrite" in _signed_headers(put_reqs[0])
 
     asyncio.run(run())
