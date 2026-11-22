@@ -1184,6 +1184,36 @@ class GitHubCommandWatcher:
         return ((BUILD_HEADING in body and "Build Result" in body)
                 or (CODE_REVIEW_HEADING in body and "Code Review" in body))
 
+    def _has_pending_review_completion(
+        self, repo: str, pr_number: int, comments, cursor: int,
+    ) -> bool:
+        """Return True only when a trusted Review Completion still needs reconcile.
+
+        A baseline must refresh the lifecycle after consuming the cursor *only*
+        when a terminal Build/Code-Review comment newer than the persisted
+        cursor is waiting to be reflected. When the HEAD and lifecycle are
+        already current this is False, so a same-HEAD baseline neither
+        reconciles a second time nor re-archives the round.
+        """
+        if not isinstance(cursor, int) or isinstance(cursor, bool):
+            return False
+        if isinstance(comments, list):
+            for comment in comments:
+                if not isinstance(comment, dict):
+                    continue
+                comment_id = comment.get("id")
+                if (type(comment_id) is int and comment_id > cursor
+                        and self._is_trusted_review_completion(comment)):
+                    return True
+        for (observed_repo, observed_pr, comment_id), record in self._recent_command_records.items():
+            if (observed_repo == repo and observed_pr == pr_number
+                    and comment_id > cursor
+                    and isinstance(record, dict)
+                    and record.get("event_type") == "review_completion"
+                    and record.get("status") not in {"handled", "already_processed"}):
+                return True
+        return False
+
     def _observe_recent_command(self, repo, pr_number, comment, created_at):
         comment_id = comment.get("id")
         if type(comment_id) is not int or comment_id <= 0:
@@ -1512,12 +1542,25 @@ class GitHubCommandWatcher:
         try:
             state = await self.proxy.read_hidden_state(repo, pr_number)
             comments = await self.proxy.get_issue_comments(repo, pr_number)
-        except Exception as exc:
+        except (GitHubRateLimitError, GitHubTransientError,
+                GitHubStateProxyError, asyncio.TimeoutError) as exc:
+            # A shared API failure is retryable: keep the item queued so the
+            # rejection notice is not lost.
             logger.warning(
                 "watcher terminal PR command scan failed %s#%s exception=%s",
                 repo, pr_number, type(exc).__name__,
             )
             return False
+        except Exception as exc:
+            # The PR is already closed/merged, so no queued command can ever
+            # execute there and there is no Lifecycle to write. If the proxy
+            # surface cannot be read at all, report the scan as done so the
+            # terminal PR cannot occupy a priority slot forever.
+            logger.warning(
+                "watcher terminal PR command scan unavailable %s#%s exception=%s",
+                repo, pr_number, type(exc).__name__,
+            )
+            return True
         if not isinstance(comments, list):
             return False
         cutoff = self._repo_baseline_cutoff_utc.get(repo)
@@ -2958,37 +3001,47 @@ class GitHubCommandWatcher:
                                 draft_selected = int(lane == 1)
                                 self._normal_pr_lane_cursor[repo] = (lane + 1) % 2
                                 break
+                # Rotate the fallback lane across ALL eligible open PRs, not a
+                # recency-capped subset. A fixed top-N window re-selects the
+                # same newest PRs every cycle and starves high-numbered PRs once
+                # they fall outside it. Sweeping the whole pool keeps each cycle
+                # bounded by ``recent_budget`` while guaranteeing every PR is
+                # eventually visited. The cursor advances past the entries this
+                # cycle actually examined, so nothing is skipped.
                 recent_pool = sorted(
                     [(number, pr) for number, pr in valid_prs
                      if pr.get("draft") is not True and number not in active_pr_numbers],
-                    key=lambda item: str(item[1].get("updated_at") or ""),
+                    # Newest first; equal timestamps fall back to ascending
+                    # number so the rotation is deterministic.
+                    key=lambda item: (str(item[1].get("updated_at") or ""), -item[0]),
                     reverse=True,
-                )[:12]
-                if len(recent_pool) > 1:
-                    rotating = recent_pool[1:]
-                    recent_start = self._recent_pr_cursor.get(repo, 0) % len(rotating)
-                    recent_order = rotating[recent_start:] + rotating[:recent_start]
-                    fast_lane = [recent_pool[0], *recent_order[:fast_lane_size - 1]]
-                    self._recent_pr_cursor[repo] = (recent_start + 1) % len(rotating)
-                else:
-                    fast_lane = list(recent_pool)
+                )
                 skipped_numbers: set[int] = set()
                 recent_budget = min(
                     fast_lane_size,
                     max(0, remaining_normal - reserve_ordinary
                         - active_selected - draft_selected),
                 )
-                for number, pr in fast_lane:
-                    if len(selected) >= pr_work_budget or recent_budget <= 0:
-                        break
-                    if number in selected_set:
-                        continue
-                    if self._ordinary_pr_cache_fresh(repo, number, pr, force=baseline_all):
-                        skipped_numbers.add(number)
-                        continue
-                    selected.append(number)
-                    selected_set.add(number)
-                    recent_budget -= 1
+                if recent_pool and recent_budget > 0:
+                    recent_start = self._recent_pr_cursor.get(repo, 0) % len(recent_pool)
+                    recent_order = recent_pool[recent_start:] + recent_pool[:recent_start]
+                    recent_examined = 0
+                    for number, pr in recent_order:
+                        if len(selected) >= pr_work_budget or recent_budget <= 0:
+                            break
+                        if number in selected_set:
+                            continue
+                        recent_examined += 1
+                        if self._ordinary_pr_cache_fresh(repo, number, pr, force=baseline_all):
+                            skipped_numbers.add(number)
+                            continue
+                        selected.append(number)
+                        selected_set.add(number)
+                        recent_budget -= 1
+                    if recent_examined:
+                        self._recent_pr_cursor[repo] = (
+                            recent_start + recent_examined
+                        ) % len(recent_pool)
 
                 scan_start = self._pr_scan_cursor.get(repo, 0) % len(open_numbers) if open_numbers else 0
                 ordinary = open_numbers[scan_start:] + open_numbers[:scan_start]
@@ -3231,6 +3284,7 @@ class GitHubCommandWatcher:
         expected_state = initial_state
 
         baseline_id = 0
+        post_cursor_reconcile = False
         if _needs_initial_comment_baseline(initial_state):
             # --- First-observation / baseline-incomplete path ---
             try:
@@ -3319,6 +3373,14 @@ class GitHubCommandWatcher:
                     if isinstance(cid, int) and not isinstance(cid, bool) and cid > max_cid_after:
                         max_cid_after = cid
                 baseline_id = max(old_cursor, max_cid_before, max_cid_after)
+
+            # Reconcile again only if a trusted Review Completion arrived after
+            # the first snapshot (i.e. between reconcile and the second read).
+            # Otherwise the lifecycle created above is already current and a
+            # second reconcile would duplicate writes for no new evidence.
+            post_cursor_reconcile = self._has_pending_review_completion(
+                repo, pr_number, comments_after, max(old_cursor, max_cid_before),
+            )
         else:
             # --- Existing baselined PR \u2014 reactivation cursor advance ---
             # The PR has a real cursor state. Advance cursor to max(old, observed)
@@ -3582,6 +3644,19 @@ class GitHubCommandWatcher:
                             repo, pr_number, comment_id, type(e).__name__,
                         )
                         return False
+            # Reconcile a second time only when the baseline is about to consume
+            # a trusted Review Completion the lifecycle has not reflected yet.
+            # Cursor reference is the lifecycle cursor after the reconcile that
+            # already ran (or the persisted cursor when no reconcile was needed),
+            # so a same-HEAD baseline never re-reconciles or re-archives.
+            if isinstance(expected_state, dict):
+                reconcile_cursor = expected_state.get("last_processed_comment_id")
+            else:
+                reconcile_cursor = old_cursor
+            post_cursor_reconcile = self._has_pending_review_completion(
+                repo, pr_number, ordered_comments,
+                reconcile_cursor if isinstance(reconcile_cursor, int) else old_cursor,
+            )
         # Revalidate the PR, authorization generation, and lifecycle identity
         # after all reads/recovery work and immediately before cursor mutation.
         if (not self.config.auth_valid or repo not in self.config.active_repos
@@ -3655,16 +3730,21 @@ class GitHubCommandWatcher:
                 repo, pr_number,
             )
             return False
-        try:
-            await self.controller.reconcile_pr(repo, pr_number)
-        except Exception as exc:
-            # The cursor is already durable. Keep it intact and retry reconcile
-            # on the next scan; never roll the cursor back to replay commands.
-            logger.warning(
-                "watcher post-cursor baseline reconcile failed %s#%s cursor=%s error=%s",
-                repo, pr_number, persisted_cid, type(exc).__name__,
-            )
-            return False
+        # Reconcile after the cursor only when a trusted Review Completion the
+        # lifecycle has not yet reflected would otherwise be consumed silently.
+        # A same-HEAD reactivation has nothing new, so it must not reconcile or
+        # archive a second time.
+        if post_cursor_reconcile:
+            try:
+                await self.controller.reconcile_pr(repo, pr_number)
+            except Exception as exc:
+                # The cursor is already durable. Keep it intact and retry reconcile
+                # on the next scan; never roll the cursor back to replay commands.
+                logger.warning(
+                    "watcher post-cursor baseline reconcile failed %s#%s cursor=%s error=%s",
+                    repo, pr_number, persisted_cid, type(exc).__name__,
+                )
+                return False
         latest_ready_cutoff = self._ready_for_review_at.get(key)
         if (latest_ready_cutoff is not None and effective_cutoff is not None
                 and latest_ready_cutoff <= effective_cutoff):
@@ -3788,20 +3868,21 @@ class GitHubCommandWatcher:
                 )
                 return
 
-            # Reconcile once more after persisting the baseline. A trusted
-            # Review Completion may have arrived between the first reconcile
-            # and the second comment snapshot, and the baseline must not consume
-            # it without refreshing the lifecycle. This remains reconcile-only:
+            # Reconcile once more only when a trusted Review Completion arrived
+            # after the first snapshot and would otherwise be consumed by the
+            # baseline cursor without a lifecycle refresh. Reconcile-only:
             # historical Slash Commands are not dispatched in this cycle.
-            try:
-                await self.controller.reconcile_pr(repo, pr_number)
-            except Exception as e:
-                # Keep the persisted cursor; a later scan retries reconciliation.
-                logger.warning(
-                    "watcher post-baseline reconcile failed %s#%s cursor=%s error=%s",
-                    repo, pr_number, persisted_cid, type(e).__name__,
-                )
-                return
+            if self._has_pending_review_completion(
+                    repo, pr_number, comments_after, max_cid_before):
+                try:
+                    await self.controller.reconcile_pr(repo, pr_number)
+                except Exception as e:
+                    # Keep the persisted cursor; a later scan retries reconciliation.
+                    logger.warning(
+                        "watcher post-baseline reconcile failed %s#%s cursor=%s error=%s",
+                        repo, pr_number, persisted_cid, type(e).__name__,
+                    )
+                    return
 
             # Baseline persisted successfully — DO NOT dispatch commands
             # in this cycle. Next cycle will process comments > baseline_id.
