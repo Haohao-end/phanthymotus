@@ -11313,7 +11313,7 @@ class DeployController:
             and not owner.strip().casefold().endswith("[bot]")
         }, key=str.casefold)
 
-    async def _approval_command_guidance(self, repo: str, pr_number: int) -> str:
+    async def _approval_command_guidance(self, repo: str, pr_number: int, *, detail: bool = False) -> str:
         """Build executable approval guidance from the current trusted lifecycle."""
         try:
             pr = await self.proxy.get_pr(repo, pr_number)
