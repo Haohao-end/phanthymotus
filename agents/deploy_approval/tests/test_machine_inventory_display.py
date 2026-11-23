@@ -2102,8 +2102,10 @@ def test_test_only_request_deploy_notice_mentions_repository_yaml_owners(control
     )
 
     rendered = "\n".join(lines)
-    assert "@test-owner" in rendered
-    assert "@other-machine-owner" in rendered
+    assert "@test-owner" not in rendered
+    assert "@other-machine-owner" not in rendered
+    assert "test-owner" in rendered
+    assert "other-machine-owner" in rendered
     assert "/approve_deploy machine=10.90.1.12" in rendered
 
 
@@ -2127,7 +2129,8 @@ def test_test_only_request_deploy_mentions_the_current_policy_owner(controller):
     )
 
     rendered = "\n".join(lines)
-    assert "@other-machine-owner" in rendered
+    assert "@other-machine-owner" not in rendered
+    assert "other-machine-owner" in rendered
     assert "/approve_deploy machine=10.90.1.13" in rendered
 
 
@@ -2181,7 +2184,8 @@ async def test_only_request_deploy_posts_yaml_owner_mentions(controller):
 
     assert posted is True
     notice = controller._post_bound_notice.await_args.kwargs["message"]
-    assert "@test-owner" in notice
+    assert "@test-owner" not in notice
+    assert "test-owner" in notice
     assert f"/approve_deploy machine={ip}" in notice
 
 
@@ -2206,10 +2210,26 @@ def test_test_only_mentions_use_repository_yaml_without_hardcoded_login(controll
     )
 
     assert configured is True
-    assert eligible == ["test-owner", "another-reviewer"]
-    assert "@test-owner" in guidance
-    assert "@another-reviewer" in guidance
-    assert "PR 作者身份不影响" in guidance
+    assert eligible == []
+    assert "@test-owner" not in guidance
+    assert "@another-reviewer" not in guidance
+    assert "test-owner" in guidance
+    assert "another-reviewer" in guidance
+    assert "没有验收权限" in guidance
+
+    # When the PR author is configured in reviewers:
+    controller.policy.reviewers_for_repo = MagicMock(return_value=[
+        "test-owner", "different-author",
+    ])
+    configured, eligible = controller._eligible_acceptance_reviewers(REPO, pr)
+    guidance = controller._acceptance_reviewer_guidance(
+        REPO, pr, configured, eligible,
+    )
+    assert configured is True
+    assert eligible == ["different-author"]
+    assert "@different-author" in guidance
+    assert "@test-owner" not in guidance
+    assert "test-owner" in guidance
 
     machine = _machine(
         "yaml-owner-machine", "10.90.1.15", owners=["test-owner"],
@@ -2220,9 +2240,10 @@ def test_test_only_mentions_use_repository_yaml_without_hardcoded_login(controll
     groups = controller._get_machine_groups_for_components([_component()], REPO)
     lines = controller._machine_notice_lines(
         groups, REPO, mention_owners=True, test_only=True,
-        components=[_component()],
+        components=[_component()], pr=pr,
     )
-    assert any("@test-owner" in line for line in lines)
+    assert not any("@test-owner" in line for line in lines)
+    assert any("test-owner" in line for line in lines)
     assert any("/approve_deploy machine=10.90.1.15" in line for line in lines)
 
 
@@ -2251,12 +2272,9 @@ async def test_rejected_in_progress_approval_has_structured_error_context(contro
 
     kwargs = controller._post_bound_notice.await_args.kwargs
     notice = kwargs["message"]
-    assert command in notice
-    assert "**具体错误：** 当前生命周期不允许：部署已在进行或结果待确认" in notice
-    assert "**失败原因：**" in notice
-    assert "**当前生命周期：** `deploying`" in notice
-    assert "**下一步：**" in notice
-    assert "不要重发审批命令或盲目重试部署 POST" in notice
+    assert "部署正在进行" in notice
+    assert "不要重复提交审批" in notice
+    assert "等待 PR Summary 显示部署结果" in notice
 
 
 @pytest.mark.asyncio

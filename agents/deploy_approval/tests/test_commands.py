@@ -50,6 +50,12 @@ class TestApproveDeploy:
         assert cmd.is_command
         assert cmd.machine_alias == "g1-bj-wifi"
 
+    def test_approve_deploy_ip_selector(self):
+        cmd = parse_command("/approve_deploy machine=10.110.8.244")
+        assert cmd.kind == "approve_deploy"
+        assert cmd.is_command
+        assert cmd.machine_alias == "10.110.8.244"
+
     def test_allows_omitted_machine(self):
         # ``machine=`` is optional at parse time. When exactly one machine is
         # fully compatible with every component the Controller executes the

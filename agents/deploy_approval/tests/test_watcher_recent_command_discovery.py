@@ -576,3 +576,278 @@ async def test_pre_baseline_rejection_is_delivered_only_once():
     controller._post_command_reply.assert_awaited_once()
     assert key not in watcher._pending_baseline_notices
     assert watcher.recent_discovery_stats["baseline_rejection_notices"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 6: PR #581 regression: Human command must not be swallowed by subsequent bot notice.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pr581_human_command_not_swallowed_by_subsequent_bot_notice():
+    """Simulate PR 581 timeline:
+    1. PR 581 on 4paradigm/phanthymotus-driver, HEAD 1f8a8cf69e69287054748d54aacb1b3b218f3b0a
+    2. R01: comment 7080880956 (/request_deploy 123) at 2026-11-22T14:53:18Z
+    3. Bot subsequently posts ordinary deploy-ready reminder: comment 7080883326 at 2026-11-22T14:53:29Z
+    4. Fixed authorization cutoff: 2026-11-22T14:50:00Z (older than R01)
+
+    Assertions:
+    - Cycle 1: Baseline establishes without consuming R01 (cursor remains 0).
+    - Cycle 2: R01 receives extra_parameter error reply, cursor advances to 7080880956.
+    - Assert business status unchanged ('deploy-ready').
+    - Assert no deployment occurred (on_command not called).
+    - Cycle 3: Bot notice consumed without dispatch, cursor advances to 7080883326.
+    - Restart: New watcher instance with persisted state does not re-reply or deploy.
+    - Subsequent valid command (/request_deploy) executes normally.
+    """
+    repo = "4paradigm/phanthymotus-driver"
+    pr = 581
+    head = "1f8a8cf69e69287054748d54aacb1b3b218f3b0a"
+    cutoff = datetime(2026, 11, 22, 14, 50, 0, tzinfo=timezone.utc)
+
+    r01_id = 7080880956
+    r01_comment = {
+        "id": r01_id,
+        "body": "/request_deploy 123",
+        "created_at": "2026-11-22T14:53:18Z",
+        "updated_at": "2026-11-22T14:53:18Z",
+        "issue_url": f"https://api.github.com/repos/{repo}/issues/{pr}",
+        "user": {"id": 1234, "login": "alice", "type": "User"},
+    }
+    bot_id = 7080883326
+    bot_comment = {
+        "id": bot_id,
+        "body": "PR status: deploy-ready\nUse /request_deploy",
+        "created_at": "2026-11-22T14:53:29Z",
+        "updated_at": "2026-11-22T14:53:29Z",
+        "issue_url": f"https://api.github.com/repos/{repo}/issues/{pr}",
+        "user": {"id": 9999, "login": "deploy-bot", "type": "Bot"},
+    }
+
+    # Verify R01 command parse result has extra_parameter error
+    parsed_r01 = commands_mod.parse_command(r01_comment["body"])
+    assert parsed_r01.is_command is True
+    assert parsed_r01.error == "extra_parameter"
+    assert parsed_r01.intent == "request_deploy"
+
+    config = Config(
+        github_repos=[repo],
+        github_api_url="https://api.github.com",
+        poll_enabled=True,
+        poll_interval_seconds=30,
+        webhook_enabled=False,
+        machine_owners_file="/dev/null",
+    )
+    config.active_repos = [repo]
+    config.auth_valid = True
+
+    state = None
+    pr_comments = [r01_comment]
+
+    proxy = MagicMock()
+    async def mock_read_hidden_state(r, p):
+        return state
+    async def mock_persist_cursor(r, p, cid):
+        nonlocal state
+        if state is None:
+            state = {
+                "head_sha": head,
+                "status": "deploy-ready",
+                "last_processed_comment_id": cid,
+                "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+            }
+        else:
+            state["last_processed_comment_id"] = max(state.get("last_processed_comment_id", 0), cid)
+        return state
+    async def mock_get_pr(r, p):
+        return {
+            "number": pr, "state": "open", "merged": False, "draft": False,
+            "head": {"sha": head}, "base": {"repo": {"full_name": repo}},
+        }
+    async def mock_get_issue_comments(r, p):
+        return list(pr_comments)
+    async def mock_get_comment(r, cid):
+        for c in pr_comments:
+            if c["id"] == cid:
+                return c
+        return None
+    async def mock_comment_identity(r, cid):
+        for c in pr_comments:
+            if c["id"] == cid:
+                return str(c["user"]["id"]), c["user"]["login"]
+        return "", ""
+
+    proxy.read_hidden_state = AsyncMock(side_effect=mock_read_hidden_state)
+    proxy.persist_cursor = AsyncMock(side_effect=mock_persist_cursor)
+    proxy.get_pr = AsyncMock(side_effect=mock_get_pr)
+    proxy.get_issue_comments = AsyncMock(side_effect=mock_get_issue_comments)
+    proxy.get_comment = AsyncMock(side_effect=mock_get_comment)
+    proxy.comment_identity = AsyncMock(side_effect=mock_comment_identity)
+    proxy.is_bot_comment = MagicMock(side_effect=lambda c: c.get("user", {}).get("login") == "deploy-bot")
+
+    controller = MagicMock()
+    async def mock_reconcile(r, p):
+        nonlocal state
+        if bot_comment not in pr_comments:
+            pr_comments.append(bot_comment)
+        if state is None:
+            state = {
+                "head_sha": head,
+                "status": "deploy-ready",
+                "last_processed_comment_id": 0,
+                "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+            }
+    controller.reconcile_pr = AsyncMock(side_effect=mock_reconcile)
+    controller.on_command = AsyncMock(return_value=True)
+    replies = []
+    async def mock_post_reply(r, p, cid, msg, topic="", error=False):
+        replies.append((cid, topic, error))
+        return True
+    controller._post_command_reply = AsyncMock(side_effect=mock_post_reply)
+    controller.begin_command_reply_tracking = MagicMock()
+    controller.take_command_reply_delivery = MagicMock(return_value=None)
+
+    watcher = GitHubCommandWatcher(config, proxy, controller)
+    watcher._repo_baseline_cutoff_utc[repo] = cutoff
+
+    # Cycle 1: Baseline pass establishes cutoff boundary; R01 and Bot notice are after cutoff
+    # Cursor remains 0, no dispatch, no reply
+    await watcher._process_scheduled_pr(repo, pr)
+    assert state is not None
+    assert state["last_processed_comment_id"] == 0
+    assert replies == []
+    controller.on_command.assert_not_called()
+
+    # Cycle 2: Normal processing evaluates R01 first (ordered by comment ID)
+    # R01 receives extra_parameter error reply, cursor advances to r01_id
+    await watcher._process_scheduled_pr(repo, pr)
+    assert len(replies) == 1
+    assert replies[0] == (r01_id, "command-error-request_deploy", True)
+    assert state["status"] == "deploy-ready"
+    assert state["command"]["kind"] == ""
+    assert state["last_processed_comment_id"] == r01_id
+    controller.on_command.assert_not_called()
+
+    # Cycle 3: Bot notice consumed without dispatch, cursor advances past bot_id
+    await watcher._process_scheduled_pr(repo, pr)
+    assert len(replies) == 1
+    assert state["status"] == "deploy-ready"
+    assert state["last_processed_comment_id"] == bot_id
+    controller.on_command.assert_not_called()
+
+    # Restart simulation: new watcher instance with persisted state from storage
+    restart_cutoff = datetime(2026, 11, 22, 15, 0, 0, tzinfo=timezone.utc)
+    watcher_restart = GitHubCommandWatcher(config, proxy, controller)
+    watcher_restart._repo_baseline_cutoff_utc[repo] = restart_cutoff
+    controller._post_command_reply.reset_mock()
+    controller.on_command.reset_mock()
+
+    # Cycle 4 (after restart): ensure no duplicate reply and no deployment
+    await watcher_restart._process_scheduled_pr(repo, pr)
+    controller._post_command_reply.assert_not_called()
+    controller.on_command.assert_not_called()
+    assert state["status"] == "deploy-ready"
+    assert state["last_processed_comment_id"] == bot_id
+
+    # New valid command: /request_deploy
+    valid_id = 7080885000
+    valid_comment = {
+        "id": valid_id,
+        "body": "/request_deploy",
+        "created_at": "2026-11-22T15:05:00Z",
+        "updated_at": "2026-11-22T15:05:00Z",
+        "issue_url": f"https://api.github.com/repos/{repo}/issues/{pr}",
+        "user": {"id": 1234, "login": "alice", "type": "User"},
+    }
+    pr_comments.append(valid_comment)
+
+    # Cycle 5: process valid command
+    await watcher_restart._process_scheduled_pr(repo, pr)
+    controller.on_command.assert_awaited_once()
+    call_args = controller.on_command.call_args[0]
+    cmd = call_args[0]
+    assert cmd.kind == "request_deploy"
+    assert cmd.is_command is True
+    assert call_args[1] == repo
+    assert call_args[2] == pr
+    assert call_args[3] == valid_id
+    assert state["last_processed_comment_id"] == valid_id
+
+
+@pytest.mark.asyncio
+async def test_pr581_temporary_api_failure_recovers_without_skipping_error_reply():
+    """Verify that if posting error reply fails transiently, cursor does NOT advance,
+    and on next cycle it retries and succeeds before advancing cursor."""
+    repo = "4paradigm/phanthymotus-driver"
+    pr = 581
+    head = "1f8a8cf69e69287054748d54aacb1b3b218f3b0a"
+    cutoff = datetime(2026, 11, 22, 14, 50, 0, tzinfo=timezone.utc)
+
+    r01_id = 7080880956
+    r01_comment = {
+        "id": r01_id,
+        "body": "/request_deploy 123",
+        "created_at": "2026-11-22T14:53:18Z",
+        "updated_at": "2026-11-22T14:53:18Z",
+        "issue_url": f"https://api.github.com/repos/{repo}/issues/{pr}",
+        "user": {"id": 1234, "login": "alice", "type": "User"},
+    }
+
+    config = Config(
+        github_repos=[repo],
+        github_api_url="https://api.github.com",
+        poll_enabled=True,
+        poll_interval_seconds=30,
+        webhook_enabled=False,
+        machine_owners_file="/dev/null",
+    )
+    config.active_repos = [repo]
+    config.auth_valid = True
+
+    state = {
+        "head_sha": head,
+        "status": "deploy-ready",
+        "last_processed_comment_id": 0,
+        "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+    }
+    pr_comments = [r01_comment]
+
+    proxy = MagicMock()
+    proxy.read_hidden_state = AsyncMock(side_effect=lambda r, p: state)
+    async def mock_persist(r, p, cid):
+        state["last_processed_comment_id"] = cid
+        return state
+    proxy.persist_cursor = AsyncMock(side_effect=mock_persist)
+    proxy.get_pr = AsyncMock(return_value={
+        "number": pr, "state": "open", "merged": False, "draft": False,
+        "head": {"sha": head}, "base": {"repo": {"full_name": repo}},
+    })
+    proxy.get_issue_comments = AsyncMock(side_effect=lambda r, p: list(pr_comments))
+    proxy.get_comment = AsyncMock(side_effect=lambda r, cid: r01_comment if cid == r01_id else None)
+    proxy.comment_identity = AsyncMock(return_value=("1234", "alice"))
+    proxy.is_bot_comment = MagicMock(return_value=False)
+
+    controller = MagicMock()
+    controller.reconcile_pr = AsyncMock()
+    controller.on_command = AsyncMock(return_value=True)
+
+    # First attempt: _post_command_reply fails (returns False)
+    controller._post_command_reply = AsyncMock(return_value=False)
+
+    watcher = GitHubCommandWatcher(config, proxy, controller)
+    watcher._repo_baseline_cutoff_utc[repo] = cutoff
+    watcher._baseline_progress[repo] = {pr}  # Already baselined
+
+    # Cycle 1: Error reply fails -> cursor must NOT advance
+    await watcher._process_scheduled_pr(repo, pr)
+    controller._post_command_reply.assert_awaited_once()
+    assert state["last_processed_comment_id"] == 0
+    controller.on_command.assert_not_called()
+
+    # Second attempt: _post_command_reply succeeds (returns True)
+    controller._post_command_reply = AsyncMock(return_value=True)
+
+    # Cycle 2: Error reply succeeds -> cursor safely advances to r01_id
+    await watcher._process_scheduled_pr(repo, pr)
+    controller._post_command_reply.assert_awaited_once()
+    assert state["last_processed_comment_id"] == r01_id
+    controller.on_command.assert_not_called()

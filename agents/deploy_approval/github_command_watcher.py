@@ -3355,24 +3355,19 @@ class GitHubCommandWatcher:
                 if (not isinstance(old_cursor, int) or isinstance(old_cursor, bool)
                         or old_cursor < 0):
                     return False
-            if effective_cutoff is not None:
-                baseline_id = self._comment_cursor_through_cutoff(
-                    comments_before + comments_after, effective_cutoff,
-                    lower_bound=old_cursor,
+            if effective_cutoff is None:
+                logger.warning("watcher baseline cutoff missing %s#%s — fail closed", repo, pr_number)
+                return False
+            baseline_id = self._comment_cursor_through_cutoff(
+                comments_before + comments_after, effective_cutoff,
+                lower_bound=old_cursor,
+            )
+            if baseline_id is None:
+                logger.warning(
+                    "watcher baseline comment cutoff invalid %s#%s \u2014 fail closed",
+                    repo, pr_number,
                 )
-                if baseline_id is None:
-                    logger.warning(
-                        "watcher baseline comment cutoff invalid %s#%s \u2014 fail closed",
-                        repo, pr_number,
-                    )
-                    return False
-            else:
-                max_cid_after = 0
-                for c in comments_after:
-                    cid = c.get("id")
-                    if isinstance(cid, int) and not isinstance(cid, bool) and cid > max_cid_after:
-                        max_cid_after = cid
-                baseline_id = max(old_cursor, max_cid_before, max_cid_after)
+                return False
 
             # Reconcile again only if a trusted Review Completion arrived after
             # the first snapshot (i.e. between reconcile and the second read).
@@ -3776,116 +3771,13 @@ class GitHubCommandWatcher:
 
         initial_state = await self.proxy.read_hidden_state(repo, pr_number)
 
-        if _needs_initial_comment_baseline(initial_state):
-            # --- First-observation / baseline-incomplete path ---
-            pr_info = await self.proxy.get_pr(repo, pr_number)
-            if not pr_info or pr_info.get("state") != "open":
-                # Closed / merged PR without usable state — reconcile if
-                # appropriate but do NOT dispatch any commands.
-                if initial_state is None:
-                    await self.controller.reconcile_pr(repo, pr_number)
-                return
-
-            # BEFORE reconcile: snapshot current comments.
-            try:
-                comments_before = await self.proxy.get_issue_comments(repo, pr_number)
-            except Exception as e:
-                logger.warning(
-                    "watcher baseline snapshot-before %s#%s: %s — fail closed",
-                    repo, pr_number, e,
-                )
-                return
-
-            max_cid_before = 0
-            for c in comments_before:
-                cid = c.get("id")
-                if isinstance(cid, int) and not isinstance(cid, bool) and cid > max_cid_before:
-                    max_cid_before = cid
-
-            # Reconcile (may create lifecycle hidden state).
-            try:
-                await self.controller.reconcile_pr(repo, pr_number)
-            except Exception as e:
-                logger.warning(
-                    "watcher reconcile %s#%s: %s — skip baseline this cycle",
-                    repo, pr_number, e,
-                )
-                return
-
-            # After reconcile: fresh read state.
-            state_after = await self.proxy.read_hidden_state(repo, pr_number)
-            if state_after is None:
-                # reconcile did not create state — abort this cycle
-                return
-
-            # AFTER reconcile: second snapshot to capture lifecycle bot
-            # comments created by reconcile, plus any race new comments.
-            try:
-                comments_after = await self.proxy.get_issue_comments(repo, pr_number)
-            except Exception as e:
-                logger.warning(
-                    "watcher baseline snapshot-after %s#%s: %s — fail closed",
-                    repo, pr_number, e,
-                )
-                return
-
-            max_cid_after = 0
-            for c in comments_after:
-                cid = c.get("id")
-                if isinstance(cid, int) and not isinstance(cid, bool) and cid > max_cid_after:
-                    max_cid_after = cid
-
-            baseline_id = max(max_cid_before, max_cid_after)
-
-            # Persist baseline cursor.
-            try:
-                persisted = await self.proxy.persist_cursor(repo, pr_number, baseline_id)
-            except Exception as e:
-                logger.warning(
-                    "watcher persist baseline %s#%s: %s — fail closed",
-                    repo, pr_number, e,
-                )
-                return
-
-            # Verify persistence succeeded at least as far as requested.
-            if not isinstance(persisted, dict):
-                logger.warning(
-                    "watcher persist baseline %s#%s returned %s — fail closed",
-                    repo, pr_number, type(persisted).__name__,
-                )
-                return
-            persisted_cid = persisted.get("last_processed_comment_id")
-            if not isinstance(persisted_cid, int) or isinstance(persisted_cid, bool):
-                logger.warning(
-                    "watcher persist baseline %s#%s invalid cursor — fail closed",
-                    repo, pr_number,
-                )
-                return
-            if persisted_cid < baseline_id:
-                logger.warning(
-                    "watcher persist baseline %s#%s cursor %s < requested %s — fail closed",
-                    repo, pr_number, persisted_cid, baseline_id,
-                )
-                return
-
-            # Reconcile once more only when a trusted Review Completion arrived
-            # after the first snapshot and would otherwise be consumed by the
-            # baseline cursor without a lifecycle refresh. Reconcile-only:
-            # historical Slash Commands are not dispatched in this cycle.
-            if self._has_pending_review_completion(
-                    repo, pr_number, comments_after, max_cid_before):
-                try:
-                    await self.controller.reconcile_pr(repo, pr_number)
-                except Exception as e:
-                    # Keep the persisted cursor; a later scan retries reconciliation.
-                    logger.warning(
-                        "watcher post-baseline reconcile failed %s#%s cursor=%s error=%s",
-                        repo, pr_number, persisted_cid, type(e).__name__,
-                    )
-                    return
-
-            # Baseline persisted successfully — DO NOT dispatch commands
-            # in this cycle. Next cycle will process comments > baseline_id.
+        if (
+            _needs_initial_comment_baseline(initial_state)
+            and pr_number not in self._baseline_progress.get(repo, set())
+        ):
+            if await self._baseline_pr(repo, pr_number):
+                self._baseline_progress.setdefault(repo, set()).add(pr_number)
+                await self._flush_pending_baseline_notices(repo, pr_number)
             return
 
         # Existing state PR — normal processing path.

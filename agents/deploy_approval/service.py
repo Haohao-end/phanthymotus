@@ -2170,7 +2170,7 @@ class DeployController:
                     })
             command_lines = self._machine_notice_lines(
                 machine_groups, repo, mention_owners=True,
-                test_only=test_only, components=components,
+                test_only=test_only, components=components, pr=pr,
             )
             next_step = (
                 [
@@ -2190,7 +2190,7 @@ class DeployController:
             )
             command_lines = self._machine_notice_lines(
                 machine_groups, repo, mention_owners=True,
-                test_only=test_only, components=components,
+                test_only=test_only, components=components, pr=pr,
             )
             next_step = (
                 [
@@ -5255,15 +5255,22 @@ class DeployController:
                 acceptance_reviewers=eligible_reviewers,
                 evidence_url=evidence_url,
             )
-            record_test_instruction = (
-                "请由验收账号执行 `/record_test result=pass` 或 `/record_test result=fail`。"
-                if reviewers_configured else
-                "配置有效的验收账号后，验收人才能执行 `/record_test result=pass` 或 `/record_test result=fail`。"
-            )
-            if self._is_test_only_pr(pr):
+            is_test_pr = self._is_test_only_pr(pr)
+            if is_test_pr:
+                pr_user = pr.get("user", {}) if isinstance(pr, dict) else {}
+                pr_author = (pr_user.get("login") or "").strip() if isinstance(pr_user, dict) else ""
                 reviewer_guidance = self._acceptance_reviewer_guidance(
                     repo, pr, reviewers_configured, eligible_reviewers,
                 )
+                if eligible_reviewers:
+                    record_test_instruction = (
+                        f"测试阶段请由 @{eligible_reviewers[0]} 执行 `/record_test result=pass` 或 `/record_test result=fail`。"
+                    )
+                else:
+                    test_account_display = f"当前测试账号 {pr_author}" if pr_author else "当前 PR 作者"
+                    record_test_instruction = (
+                        f"{test_account_display} 未在当前仓库验收名单中，没有验收权限。测试阶段不提醒其他账号。"
+                    )
                 notice = "\n\n".join((reviewer_guidance, record_test_instruction))
                 if eligible_reviewers:
                     markdown = markdown.rstrip() + "\n\n" + notice
@@ -5271,6 +5278,8 @@ class DeployController:
                     no_reviewer_messages = (
                         "当前仓库没有可用的验收人，暂时无法验收。请联系仓库管理员配置验收账号。",
                         "当前没有可用的验收人，暂时无法验收。请联系仓库管理员检查验收账号。",
+                        "当前仓库还没有可用的验收账号，暂时无法验收。请联系仓库维护者配置验收账号。",
+                        "当前没有可用的验收账号，暂时无法验收。请联系仓库维护者检查验收账号。",
                     )
                     for message in no_reviewer_messages:
                         if message in markdown:
@@ -5278,6 +5287,12 @@ class DeployController:
                             break
                     else:
                         markdown = markdown.rstrip() + "\n\n" + notice
+            else:
+                record_test_instruction = (
+                    "请由验收账号执行 `/record_test result=pass` 或 `/record_test result=fail`。"
+                    if reviewers_configured else
+                    "配置有效的验收账号后，验收人才能执行 `/record_test result=pass` 或 `/record_test result=fail`。"
+                )
             event = None
             if not refresh_pending_request:
                 event = {
@@ -5303,15 +5318,35 @@ class DeployController:
             reviewer_notice = self._acceptance_reviewer_guidance(
                 repo, pr, reviewers_configured, eligible_reviewers,
             )
-            next_action = (
-                "请验收人检查本轮证据和实际部署效果，确认是否符合 PR 需求、"
-                "是否存在阻塞问题，然后执行 `/record_test result=pass` 或 "
-                "`/record_test result=fail`。"
-                if reviewers_configured else
-                "当前仓库还没有可用的验收账号，请联系仓库维护者配置；"
-                "配置后验收人即可执行 `/record_test result=pass` 或 "
-                "`/record_test result=fail`。"
-            )
+            if is_test_pr:
+                pr_user = pr.get("user", {}) if isinstance(pr, dict) else {}
+                pr_author = (pr_user.get("login") or "").strip() if isinstance(pr_user, dict) else ""
+                if eligible_reviewers:
+                    next_action = (
+                        f"请 @{eligible_reviewers[0]} 检查本轮证据和实际部署效果，确认是否符合 PR 需求、"
+                        "是否存在阻塞问题，然后执行 `/record_test result=pass` 或 "
+                        "`/record_test result=fail`。"
+                    )
+                else:
+                    test_account_display = f"当前测试账号 {pr_author}" if pr_author else "当前 PR 作者"
+                    next_action = (
+                        f"{test_account_display} 没有验收权限，不能执行 `/record_test`。"
+                        "请联系仓库维护者将测试账号加入验收名单后重试。"
+                    )
+            else:
+                next_action = (
+                    "请验收人 " + " ".join(f"@{r}" for r in eligible_reviewers) + " 检查本轮证据和实际部署效果，确认是否符合 PR 需求、"
+                    "是否存在阻塞问题，然后执行 `/record_test result=pass` 或 "
+                    "`/record_test result=fail`。"
+                    if (reviewers_configured and eligible_reviewers) else
+                    ("请验收人检查本轮证据和实际部署效果，确认是否符合 PR 需求、"
+                     "是否存在阻塞问题，然后执行 `/record_test result=pass` 或 "
+                     "`/record_test result=fail`。"
+                     if reviewers_configured else
+                     "当前仓库还没有可用的验收账号，请联系仓库维护者配置；"
+                     "配置后验收人即可执行 `/record_test result=pass` 或 "
+                     "`/record_test result=fail`。")
+                )
             evidence_location = (
                 f"本轮测试视频或图片（可选）：[打开固定上传页面](<{evidence_url}>)，"
                 "也可在 PR Summary 的测试证据区域查看。"
@@ -11070,15 +11105,44 @@ class DeployController:
                 continue
             seen.add(key)
             valid_reviewers.append(reviewer.strip())
-        # TEST ONLY affects only which YAML source is read: reminders still
-        # use the current repository's complete, validated reviewer list.
-        return bool(valid_reviewers), valid_reviewers
+        reviewers_configured = bool(valid_reviewers)
+        if self._is_test_only_pr(pr):
+            pr_user = pr.get("user", {}) if isinstance(pr, dict) else {}
+            pr_author = (pr_user.get("login") or "").strip() if isinstance(pr_user, dict) else ""
+            author_match = next((r for r in valid_reviewers if r.casefold() == pr_author.casefold()), None) if pr_author else None
+            if author_match:
+                return reviewers_configured, [author_match]
+            return reviewers_configured, []
+        return reviewers_configured, valid_reviewers
 
     def _acceptance_reviewer_guidance(
         self, repo: str, pr: dict | None, reviewers_configured: bool,
         eligible_reviewers: list[str],
     ) -> str:
         """Describe repo-scoped acceptance authorization in user-facing terms."""
+        if self._is_test_only_pr(pr):
+            try:
+                configured_reviewers = self.policy.reviewers_for_repo(repo)
+            except Exception:
+                configured_reviewers = []
+            valid_reviewers = []
+            seen = set()
+            for r in configured_reviewers if isinstance(configured_reviewers, list) else []:
+                if isinstance(r, str) and _LOGIN_RE.fullmatch(r.strip()) and not r.strip().casefold().endswith("[bot]"):
+                    k = r.strip().casefold()
+                    if k not in seen:
+                        seen.add(k)
+                        valid_reviewers.append(r.strip())
+            whitelist_display = " ".join(valid_reviewers) if valid_reviewers else "无"
+            pr_user = pr.get("user", {}) if isinstance(pr, dict) else {}
+            pr_author = (pr_user.get("login") or "").strip() if isinstance(pr_user, dict) else ""
+            author_match = next((r for r in valid_reviewers if r.casefold() == pr_author.casefold()), None) if pr_author else None
+            if author_match:
+                return f"测试阶段验收由 @{author_match} 执行（当前仓库验收名单：{whitelist_display}）。"
+            test_account_display = f"当前测试账号 {pr_author}" if pr_author else "当前 PR 作者"
+            if not reviewers_configured:
+                return f"当前仓库没有配置验收账号，{test_account_display} 没有验收权限。测试阶段不提醒其他账号。"
+            return f"{test_account_display} 未在当前仓库验收名单中（当前验收名单：{whitelist_display}），没有验收权限。测试阶段不提醒其他账号。"
         if eligible_reviewers:
             return "验收由这些 GitHub 账号执行：" + " ".join(
                 f"@{reviewer}" for reviewer in eligible_reviewers
@@ -11166,7 +11230,7 @@ class DeployController:
     def _machine_notice_lines(
         self, groups: list[dict], repo: str, *, mention_owners: bool,
         test_only: bool = False, components: list[dict] | None = None,
-        show_components: bool = True,
+        show_components: bool = True, pr: dict | None = None,
     ) -> list[str]:
         lines: list[str] = []
         for group in groups:
@@ -11213,10 +11277,25 @@ class DeployController:
             # Owner reminders belong only to a fresh /request_deploy notice.
             # deploy-ready keeps the machine commands; deploy-requested adds
             # exact @mentions of the configured machine Owners.
-            requester_note = (
-                "，请 " + " ".join(f"@{owner}" for owner in valid_owners) + " 审批"
-                if can_mention_owners else ""
-            )
+            if test_only:
+                pr_user = pr.get("user", {}) if isinstance(pr, dict) else {}
+                pr_author = (pr_user.get("login") or "").strip() if isinstance(pr_user, dict) else ""
+                author_match = next((o for o in valid_owners if o.casefold() == pr_author.casefold()), None) if pr_author else None
+                if can_mention_owners and author_match:
+                    other_owners = [o for o in valid_owners if o.casefold() != author_match.casefold()]
+                    owner_info = f"（机器负责人：{' '.join(valid_owners)}）" if other_owners else ""
+                    requester_note = f"，请 @{author_match} 审批{owner_info}"
+                elif valid_owners:
+                    requester_note = f"（机器负责人：{' '.join(valid_owners)}）"
+                else:
+                    requester_note = ""
+            else:
+                if can_mention_owners and valid_owners:
+                    requester_note = "，请 " + " ".join(f"@{owner}" for owner in valid_owners) + " 审批"
+                elif valid_owners:
+                    requester_note = f"（机器负责人：{' '.join(valid_owners)}）"
+                else:
+                    requester_note = ""
             lines.append(
                 f"机器 `{alias}`（主 IP：`{primary_ip}`）"
                 f"{components_note}{requester_note}"
@@ -11421,6 +11500,7 @@ class DeployController:
                     # deploy-ready lists compatible components; deploy-requested
                     # only needs the machines still awaiting approval.
                     show_components=detail and status == "deploy-ready",
+                    pr=pr,
                 )
                 if not command_lines:
                     if not detail:
