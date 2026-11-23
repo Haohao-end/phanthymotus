@@ -1655,9 +1655,34 @@ class GitHubCommandWatcher:
             in self._pending_baseline_notices
             if notice_repo == repo and notice_pr == pr_number
         )
+        if not pending:
+            return True
+
+        # Discovery caches are process-local. After a Controller restart they
+        # must not resurrect comments already covered by the durable PR cursor.
+        try:
+            persisted_state = await self.proxy.read_hidden_state(repo, pr_number)
+        except Exception as exc:
+            logger.warning(
+                "watcher baseline notice cursor read failed %s#%s reason=%s",
+                repo, pr_number, type(exc).__name__,
+            )
+            return False
+        if not isinstance(persisted_state, dict):
+            return False
+        persisted_cursor = persisted_state.get("last_processed_comment_id")
+        if type(persisted_cursor) is not int or persisted_cursor < 0:
+            return False
+
         ok = True
         for comment_id in pending:
             key = (repo, pr_number, comment_id)
+            if comment_id <= persisted_cursor:
+                self._pending_baseline_notices.pop(key, None)
+                self._mark_recent_command_already_processed(
+                    repo, pr_number, comment_id,
+                )
+                continue
             record = self._recent_command_records.get(key)
             if not isinstance(record, dict):
                 self._pending_baseline_notices.pop(key, None)
