@@ -1688,21 +1688,15 @@ class DeployController:
         all_machine_groups = self._get_machine_groups_for_components(
             candidate["components"], repo,
         )
-        machine_commands = await self._machine_notice_lines(
-            all_machine_groups, repo, mention_owners=False,
-            components=candidate["components"],
+        verified_groups = await self._machine_groups_verify_endpoints(
+            all_machine_groups, repo, candidate["components"],
         )
         markdown = comments_mod.deploy_ready(
             repo, pr_number, current_head, candidate["builds"],
             review_evidence=candidate["snapshot"],
-            machine_groups=[],
+            machine_groups=verified_groups,
             components=candidate["components"],
         )
-        if machine_commands:
-            markdown += (
-                "\n\n### Deployment progress\n\n"
-                "可以执行的机器审批命令：\n" + "\n".join(machine_commands)
-            )
         try:
             written = await self._write_lifecycle_with_history(
                 repo, pr_number, next_state, markdown, event=event,
@@ -9348,7 +9342,7 @@ class DeployController:
         markdown = comments_mod.deploy_ready(
             repo, pr_number, state.get("head_sha", ""), builds,
             review_evidence=state.get("review_evidence", {}),
-            machine_groups=self._ip_command_machine_groups(machine_groups),
+            machine_groups=machine_groups,
             components=remaining,
         )
         markdown = self._require_explicit_ip_for_multiple_full_machines(
@@ -9400,9 +9394,15 @@ class DeployController:
                     "可以执行的机器审批命令：",
                     *command_lines,
                 ])
+        verified_groups = (
+            await self._machine_groups_verify_endpoints(
+                machine_groups, repo, remaining,
+            )
+            if not command_pending else []
+        )
         if status == "deploy-ready":
             return self._deploy_ready_retry_markdown(
-                repo, pr_number, state, remaining, [],
+                repo, pr_number, state, remaining, verified_groups,
                 gate_note=progress_notes,
             )
         markdown = await self._deploy_requested_markdown(
@@ -12484,9 +12484,14 @@ class DeployController:
                 origin.get("body", "") if isinstance(origin.get("body"), str) else "",
                 comment_id=comment_id,
             )
+            from .commands import detect_deployment_command_intent
+            parse_error = parsed.error if isinstance(parsed.error, str) else ""
+            if not parse_error and parsed.kind == "unknown":
+                source = origin.get("body") or ""
+                if detect_deployment_command_intent(source):
+                    parse_error = "command_not_found"
             qa = self._final_reply_qa(
-                pr, labels, topic, message,
-                parsed.error if isinstance(parsed.error, str) else "",
+                pr, labels, topic, message, parse_error,
             )
         marker = "<!-- deploy-approval-reply-to-comment:" + str(comment_id) + " -->"
         result_marker = f"<!-- deploy-approval-result:{result} -->"
@@ -12534,8 +12539,8 @@ class DeployController:
     def _visible_command_lines(message: str) -> list[str]:
         """Extract the executable commands actually shown in a reply body."""
         pattern = re.compile(
-            r"(?<![A-Za-z0-9_])/(?:approve_deploy|request_deploy|reject_deploy|"
-            r"record_test|request_acceptance)(?:[ \t]+[^\s`]+)*",
+            r"(?<![A-Za-z0-9_])/(?:approve_deploy|request_deploy|request_bot_review|"
+            r"record_test|request_acceptance|deploy_status|deploy_help)(?:[ \t]+[^\s`]+)*",
         )
         lines: list[str] = []
         for line in message.splitlines():
@@ -12560,13 +12565,13 @@ class DeployController:
             if isinstance(labels, list) else None
         status_labels = [label for label in label_list or []
                          if label.startswith("status:")]
-        status = status_labels[0] if len(status_labels) == 1 else "unknown"
+        status = status_labels[0].split(":", 1)[1].strip() if len(status_labels) == 1 else "unknown"
         normalized_topic = re.sub(r"[^a-z0-9]+", "_", topic.casefold()).strip("_")
         normalized_parse_error = re.sub(
             r"[^a-z0-9]+", "_", parse_error.casefold(),
         ).strip("_")
         if normalized_parse_error:
-            error_category = f"command_parse_{normalized_parse_error}"
+            error_category = parse_error
         else:
             category_rules = (
                 ("machine_offline", "machine_unavailable"),
@@ -15270,21 +15275,15 @@ class DeployController:
                     all_machine_groups = self._get_machine_groups_for_components(
                         components, repo,
                     )
-                    machine_commands = await self._machine_notice_lines(
-                        all_machine_groups, repo, mention_owners=False,
-                        components=components,
+                    verified_groups = await self._machine_groups_verify_endpoints(
+                        all_machine_groups, repo, components,
                     )
                     markdown = comments_mod.deploy_ready(
                         repo, pr_number, current_head, build_infos,
                         review_evidence=review_evidence_data,
-                        machine_groups=[],
+                        machine_groups=verified_groups,
                         components=components,
                     )
-                    if machine_commands:
-                        markdown += (
-                            "\n\n### Deployment progress\n\n"
-                            "可以执行的机器审批命令：\n" + "\n".join(machine_commands)
-                        )
                 if state_was_none:
                     event = {
                         "event": "Lifecycle initialized",
