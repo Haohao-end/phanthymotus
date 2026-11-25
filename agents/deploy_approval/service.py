@@ -3149,14 +3149,27 @@ class DeployController:
             return state, state, False, False, True
         if not machine_selector:
             drift_checks = self._confirmed_runtime_drift(state)
-            drift_component_ids = {
-                check.get("component_id") for check in drift_checks
-                if isinstance(check.get("component_id"), str)
-            }
             component_map = {
                 component.get("component_id"): component
                 for component in state.get("components", [])
                 if isinstance(component, dict)
+            }
+            mismatch_components_by_binding: dict[tuple[str, str], set[str]] = {}
+            for check in drift_checks:
+                alias = check.get("machine")
+                checked_ip = self._canonical_primary_ipv4(check.get("ip", ""))
+                component_id = check.get("component_id")
+                if (not isinstance(alias, str) or not alias
+                        or not checked_ip
+                        or not isinstance(component_id, str) or not component_id):
+                    continue
+                mismatch_components_by_binding.setdefault(
+                    (alias, checked_ip), set(),
+                ).add(component_id)
+            drift_component_ids = {
+                component_id
+                for component_ids in mismatch_components_by_binding.values()
+                for component_id in component_ids
             }
             drift_components = [component_map[component_id]
                                 for component_id in drift_component_ids
@@ -3184,48 +3197,85 @@ class DeployController:
                     topic="runtime-redeploy-machine-selection-unavailable",
                 )
                 return state, state, False, False, True
-            full_candidates = []
+            valid_bindings: dict[tuple[str, str], tuple[dict, dict]] = {}
             if drift_component_ids and len(drift_components) == len(drift_component_ids):
-                for group in groups:
-                    if (not isinstance(group, dict)
-                            or group.get("approval_available") is not True
-                            or not drift_component_ids.issubset(
-                                set(group.get("component_ids", [])))):
+                for (alias, checked_ip), component_ids in mismatch_components_by_binding.items():
+                    binding_components = [
+                        component_map[component_id]
+                        for component_id in component_ids
+                        if component_id in component_map
+                    ]
+                    if len(binding_components) != len(component_ids):
                         continue
-                    alias = str(group.get("alias", "") or "")
+                    group = next((
+                        item for item in groups
+                        if isinstance(item, dict)
+                        and item.get("alias") == alias
+                        and item.get("approval_available") is True
+                        and item.get("repo_authorized") is True
+                        and item.get("identity_confirmed") is True
+                        and component_ids.issubset(
+                            set(item.get("component_ids", []))
+                        )
+                    ), None)
+                    if group is None:
+                        continue
                     try:
                         candidate_machine = self.policy.get_machine(alias, repo=repo)
+                        endpoint_rows = self._policy_machine_endpoints(
+                            candidate_machine, repo,
+                        ) if candidate_machine is not None else []
                     except Exception:
                         candidate_machine = None
+                        endpoint_rows = []
                     if candidate_machine is None:
                         continue
-                    for endpoint in await self._agent_core_verified_endpoints(
-                            repo, candidate_machine, drift_components):
-                        if drift_component_ids.issubset(set(
-                                endpoint.get("component_ids", []),
-                        )):
-                            full_candidates.append((group, endpoint))
-            full_aliases = {str(group.get("alias", ""))
-                            for group, _endpoint in full_candidates}
-            if len(full_aliases) == 1 and full_candidates:
-                _selected_group, selected_endpoint = full_candidates[0]
+                    if (checked_ip not in {
+                            item.get("ip") for item in endpoint_rows
+                            if isinstance(item, dict)
+                    } or not self._endpoint_allowed_for_repository(
+                            repo, candidate_machine, checked_ip,
+                            components=binding_components,
+                    )):
+                        continue
+                    verified_endpoints = await self._agent_core_verified_endpoints(
+                        repo, candidate_machine, binding_components,
+                        endpoints=[checked_ip],
+                    )
+                    verified_endpoint = next((item for item in verified_endpoints
+                                               if isinstance(item, dict)
+                                               and item.get("ip") == checked_ip
+                                               and component_ids.issubset(set(
+                                                   item.get("component_ids", []),
+                                               ))), None)
+                    if verified_endpoint is not None:
+                        valid_bindings[(alias, checked_ip)] = (
+                            group, verified_endpoint,
+                        )
+            if len(valid_bindings) == 1:
+                _binding, (_selected_group, selected_endpoint) = next(
+                    iter(valid_bindings.items()),
+                )
                 machine_selector = str(selected_endpoint.get("ip", "") or "")
-            elif len(full_aliases) > 1:
-                message = "有多台机器都能部署这次需要重新部署的组件，请在命令中明确指定一台。"
+            elif len(valid_bindings) > 1:
+                commands = sorted({
+                    f"/approve_deploy machine={checked_ip}"
+                    for _alias, checked_ip in valid_bindings
+                })
+                message = "多个已确认镜像差异绑定可用，请明确指定实际检查 IP。"
+                if commands:
+                    message += "\n" + "\n".join(f"`{command}`" for command in commands)
                 topic = "runtime-redeploy-multiple-compatible-machines"
                 await self._post_command_reply(
                     repo, pr_number, comment_id, message, topic=topic,
                 )
                 return state, state, False, False, True
             else:
-                if await self._runtime_drift_command_lines(state, repo):
-                    message = "这次需要重新部署的组件没有唯一的适配机器，请在命令中明确指定机器。"
-                    topic = "runtime-redeploy-requires-machine-ip"
-                else:
-                    message = (
-                        "目前还没有确认到需要重新部署的机器，这次没有发送部署请求。"
-                    )
-                    topic = "runtime-redeploy-no-confirmed-machine"
+                message = (
+                    "目前没有找到与已确认镜像差异机器、实际检查 IP 和组件完全对应的有效绑定，"
+                    "这次没有发送部署请求。"
+                )
+                topic = "runtime-redeploy-no-confirmed-machine"
                 await self._post_command_reply(
                     repo, pr_number, comment_id, message, topic=topic,
                 )
@@ -12151,7 +12201,6 @@ class DeployController:
             identity.encode("utf-8"),
         ).hexdigest() + " -->"
         reply_marker = "<!-- deploy-approval-reply-to-comment:" + str(comment_id) + " -->"
-        result_marker = f"<!-- deploy-approval-result:{result} -->" if result else ""
         reply_marker_re = re.compile(
             r"<!--\s*deploy-approval-reply-to-comment:(\d+)\s*-->"
         )
@@ -12187,17 +12236,27 @@ class DeployController:
                 return True, ""
             return True, results[0]
 
+        notice_result = result
         has_final, existing_result = existing_final_result(comments)
-        if has_final:
-            delivered = bool(existing_result and (
-                result is None or existing_result == result
-            ))
-            self._record_command_reply_delivery(
-                repo, pr_number, comment_id, delivered,
-            )
-            return delivered
+        if has_final and result is not None:
+            if not existing_result:
+                self._record_command_reply_delivery(
+                    repo, pr_number, comment_id, False,
+                )
+                return False
+            if existing_result == result or (
+                    existing_result == "uncertain" and result == "accepted"):
+                # A source command may have only one terminal result marker.
+                # Later completion topics remain deliverable, but cannot
+                # replace an earlier result or add a second marker.
+                notice_result = None
+            else:
+                self._record_command_reply_delivery(
+                    repo, pr_number, comment_id, False,
+                )
+                return False
         existing_notice = found_marker(comments)
-        if existing_notice and result is None:
+        if existing_notice and notice_result is None:
             self._record_command_reply_delivery(repo, pr_number, comment_id, True)
             return True
         payload = message.strip()
@@ -12212,16 +12271,20 @@ class DeployController:
         body_parts = [comments_mod.BOT_MARKER]
         if not existing_notice:
             body_parts.append(marker)
+        result_marker = (
+            f"<!-- deploy-approval-result:{notice_result} -->"
+            if notice_result else ""
+        )
         if result_marker:
             body_parts.extend(("", reply_marker, result_marker))
         body_parts.extend(("", payload))
         body = "\n".join(body_parts)
 
         def is_delivered(items):
-            if result is None:
+            if notice_result is None:
                 return bool(found_marker(items))
             has_result, observed = existing_final_result(items)
-            return has_result and observed == result
+            return has_result and observed == notice_result
 
         try:
             posted = await self.proxy.post_issue_comment(repo, pr_number, body)
@@ -12243,8 +12306,8 @@ class DeployController:
             if not isinstance(body_value, str):
                 body_value = ""
             marker_present = (
-                result is None and marker in body_value
-                or result is not None
+                notice_result is None and marker in body_value
+                or notice_result is not None
                 and reply_marker in body_value and result_marker in body_value
             )
             if marker_present and self.proxy.is_bot_comment(posted):
@@ -16030,14 +16093,30 @@ class DeployController:
                                repo, pr_number, type(exc).__name__)
             if (refreshed.get("status") == "testing"
                     and state.get("status") != "testing"):
+                approval_comment_id = int(command.get("comment_id", 0) or 0)
+                upload_url = await self._current_testing_upload_url(
+                    repo, pr_number, head_sha=refreshed["head_sha"],
+                    round_id=round_id_for_state(refreshed),
+                    approval_comment_id=approval_comment_id,
+                )
+                upload_message = (
+                    f"可选上传测试视频或图片，方便验收人了解实际效果：[打开固定上传页面](<{upload_url}>)。"
+                    if upload_url else
+                    "测试视频或图片上传完全可选；公共上传入口暂时不可用时不影响测试和验收，"
+                    "恢复后 PR Summary 会出现同一个固定链接。"
+                )
                 await self._post_bound_notice(
                     repo, pr_number, head_sha=refreshed["head_sha"],
                     round_id=round_id_for_state(refreshed),
-                    comment_id=int(command.get("comment_id", 0) or 0),
+                    comment_id=approval_comment_id,
                     topic="deployment-recovered-complete",
                     expected_command_kind="approve_deploy",
                     result="accepted",
-                    message=("上一次部署已经确认完成，现在可以开始测试。"),
+                    message=(
+                        "上一次部署已经确认完成，现在可以开始测试。\n\n"
+                        f"{upload_message}\n\n"
+                        "测试完成后，请发送 `/request_acceptance` 提交验收。"
+                    ),
                 )
             elif recovered_ids and refreshed.get("status") in {"deploy-requested", "deploy-ready"}:
                 remaining = [

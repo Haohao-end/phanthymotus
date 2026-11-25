@@ -4037,11 +4037,13 @@ class GitHubCommandWatcher:
                 final_result = await self._recover_final_command_reply_delivery(
                     repo, pr_number, persisted_comment_id,
                 )
-                if final_result is not None:
-                    await self._consume_final_command_reply(
-                        repo, pr_number, persisted_comment_id,
-                    )
-                return
+                if final_result is None:
+                    return
+                consumed = await self._consume_final_command_reply(
+                    repo, pr_number, persisted_comment_id,
+                )
+                if not consumed:
+                    return
         native_comment_budget = 3
         native_comments_processed = 0
 
