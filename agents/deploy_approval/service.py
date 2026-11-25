@@ -610,7 +610,10 @@ class DeployController:
             raise DeployControllerError("machine identity changed before Agent Core authentication")
         primary_ip = self._canonical_primary_ipv4(getattr(current, "node_host", ""))
         if endpoint == primary_ip:
-            return await self._core_for_node(current.node_id, repo, timeout=timeout)
+            return await self._core_for_node(
+                current.node_id, repo, timeout=timeout,
+                record_machine_health=False,
+            )
         token = self._agent_core_token(alias)
         if not token:
             raise DeployControllerError(
@@ -629,14 +632,10 @@ class DeployController:
             await self._close_core_client(cache_key)
         endpoint_machine = copy.copy(current)
         endpoint_machine.node_host = endpoint
-        try:
-            client = await self._resolve_core_client(
-                current.node_id, repo, machine=endpoint_machine, token=token,
-                timeout=timeout, use_factory=False,
-            )
-        except Exception:
-            self._record_agent_core_health(repo, current, "unavailable")
-            raise
+        client = await self._resolve_core_client(
+            current.node_id, repo, machine=endpoint_machine, token=token,
+            timeout=timeout, use_factory=False,
+        )
         try:
             latest = self.policy.get_machines(repo=repo)
             latest_matches = [item for item in latest
@@ -655,11 +654,11 @@ class DeployController:
             raise
         self._core_clients[cache_key] = client
         self._core_client_fingerprints[cache_key] = fingerprint
-        self._record_agent_core_health(repo, current, "available")
         return client
 
     async def _core_for_node(
         self, node_id: str, repo: str, *, timeout: float | None = None,
+        record_machine_health: bool = True,
     ) -> AgentCoreClient:
         repo_key = repo.casefold()
         try:
@@ -736,7 +735,8 @@ class DeployController:
                 node_id, repo, machine=machine, token=token, timeout=timeout,
             )
         except Exception:
-            self._record_agent_core_health(repo, machine, "unavailable")
+            if record_machine_health:
+                self._record_agent_core_health(repo, machine, "unavailable")
             raise
         if any(
             key[0] != repo_key and existing is client
@@ -771,7 +771,8 @@ class DeployController:
             )
         self._core_clients[key] = client
         self._core_client_fingerprints[key] = fingerprint
-        self._record_agent_core_health(repo, machine, "available")
+        if record_machine_health:
+            self._record_agent_core_health(repo, machine, "available")
         return client
 
     async def _resolve_core_client(
@@ -2506,6 +2507,7 @@ class DeployController:
                     machine_groups.append({
                         **group, "component_ids": sorted(binding_ids),
                         "required_component_ids": sorted(binding_ids),
+                        "verification_endpoints": [binding_ip],
                     })
             command_lines = await self._machine_notice_lines(
                 machine_groups, repo, mention_owners=True,
@@ -2518,6 +2520,8 @@ class DeployController:
                 ]
                 if command_lines else self._machine_blocking_summary(candidate_groups)
             )
+            if command_lines and test_only:
+                next_step.append("测试 PR 仅提醒 @Haohao-end。")
             topic = "runtime-redeploy-request-created"
             message = "\n".join([
                 "镜像与当前批准版本不一致，已经为本轮创建了重新部署申请。",
@@ -2538,16 +2542,22 @@ class DeployController:
                 ]
                 if command_lines else self._machine_blocking_summary(machine_groups)
             )
+            if command_lines and test_only:
+                next_step.append("测试 PR 仅提醒 @Haohao-end。")
             topic = "deployment-requested-next-approver"
             message = "\n".join([
                 "部署审批申请已经生效。",
                 *next_step,
             ])
+        if test_only:
+            message = message.replace("@", "＠").replace(
+                "＠Haohao-end", "@Haohao-end",
+            )
         return await self._post_bound_notice(
             repo, pr_number, head_sha=head_sha,
             round_id=round_id_for_state(state), comment_id=comment_id,
             topic=topic, expected_command_kind="request_deploy",
-            message=message,
+            message=message, result="accepted",
         )
 
     async def handle_request_deploy(
@@ -2950,6 +2960,7 @@ class DeployController:
                     machine_groups.append({
                         **group, "component_ids": sorted(binding_ids),
                         "required_component_ids": sorted(binding_ids),
+                        "verification_endpoints": [binding_ip],
                     })
                 if not machine_groups:
                     await self._post_command_reply(
@@ -4446,7 +4457,6 @@ class DeployController:
                 self._get_machine_groups_for_components(state.get("components", []), repo),
                 test_only=self._is_test_only_pr(pr_data),
                 deployments=state.get("deployments", []),
-                last_lifecycle_event=comments_mod.beijing_now_str(),
                 display_status=preflight_source_status,
             )
             deploy_reservation = {
@@ -5393,6 +5403,7 @@ class DeployController:
                     round_id=round_id_for_state(state), comment_id=comment_id,
                     topic="partial-deployment-next-approver",
                     expected_command_kind="approve_deploy",
+                    result="accepted",
                     message="\n".join([
                         "这台机器负责的组件已经部署完成，剩余组件还需要其他机器审批。",
                         *(
@@ -5402,11 +5413,6 @@ class DeployController:
                         ),
                     ]),
                 )
-                if redeploy_mode:
-                    await self._post_already_target_redeploy_reply(
-                        repo, pr_number, comment_id, machine,
-                        approve_attempt.get("health", []),
-                    )
                 return True
 
             # All components deployed -> durable testing state FIRST
@@ -5456,11 +5462,6 @@ class DeployController:
                     ),
                 )
             await self._project_status_best_effort(repo, pr_number, "testing")
-            if redeploy_mode:
-                await self._post_already_target_redeploy_reply(
-                    repo, pr_number, comment_id, machine,
-                    approve_attempt.get("health", []),
-                )
             upload_url = await self._current_testing_upload_url(
                 repo, pr_number, head_sha=pr_head,
                 round_id=round_id_for_state(state),
@@ -5477,6 +5478,7 @@ class DeployController:
                 round_id=round_id_for_state(state), comment_id=comment_id,
                 topic="deployment-complete-testing-next",
                 expected_command_kind="approve_deploy",
+                result="accepted",
                 message=(f"部署已完成，现在可以开始测试。\n\n"
                          f"{upload_message}\n\n"
                          "测试完成后，请发送 `/request_acceptance` 提交验收。"),
@@ -6061,6 +6063,7 @@ class DeployController:
                 repo, pr_number, head_sha=head, round_id=round_id,
                 comment_id=comment_id, topic="acceptance-requested",
                 expected_command_kind="request_acceptance",
+                result="accepted",
                 message=self._format_user_reply(
                     "\n\n".join((
                         "验收申请已经提交，本轮测试的验收现在开始。",
@@ -6322,6 +6325,7 @@ class DeployController:
                 repo, pr_number, head_sha=pr_head,
                 round_id=round_id_for_state(state), comment_id=comment_id,
                 topic="test-result-recorded", expected_command_kind="record_test",
+                result="accepted",
                 message=(
                     f"验收结果已经记录：{'通过' if result == 'pass' else '未通过'}。\n\n"
                     f"{next_step}"
@@ -6969,7 +6973,6 @@ class DeployController:
                         },
                     )
                     continue
-                self._record_agent_core_health(repo, current_machine, "available")
                 supported_ids: list[str] = []
                 runtime_failures: list[tuple[str, str]] = []
                 if requested_components:
@@ -7195,8 +7198,16 @@ class DeployController:
                 result.append(group)
                 continue
             endpoint_diagnostics: list[dict] = []
+            verification_endpoints = group.get("verification_endpoints")
+            if verification_endpoints is not None:
+                verification_endpoints = sorted({
+                    self._canonical_primary_ipv4(value)
+                    for value in verification_endpoints
+                    if self._canonical_primary_ipv4(value)
+                }) if isinstance(verification_endpoints, (list, tuple, set)) else []
             verified = await self._agent_core_verified_endpoints(
                 repo, machine, requested,
+                endpoints=verification_endpoints,
                 endpoint_diagnostics=endpoint_diagnostics,
             )
             full_endpoints = [
@@ -7475,9 +7486,12 @@ class DeployController:
                 and len(policy_aliases_by_ip.get(node_host, [])) == 1
                 and (confirmed_endpoint_set is None or node_host in confirmed_endpoint_set)
             )
-            core_ready = agent_core_status not in {
-                "credential_missing", "unavailable",
-            } and bool(repo_authorized and policy_machine and node_id and node_host)
+            # A previous probe failure on one address must not reject a
+            # different, repository-authorized address. The selected endpoint
+            # is checked again by Agent Core during deployment preflight.
+            core_ready = agent_core_status != "credential_missing" and bool(
+                repo_authorized and policy_machine and node_id and node_host
+            )
             approval_available = bool(
                 repo_authorized and valid_policy_owners and core_ready
                 and platform_verified and compatible_ids
@@ -7580,6 +7594,7 @@ class DeployController:
                 result.append({
                     **match, "component_ids": sorted(drift_ids),
                     "required_component_ids": sorted(drift_ids),
+                    "verification_endpoints": [drift_ip],
                 })
         return result
 
@@ -12080,12 +12095,15 @@ class DeployController:
     async def _post_bound_notice(
         self, repo: str, pr_number: int, *, head_sha: str, round_id: str,
         comment_id: int, topic: str, message: str,
+        result: str | None = None,
         expected_command_kind: str = "",
         allow_bot_origin: bool = False,
         allow_missing_state: bool = False,
         reply_to: int | None = None,
     ) -> bool:
         """Post one command-bound public reply, confirming uncertain POSTs by readback."""
+        if result is not None and result not in {"accepted", "rejected", "uncertain"}:
+            return False
         if reply_to is not None and (not isinstance(reply_to, int) or reply_to <= 0):
             return False
         if (not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
@@ -12132,6 +12150,14 @@ class DeployController:
         marker = "<!-- deploy-approval-notice:v1:" + hashlib.sha256(
             identity.encode("utf-8"),
         ).hexdigest() + " -->"
+        reply_marker = "<!-- deploy-approval-reply-to-comment:" + str(comment_id) + " -->"
+        result_marker = f"<!-- deploy-approval-result:{result} -->" if result else ""
+        reply_marker_re = re.compile(
+            r"<!--\s*deploy-approval-reply-to-comment:(\d+)\s*-->"
+        )
+        result_marker_re = re.compile(
+            r"<!--\s*deploy-approval-result:([a-z-]+)\s*-->"
+        )
 
         def found_marker(items):
             return next((item for item in items
@@ -12140,7 +12166,38 @@ class DeployController:
                          and marker in item["body"]
                          and self.proxy.is_bot_comment(item)), None)
 
-        if found_marker(comments):
+        def existing_final_result(items):
+            bound = [
+                item for item in items
+                if isinstance(item, dict)
+                and isinstance(item.get("body"), str)
+                and self.proxy.is_bot_comment(item)
+                and str(comment_id) in reply_marker_re.findall(item["body"])
+            ]
+            if not bound:
+                return False, ""
+            if len(bound) != 1:
+                return True, ""
+            body_value = bound[0]["body"]
+            if (reply_marker_re.findall(body_value) != [str(comment_id)]):
+                return True, ""
+            results = result_marker_re.findall(body_value)
+            if len(results) != 1 or results[0] not in {
+                    "accepted", "rejected", "uncertain"}:
+                return True, ""
+            return True, results[0]
+
+        has_final, existing_result = existing_final_result(comments)
+        if has_final:
+            delivered = bool(existing_result and (
+                result is None or existing_result == result
+            ))
+            self._record_command_reply_delivery(
+                repo, pr_number, comment_id, delivered,
+            )
+            return delivered
+        existing_notice = found_marker(comments)
+        if existing_notice and result is None:
             self._record_command_reply_delivery(repo, pr_number, comment_id, True)
             return True
         payload = message.strip()
@@ -12152,7 +12209,20 @@ class DeployController:
             logger.warning("notice payload empty %s#%s topic=%s",
                            repo, pr_number, topic)
             return False
-        body = "\n".join((comments_mod.BOT_MARKER, marker, "", payload))
+        body_parts = [comments_mod.BOT_MARKER]
+        if not existing_notice:
+            body_parts.append(marker)
+        if result_marker:
+            body_parts.extend(("", reply_marker, result_marker))
+        body_parts.extend(("", payload))
+        body = "\n".join(body_parts)
+
+        def is_delivered(items):
+            if result is None:
+                return bool(found_marker(items))
+            has_result, observed = existing_final_result(items)
+            return has_result and observed == result
+
         try:
             posted = await self.proxy.post_issue_comment(repo, pr_number, body)
         except Exception as post_error:
@@ -12165,12 +12235,19 @@ class DeployController:
                                repo, pr_number, topic)
                 self._record_command_reply_delivery(repo, pr_number, comment_id, False)
                 return False
-            delivered = bool(isinstance(latest, list) and found_marker(latest))
+            delivered = bool(isinstance(latest, list) and is_delivered(latest))
             self._record_command_reply_delivery(repo, pr_number, comment_id, delivered)
             return delivered
         if isinstance(posted, dict) and posted.get("id"):
             body_value = posted.get("body", "")
-            if marker in body_value and self.proxy.is_bot_comment(posted):
+            if not isinstance(body_value, str):
+                body_value = ""
+            marker_present = (
+                result is None and marker in body_value
+                or result is not None
+                and reply_marker in body_value and result_marker in body_value
+            )
+            if marker_present and self.proxy.is_bot_comment(posted):
                 self._record_command_reply_delivery(repo, pr_number, comment_id, True)
                 return True
         try:
@@ -12178,7 +12255,7 @@ class DeployController:
         except Exception:
             self._record_command_reply_delivery(repo, pr_number, comment_id, False)
             return False
-        delivered = bool(isinstance(latest, list) and found_marker(latest))
+        delivered = bool(isinstance(latest, list) and is_delivered(latest))
         self._record_command_reply_delivery(repo, pr_number, comment_id, delivered)
         return delivered
 
@@ -15959,6 +16036,7 @@ class DeployController:
                     comment_id=int(command.get("comment_id", 0) or 0),
                     topic="deployment-recovered-complete",
                     expected_command_kind="approve_deploy",
+                    result="accepted",
                     message=("上一次部署已经确认完成，现在可以开始测试。"),
                 )
             elif recovered_ids and refreshed.get("status") in {"deploy-requested", "deploy-ready"}:
@@ -15982,6 +16060,7 @@ class DeployController:
                     comment_id=int(command.get("comment_id", 0) or 0),
                     topic="deployment-recovered-partial",
                     expected_command_kind="approve_deploy",
+                    result="accepted",
                     message="\n".join([
                         "部署已经部分完成，剩余组件需要其他机器审批。",
                         *(
