@@ -1449,7 +1449,10 @@ class GitHubStateProxy:
                 await self.update_comment(repo, comment_id, body)
                 return existing
         # Create new comment
-        result = await self.post_issue_comment(repo, pr_number, body)
+        # Lifecycle state comments are internal persistence writes. They may
+        # contain only hidden markers when visible markdown is empty, so keep
+        # them separate from the public-notification empty-comment guard.
+        result = await self._github.post_issue_comment(repo, pr_number, body)
         return result
 
     def _evidence_repo_guard(self, repo: str) -> None:

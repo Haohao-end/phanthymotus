@@ -31,6 +31,7 @@ _MACHINE_SELECTOR_NOTE = "请直接执行上方对应机器的那条命令，不
 # account. They are never rendered as "@uploader" in an upload notification.
 _NON_ACCOUNT_UPLOADERS = frozenset({
     "shared-link", "evidence-capability", "4pd-pr-assistant[bot]",
+    "anonymous", "unknown", "unverified", "guest",
 })
 
 _MAX_VISIBLE_LIFECYCLE_BYTES = 48 * 1024  # 48 KiB soft budget
@@ -185,13 +186,255 @@ _LEGACY_RUNTIME_CHECKS_END = "<!-- deploy-approval-runtime-checks:end -->"
 
 
 def _runtime_component_label(component: dict) -> str:
-    target = str(component.get("target", "") or "")
-    if target == "driver":
-        path = str(component.get("driver_path", "") or "").strip()
-        return f"driver {path}" if path else "driver"
+    target = str(
+        component.get("target") or component.get("component_target")
+        or component.get("name") or component.get("label") or ""
+    ).strip()
     variant = str(component.get("variant", "") or "").strip()
+    if target.casefold() == "core":
+        return f"Agent Core {variant}".strip()
+    if target.casefold() == "driver":
+        path = str(component.get("driver_path") or variant or "").strip()
+        return f"driver {path}" if path else "driver"
     return f"{target} {variant}" if variant else target
 
+def _agent_core_is_available(*records) -> bool:
+    """Require explicit health when no verified endpoint has been supplied."""
+    available_statuses = {"available", "healthy", "reachable", "ok"}
+    statuses = [
+        str(record.get("agent_core_status") or "").strip().casefold().replace("_", "-")
+        for record in records if isinstance(record, dict)
+        and record.get("agent_core_status")
+    ]
+    flags = [
+        record.get("agent_core_available", record.get("agent_core_reachable"))
+        for record in records if isinstance(record, dict)
+        and ("agent_core_available" in record or "agent_core_reachable" in record)
+    ]
+    if statuses and not all(status in available_statuses for status in statuses):
+        return False
+    if flags and not all(value is True for value in flags):
+        return False
+    return bool(statuses or flags)
+
+def _verified_endpoints_for_machine(machine: dict) -> list[dict]:
+    """Read only Service's live verified_endpoints; never infer a selector.
+
+    A nonempty endpoint row is itself the Service's authenticated Core proof.
+    Explicit credential or connectivity failures still fail closed. An unknown
+    Core with no verified row is unavailable.
+    """
+    if (not isinstance(machine, dict)
+            or machine.get("repo_authorized") is not True
+            or machine.get("identity_confirmed") is not True):
+        return []
+
+    def explicitly_unavailable(record):
+        if not isinstance(record, dict):
+            return False
+        status = str(record.get("agent_core_status") or "").strip().casefold().replace("-", "_")
+        if status in {"credential_missing", "credentials_missing", "missing_credentials",
+                      "unavailable", "offline", "unreachable"}:
+            return True
+        for field in ("agent_core_available", "agent_core_reachable"):
+            if field in record and record[field] is not True:
+                return True
+        return False
+
+    if explicitly_unavailable(machine):
+        return []
+    rows = machine.get("verified_endpoints")
+    if not isinstance(rows, list):
+        return []
+    if machine.get("approval_available") is not True:
+        reasons = {
+            str(reason or "").strip().upper()
+            for reason in machine.get("blocking_reasons", [])
+        } if isinstance(machine.get("blocking_reasons"), (list, tuple, set)) else set()
+        endpoint_override_reasons = {
+            "AGENT_CORE_UNKNOWN", "AGENT_CORE_UNAVAILABLE",
+        }
+        if (not reasons or not reasons.issubset(endpoint_override_reasons)
+                or not rows):
+            return []
+    result = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict) or explicitly_unavailable(row):
+            continue
+        raw_ip = row.get("ip")
+        try:
+            ip = str(ipaddress.IPv4Address(raw_ip.strip())) if isinstance(raw_ip, str) else ""
+        except ValueError:
+            ip = ""
+        component_ids = row.get("component_ids")
+        ids = {
+            value for value in component_ids
+            if isinstance(value, str) and value
+        } if isinstance(component_ids, list) else set()
+        if not ip or ip in seen or not ids:
+            continue
+        seen.add(ip)
+        result.append({
+            "ip": ip,
+            "label": str(row.get("label") or "").strip(),
+            "component_ids": ids,
+        })
+    return result
+
+def _physical_machine_key(machine: dict) -> str:
+    for field in ("node_id", "machine_id", "machine_identity", "device_id"):
+        value = machine.get(field) if isinstance(machine, dict) else None
+        if isinstance(value, str) and value.strip():
+            return field + ":" + value.strip().casefold()
+    alias = _machine_alias(machine) if isinstance(machine, dict) else ""
+    if alias and machine.get("identity_confirmed") is True:
+        return "alias:" + alias.casefold()
+    return ""
+
+
+def _connection_failure_label(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    folded = text.casefold()
+    if any(token in folded for token in ("401", "403", "auth", "credential", "token", "unauthorized")):
+        return "Agent Core 鉴权失败"
+    if any(token in folded for token in ("timeout", "timed out", "超时", "deadline")):
+        return "Agent Core 连接超时"
+    if any(token in folded for token in ("unreachable", "offline", "refused", "connect", "不可达", "离线")):
+        return "Agent Core 当前不可达"
+    return _safe_display_text(text)[:240]
+
+_MACHINE_BLOCK_REASON_TEXT = {
+    "AGENT_CORE_CREDENTIAL_MISSING": "Agent Core 鉴权失败",
+    "AGENT_CORE_UNAVAILABLE": "Agent Core 当前不可达",
+    "AGENT_CORE_UNKNOWN": "Agent Core 状态尚未确认",
+    "MACHINE_NOT_AUTHORIZED": "当前仓库没有授权这台机器",
+    "REPOSITORY_POLICY_MISSING": "当前仓库机器策略不可用",
+    "MACHINE_IDENTITY_MISMATCH": "机器身份与当前仓库策略不匹配",
+    "OWNER_NOT_CONFIGURED": "机器负责人尚未配置",
+    "TARGET_UNSUPPORTED": "机器不支持本次部署目标",
+    "PLATFORM_MISMATCH": "机器平台与构建结果不兼容",
+    "PLATFORM_UNVERIFIED": "机器平台尚未确认",
+    "VARIANT_MISMATCH": "机器型号与构建变体不兼容",
+    "DRIVER_PATH_MISMATCH": "Driver 路径与机器登记信息不匹配",
+    "PRIMARY_IP_AMBIGUOUS": "机器登记 IP 存在冲突",
+}
+
+def _machine_unavailability_notes(machine: dict) -> list[str]:
+    """Describe Service-reported failures without using them as selectors."""
+    if not isinstance(machine, dict):
+        return []
+    notes = []
+    status = str(machine.get("agent_core_status") or "").strip().casefold().replace("-", "_")
+    has_verified_endpoint = bool(
+        isinstance(machine.get("verified_endpoints"), list)
+        and machine.get("verified_endpoints")
+    )
+    status_note = {
+        "credential_missing": "Agent Core 鉴权失败",
+        "unavailable": "Agent Core 当前不可达",
+        "offline": "Agent Core 当前不可达",
+        "unreachable": "Agent Core 当前不可达",
+        "unknown": "Agent Core 状态尚未确认",
+    }.get(status)
+    if has_verified_endpoint and status == "unknown":
+        status_note = ""
+    if status_note:
+        notes.append(status_note)
+    reasons = machine.get("blocking_reasons")
+    if isinstance(reasons, (list, tuple, set)):
+        for reason in reasons:
+            if (has_verified_endpoint and str(reason or "").strip().upper()
+                    == "AGENT_CORE_UNKNOWN"):
+                continue
+            label = _MACHINE_BLOCK_REASON_TEXT.get(str(reason or "").strip().upper())
+            if label:
+                notes.append(label)
+    for field in ("agent_core_error", "connection_error", "unavailable_reason"):
+        label = _connection_failure_label(machine.get(field))
+        if label:
+            notes.append(label)
+    for field in (
+        "endpoint_diagnostics", "endpoint_checks", "endpoint_failures",
+        "unavailable_endpoints", "failed_endpoints",
+    ):
+        rows = machine.get(field)
+        if not isinstance(rows, list):
+            continue
+        for endpoint in rows:
+            if not isinstance(endpoint, dict):
+                continue
+            state = str(
+                endpoint.get("agent_core_status") or endpoint.get("status")
+                or endpoint.get("state") or ""
+            ).strip().casefold()
+            reachable = endpoint.get("reachable", endpoint.get("agent_core_available"))
+            if reachable is True or state in {"available", "healthy", "reachable", "ok", "match"}:
+                continue
+            label = _connection_failure_label(
+                endpoint.get("reason") or endpoint.get("error") or state,
+            )
+            if not label:
+                continue
+            raw_ip = endpoint.get("ip")
+            try:
+                ip = str(ipaddress.IPv4Address(raw_ip.strip())) if isinstance(raw_ip, str) else ""
+            except ValueError:
+                ip = ""
+            name = str(endpoint.get("label") or "").strip()
+            endpoint_name = "、".join(value for value in (ip, name) if value)
+            notes.append(f"{endpoint_name}：{label}" if endpoint_name else label)
+    return list(dict.fromkeys(notes))
+
+def _verified_approval_rows(machine_groups, component_ids) -> list[dict]:
+    requested_ids = {
+        value for value in component_ids
+        if isinstance(value, str) and value
+    } if isinstance(component_ids, (list, tuple, set)) else set()
+    if not requested_ids:
+        return []
+    rows = []
+    for group in machine_groups if isinstance(machine_groups, list) else []:
+        if not isinstance(group, dict):
+            continue
+        alias = _machine_alias(group) or "机器"
+        physical_id = _physical_machine_key(group)
+        for endpoint in _verified_endpoints_for_machine(group):
+            compatible_ids = requested_ids.intersection(endpoint["component_ids"])
+            if compatible_ids:
+                rows.append({
+                    "alias": alias,
+                    "physical_id": physical_id,
+                    "ip": endpoint["ip"],
+                    "label": endpoint["label"],
+                    "owners": _owner_names({}, {}, group),
+                    "component_ids": compatible_ids,
+                })
+    ip_owners = {}
+    for row in rows:
+        ip_owners.setdefault(row["ip"], set()).add(
+            row["physical_id"] or row["alias"].casefold(),
+        )
+    return [
+        row for row in rows if len(ip_owners.get(row["ip"], set())) == 1
+    ]
+
+def _unavailability_lines(machine_groups) -> list[str]:
+    lines = []
+    for group in machine_groups if isinstance(machine_groups, (list, tuple)) else []:
+        if not isinstance(group, dict):
+            continue
+        reasons = _machine_unavailability_notes(group)
+        if reasons:
+            alias = _machine_alias(group) or "机器"
+            lines.append(
+                f"- `{_escape(alias)}`：" + "；".join(
+                    _escape(reason) for reason in reasons
+                )
+            )
+    return list(dict.fromkeys(lines))
 
 def runtime_image_checks_block(
     runtime_checks, components, *, lifecycle_status: str = "",
@@ -206,103 +449,28 @@ def runtime_image_checks_block(
         item.get("component_id"): item for item in components or []
         if isinstance(item, dict) and isinstance(item.get("component_id"), str)
     }
-    context = machine_context if isinstance(machine_context, dict) else {}
     groups = _record_rows(machine_groups)
-    inventory = _machine_inventory_records(machine_inventory)
     diagnostics = _machine_diagnostic_rows(machine_diagnostics)
     group_by_alias = {_machine_alias(row).casefold(): row for row in groups
                       if _machine_alias(row)}
-    inventory_by_alias = {_machine_alias(row).casefold(): row for row in inventory
-                          if _machine_alias(row)}
     diagnostic_by_alias = {_machine_alias(row).casefold(): row for row in diagnostics
                            if _machine_alias(row)}
-    physical_ip_counts = {}
-    physical_alias_counts = {}
-    for row in inventory:
-        primary_ip = _canonical_ip(_machine_ip(row))
-        alias = _machine_alias(row).casefold()
-        if primary_ip:
-            physical_ip_counts[primary_ip] = physical_ip_counts.get(primary_ip, 0) + 1
-        if alias:
-            physical_alias_counts[alias] = physical_alias_counts.get(alias, 0) + 1
-    policy_aliases_by_ip = {}
-    for row in groups:
-        alias = _machine_alias(row)
-        node_host = _canonical_ip(_record_value(row, "node_host"))
-        if alias and node_host:
-            policy_aliases_by_ip.setdefault(node_host, set()).add(alias.casefold())
 
-    def ipv4(value):
-        return _canonical_ip(value)
-
-    def safe_selector_for(check, diagnostic, group, physical, key, ip_value,
-                          group_node_host, duplicate_ip, identity_confirmed,
-                          repo_authorization, binding_matches):
-        selector = str(check.get("command_selector", "") or "").strip()
-        if not selector:
-            return ""
-        selector_ip = ipv4(selector)
-        approval_flags = [
-            value for value in (
-                _field_flag(record, "approval_available", "safe_to_approve", "safe_to_deploy")
-                for record in (check, diagnostic, group)
-            ) if value is not None
-        ]
-        compatibility_flags = [
-            value for value in (
-                _field_flag(record, "component_compatible", "components_compatible")
-                for record in (check, diagnostic, group)
-            ) if value is not None
-        ]
-        explicit_check_selector = (
-            "command_selector" in check
-            and isinstance(check.get("command_selector"), str)
-            and bool(check.get("command_selector").strip())
-        )
-        approval_confirmed = (
-            False if False in approval_flags else
-            True if True in approval_flags else explicit_check_selector
-        )
-        compatibility_confirmed = (
-            False if False in compatibility_flags else
-            True if True in compatibility_flags else explicit_check_selector
-        )
-        if (not approval_confirmed or not compatibility_confirmed
-                or identity_confirmed is not True
-                or repo_authorization is not True or not binding_matches):
-            return ""
-        if selector_ip:
-            return selector_ip if (
-                selector_ip == ip_value
-                and selector_ip == group_node_host
-                and not duplicate_ip
-            ) else ""
-        alias = _machine_alias(physical)
-        physical_primary_ip = ipv4(_machine_ip(physical))
-        physical_identity_matches = bool(
-            physical_primary_ip == ip_value
-            and physical_alias_counts.get(key, 0) == 1
-            and alias.casefold() == key
-        )
-        alias_is_verified = bool(
-            selector == alias
-            and alias.casefold() == key
-            and physical_identity_matches
-            and (not group_node_host or group_node_host == ip_value)
-        )
-        if not alias_is_verified:
-            return ""
-        ip_command_flags = [
-            _field_flag(record, "ip_command_safe")
-            for record in (check, diagnostic, group)
-        ]
-        ip_is_safe = (
-            False if False in ip_command_flags else
-            True if True in ip_command_flags else not duplicate_ip
-        )
-        if ip_is_safe and not duplicate_ip and group_node_host == ip_value:
-            return ip_value
-        return selector
+    def verified_selectors_for(check, group, component_id):
+        if (not isinstance(group, dict)
+                or group.get("approval_available") is not True
+                or group.get("identity_confirmed") is not True
+                or group.get("repo_authorized") is not True
+                or not isinstance(component_id, str) or not component_id):
+            return []
+        if (_field_flag(check, "approval_available", "safe_to_approve", "safe_to_deploy") is False
+                or _field_flag(check, "component_compatible", "components_compatible") is False):
+            return []
+        selected = []
+        for endpoint in _verified_endpoints_for_machine(group):
+            if component_id in endpoint["component_ids"]:
+                selected.append(endpoint["ip"])
+        return sorted(set(selected))
 
     grouped: dict[str, dict] = {}
     seen_checks = set()
@@ -314,19 +482,7 @@ def runtime_image_checks_block(
             continue
         key = machine.casefold()
         group = group_by_alias.get(key, {})
-        physical = inventory_by_alias.get(key, {})
         diagnostic = diagnostic_by_alias.get(key, {})
-        supplied_context = context.get(key, {})
-        if not isinstance(supplied_context, dict):
-            supplied_context = {}
-        ip_value = (
-            ipv4(_record_value(check, "primary_ip"))
-            or ipv4(_record_value(check, "main_ip"))
-            or ipv4(_machine_ip(physical))
-            or ipv4(_record_value(supplied_context, "primary_ip"))
-            or ipv4(_record_value(supplied_context, "main_ip"))
-            or ipv4(_record_value(check, "ip"))
-        )
         identity_values = [value for value in (
             _field_flag(record, "identity_confirmed", "machine_identity_confirmed")
             for record in (check, diagnostic, group)
@@ -334,25 +490,6 @@ def runtime_image_checks_block(
         identity_confirmed = (
             False if False in identity_values else
             True if True in identity_values else None
-        )
-        group_node_host = next((value for value in (
-            ipv4(_record_value(group, "node_host")),
-            ipv4(_record_value(group, "policy_node_host")),
-            ipv4(_record_value(diagnostic, "node_host")),
-            ipv4(_record_value(diagnostic, "policy_node_host")),
-            ipv4(_record_value(check, "node_host")),
-            ipv4(_record_value(check, "policy_node_host")),
-            ipv4(_record_value(group, "primary_ip")),
-        ) if value), "")
-        duplicate_ip = bool(
-            (ip_value and physical_ip_counts.get(ip_value, 0) > 1)
-            or _field_flag(check, "duplicate_ip") is True
-            or _field_flag(diagnostic, "duplicate_ip") is True
-            or _field_flag(group, "duplicate_ip") is True
-            or "PRIMARY_IP_AMBIGUOUS" in _display_values(
-                _record_value(group, "blocking_reasons", default=[])
-            )
-            or len(policy_aliases_by_ip.get(group_node_host, set())) > 1
         )
         repo_authorization_values = [value for value in (
             _field_flag(record, "repository_authorized", "repo_authorized")
@@ -362,37 +499,31 @@ def runtime_image_checks_block(
             False if False in repo_authorization_values else
             True if True in repo_authorization_values else None
         )
-        physical_primary_ip = ipv4(_machine_ip(physical))
-        physical_identity_matches = bool(
-            ip_value and physical_primary_ip == ip_value
-            and physical_alias_counts.get(key, 0) == 1
-            and _machine_alias(physical).casefold() == key
-        )
-        binding_matches = bool(
-            ip_value and (
-                group_node_host == ip_value
-                if group_node_host else physical_identity_matches
-            )
-        )
-        command_selector = safe_selector_for(
-            check, diagnostic, group, physical, key, ip_value,
-            group_node_host, duplicate_ip, identity_confirmed,
-            repo_authorization, binding_matches,
-        )
+        component_id = check.get("component_id")
+        verified_ips = [
+            endpoint["ip"] for endpoint in _verified_endpoints_for_machine(group)
+            if component_id in endpoint["component_ids"]
+        ] if isinstance(component_id, str) else []
+        command_selectors = verified_selectors_for(check, group, component_id)
         component = component_map.get(check.get("component_id"), {})
-        component_id = str(check.get("component_id", "") or "组件未提供")
         component_label = (
-            _runtime_component_label(component) or component_id
+            _runtime_component_label(component)
+            or _runtime_component_label(check)
+            or "组件名称暂不可用"
         )
         target_image, observed_image = _runtime_image_values(check, component)
         images_confirmed = target_image != "未取得" and observed_image != "未取得"
         if not images_confirmed:
-            command_selector = ""
+            command_selectors = []
         status = str(check.get("status", "unavailable") or "unavailable").casefold()
         if status not in {"match", "mismatch", "not_running", "unavailable", "identity_changed"}:
             status = "unavailable"
+        if (status in {"match", "mismatch"}
+                and (not images_confirmed or identity_confirmed is not True
+                     or repo_authorization is not True)):
+            status = "unavailable"
         check_key = (
-            key, ip_value, component_id, status, target_image, observed_image,
+            key, tuple(verified_ips), component_id, status, target_image, observed_image,
         )
         if check_key in seen_checks:
             continue
@@ -402,15 +533,17 @@ def runtime_image_checks_block(
             "target": target_image,
             "observed": observed_image,
             "status": status,
-            "selector": command_selector,
+            "selectors": command_selectors,
             "images_confirmed": images_confirmed,
             "identity_confirmed": identity_confirmed,
             "repo_authorization": repo_authorization,
-            "ip": ip_value if identity_confirmed is True else "",
+            "verified_ips": verified_ips,
         }
-        machine_row = grouped.setdefault(key, {"alias": machine, "ips": set(), "checks": []})
-        if item["ip"]:
-            machine_row["ips"].add(item["ip"])
+        owners = _owner_names({}, {}, group)
+        machine_row = grouped.setdefault(key, {
+            "alias": machine, "ips": set(), "checks": [], "owners": owners,
+        })
+        machine_row["ips"].update(item["verified_ips"])
         machine_row["checks"].append(item)
 
     if not grouped:
@@ -424,8 +557,12 @@ def runtime_image_checks_block(
     for key in sorted(grouped):
         row = grouped[key]
         ips = row["ips"]
-        ip_text = next(iter(ips)) if len(ips) == 1 else "IP 未确认"
-        lines.append(f"- {row['alias']}（{ip_text}）")
+        ip_text = "、".join(sorted(ips)) if ips else "IP 未确认"
+        owner_text = _owner_label(
+            row["owners"], test_only=bool(test_only),
+            mention=(lifecycle_status == "deploy-requested" and not test_only),
+        )
+        lines.append(f"- {row['alias']}（{ip_text}） · 负责人：{owner_text}")
         selectors = set()
         for item in row["checks"]:
             component = _escape(item["component"])
@@ -440,24 +577,18 @@ def runtime_image_checks_block(
                 else:
                     message = ""
                 if message:
-                    lines.extend([
-                        f"  - {component}：状态：UNAVAILABLE",
-                        f"    审批目标：<code>{_escape(item['target'])}</code>",
-                        f"    当前运行：<code>{_escape(item['observed'])}</code>",
-                        f"    {message}",
-                    ])
+                    lines.append(f"  - {component}：{message}")
                     continue
                 lines.extend([
-                    f"  - {component}：状态：MATCH",
+                    f"  - {component}",
                     f"    审批目标：<code>{_escape(item['target'])}</code>",
                     f"    当前运行：<code>{_escape(item['observed'])}</code>",
                     "    运行镜像与本轮批准镜像一致。",
                 ])
                 continue
             if status == "mismatch":
-                result_label = "MISMATCH" if item["images_confirmed"] else "UNAVAILABLE"
                 lines.extend([
-                    f"  - {component}：状态：{result_label}",
+                    f"  - {component}",
                     f"    审批目标：<code>{_escape(item['target'])}</code>",
                     f"    当前运行：<code>{_escape(item['observed'])}</code>",
                 ])
@@ -468,8 +599,8 @@ def runtime_image_checks_block(
                     )
                 else:
                     lines.append("    镜像不一致，需要重新部署。")
-                if item["selector"] and item["images_confirmed"]:
-                    selectors.add(item["selector"])
+                if item["selectors"] and item["images_confirmed"]:
+                    selectors.update(item["selectors"])
                 elif item["images_confirmed"]:
                     reason = (
                         "当前仓库尚未确认授权该机器"
@@ -480,49 +611,43 @@ def runtime_image_checks_block(
                     )
                     lines.append(f"    {reason}，因此暂时不能生成重新部署命令。")
                 continue
-            unavailable_reason = (
-                "机器身份绑定发生变化，暂时无法确认运行镜像。"
-                if status == "identity_changed" else
-                "组件当前未运行，暂时无法确认运行镜像。"
-                if status == "not_running" else
-                "运行状态暂时无法确认，不能判断镜像是否一致。"
-            )
-            lines.extend([
-                f"  - {component}：状态：UNAVAILABLE",
-                f"    审批目标：<code>{_escape(item['target'])}</code>",
-                f"    当前运行：<code>{_escape(item['observed'])}</code>",
-                f"    {unavailable_reason}请等待自动检查重新确认。",
-            ])
-        for selector in sorted(selectors):
-            selector_ip = ipv4(selector)
-            if selector_ip:
-                command = f"/approve_deploy machine={selector_ip}"
-            elif re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", selector):
-                # No confirmed IPv4 for this machine; the verified alias is
-                # the only selector that still names exactly this machine.
-                command = f"/approve_deploy machine={selector}"
+            if status == "identity_changed":
+                lines.extend([
+                    f"  - {component}：状态：UNAVAILABLE",
+                    f"    审批目标：<code>{_escape(item['target'])}</code>",
+                    f"    当前运行：<code>{_escape(item['observed'])}</code>",
+                    "    机器身份绑定发生变化，暂时无法确认运行镜像；请等待自动检查重新确认。",
+                ])
+            elif status == "not_running":
+                lines.extend([
+                    f"  - {component}：状态：UNAVAILABLE",
+                    f"    审批目标：<code>{_escape(item['target'])}</code>",
+                    f"    当前运行：<code>{_escape(item['observed'])}</code>",
+                    "    组件当前未运行，暂时无法确认运行镜像；请等待自动检查重新确认。",
+                ])
             else:
-                continue
-            same_machine_commands = {
-                f"/approve_deploy machine={selector}",
-                f"/approve_deploy machine={selector_ip}",
-                f"/approve_deploy machine={row['alias']}",
-            }
-            if (command in existing_commands
-                    or same_machine_commands.intersection(existing_commands)):
+                lines.extend([
+                    f"  - {component}：状态：UNAVAILABLE",
+                    f"    审批目标：<code>{_escape(item['target'])}</code>",
+                    f"    当前运行：<code>{_escape(item['observed'])}</code>",
+                ])
+                lines.append(
+                    "    运行状态暂时无法确认，不能判断镜像是否一致；请等待自动检查完成。"
+                )
+        for selector in sorted(selectors):
+            command = f"/approve_deploy machine={selector}"
+            if command in existing_commands:
                 lines.append("    这台机器的重新部署命令已经在上方列出。")
                 continue
             if command in emitted_commands:
                 continue
             emitted_commands.add(command)
-            # The selector is an IPv4 address or a verified alias limited to
-            # [A-Za-z0-9_.-], so the command can be shown verbatim; HTML
-            # escaping would mangle the underscore into ``&#95;``.
+            # Service supplied this exact verified IPv4 endpoint.
             lines.append(f"  - 重新部署命令：<code>{command}</code>")
+    lines.extend(_unavailability_lines(groups))
     if not lines:
         return ""
     return "\n".join((_RUNTIME_CHECKS_START, *lines, _RUNTIME_CHECKS_END))
-
 
 def _next_action_body_bounds(markdown: str) -> tuple[int, int] | None:
     """Return the exact body span of the one visible action guidance section.
@@ -830,9 +955,7 @@ def evidence_upload_comment(
                 and re.fullmatch(
                     r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}(?:\[bot\])?", candidate)):
             uploader = candidate
-    if not uploader:
-        return ""
-    author = f"开发者 @{uploader} "
+    author = f"开发者 @{uploader} " if uploader else "本轮"
     if suffix in image_suffixes:
         # The caption names the uploader and the exact file; the inline image is
         # a preview of this attachment and the link is the direct download.
@@ -1313,166 +1436,65 @@ def deploy_ready(
             and _record_value(build, "component_id")
         }
     commands = []
-    full_machine_aliases = set()
+    full_machine_ids = set()
     group_rows = [group for group in (machine_groups or [])
                   if isinstance(group, dict)]
-    alias_counts = {}
-    primary_ip_counts = {}
-    aliases_by_node_host = {}
-
-    def ipv4(value):
-        if not isinstance(value, str) or not value.strip():
-            return ""
-        try:
-            address = ipaddress.ip_address(value.strip())
-        except ValueError:
-            return ""
-        return str(address) if address.version == 4 else ""
-
-    for group in group_rows:
-        alias = group.get("alias")
-        if isinstance(alias, str) and alias.strip():
-            key = alias.strip().casefold()
-            alias_counts[key] = alias_counts.get(key, 0) + 1
-        primary_ip = ipv4(group.get("primary_ip"))
-        node_host = ipv4(group.get("node_host"))
-        if primary_ip:
-            primary_ip_counts[primary_ip] = primary_ip_counts.get(primary_ip, 0) + 1
-        if isinstance(alias, str) and alias.strip() and node_host:
-            aliases_by_node_host.setdefault(node_host, set()).add(alias.strip().casefold())
-
+    unavailable_machine_lines = _unavailability_lines(group_rows)
     if approval_evidence_ready:
-        eligible_machines = []
+        endpoint_rows = []
+        full_machine_identity_missing = False
         component_by_id = {
             item.get("component_id"): item for item in components or []
             if isinstance(item, dict)
             and isinstance(item.get("component_id"), str)
         }
         for group in group_rows:
-            compatible = group.get("component_ids")
-            if not isinstance(compatible, list):
-                continue
-            compatible_ids = {
-                component_id for component_id in compatible
-                if isinstance(component_id, str) and component_id
-            }
-            machine_component_ids = deployable_ids.intersection(compatible_ids)
-            if not machine_component_ids:
-                continue
-            alias = group.get("alias")
-            if (not isinstance(alias, str)
-                    or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", alias) is None
-                    or alias_counts.get(alias.casefold(), 0) != 1
-                    or group.get("approval_available") is not True
-                    or group.get("repo_authorized") is not True
-                    or group.get("identity_confirmed") is not True):
-                continue
-            node_id = group.get("node_id")
-            primary_ip = ipv4(group.get("primary_ip"))
-            node_host = ipv4(group.get("node_host"))
-            if (not isinstance(node_id, str) or not node_id.strip()
-                    or not primary_ip or primary_ip != node_host):
-                continue
-
-            reasons = set(_display_values(group.get("blocking_reasons")))
-            ambiguous_ip = bool(
-                group.get("duplicate_ip") is True
-                or "PRIMARY_IP_AMBIGUOUS" in reasons
-                or primary_ip_counts.get(primary_ip, 0) > 1
-                or len(aliases_by_node_host.get(node_host, set())) > 1
-            )
-            # A present selector is authoritative, including an empty value.
-            # A verified alias may resolve to its unique primary IP below.
-            if "command_selector" in group:
-                raw_selector = group.get("command_selector")
-            else:
-                raw_selector = (
-                    group.get("ip") if group.get("ip_command_safe") is True
-                    else ""
-                )
-            selector = raw_selector.strip() if isinstance(raw_selector, str) else ""
-            if not selector:
-                continue
-
-            selector_ip = ipv4(selector)
-            if selector_ip:
-                if (selector_ip != primary_ip or selector_ip != node_host
-                        or group.get("ip_command_safe") is not True
-                        or ambiguous_ip):
+            alias = _machine_alias(group) or "机器"
+            physical_id = _physical_machine_key(group)
+            owners = _owner_names({}, {}, group)
+            for endpoint in _verified_endpoints_for_machine(group):
+                compatible_ids = deployable_ids.intersection(endpoint["component_ids"])
+                if not compatible_ids:
                     continue
-                command_selector = selector_ip
-            else:
-                if selector != alias:
-                    continue
-                if (group.get("ip_command_safe") is not False and not ambiguous_ip
-                        and aliases_by_node_host.get(node_host, set())
-                        == {alias.strip().casefold()}):
-                    command_selector = primary_ip
-                else:
-                    # Keep the verified alias fallback when the IP selector is
-                    # unsafe. The alias must be unique and bound to this exact
-                    # authorized machine and compatible component set.
-                    alias_fallback_allowed = bool(
-                        group.get("ip_command_safe") is False or ambiguous_ip
-                    )
-                    if (not alias_fallback_allowed
-                            or aliases_by_node_host.get(node_host, set())
-                            != {alias.strip().casefold()}):
-                        continue
-                    command_selector = alias
+                labels = [
+                    _runtime_component_label(component_by_id[component_id])
+                    if component_id in component_by_id else "组件名称暂不可用"
+                    for component_id in sorted(compatible_ids)
+                ]
+                endpoint_rows.append({
+                    "alias": alias,
+                    "physical_id": physical_id,
+                    "owners": owners,
+                    "ip": endpoint["ip"],
+                    "label": endpoint["label"],
+                    "component_ids": compatible_ids,
+                    "component_text": "、".join(
+                        _escape(label) for label in labels if label
+                    ),
+                })
 
-            component_labels = [
-                _runtime_component_label(component_by_id[component_id])
-                if component_id in component_by_id else component_id
-                for component_id in sorted(machine_component_ids)
-            ]
-            component_text = "、".join(
-                _escape(label) for label in component_labels if label
-            )
-            complete_compatibility = deployable_ids.issubset(compatible_ids)
-            if complete_compatibility:
-                full_machine_aliases.add(alias.casefold())
-            eligible_machines.append({
-                "alias": alias,
-                "primary_ip": primary_ip,
-                "command_selector": command_selector,
-                "ip_command_safe": group.get("ip_command_safe") is True,
-                "ambiguous_ip": ambiguous_ip,
-                "component_text": component_text,
-                "complete": complete_compatibility,
-            })
-
+        ip_owners = {}
+        for row in endpoint_rows:
+            ip_owners.setdefault(row["ip"], set()).add(row["physical_id"] or row["alias"])
         seen_commands = set()
-        for machine in eligible_machines:
-            alias = machine["alias"]
-            primary_ip = machine["primary_ip"]
-            command_selector = machine["command_selector"]
-            if machine["complete"] and len(full_machine_aliases) > 1:
-                # A complete machine among multiple candidates is selected by
-                # its verified primary IP, never by a placeholder or alias.
-                if (command_selector != primary_ip
-                        or not machine["ip_command_safe"]
-                        or machine["ambiguous_ip"]):
-                    continue
-            if command_selector == primary_ip:
-                # The normal case: the command names the real machine IP.
-                command = f"/approve_deploy machine={primary_ip}"
-            elif (command_selector == alias
-                  and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", alias or "")):
-                # Only a verified alias is available (its IP selector would be
-                # unsafe). The alias is a real, unique machine name, so the
-                # reader never sees a placeholder such as <alias-or-ip>.
-                command = f"/approve_deploy machine={alias}"
-            else:
+        for row in endpoint_rows:
+            if len(ip_owners[row["ip"]]) != 1:
                 continue
+            command = f"/approve_deploy machine={row['ip']}"
             if command in seen_commands:
                 continue
             seen_commands.add(command)
             commands.append(
-                f"- `{_escape(alias)}`（{primary_ip}）\n"
-                f"  兼容组件：{machine['component_text'] or '当前部署组件'}\n"
-                f"  `{command}`"
+                f"- `{_escape(row['alias'])}`（`{_escape(row['ip'])}`）"
+                + (f" · {_escape(row['label'])}" if row["label"] else "")
+                + f"\n  负责人：{_owner_label(row['owners'], mention=False)}"
+                + f"\n  兼容组件：{row['component_text']}\n  `{command}`"
             )
+            if deployable_ids.issubset(row["component_ids"]):
+                if row["physical_id"]:
+                    full_machine_ids.add(row["physical_id"])
+                else:
+                    full_machine_identity_missing = True
 
     lines = [
         BOT_MARKER,
@@ -1502,7 +1524,8 @@ def deploy_ready(
             "",
             _MACHINE_SELECTOR_NOTE,
         ])
-        if len(full_machine_aliases) == 1 and len(commands) == 1 and approval_evidence_ready:
+        if (len(full_machine_ids) == 1 and not full_machine_identity_missing
+                and approval_evidence_ready):
             lines.extend([
                 "",
                 "只有一台机器完整兼容所有组件，也可以直接执行 `/approve_deploy`。",
@@ -1514,8 +1537,11 @@ def deploy_ready(
     elif approval_evidence_ready:
         lines.extend([
             "",
-            "当前还没有通过机器身份、仓库授权和组件兼容检查的机器，暂时无法部署。",
-            "请等待状态同步后刷新本 Summary；确认前不要执行部署命令。",
+            ("当前还没有通过机器身份、仓库授权和组件兼容检查的机器，暂时无法部署。"
+             if group_rows else
+             "本节尚未收到机器验证结果；只执行 PR Summary 中由服务实时验证后列出的 IP 命令。"
+             "如果没有已验证命令，当前暂不能部署。"),
+            "确认前不要使用 alias、主 IP 或其他未验证地址。",
         ])
     else:
         lines.extend([
@@ -1523,12 +1549,20 @@ def deploy_ready(
             "审核或镜像构建还没有完成，这里还不会列出部署命令。",
             "请等待本 Summary 更新，暂时不需要执行任何命令。",
         ])
+    if unavailable_machine_lines:
+        lines.extend([
+            "",
+            "机器连通性与阻塞原因：",
+            *unavailable_machine_lines,
+            ("上方命令仅使用 Agent Core 已验证可用的 IP；不可达或未验证的地址不会生成命令。"
+             if commands else
+             "目前没有经过 Agent Core 验证的可用 IP，因此没有可执行审批命令。"),
+        ])
     lines.extend(["", "### 构建结果", "", _build_table(builds, components)])
     return _lifecycle_body(lines)
 
 
 _OWNER_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}\Z")
-
 
 def _record_value(record, *names, default=None):
     for name in names:
@@ -2189,7 +2223,6 @@ def deploy_requested(
     diagnostic_rows = _machine_diagnostic_rows(machine_diagnostics)
     group_rows = _record_rows(machine_groups)
     runtime_rows = _record_rows(runtime_checks, ("checks", "runtime_checks", "items"))
-    policy = _repo_policy_display_status(repo, repository_policy_status, machine_diagnostics)
     test_only = _test_only_status(
         repository_policy_status, machine_diagnostics, group_rows, components,
     ) or any(
@@ -2197,20 +2230,6 @@ def deploy_requested(
         for note in [last_lifecycle_event, *(gate_note or [])]
     )
 
-    def alias_key(record):
-        return _machine_alias(record).casefold()
-
-    diagnostic_by_alias = {alias_key(row): row for row in diagnostic_rows if alias_key(row)}
-    inventory_by_alias = {alias_key(row): row for row in inventory_rows if alias_key(row)}
-    group_by_alias = {alias_key(row): row for row in group_rows if alias_key(row)}
-    diagnostics_by_ip = {
-        _canonical_ip(_machine_ip(row)): row for row in diagnostic_rows
-        if _canonical_ip(_machine_ip(row))
-    }
-    inventory_by_ip = {
-        _canonical_ip(_machine_ip(row)): row for row in inventory_rows
-        if _canonical_ip(_machine_ip(row))
-    }
     components = components if isinstance(components, list) else []
     component_by_id = {
         item.get("component_id"): item for item in components
@@ -2229,348 +2248,47 @@ def deploy_requested(
         if isinstance(component_id, str) and component_id
     }
     remaining_component_ids = component_ids - deployed_component_ids
-    known_aliases_by_ip = {}
-    inventory_ip_counts = {}
-    inventory_alias_counts = {}
-    policy_aliases_by_ip = {}
-    policy_alias_counts = {}
-    for row in inventory_rows:
-        ip_value = _canonical_ip(_machine_ip(row))
-        alias = _machine_alias(row)
-        if alias:
-            alias_key_value = alias.casefold()
-            inventory_alias_counts[alias_key_value] = (
-                inventory_alias_counts.get(alias_key_value, 0) + 1
-            )
-        if ip_value:
-            inventory_ip_counts[ip_value] = inventory_ip_counts.get(ip_value, 0) + 1
-            known_aliases_by_ip.setdefault(ip_value, []).append(alias or "别名未提供")
-    for row in group_rows:
-        alias = _machine_alias(row)
-        alias_key_value = alias.casefold()
-        node_host = next((value for value in (
-            _canonical_ip(_record_value(row, "node_host")),
-            _canonical_ip(_record_value(row, "policy_node_host")),
-            _canonical_ip(_record_value(row, "primary_ip")),
-        ) if value), "")
-        if alias:
-            policy_alias_counts[alias_key_value] = policy_alias_counts.get(alias_key_value, 0) + 1
-        if node_host:
-            policy_aliases_by_ip.setdefault(node_host, []).append(alias or "别名未提供")
-        ip_value = _canonical_ip(_machine_ip(row))
-        if ip_value and alias and not inventory_ip_counts.get(ip_value):
-            aliases = known_aliases_by_ip.setdefault(ip_value, [])
-            if alias not in aliases:
-                aliases.append(alias)
 
-    def machine_parts(machine):
-        alias = _machine_alias(machine)
-        key = alias.casefold()
-        ip_value = _canonical_ip(_machine_ip(machine))
-        diagnostic = diagnostic_by_alias.get(key)
-        physical = inventory_by_alias.get(key)
-        if ip_value and inventory_ip_counts.get(ip_value, 0) == 1:
-            diagnostic = diagnostic or diagnostics_by_ip.get(ip_value, {})
-            physical = physical or inventory_by_ip.get(ip_value)
-        physical = physical or machine
-        group = group_by_alias.get(key) or {}
-        if not group and diagnostic:
-            group = diagnostic
-        return alias, ip_value, diagnostic, physical, group
-
-    def machine_flags(machine):
-        alias, ip_value, diagnostic, physical, group = machine_parts(machine)
-        records = (diagnostic, group, physical)
-        duplicate_aliases = known_aliases_by_ip.get(ip_value, [])
-        physical_ip = _canonical_ip(_record_value(
-            physical, "primary_ip", "main_ip", "primary_ip_address", "ip",
-        )) or ip_value
-        policy_node_host = next((value for value in (
-            _canonical_ip(_record_value(group, "node_host")),
-            _canonical_ip(_record_value(group, "policy_node_host")),
-            _canonical_ip(_record_value(diagnostic, "node_host")),
-            _canonical_ip(_record_value(diagnostic, "policy_node_host")),
-            _canonical_ip(_record_value(group, "primary_ip")),
-            _canonical_ip(_record_value(diagnostic, "primary_ip")),
-        ) if value), "")
-        group_primary_ip = next((value for value in (
-            _canonical_ip(_record_value(group, "primary_ip")),
-            _canonical_ip(_record_value(group, "main_ip")),
-            _canonical_ip(_record_value(group, "primary_ip_address")),
-        ) if value), "")
-        duplicate_ip = bool(
-            inventory_ip_counts.get(physical_ip, 0) > 1
-            or len({name.casefold() for name in duplicate_aliases}) > 1
-            or _field_flag(diagnostic, "duplicate_ip") is True
-            or "PRIMARY_IP_AMBIGUOUS" in _display_values(
-                _record_value(group, "blocking_reasons", default=[])
+    compatible_states = []
+    unavailable_machine_lines = _unavailability_lines(group_rows)
+    full_machine_ids = set()
+    full_machine_identity_missing = False
+    for group in group_rows:
+        alias = _machine_alias(group) or "机器"
+        physical_id = _physical_machine_key(group)
+        owners = _owner_names({}, {}, group)
+        for endpoint in _verified_endpoints_for_machine(group):
+            compatible_ids = remaining_component_ids.intersection(
+                endpoint["component_ids"],
             )
-            or len({name.casefold() for name in policy_aliases_by_ip.get(
-                policy_node_host, [],
-            )}) > 1
+            if not compatible_ids:
+                continue
+            compatible_states.append({
+                "alias": alias,
+                "ip": endpoint["ip"],
+                "endpoint_label": endpoint["label"],
+                "group": {"component_ids": compatible_ids},
+                "owners": owners,
+                "physical_id": physical_id,
+            })
+    ip_owners = {}
+    for state in compatible_states:
+        ip_owners.setdefault(state["ip"], set()).add(
+            state["physical_id"] or state["alias"].casefold(),
         )
-        authorized = _field_flag(
-            diagnostic, "repository_authorized", "authorized", "machine_authorized",
-        )
-        if authorized is None:
-            authorized = alias.casefold() in policy["authorized_aliases"]
-        authorized = bool(
-            policy["app_authorized"] and policy["machines_configured"] and authorized
-        )
-        identity_flags = [value for value in (
-            _field_flag(record, "identity_confirmed", "machine_identity_confirmed")
-            for record in records
-        ) if value is not None]
-        identity_flag = (
-            False if False in identity_flags else
-            True if True in identity_flags else None
-        )
-        identity_confirmed = identity_flag is True
-        configured_flags = [value for value in (
-            _field_flag(record, "agent_core_credentials_configured")
-            for record in records
-        ) if value is not None]
-        if False in configured_flags:
-            credentials_configured = False
-        elif True in configured_flags:
-            credentials_configured = True
-        else:
-            legacy_configured_flags = [value for value in (
-                _field_flag(record, "agent_core_credentials_available")
-                for record in records
-            ) if value is not None]
-            credentials_configured = (
-                False if False in legacy_configured_flags else
-                True if True in legacy_configured_flags else None
-            )
-
-        core_status_values = [
-            str(value).strip().casefold().replace("_", "-")
-            for value in (_record_value(record, "agent_core_status") for record in records)
-            if isinstance(value, str) and value.strip()
-        ]
-        denied_core_statuses = {
-            "credential-missing", "credentials-missing", "missing-credentials",
-            "unavailable", "offline", "unreachable",
-        }
-        if any(value in denied_core_statuses for value in core_status_values):
-            agent_core_status = next(
-                value for value in core_status_values if value in denied_core_statuses
-            )
-        elif any(value in {"available", "healthy", "reachable", "ok"}
-                 for value in core_status_values):
-            agent_core_status = "available"
-        elif core_status_values:
-            agent_core_status = "unknown"
-        else:
-            legacy_health_flags = [value for value in (
-                _field_flag(record, "agent_core_available", "agent_core_reachable")
-                for record in records
-            ) if value is not None]
-            agent_core_status = (
-                "unavailable" if False in legacy_health_flags else
-                "available" if True in legacy_health_flags else "unknown"
-            )
-
-        explicit_core_failure = agent_core_status in denied_core_statuses
-        credentials_available = bool(
-            not explicit_core_failure
-            and credentials_configured is not False
-            and (
-                agent_core_status == "available"
-                or agent_core_status == "unknown" and credentials_configured is True
-            )
-        )
-        credentials_flag = (
-            False if explicit_core_failure or credentials_configured is False else
-            True if credentials_available else None
-        )
-        platform_flag = next((value for value in (
-            _field_flag(record, "platform_confirmed", "platform_known")
-            for record in records
-        ) if value is not None), None)
-        platform_confirmed = platform_flag is True
-        if platform_flag is None:
-            platform_value = _record_value(
-                diagnostic, "platform", "platform_name", "platforms",
-                default=_record_value(physical, "platform", "platform_name", "platforms"),
-            )
-            platform_values = _display_values(platform_value)
-            platform_confirmed = bool(platform_values) and all(
-                value.casefold() not in {"unknown", "unconfirmed", "未确认", "未知"}
-                for value in platform_values
-            )
-        group_component_ids = _record_value(group, "component_ids", default=[])
-        if not isinstance(group_component_ids, (list, tuple, set)):
-            group_component_ids = []
-        diagnostic_component_ids = _record_value(diagnostic, "component_ids", default=[])
-        if not isinstance(diagnostic_component_ids, (list, tuple, set)):
-            diagnostic_component_ids = []
-        machine_component_ids = {
-            component_id for component_id in group_component_ids
-            if isinstance(component_id, str) and component_id
-        }
-        diagnosed_component_ids = {
-            component_id for component_id in diagnostic_component_ids
-            if isinstance(component_id, str) and component_id
-        }
-        component_flags = [value for value in (
-            _field_flag(record, "component_compatible", "components_compatible")
-            for record in (diagnostic, group)
-        ) if value is not None]
-        component_flag = (
-            False if False in component_flags else
-            True if True in component_flags else None
-        )
-        component_coverage_confirmed = bool(
-            machine_component_ids
-            and diagnosed_component_ids
-            and machine_component_ids.issubset(diagnosed_component_ids)
-        )
-        if component_flag is False:
-            component_compatible = False
-        else:
-            component_compatible = component_coverage_confirmed
-        ip_identity_matches = bool(
-            physical_ip and policy_node_host and physical_ip == policy_node_host
-            and (not group_primary_ip or group_primary_ip == physical_ip)
-        )
-        alias_identity_matches = bool(
-            alias
-            and _machine_alias(physical).casefold() == alias.casefold()
-            and _machine_alias(group).casefold() == alias.casefold()
-            and inventory_alias_counts.get(alias.casefold(), 0) == 1
-            and policy_alias_counts.get(alias.casefold(), 0) == 1
-        )
-        identity_confirmed = bool(
-            identity_flag is True and alias_identity_matches and ip_identity_matches
-        )
-        identity_mismatch = False
-        try:
-            identity_mismatch = bool(
-                physical_ip and policy_node_host and physical_ip != policy_node_host
-            )
-        except ValueError:
-            pass
-        safe_flag = _field_flag(diagnostic, "safe_to_approve", "approval_safe")
-        provided_selector = str(
-            _record_value(group, "command_selector", default="")
-            or _record_value(diagnostic, "command_selector", default="")
-            or ""
-        ).strip()
-        group_approval_flag = _field_flag(group, "approval_available")
-        physical_ip_unique = bool(
-            physical_ip
-            and inventory_ip_counts.get(physical_ip, 0) == 1
-            and len({name.casefold() for name in policy_aliases_by_ip.get(
-                policy_node_host, [],
-            )}) == 1
-            and not duplicate_ip
-        )
-        if identity_confirmed and authorized and group_approval_flag is not False:
-            if (physical_ip_unique
-                    and _field_flag(group, "ip_command_safe") is not False
-                    and provided_selector in {"", physical_ip, alias}):
-                command_selector = physical_ip
-            elif (alias_identity_matches
-                  and (duplicate_ip
-                       or _field_flag(group, "ip_command_safe") is False)
-                  and provided_selector in {"", alias}):
-                command_selector = alias
+    compatible_states = [
+        state for state in compatible_states
+        if len(ip_owners.get(state["ip"], set())) == 1
+    ]
+    for state in compatible_states:
+        if (remaining_component_ids
+                and remaining_component_ids.issubset(state["group"]["component_ids"])):
+            if state["physical_id"]:
+                full_machine_ids.add(state["physical_id"])
             else:
-                command_selector = ""
-        else:
-            command_selector = ""
-        group_approval_available = (
-            group_approval_flag is True
-        )
-        safe_flag_allows = safe_flag is not False or bool(
-            command_selector == alias
-            and (duplicate_ip
-                 or _field_flag(group, "ip_command_safe") is False)
-            and group_approval_available
-            and component_coverage_confirmed
-        )
-        safe = bool(
-            authorized and identity_confirmed and credentials_available
-            and platform_confirmed and component_compatible and command_selector
-            and safe_flag_allows
-        )
-        reasons = []
-        supplied_reasons = _record_value(diagnostic, "reasons", "reason", "diagnostic")
-        reasons.extend(_safe_display_text(reason) for reason in _display_values(supplied_reasons))
-        if not policy["app_authorized"]:
-            reasons.append("GitHub App 对该仓库的授权未确认。")
-        elif not policy["machines_configured"]:
-            reasons.append(
-                "当前仓库尚未配置有效的机器授权。"
-                if policy["machines_main_missing"]
-                else "当前仓库机器授权状态未确认。"
-            )
-        elif not authorized:
-            reasons.append("当前仓库已加载的机器策略未授权该机器。")
-        if duplicate_ip:
-            conflicting_aliases = _display_values(_record_value(
-                diagnostic, "ip_conflicts", "conflicting_aliases",
-            ))
-            if inventory_ip_counts.get(ip_value, 0) > 1:
-                conflicting_aliases.extend(duplicate_aliases)
-            conflict_labels = sorted(
-                set(conflicting_aliases), key=str.casefold,
-            )
-            reasons.append(
-                "主 IP 存在冲突，涉及别名："
-                + ("、".join(conflict_labels) or "冲突别名待确认") + "。"
-            )
-        if identity_mismatch:
-            reasons.append("物理主 IP 与当前仓库 node_host 不一致，禁止审批命令。")
-        elif not identity_confirmed:
-            reasons.append("机器别名、node_id 与主 IP 的身份绑定未确认。")
-        if credentials_flag is False:
-            reasons.append("Agent Core 凭据或连接不可用。")
-        elif not credentials_available:
-            reasons.append("Agent Core 凭据或连接状态未确认。")
-        if platform_flag is False:
-            reasons.append("机器平台状态未确认。")
-        elif not platform_confirmed:
-            reasons.append("机器平台尚未确认。")
-        if not component_compatible:
-            reasons.append(
-                "当前 PR 所需组件与该机器不兼容。"
-                if component_flag is False else "当前 PR 组件匹配结果尚未确认。"
-            )
-        if safe_flag is False and not (
-                command_selector == alias
-                and (duplicate_ip
-                     or _field_flag(group, "ip_command_safe") is False)
-                and group_approval_available):
-            reasons.append("机器诊断未允许安全审批。")
-        return {
-            "alias": alias,
-            "ip": physical_ip or ip_value or _machine_ip(machine),
-            "command_selector": command_selector,
-            "diagnostic": diagnostic,
-            "physical": physical,
-            "group": group,
-            "owners": _owner_names(diagnostic, physical, group),
-            "authorized": authorized,
-            "identity_flag": identity_flag,
-            "identity_confirmed": identity_confirmed,
-            "credentials_flag": credentials_flag,
-            "credentials_available": credentials_available,
-            "platform_flag": platform_flag,
-            "platform_confirmed": platform_confirmed,
-            "component_flag": component_flag,
-            "component_compatible": component_compatible,
-            "duplicate_ip": duplicate_ip,
-            "safe": safe,
-            "reasons": list(dict.fromkeys(reasons)),
-        }
-
-    machine_states = [machine_flags(row) for row in inventory_rows]
-    compatible_states = sorted(
-        (item for item in machine_states if item["safe"] and item["alias"]),
-        key=lambda item: item["alias"].casefold(),
+                full_machine_identity_missing = True
+    compatible_states.sort(
+        key=lambda item: (item["alias"].casefold(), item["ip"]),
     )
     component_by_id = {
         item.get("component_id"): item for item in components
@@ -2593,7 +2311,6 @@ def deploy_requested(
         "",
     ]
     seen_commands = set()
-    full_machine_aliases = set()
     if display_status == "deploying":
         lines.extend(_deploying_next_action(
             deployments, components, attempt,
@@ -2614,10 +2331,8 @@ def deploy_requested(
         pending_lines = []
         for state in compatible_states:
             alias = state["alias"]
-            selector = state["command_selector"]
-            if (not isinstance(selector, str)
-                    or not (_canonical_ip(selector)
-                            or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", selector))):
+            selector = _canonical_ip(state["ip"])
+            if not selector:
                 continue
             command = f"/approve_deploy machine={selector}"
             if command in seen_commands:
@@ -2631,11 +2346,9 @@ def deploy_requested(
                 component_id for component_id in ids
                 if isinstance(component_id, str) and component_id
             })
-            if remaining_component_ids and remaining_component_ids.issubset(set(ids)):
-                full_machine_aliases.add(alias.casefold())
             component_labels = [
                 _runtime_component_label(component_by_id[component_id])
-                if component_id in component_by_id else component_id
+                if component_id in component_by_id else "组件名称暂不可用"
                 for component_id in ids
             ]
             component_text = "、".join(
@@ -2645,7 +2358,10 @@ def deploy_requested(
                 state["owners"], test_only=test_only, mention=not test_only,
             )
             pending_lines.append(
-                f"- `{_escape(alias)}`（`{_escape(state['ip'] or '主 IP 未确认')}`）\n"
+                f"- `{_escape(alias)}`（`{_escape(state['ip'])}`）"
+                + (f" · {_escape(state['endpoint_label'])}"
+                   if state["endpoint_label"] else "")
+                + "\n"
                 f"  负责审批：{owner_text}\n"
                 f"  兼容组件：{component_text}\n"
                 f"  审批命令：`{command}`"
@@ -2654,18 +2370,31 @@ def deploy_requested(
             lines.extend(["", "等待下列机器的负责人审批：", "", *pending_lines])
         if not seen_commands:
             lines.append(
-                "暂时还没有可以执行的审批命令。请等待状态同步后刷新本 Summary，"
-                "刷新前不需要执行任何命令。"
+                ("当前没有 Agent Core 已确认可用且具备仓库授权、机器身份和组件兼容性的已验证地址，"
+                 "暂时没有可执行的审批命令。请等待状态同步后刷新本 Summary。"
+                 if group_rows else
+                 "本节尚未收到机器验证结果；只执行 PR Summary 中由服务实时验证后列出的 IP 命令。"
+                 "如果没有已验证命令，当前暂不能审批。")
             )
         else:
             lines.extend([
                 "",
                 "审批完成后本 Summary 会自动更新为部署进度；审批前不需要其他操作。",
             ])
-        if len(full_machine_aliases) == 1 and len(seen_commands) == 1:
+        if len(full_machine_ids) == 1 and not full_machine_identity_missing:
             lines.append(
                 "只有一台机器完整兼容所有组件，负责人也可以直接执行 `/approve_deploy`。"
             )
+
+    if display_status != "deploying" and unavailable_machine_lines:
+        lines.extend([
+            "",
+            "机器连通性与阻塞原因：",
+            *unavailable_machine_lines,
+            ("上方命令仅使用 Agent Core 已验证可用的 IP；不可达或未验证的地址不会生成命令。"
+             if seen_commands else
+             "目前没有经过 Agent Core 验证的可用 IP，因此没有可执行审批命令。"),
+        ])
 
     notes = []
     for note in gate_note or []:
@@ -2680,6 +2409,9 @@ def deploy_requested(
             notes.append(_safe_display_text(value))
     if notes:
         lines.extend(["", *notes])
+
+    if test_only and display_status == "deploy-requested":
+        lines.extend(["", f"测试 PR 仅提醒 @{_TEST_ONLY_HAOHAO_REMINDER}。"])
 
     runtime_action = runtime_image_checks_block(
         runtime_rows, components, lifecycle_status=display_status,
@@ -2699,8 +2431,13 @@ def deploy_requested(
         ),
     ])
     body = _lifecycle_body(lines)
-    return body.replace("@", "＠") if test_only else body
-
+    if test_only:
+        body = body.replace("@", "＠")
+        body = body.replace(
+            "＠" + _TEST_ONLY_HAOHAO_REMINDER,
+            "@Haohao-end",
+        )
+    return body
 
 def testing(
     repo: str, pr_number: int, head_sha: str,
@@ -2853,15 +2590,14 @@ def failed_comment(
         lines.extend([
             "请先按上面的失败原因修复问题；修复后需要重新部署并重新测试，"
             "再由验收人重新记录结果。",
-            "重新部署时由对应机器的负责人执行该机器的 `/approve_deploy` 命令，"
-            "`/request_deploy` 是可选步骤；如果 Summary 没有可执行的机器命令，"
-            "请按仓库流程重新触发审核和构建。",
+            "重新部署时仅使用 PR Summary 中实际列出的已验证机器审批命令；"
+            "`/request_deploy` 是可选步骤。若没有可执行命令，请先修复机器配置或重新触发审核和构建。",
         ])
     else:
         lines.extend([
             "请先按上面的失败原因修复问题，并确认目标机器可以正常读取。",
-            "如果 Summary 已列出兼容机器命令，由对应机器的负责人直接重新执行；"
-            "`/request_deploy` 是可选步骤。没有可执行命令时，请按仓库流程重新触发审核和构建。",
+            "如果 PR Summary 列出了已验证的兼容机器命令，由对应负责人按该命令重试；"
+            "`/request_deploy` 是可选步骤。没有可执行命令时，请先修复机器配置或重新触发审核和构建。",
         ])
     lines.append("在重新部署之前，不需要执行其他命令。")
     lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
@@ -2940,7 +2676,7 @@ def uncertain_comment(
 def _status_next_action(
     status: str, deployments, components, machine_groups, attempt,
 ) -> list[str]:
-    """Same structure for every state: what happens, what to do, whether to wait."""
+    """Render only actions valid for the supplied trusted lifecycle status."""
     if status == "review-required":
         return [
             "当前提交还没有审核和镜像构建结果，现在还不能部署。",
@@ -2950,20 +2686,79 @@ def _status_next_action(
     if status == "reviewing":
         return [
             "当前提交正在审核并构建镜像，现在还不能部署。",
-            "请等待审核和镜像构建完成，完成后这里会列出可以部署的机器和对应命令。",
-            "暂时不需要执行任何命令。",
+            "请等待审核和镜像构建完成；暂时不需要执行任何命令。",
         ]
-    if status == "deploy-ready":
-        return [
-            "当前提交的代码审核和镜像构建都已完成，可以部署。",
-            "请由对应机器的负责人在本 PR 的评论中执行本 Summary 里该机器对应的命令；"
-            "`/request_deploy` 是可选的。",
-        ]
-    if status == "deploy-requested":
-        return [
-            "部署申请已经提交，现在等待对应机器的负责人审批。",
-            "审批完成后这里会显示部署进度；审批前不需要其他操作。",
-        ]
+    if status in {"deploy-ready", "deploy-requested"}:
+        component_ids = {
+            item.get("component_id") for item in components or []
+            if isinstance(item, dict) and isinstance(item.get("component_id"), str)
+            and item.get("component_id")
+        }
+        if status == "deploy-requested":
+            deployed_ids = {
+                component_id
+                for deployment in deployments or []
+                if isinstance(deployment, dict) and deployment.get("phase") == "deployed"
+                for component_id in deployment.get("component_ids", [])
+                if isinstance(component_id, str) and component_id
+            }
+            component_ids -= deployed_ids
+        rows = _verified_approval_rows(machine_groups, component_ids)
+        test_only = _test_only_status(machine_groups, components)
+        if status == "deploy-ready":
+            lines = ["当前提交的代码审核和镜像构建都已完成，可以部署。"]
+            lines.append("`/request_deploy` 是可选步骤，可以直接执行下列已验证 IP 命令：")
+            mention_owners = False
+        else:
+            lines = ["部署申请已经提交，现在等待对应机器负责人审批。"]
+            mention_owners = not test_only
+        full_machine_ids = set()
+        full_identity_missing = False
+        seen = set()
+        for row in rows:
+            command = f"/approve_deploy machine={row['ip']}"
+            if command in seen:
+                continue
+            seen.add(command)
+            if component_ids and component_ids.issubset(row["component_ids"]):
+                if row["physical_id"]:
+                    full_machine_ids.add(row["physical_id"])
+                else:
+                    full_identity_missing = True
+            labels = []
+            component_map = {
+                item.get("component_id"): item for item in components or []
+                if isinstance(item, dict)
+            }
+            for component_id in sorted(row["component_ids"]):
+                label = _runtime_component_label(component_map.get(component_id, {}))
+                if label:
+                    labels.append(_escape(label))
+            lines.extend([
+                "",
+                f"- `{_escape(row['alias'])}`（`{_escape(row['ip'])}`）"
+                + (f" · {_escape(row['label'])}" if row["label"] else ""),
+                f"  负责人：{_owner_label(row['owners'], mention=mention_owners and not test_only)}",
+                f"  兼容组件：{'、'.join(labels) or '当前适配组件'}",
+                f"  `{command}`",
+            ])
+        if test_only and status == "deploy-requested":
+            lines.extend(["", "测试 PR 仅提醒 @Haohao-end。"])
+        if not seen and not component_ids:
+            lines.extend(["", "所有需要的组件都已部署，无需再次审批。"])
+        elif not seen:
+            lines.extend([
+                "",
+                "当前没有 Agent Core 已确认可用且具备当前仓库授权、机器身份和组件兼容性的地址，"
+                "暂时没有可执行的审批命令。",
+            ])
+            lines.extend(_unavailability_lines(machine_groups))
+        elif status == "deploy-requested":
+            lines.extend(["", "审批完成后等待 Summary 更新；不要重复审批。"])
+        if (len(full_machine_ids) == 1
+                and not full_identity_missing):
+            lines.extend(["", "只有一台机器完整兼容所有待部署组件，也可以直接执行 `/approve_deploy`。"])
+        return lines
     if status == "deploying":
         return _deploying_next_action(
             deployments, components, attempt, machine_groups=machine_groups,
@@ -2971,29 +2766,24 @@ def _status_next_action(
     if status == "testing":
         return [
             "机器已经部署，现在可以开始测试。",
-            "测试完成后由本轮部署机器的负责人执行 `/request_acceptance` 提交验收。",
+            "测试视频或图片可以选传；测试完成后执行 `/request_acceptance` 申请验收。",
         ]
     if status == "acceptance-required":
         return [
-            "机器已经部署，本轮测试也已完成，现在等待验收。",
-            "请由本 Summary 中列出的验收人记录结果："
-            "`/record_test result=pass`（通过）或 `/record_test result=fail`（不通过）。",
-            "在验收人记录结果之前，PR 作者不需要执行其他命令。",
+            "机器已经部署，本轮测试也已完成，现在等待当前仓库配置的验收人。",
+            "请由验收人执行 `/record_test result=pass` 或 `/record_test result=fail`。",
         ]
     if status == "succeeded":
         return [
-            "本轮验收已经通过，部署完成。",
-            "现在不需要执行部署或测试命令；可以按仓库流程继续合并这个 PR。",
+            "本轮测试验收已经通过，部署完成。",
+            "现在不需要执行部署或测试命令；可以按仓库流程继续处理这个 PR。",
         ]
     if status == "failed":
         return [
             "本次部署没有完成。",
-            "请先按失败原因修复问题，确认目标机器可以正常读取，"
-            "如果 Summary 已列出兼容机器命令，由对应机器的负责人直接重新执行；"
-            "`/request_deploy` 是可选步骤。没有可执行命令时，请按仓库流程重新触发审核和构建。",
+            "请先按 Summary 中的具体失败原因修复；仅使用 Summary 明确列出的已验证机器命令恢复。",
         ]
-    return ["请查看当前部署状态，按本 Summary 中的提示操作。"]
-
+    return ["当前没有可执行的下一步命令，请查看 PR Summary 中当前状态和原因。"]
 
 def deploy_status_comment(
     status: str, head_sha: str, repo: str, pr_number: int,

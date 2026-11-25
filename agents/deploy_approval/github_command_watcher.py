@@ -20,6 +20,7 @@ Safety rules:
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import logging
 import re
@@ -313,6 +314,7 @@ class GitHubCommandWatcher:
         # Insertion-ordered maps used as bounded sets: the oldest entry is
         # evicted first so a long-running watcher never grows without limit.
         self._posted_error_replies: dict[tuple[str, int, int], None] = {}
+        self._confirmed_command_results: dict[tuple[str, int, int], str] = {}
         # Commands that arrived before the fixed authorization baseline. They
         # must never execute, but they are not silently dropped: each one gets
         # exactly one rejection notice after its PR baseline completes.
@@ -1373,6 +1375,185 @@ class GitHubCommandWatcher:
         record["posted_notices"] = sorted(notices)
 
     @staticmethod
+    def _is_progress_reply_body(body):
+        visible = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL).casefold()
+        progress_phrases = (
+            "正在检查部署条件",
+            "预检已通过，正在准备部署请求",
+            "部署条件已通过，正在准备发送部署请求",
+            "部署 post 已发送，正在确认运行镜像",
+            "正在核对结果，请勿重复审批",
+            "尚未发送部署 post",
+        )
+        return any(phrase in visible for phrase in progress_phrases)
+
+    async def _read_final_command_result(self, repo, pr_number, comment_id):
+        """Confirm the Service's final result bound to the source comment ID."""
+        key = (repo, pr_number, comment_id)
+        cached = self._confirmed_command_results.get(key)
+        if cached in {"accepted", "rejected", "uncertain"}:
+            return cached
+        try:
+            comments = await self.proxy.get_issue_comments(repo, pr_number)
+        except Exception as exc:
+            logger.warning(
+                "watcher final reply readback failed repo=%s pr=%s comment_id=%s reason=%s",
+                repo, pr_number, comment_id, _github_failure_reason(exc),
+            )
+            return None
+        if not isinstance(comments, list):
+            return None
+        reply_marker = re.compile(
+            r"<!--\s*deploy-approval-reply-to-comment:(\d+)\s*-->"
+        )
+        result_marker = re.compile(
+            r"<!--\s*deploy-approval-result:([a-z-]+)\s*-->"
+        )
+        qa_marker = re.compile(
+            r"<!--\s*deploy-approval-qa:(.*?)\s*-->", re.DOTALL,
+        )
+        bound = []
+        for comment in comments:
+            if not isinstance(comment, dict) or not self.proxy.is_bot_comment(comment):
+                continue
+            body = comment.get("body")
+            if not isinstance(body, str):
+                continue
+            if self._is_progress_reply_body(body):
+                continue
+            ids = reply_marker.findall(body)
+            if str(comment_id) in ids:
+                bound.append((body, ids, result_marker.findall(body), qa_marker.findall(body)))
+        if len(bound) != 1:
+            return None
+        body, ids, results, qa_payloads = bound[0]
+        if (ids != [str(comment_id)] or len(results) != 1
+                or results[0] not in {"accepted", "rejected", "uncertain"}):
+            return None
+        result = results[0]
+        if result == "rejected":
+            if len(qa_payloads) != 1:
+                return None
+            try:
+                qa = json.loads(qa_payloads[0])
+            except (TypeError, ValueError):
+                return None
+            if (not isinstance(qa, dict)
+                    or not isinstance(qa.get("status"), str)
+                    or not isinstance(qa.get("error"), str)
+                    or not qa["error"].strip()
+                    or not isinstance(qa.get("head"), str)
+                    or re.fullmatch(r"[0-9a-f]{40}", qa["head"]) is None
+                    or not isinstance(qa.get("next_commands"), list)
+                    or any(not isinstance(command, str)
+                           for command in qa["next_commands"])):
+                return None
+            qa_status = qa["status"].strip()
+            if qa_status.casefold().startswith("status:"):
+                qa_status = qa_status.split(":", 1)[1].strip()
+            try:
+                labels = await self.proxy.get_issue_labels(repo, pr_number)
+            except Exception as exc:
+                logger.warning(
+                    "watcher final reply labels unavailable repo=%s pr=%s comment_id=%s reason=%s",
+                    repo, pr_number, comment_id, _github_failure_reason(exc),
+                )
+                return None
+            status_labels = [
+                label for label in labels if isinstance(label, str)
+                and label.casefold().startswith("status:")
+            ] if isinstance(labels, list) else []
+            if (len(status_labels) != 1
+                    or status_labels[0].casefold() not in CANONICAL_STATUS_LABELS
+                    or qa_status.casefold()
+                    != status_labels[0].split(":", 1)[1].strip().casefold()):
+                return None
+            visible_body = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+            visible_command_reader = getattr(
+                self.controller, "_visible_command_lines", None,
+            )
+            if not callable(visible_command_reader):
+                return None
+            visible_commands = visible_command_reader(visible_body)
+            if not isinstance(visible_commands, list):
+                return None
+            visible_commands = [item for item in visible_commands
+                                if isinstance(item, str)]
+            if qa["next_commands"] != visible_commands:
+                return None
+        self._confirmed_command_results[key] = result
+        while len(self._confirmed_command_results) > RECENT_COMMAND_NOTICE_MAX:
+            self._confirmed_command_results.pop(
+                next(iter(self._confirmed_command_results)),
+            )
+        record = self._recent_command_records.get(key)
+        if isinstance(record, dict):
+            record["final_result"] = result
+        return result
+
+    async def _source_has_final_reply_marker(self, repo, pr_number, comment_id):
+        """Distinguish a delayed/invalid final reply from a reply that is absent."""
+        try:
+            comments = await self.proxy.get_issue_comments(repo, pr_number)
+        except Exception:
+            return True  # Fail closed: never create a competing final reply.
+        if not isinstance(comments, list):
+            return True
+        marker = re.compile(
+            r"<!--\s*deploy-approval-reply-to-comment:(\d+)\s*-->"
+        )
+        return any(
+            isinstance(comment, dict)
+            and self.proxy.is_bot_comment(comment)
+            and isinstance(comment.get("body"), str)
+            and not self._is_progress_reply_body(comment["body"])
+            and str(comment_id) in marker.findall(comment["body"])
+            for comment in comments
+        )
+
+    async def _consume_final_command_reply(self, repo, pr_number, comment_id):
+        result = await self._read_final_command_result(repo, pr_number, comment_id)
+        if result is None:
+            return False
+        consumed = await self._consume_comment_cursor(repo, pr_number, comment_id)
+        self._finish_recent_command(
+            repo, pr_number, comment_id,
+            failure_reason=(None if consumed else "cursor_persist_not_confirmed"),
+            retryable=not consumed,
+        )
+        return consumed
+
+    async def _recover_final_command_reply_delivery(self, repo, pr_number, comment_id):
+        """Recover only a source-bound final notice; never re-dispatch its command."""
+        result = await self._read_final_command_result(repo, pr_number, comment_id)
+        if result is not None:
+            return result
+        if await self._source_has_final_reply_marker(repo, pr_number, comment_id):
+            return None
+        post_reply = getattr(self.controller, "_post_command_reply", None)
+        if not callable(post_reply):
+            return None
+        message = (
+            "这条命令的处理结果暂时无法确认。系统不会重复执行这条命令；"
+            "请以 PR Summary 当前显示的状态为准。"
+        )
+        try:
+            delivered = await post_reply(
+                repo, pr_number, comment_id, message,
+                topic="command-result-uncertain",
+                error=False, result="uncertain",
+            )
+        except Exception as exc:
+            logger.warning(
+                "watcher final reply recovery failed repo=%s pr=%s comment_id=%s reason=%s",
+                repo, pr_number, comment_id, _github_failure_reason(exc),
+            )
+            return None
+        if delivered is not True:
+            return None
+        return await self._read_final_command_result(repo, pr_number, comment_id)
+
+    @staticmethod
     def _is_error_notice_topic(topic) -> bool:
         return isinstance(topic, str) and topic.startswith((
             "command-error-", "command-not-ready", "command-rejected-",
@@ -1405,9 +1586,11 @@ class GitHubCommandWatcher:
         unconfirmed POST returns ``False`` without advancing any cursor, so the
         caller can retry safely.
         """
+        if await self._read_final_command_result(repo, pr_number, comment_id):
+            return True
         if (self._recent_command_error_replied(repo, pr_number, comment_id)
                 or (repo, pr_number, comment_id) in self._posted_error_replies):
-            return True
+            return False
         post_reply = getattr(self.controller, "_post_command_reply", None)
         if not callable(post_reply):
             return False
@@ -1421,7 +1604,8 @@ class GitHubCommandWatcher:
                 repo, pr_number, comment_id, _github_failure_reason(exc),
             )
             return False
-        if delivered is not True:
+        result = await self._read_final_command_result(repo, pr_number, comment_id)
+        if result is None:
             return False
         self._posted_error_replies[(repo, pr_number, comment_id)] = None
         while len(self._posted_error_replies) > RECENT_COMMAND_NOTICE_MAX:
@@ -3834,6 +4018,36 @@ class GitHubCommandWatcher:
             if isinstance(c.get("id"), int) and not isinstance(c.get("id"), bool) and c["id"] > cursor
         ]
         new_comments.sort(key=lambda c: c["id"])
+        persisted_command = state.get("command")
+        persisted_comment_id = (
+            persisted_command.get("comment_id")
+            if isinstance(persisted_command, dict) else None
+        )
+        if (type(persisted_comment_id) is int
+                and persisted_comment_id > 0
+                and persisted_comment_id == cursor
+                and persisted_command.get("phase") == "completed"):
+            source_comment = next(
+                (item for item in comments if isinstance(item, dict)
+                 and item.get("id") == persisted_comment_id),
+                None,
+            )
+            source_body = (
+                source_comment.get("body") if isinstance(source_comment, dict) else ""
+            )
+            source_command = commands_mod.parse_command(
+                source_body if isinstance(source_body, str) else "",
+                comment_id=persisted_comment_id,
+            )
+            if source_command.is_command:
+                final_result = await self._recover_final_command_reply_delivery(
+                    repo, pr_number, persisted_comment_id,
+                )
+                if final_result is not None:
+                    await self._consume_final_command_reply(
+                        repo, pr_number, persisted_comment_id,
+                    )
+                return
         native_comment_budget = 3
         native_comments_processed = 0
 
@@ -3852,13 +4066,23 @@ class GitHubCommandWatcher:
             if (isinstance(recent_command, dict)
                     and str(recent_command.get("failure_reason", "")).startswith(
                         "dispatch_outcome_unknown")):
-                # Do not replay a command after its handler began but returned
-                # an unknown result. Reconciliation on the next pass can expose
-                # a persisted executing/uncertain lifecycle for manual recovery.
+                # Recover only the source-bound final reply. The deployment
+                # handler may already have sent its POST, so never dispatch it
+                # again while the outcome or reply is uncertain.
+                result = await self._recover_final_command_reply_delivery(
+                    repo, pr_number, comment_id,
+                )
+                if result is not None:
+                    await self._consume_final_command_reply(
+                        repo, pr_number, comment_id,
+                    )
                 return
             if (isinstance(recent_command, dict)
                     and recent_command.get("failure_reason") == "cursor_persist_not_confirmed"
                     and recent_command.get("dispatch_completed_at")):
+                if await self._read_final_command_result(
+                        repo, pr_number, comment_id) is None:
+                    return
                 if await self._consume_comment_cursor(repo, pr_number, comment_id):
                     self._finish_recent_command(repo, pr_number, comment_id)
                     continue
@@ -4384,7 +4608,7 @@ class GitHubCommandWatcher:
                 self._mark_recent_command_dispatch_started(
                     repo, pr_number, comment_id,
                 )
-                handled = await self.controller.on_command(
+                await self.controller.on_command(
                     cmd, repo, pr_number, comment_id,
                 )
                 self._mark_recent_command_dispatch_completed(
@@ -4393,59 +4617,30 @@ class GitHubCommandWatcher:
                 take_reply_delivery = getattr(
                     self.controller, "take_command_reply_delivery", None,
                 )
-                reply_delivery = (
+                if (callable(take_reply_delivery)
+                        and not asyncio.iscoroutinefunction(take_reply_delivery)):
+                    # This boolean is only delivery telemetry. It is not a
+                    # source-bound final result and cannot advance the cursor.
                     take_reply_delivery(repo, pr_number, comment_id)
-                    if (callable(take_reply_delivery)
-                        and not asyncio.iscoroutinefunction(take_reply_delivery))
-                    else None
+                result = await self._read_final_command_result(
+                    repo, pr_number, comment_id,
                 )
-                if handled:
-                    if reply_delivery is False:
-                        self._finish_recent_command(
-                            repo, pr_number, comment_id,
-                            failure_reason="command_reply_not_confirmed",
-                            retryable=True,
-                        )
-                        return
-                    if reply_delivery is not True:
-                        post_reply = getattr(self.controller, "_post_command_reply", None)
-                        delivered = False
-                        if callable(post_reply):
-                            try:
-                                delivered = await post_reply(
-                                    repo, pr_number, comment_id,
-                                    "命令已处理。",
-                                    topic="command-processed",
-                                )
-                            except Exception:
-                                delivered = False
-                        if delivered is not True:
-                            self._finish_recent_command(
-                                repo, pr_number, comment_id,
-                                failure_reason="command_reply_not_confirmed",
-                                retryable=True,
-                            )
-                            return
-                    if await self._consume_comment_cursor(repo, pr_number, comment_id):
-                        self._finish_recent_command(repo, pr_number, comment_id)
-                    else:
-                        self._finish_recent_command(
-                            repo, pr_number, comment_id,
-                            failure_reason="cursor_persist_not_confirmed",
-                        )
+                if result is None:
+                    result = await self._recover_final_command_reply_delivery(
+                        repo, pr_number, comment_id,
+                    )
+                if result is not None:
+                    await self._consume_final_command_reply(
+                        repo, pr_number, comment_id,
+                    )
                 else:
+                    # The command may already have performed a deployment POST.
+                    # Preserve its source comment and suppress handler replay.
                     self._finish_recent_command(
                         repo, pr_number, comment_id,
-                        failure_reason="command_handler_returned_unfinished",
+                        failure_reason="dispatch_outcome_unknown_final_reply_not_confirmed",
+                        retryable=True,
                     )
-                    # Same reason text and current-state guidance as every
-                    # other error entry; at most one error reply per comment.
-                    await self._post_command_error_notice(
-                        repo, pr_number, comment_id, cmd,
-                        f"command-error-uncertain-{_command_kind(cmd)}",
-                    )
-                # False means unfinished work (including COS failure). Never
-                # consume a later comment past it; retry from fresh state next poll.
                 return
             except DeployCommandError as e:
                 logger.warning(
@@ -4455,41 +4650,30 @@ class GitHubCommandWatcher:
                 take_reply_delivery = getattr(
                     self.controller, "take_command_reply_delivery", None,
                 )
-                reply_delivery = (
+                if (callable(take_reply_delivery)
+                        and not asyncio.iscoroutinefunction(take_reply_delivery)):
                     take_reply_delivery(repo, pr_number, comment_id)
-                    if (callable(take_reply_delivery)
-                        and not asyncio.iscoroutinefunction(take_reply_delivery))
-                    else None
+                result = await self._read_final_command_result(
+                    repo, pr_number, comment_id,
                 )
-                if reply_delivery is True:
-                    consumed = await self._consume_comment_cursor(
+                if result is None:
+                    await self._post_command_error_notice(
+                        repo, pr_number, comment_id, cmd,
+                        f"command-error-{_command_kind(cmd)}",
+                    )
+                    result = await self._read_final_command_result(
                         repo, pr_number, comment_id,
                     )
-                    self._finish_recent_command(
+                if result is not None:
+                    await self._consume_final_command_reply(
                         repo, pr_number, comment_id,
-                        failure_reason=(type(e).__name__ if consumed else
-                                        "cursor_persist_not_confirmed"),
-                        retryable=not consumed,
                     )
-                    return
-                posted = await self._post_command_error_notice(
-                    repo, pr_number, comment_id, cmd,
-                    f"command-error-{_command_kind(cmd)}",
-                )
-                if posted is not True:
+                else:
                     self._finish_recent_command(
                         repo, pr_number, comment_id,
-                        failure_reason="command_rejection_notice_not_confirmed",
+                        failure_reason="dispatch_outcome_unknown_final_reply_not_confirmed",
                         retryable=True,
                     )
-                    return
-                consumed = await self._consume_comment_cursor(repo, pr_number, comment_id)
-                self._finish_recent_command(
-                    repo, pr_number, comment_id,
-                    failure_reason=(type(e).__name__ if consumed
-                                    else "cursor_persist_not_confirmed"),
-                    retryable=not consumed,
-                )
                 return
             except Exception as e:
                 exception_code = _exception_code(e)
@@ -4498,79 +4682,52 @@ class GitHubCommandWatcher:
                     take_reply_delivery = getattr(
                         self.controller, "take_command_reply_delivery", None,
                     )
-                    reply_delivery = (
+                    if (callable(take_reply_delivery)
+                            and not asyncio.iscoroutinefunction(take_reply_delivery)):
                         take_reply_delivery(repo, pr_number, comment_id)
-                        if (callable(take_reply_delivery)
-                            and not asyncio.iscoroutinefunction(take_reply_delivery))
-                        else None
+                    result = await self._read_final_command_result(
+                        repo, pr_number, comment_id,
                     )
-                    if reply_delivery is True:
-                        consumed = await self._consume_comment_cursor(
+                    if result is None:
+                        await self._post_command_error_notice(
+                            repo, pr_number, comment_id, cmd,
+                            f"command-error-{_command_kind(cmd)}",
+                        )
+                        result = await self._read_final_command_result(
                             repo, pr_number, comment_id,
                         )
-                        self._finish_recent_command(
+                    if result is not None:
+                        await self._consume_final_command_reply(
                             repo, pr_number, comment_id,
-                            failure_reason=(normalized_code if consumed else
-                                            "cursor_persist_not_confirmed"),
-                            retryable=not consumed,
                         )
-                        return
-                    posted = await self._post_command_error_notice(
-                        repo, pr_number, comment_id, cmd,
-                        f"command-error-{_command_kind(cmd)}",
-                    )
-                    if posted is not True:
+                    else:
                         self._finish_recent_command(
                             repo, pr_number, comment_id,
-                            failure_reason="command_rejection_notice_not_confirmed",
+                            failure_reason="dispatch_outcome_unknown_final_reply_not_confirmed",
                             retryable=True,
                         )
-                        return
-                    consumed = await self._consume_comment_cursor(
+                    return
+                result = await self._recover_final_command_reply_delivery(
+                    repo, pr_number, comment_id,
+                )
+                if result is not None:
+                    await self._consume_final_command_reply(
                         repo, pr_number, comment_id,
-                    )
-                    self._finish_recent_command(
-                        repo, pr_number, comment_id,
-                        failure_reason=(normalized_code if consumed else
-                                        "cursor_persist_not_confirmed"),
-                        retryable=not consumed,
                     )
                     return
                 self._finish_recent_command(
                     repo, pr_number, comment_id,
-                    failure_reason=f"dispatch_outcome_unknown_{_github_failure_reason(e)}",
+                    failure_reason=(
+                        "dispatch_outcome_unknown_"
+                        + _github_failure_reason(e)
+                        + "_final_reply_not_confirmed"
+                    ),
+                    retryable=True,
                 )
                 logger.error(
                     "command handler outcome unknown command=%s comment_id=%s repo=%s pr=%s error=%s; automatic replay suppressed",
                     cmd.kind, comment_id, repo, pr_number, _github_failure_reason(e),
                 )
-                # A handler may persist an in-progress deployment before
-                # failing. Keep automatic replay suppressed and route the note
-                # through the same Service formatter used by every other
-                # error entry, so the reason and current-state guidance are
-                # identical for the same Lifecycle state. A failed notice is
-                # not fatal here: the outcome is unknown either way, and the
-                # per-comment dedupe keeps any retry from double-posting.
-                failure_reason = _github_failure_reason(e)
-                if failure_reason.startswith("github_"):
-                    github_message = (
-                        "GitHub 请求受到限流，当前无法确认命令结果；"
-                        "请查看 PR Summary，在结果确认前不要重复提交可能已经开始的部署审批。"
-                        if failure_reason == "github_rate_limited" else
-                        "GitHub 请求暂时超时，当前无法确认命令结果；"
-                        "请查看 PR Summary，在结果确认前不要重复提交可能已经开始的部署审批。"
-                    )
-                    await self._post_command_error_notice(
-                        repo, pr_number, comment_id, cmd,
-                        f"command-error-github-timeout-{_command_kind(cmd)}",
-                        message=github_message,
-                    )
-                else:
-                    await self._post_command_error_notice(
-                        repo, pr_number, comment_id, cmd,
-                        f"command-error-uncertain-{_command_kind(cmd)}",
-                    )
-                # Transient error — do NOT advance cursor, stop processing this PR
                 return
 
     async def _consume_comment_cursor(self, repo: str, pr_number: int, comment_id: int) -> bool:
