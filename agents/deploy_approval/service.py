@@ -83,6 +83,7 @@ logger = logging.getLogger(__name__)
 
 AGENT_CORE_STATUS_PROBE_TIMEOUT_SECONDS = 4.0
 RUNTIME_IMAGE_CHECK_INTERVAL_SECONDS = 30 * 60
+DEPLOYMENT_UNCERTAIN_ESCALATION_SECONDS = 900
 
 
 class DeployControllerError(Exception):
@@ -5171,19 +5172,32 @@ class DeployController:
                         state, machine, new_deployments, approve_attempt["health"],
                     )
                 state["status"] = "deploying"
-                state["command"] = {
+                previous_command = state.get("command", {})
+                previous_args = (
+                    previous_command.get("args", {})
+                    if isinstance(previous_command, dict) else {}
+                )
+                uncertain_args = {
+                    "machine": machine_alias,
+                    "actor": actor,
+                    "node_id": node_id,
+                    "node_host": selected_endpoint,
+                    "deployment_request_submitted": deployment_request_submitted,
+                    "pending_component_ids": [component_id],
+                }
+                if (isinstance(previous_args, dict)
+                        and "execution_started_at" in previous_args):
+                    uncertain_args["execution_started_at"] = previous_args[
+                        "execution_started_at"
+                    ]
+                uncertain_command = {
                     "comment_id": comment_id,
                     "kind": "approve_deploy",
                     "phase": "uncertain",
-                    "args": {
-                        "machine": machine_alias,
-                        "actor": actor,
-                        "node_id": node_id,
-                        "node_host": selected_endpoint,
-                        "deployment_request_submitted": deployment_request_submitted,
-                        "pending_component_ids": [component_id],
-                    },
+                    "args": uncertain_args,
                 }
+                self._ensure_uncertain_since(uncertain_command)
+                state["command"] = uncertain_command
                 state["last_processed_comment_id"] = comment_id
                 approve_attempt["outcome"] = "uncertain"
                 self._record_approve_attempt(state, approve_attempt)
@@ -15275,23 +15289,59 @@ class DeployController:
                             return
                         state = refreshed
             cmd = state.get("command", {})
-            cmd_phase = cmd.get("phase", "")
+            cmd_phase = cmd.get("phase", "") if isinstance(cmd, dict) else ""
             same_head = current_head == state.get("head_sha", "")
             command_args = cmd.get("args", {}) if isinstance(cmd, dict) else {}
-            if (same_head and state.get("status") in {
-                    "deploying", "deploy-ready", "deploy-requested",
-                }
+            if (same_head
+                    and isinstance(cmd, dict)
+                    and cmd.get("kind") == "approve_deploy"
                     and cmd_phase == "completed"
                     and isinstance(command_args, dict)
                     and command_args.get("preflight_pending") is True):
-                restored = await self._restore_interrupted_approval_preflight(
-                    repo, pr_number,
-                    reason="上一次审批在部署前检查阶段中断，当时没有发送部署请求，这次也没有重复发送。",
-                    topic="approval-preflight-retry-required",
-                    require_stale=True,
-                )
+                try:
+                    restored = await self._restore_interrupted_approval_preflight(
+                        repo, pr_number,
+                        reason="上一次审批在部署前检查阶段中断，当时没有发送部署请求，这次也没有重复发送。",
+                        topic="approval-preflight-retry-required",
+                        require_stale=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "approval preflight recovery %s#%s failed: %s",
+                        repo, pr_number, type(exc).__name__,
+                    )
+                    restored = False
                 if restored:
                     return
+                try:
+                    latest_state = await self.proxy.read_hidden_state(repo, pr_number)
+                except Exception as exc:
+                    logger.warning(
+                        "approval preflight recovery readback %s#%s failed: %s",
+                        repo, pr_number, type(exc).__name__,
+                    )
+                    return
+                latest_command = (
+                    latest_state.get("command")
+                    if isinstance(latest_state, dict) else None
+                )
+                latest_args = (
+                    latest_command.get("args", {})
+                    if isinstance(latest_command, dict) else {}
+                )
+                if (not isinstance(latest_state, dict)
+                        or latest_state.get("head_sha") != current_head
+                        or not isinstance(latest_command, dict)
+                        or latest_command.get("kind") != "approve_deploy"
+                        or latest_command.get("phase") != "completed"
+                        or latest_command.get("comment_id") != cmd.get("comment_id")
+                        or not isinstance(latest_args, dict)
+                        or latest_args.get("preflight_pending") is not True):
+                    return
+                await self._project_status_best_effort(
+                    repo, pr_number, "deploying",
+                )
+                return
             if (cmd_phase == "executing" and same_head
                     and state.get("status") in {"deploying", "deploy-requested", "deploy-ready"}):
                 await self._handle_uncertain_if_needed(repo, pr_number, state)
@@ -15660,6 +15710,29 @@ class DeployController:
                     "reconcile lifecycle %s#%s: %s", repo, pr_number, e,
                 )
 
+    @staticmethod
+    def _ensure_uncertain_since(command: dict) -> tuple[float | None, bool]:
+        """Persist one stable epoch timestamp in command args for recovery timing."""
+        args = command.get("args") if isinstance(command, dict) else None
+        if not isinstance(args, dict):
+            return None, False
+        for key in ("uncertain_since", "execution_started_at"):
+            value = args.get(key)
+            if type(value) not in {int, float}:
+                continue
+            try:
+                timestamp = float(value)
+            except (OverflowError, ValueError):
+                continue
+            if math.isfinite(timestamp) and timestamp > 0:
+                if key == "uncertain_since":
+                    return timestamp, False
+                args["uncertain_since"] = timestamp
+                return timestamp, True
+        value = time.time()
+        args["uncertain_since"] = value
+        return value, True
+
     async def _handle_uncertain_if_needed(
         self, repo: str, pr_number: int, state: dict,
     ) -> None:
@@ -15692,6 +15765,7 @@ class DeployController:
         )
 
         cmd["phase"] = "uncertain"
+        self._ensure_uncertain_since(cmd)
         state["status"] = "deploying"
         state["command"] = cmd
         comment_id = int(cmd.get("comment_id") or 0)
@@ -15783,8 +15857,12 @@ class DeployController:
         old_args = args
         fresh_args = fresh_command.get("args", {}) if isinstance(fresh_command, dict) else {}
         if (
-            old_state.get("status") not in {"deploying", "deploy-requested"}
-            or refreshed_state.get("status") not in {"deploying", "deploy-requested"}
+            old_state.get("status") not in {
+                "deploying", "deploy-requested", "deploy-ready",
+            }
+            or refreshed_state.get("status") not in {
+                "deploying", "deploy-requested", "deploy-ready",
+            }
             or old_state.get("head_sha") != refreshed_state.get("head_sha")
             or round_id_for_state(old_state) != round_id_for_state(refreshed_state)
             or old_state.get("round_archive") != refreshed_state.get("round_archive")
@@ -15993,6 +16071,66 @@ class DeployController:
             refreshed_state["status"] = "deploying"
         return not unresolved
 
+    async def _post_deployment_recovery_escalation(
+        self, repo: str, pr_number: int, state: dict,
+    ) -> bool:
+        """Post one idempotent operator notice for a long-running uncertain deployment."""
+        command = state.get("command", {})
+        args = command.get("args", {}) if isinstance(command, dict) else {}
+        if not isinstance(args, dict):
+            return False
+        machine_alias = args.get("machine")
+        endpoint = self._canonical_primary_ipv4(args.get("node_host"))
+        comment_id = command.get("comment_id") if isinstance(command, dict) else None
+        head_sha = state.get("head_sha", "")
+        if (not isinstance(machine_alias, str) or not machine_alias
+                or not endpoint or type(comment_id) is not int or comment_id <= 0
+                or not isinstance(head_sha, str)):
+            return False
+        pending = args.get("pending_component_ids")
+        if not isinstance(pending, list):
+            return False
+        pending_ids = list(dict.fromkeys(
+            item for item in pending if isinstance(item, str) and item
+        ))
+        if not pending_ids:
+            return False
+        components = state.get("components", [])
+        by_id = {
+            item.get("component_id"): item
+            for item in components if isinstance(item, dict)
+            and isinstance(item.get("component_id"), str)
+        } if isinstance(components, list) else {}
+        lines = []
+        for component_id in pending_ids:
+            component = by_id.get(component_id, {})
+            target = str(component.get("target") or component_id)
+            image_ref = component.get("image_ref") or component.get("review_image_tag")
+            image_text = f"`{image_ref}`" if isinstance(image_ref, str) and image_ref else "无法从当前状态读取"
+            lines.append(
+                f"- {target}（`{component_id}`）：目标镜像 {image_text}"
+            )
+        message = "\n".join([
+            "部署结果已超过 15 分钟仍无法确认。",
+            f"机器：`{machine_alias}`",
+            f"本次审批时已验证并绑定的 IP：`{endpoint}`",
+            "未确认的组件及目标镜像：",
+            *lines,
+            "请检查 Agent Core 和机器运行状态。",
+            "不要重复执行 `/approve_deploy`。",
+            "控制器会继续只读核对，确认后自动更新状态。",
+        ])
+        return await self._post_bound_notice(
+            repo, pr_number,
+            head_sha=head_sha,
+            round_id=round_id_for_state(state),
+            comment_id=comment_id,
+            topic="deployment-recovery-escalation",
+            result=None,
+            expected_command_kind="approve_deploy",
+            message=message,
+        )
+
     async def _recover_uncertain_deployment_tick(
         self, repo: str, pr_number: int, state: dict, pr_data: dict,
     ) -> None:
@@ -16000,19 +16138,53 @@ class DeployController:
         command = state.get("command", {})
         if (not isinstance(command, dict) or command.get("kind") != "approve_deploy"
                 or command.get("phase") != "uncertain"
-                or state.get("status") not in {"deploying", "deploy-requested"}
+                or state.get("status") not in {
+                    "deploying", "deploy-requested", "deploy-ready",
+                }
                 or pr_data.get("head", {}).get("sha") != state.get("head_sha")):
             return
         refreshed = copy.deepcopy(state)
-        if refreshed.get("status") == "deploy-requested":
+        if refreshed.get("status") in {"deploy-ready", "deploy-requested"}:
             refreshed["status"] = "deploying"
         try:
             await self._recover_uncertain_deployments(repo, state, refreshed)
         except Exception as exc:
             logger.warning("uncertain deployment recovery tick %s#%s failed: %s",
                            repo, pr_number, type(exc).__name__)
-            return
+        refreshed_command = refreshed.get("command", {})
+        uncertain_since = None
+        if (isinstance(refreshed_command, dict)
+                and refreshed_command.get("phase") == "uncertain"):
+            uncertain_since, _ = self._ensure_uncertain_since(refreshed_command)
+            refreshed["command"] = refreshed_command
+        pending_ids = (
+            refreshed_command.get("args", {}).get("pending_component_ids", [])
+            if isinstance(refreshed_command, dict)
+            and isinstance(refreshed_command.get("args"), dict) else []
+        )
+        escalation_due = (
+            state.get("status") in {
+                "deploying", "deploy-requested", "deploy-ready",
+            }
+            and refreshed.get("status") == "deploying"
+            and isinstance(refreshed_command, dict)
+            and refreshed_command.get("phase") == "uncertain"
+            and isinstance(uncertain_since, (int, float))
+            and time.time() - uncertain_since >= DEPLOYMENT_UNCERTAIN_ESCALATION_SECONDS
+            and isinstance(pending_ids, list)
+            and any(isinstance(item, str) and item for item in pending_ids)
+        )
         if refreshed == state:
+            if escalation_due:
+                try:
+                    await self._post_deployment_recovery_escalation(
+                        repo, pr_number, refreshed,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "deployment recovery escalation %s#%s failed: %s",
+                        repo, pr_number, type(exc).__name__,
+                    )
             await self._project_status_best_effort(
                 repo, pr_number, state.get("status", "deploying"),
             )
@@ -16091,6 +16263,16 @@ class DeployController:
             except Exception as exc:
                 logger.warning("uncertain recovery label %s#%s exception=%s",
                                repo, pr_number, type(exc).__name__)
+            if escalation_due:
+                try:
+                    await self._post_deployment_recovery_escalation(
+                        repo, pr_number, refreshed,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "deployment recovery escalation %s#%s failed: %s",
+                        repo, pr_number, type(exc).__name__,
+                    )
             if (refreshed.get("status") == "testing"
                     and state.get("status") != "testing"):
                 approval_comment_id = int(command.get("comment_id", 0) or 0)
@@ -16260,11 +16442,13 @@ class DeployController:
                 repo, pr_number, current_head,
             )
             state["status"] = "deploying"
+            uncertain_args = dict(cmd.get("args", {}) or {})
+            self._ensure_uncertain_since({"args": uncertain_args})
             state["command"] = {
                 "comment_id": comment_id,
                 "kind": "approve_deploy",
                 "phase": "uncertain",
-                "args": dict(cmd.get("args", {}) or {}),
+                "args": uncertain_args,
             }
             state["last_processed_comment_id"] = max(old_cursor, comment_id)
             markdown = self._set_lifecycle_summary_status(

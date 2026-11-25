@@ -63,6 +63,8 @@ CANONICAL_STATUS_LABELS = frozenset({
     "status: failed",
 })
 ACTIVE_PROJECTION_STATUS_LABELS = frozenset({
+    "status: reviewing",
+    "status: deploy-ready",
     "status: deploy-requested",
     "status: deploying",
     "status: testing",
