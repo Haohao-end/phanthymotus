@@ -1444,6 +1444,8 @@ class GitHubCommandWatcher:
                     or not qa["error"].strip()
                     or not isinstance(qa.get("head"), str)
                     or re.fullmatch(r"[0-9a-f]{40}", qa["head"]) is None
+                    or not isinstance(qa.get("labels"), list)
+                    or any(not isinstance(label, str) for label in qa["labels"])
                     or not isinstance(qa.get("next_commands"), list)
                     or any(not isinstance(command, str)
                            for command in qa["next_commands"])):
@@ -1451,18 +1453,10 @@ class GitHubCommandWatcher:
             qa_status = qa["status"].strip()
             if qa_status.casefold().startswith("status:"):
                 qa_status = qa_status.split(":", 1)[1].strip()
-            try:
-                labels = await self.proxy.get_issue_labels(repo, pr_number)
-            except Exception as exc:
-                logger.warning(
-                    "watcher final reply labels unavailable repo=%s pr=%s comment_id=%s reason=%s",
-                    repo, pr_number, comment_id, _github_failure_reason(exc),
-                )
-                return None
             status_labels = [
-                label for label in labels if isinstance(label, str)
-                and label.casefold().startswith("status:")
-            ] if isinstance(labels, list) else []
+                label for label in qa["labels"]
+                if label.casefold().startswith("status:")
+            ]
             if (len(status_labels) != 1
                     or status_labels[0].casefold() not in CANONICAL_STATUS_LABELS
                     or qa_status.casefold()
