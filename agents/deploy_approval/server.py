@@ -6,7 +6,9 @@ Single writer: only GitHubCommandWatcher mutates deploy state.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -24,6 +26,12 @@ from .service import DeployController
 from .evidence_api import router as evidence_router
 from .evidence_auth import disabled_reason
 from .evidence_store import CosAttachmentStore
+from .feishu_machine_source import (
+    FeishuMachineSource,
+    FeishuSyncError,
+    FEISHU_SYNC_INTERVAL_SECONDS,
+    FEISHU_TOKEN_MAINTENANCE_INTERVAL_SECONDS,
+)
 
 # Install logsafe before any logging to prevent control chars from corrupting container logs.
 # This must run before logging.basicConfig and uvicorn startup.
@@ -261,12 +269,26 @@ async def _resolve_active_repos(
 
 
 
-async def _lifespan_cleanup(watcher, controller, github, github_auth):
+async def _lifespan_cleanup(
+    watcher, controller, github, github_auth, *, background_tasks=(), feishu_source=None,
+):
     """Best-effort cleanup for every lifespan exit path.
 
     Each step is independently try/except so that a cleanup failure
     never masks the original startup or shutdown exception.
     """
+    for task in background_tasks:
+        if task is not None:
+            task.cancel()
+    if background_tasks:
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+
+    try:
+        if feishu_source is not None:
+            await feishu_source.aclose()
+    except Exception as exc:
+        logger.warning("lifespan cleanup Feishu source close failed: %s", type(exc).__name__)
+
     try:
         await watcher.stop()
     except Exception as exc:
@@ -305,6 +327,8 @@ def create_app(config: Config | None = None):
     config = config or load_config()
     config.github_repos = validate_repository_names(config.github_repos)
     policy = Policy(config)
+    feishu_source = FeishuMachineSource(config)
+    policy.set_feishu_machine_source(feishu_source)
     # Repository authorization is loaded independently from each official
     # repository's main branch. Never seed Policy's legacy global list from the
     # shared local machines.yaml mount when PRs come from user-owned forks.
@@ -363,6 +387,18 @@ def create_app(config: Config | None = None):
         config.auth_valid = False
         config.active_repos = []
         config.policy_active_repos = []
+        background_tasks = []
+        policy_repos: list[str] = []
+        background_tasks.append(asyncio.create_task(
+            _periodic_feishu_token_maintenance(feishu_source),
+            name="deploy-approval-feishu-oauth-maintenance",
+        ))
+        # Queue the initial Feishu sync before GitHub repository discovery, so
+        # the first read starts as soon as the lifespan yields to the loop.
+        background_tasks.append(asyncio.create_task(
+            _periodic_feishu_sync(feishu_source, policy, policy_repos),
+            name="deploy-approval-feishu-machine-sync",
+        ))
         try:
             active_repos = await _resolve_active_repos(
                 github, desired_repos, config=config,
@@ -372,6 +408,8 @@ def create_app(config: Config | None = None):
             # _resolve_active_repos stores the formal-policy intersection from
             # that same complete Installation snapshot in policy_active_repos.
             config.auth_valid = True
+            # The watcher retains the existing independent 30-minute policy refresh.
+            policy_repos.extend(config.policy_active_repos)
             watcher.mark_repos_pending_baseline(active_repos)
             try:
                 await _bootstrap_status_labels(github, repos=active_repos)
@@ -390,6 +428,8 @@ def create_app(config: Config | None = None):
                 controller,
                 github,
                 github_auth,
+                background_tasks=background_tasks,
+                feishu_source=feishu_source,
             )
 
     app = FastAPI(title="Deploy Approval Agent", lifespan=lifespan)
@@ -401,6 +441,7 @@ def create_app(config: Config | None = None):
     app.state.watcher = watcher
     app.state.evidence_service = evidence_service
     app.state.evidence_store = store
+    app.state.feishu_machine_source = feishu_source
 
     @app.get("/healthz")
     async def healthz():
@@ -409,6 +450,56 @@ def create_app(config: Config | None = None):
     app.include_router(webhook_router)
     app.include_router(evidence_router)
     return app
+
+
+
+async def _periodic_feishu_sync(
+    source: FeishuMachineSource, policy: Policy, repos: list[str],
+) -> None:
+    # Start immediately in the background so Wiki downtime cannot hold up PR
+    # comments, test results or attachment uploads during application startup.
+    next_run = time.monotonic()
+    while True:
+        delay = next_run - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        try:
+            if await source.sync():
+                # Each repository keeps its own main-branch policy snapshots.
+                for repo in tuple(repos):
+                    try:
+                        policy.get_machines(repo=repo)
+                    except Exception as exc:
+                        logger.warning(
+                            "Feishu policy identity projection failed repo=%s reason=%s",
+                            repo, type(exc).__name__,
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A transient network, schema, or policy projection error must not
+            # terminate the hourly sync loop.
+            logger.warning("Feishu periodic sync iteration failed: %s", type(exc).__name__)
+        next_run += FEISHU_SYNC_INTERVAL_SECONDS
+        while next_run <= time.monotonic():
+            next_run += FEISHU_SYNC_INTERVAL_SECONDS
+
+
+async def _periodic_feishu_token_maintenance(source: FeishuMachineSource) -> None:
+    """Maintain OAuth credentials separately from the hourly document read."""
+    last_reported_error = None
+    while True:
+        try:
+            await source.ensure_access_token()
+            last_reported_error = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, FeishuSyncError) else type(exc).__name__
+            if reason != last_reported_error:
+                logger.warning("FEISHU_OAUTH_MAINTENANCE_FAILED reason=%s", reason)
+            last_reported_error = reason
+        await asyncio.sleep(FEISHU_TOKEN_MAINTENANCE_INTERVAL_SECONDS)
 
 
 def main():

@@ -23,8 +23,8 @@ same what/why/which-command structure.
 
 Commands are public:
   - ``/request_deploy`` — optional PR Author request for current HEAD
-  - ``/approve_deploy`` — Machine Owner approves; selects by alias or IPv4
-    when needed and may omit ``machine=`` for one fully compatible machine
+  - ``/approve_deploy`` — Machine Owner approves; selects by alias, primary IPv4,
+    or a Policy-confirmed endpoint for the same physical machine
   - ``/record_test`` — Machine Owner records test result (no machine=)
   - ``/request_acceptance`` — Machine Owner requests independent acceptance
   - ``/evidence_link`` — Deprecated; consumed with a deprecation notice
@@ -274,7 +274,7 @@ def _iter_top_level_command_lines(comment_text: str) -> list[str]:
     return result
 
 
-def parse_command(comment_text: str) -> ParsedCommand:
+def _parse_command(comment_text: str) -> ParsedCommand:
     """Parse the first top-level command line in ``comment_text``."""
     if not comment_text:
         return ParsedCommand(kind="unknown", raw="")
@@ -328,6 +328,14 @@ def parse_command(comment_text: str) -> ParsedCommand:
             parsed.error = parsed.error or "invalid_arguments"
         return parsed
     return ParsedCommand(kind="unknown", raw="")
+
+
+def parse_command(comment_text: str, *, comment_id: int = 0) -> ParsedCommand:
+    """Parse a command and bind it to its immutable GitHub source comment."""
+    parsed = _parse_command(comment_text)
+    if type(comment_id) is int and comment_id > 0:
+        parsed.comment_id = comment_id
+    return parsed
 
 
 def _is_single_edit_or_transposition(name: str, candidate: str) -> bool:

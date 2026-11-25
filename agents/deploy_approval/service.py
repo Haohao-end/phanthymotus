@@ -22,6 +22,7 @@ import ipaddress
 import math
 
 import asyncio
+import json
 import logging
 import time
 import copy
@@ -46,10 +47,13 @@ from .evidence_builder import EvidenceBuilder
 from .evidence_models import (
     archive_snapshot, make_round_id, round_id_for_state, trusted_round_numbers, utc_now,
 )
-from .github_client import GitHubClient, GitHubError
+from .github_client import (
+    GitHubClient, GitHubError, GitHubRateLimitError, GitHubTransientError,
+)
 from .github_state_proxy import (
     GitHubStateProxy,
     GitHubStateProxyError,
+    _ALLOWED_STATUS_LABELS,
     _validate_hidden_state,
     _extract_hidden_state,
     _build_hidden_state_body,
@@ -59,6 +63,7 @@ from .github_state_proxy import (
     _MAX_VISIBLE_LIFECYCLE_BYTES,
     HISTORY_ARCHIVE_MARKER_PREFIX,
     HISTORY_EVENT_DELIMITER,
+    STATUS_PREFIX,
     _next_history_archive_page,
     _build_archive_body,
     _parse_visible_history,
@@ -287,6 +292,13 @@ class DeployController:
         self._agent_core_health: dict[
             tuple[str, str], tuple[float, tuple[str, str, str], str]
         ] = {}
+        # V49 Codex C contract: Agent Core-verified endpoint bindings. Only
+        # endpoints that pass the read-only Agent Core health and identity
+        # checks can generate new approval commands. Keyed by
+        # (repo, machine_alias) for history-compatible access.
+        self._agent_core_verified_endpoints_cache: dict[
+            tuple[str, str], list[dict[str, str]]
+        ] = {}
         self.cos = CosClient(config)
         self._case_runner: CaseRunner | None = None
         self._evidence_lock = asyncio.Lock()
@@ -321,8 +333,8 @@ class DeployController:
         key = self._command_reply_key(repo, pr_number, comment_id)
         if key not in self._command_reply_tracking:
             return
-        previous = self._command_reply_delivery.get(key, True)
-        self._command_reply_delivery[key] = previous and delivered
+        previous = self._command_reply_delivery.get(key, False)
+        self._command_reply_delivery[key] = previous or delivered
 
     async def aclose(self) -> None:
         for core in self._core_clients.values():
@@ -334,6 +346,292 @@ class DeployController:
         self._core_client_fingerprints.clear()
 
     # ── Core helpers ──
+
+    def _resolve_policy_machine_selector(
+        self, selector: str, repo: str,
+    ) -> tuple[object, str]:
+        """Resolve an alias or any confirmed address without crossing devices."""
+        machines = self.policy.get_machines(repo=repo)
+        if not isinstance(machines, list):
+            raise PolicyError("current machine policy is unavailable")
+        policy_resolver = getattr(self.policy, "resolve_machine_selector", None)
+        if callable(policy_resolver):
+            try:
+                parameters = list(inspect.signature(policy_resolver).parameters.values())
+            except (TypeError, ValueError):
+                parameters = []
+            if len(parameters) >= 2 and parameters[1].name in {"repo", "repository"}:
+                resolved = policy_resolver(selector, repo)
+                resolved_machine, resolved_endpoint = resolved, ""
+                if (isinstance(resolved, tuple) and len(resolved) == 2):
+                    resolved_machine, resolved_endpoint = resolved
+                if isinstance(resolved_machine, str):
+                    resolved_alias = resolved_machine
+                    resolved_machine = next((item for item in machines
+                                             if getattr(item, "alias", None) == resolved_alias), None)
+                if resolved_machine is not None:
+                    resolved_alias = str(getattr(resolved_machine, "alias", "") or "")
+                    current_matches = [item for item in machines
+                                       if getattr(item, "alias", None) == resolved_alias]
+                    if len(current_matches) != 1:
+                        raise PolicyError("machine selector is ambiguous in current repository policy")
+                    resolved_machine = current_matches[0]
+                    selected = self._canonical_primary_ipv4(resolved_endpoint)
+                    if not selected and self._canonical_primary_ipv4(selector):
+                        selected = self._canonical_primary_ipv4(selector)
+                    endpoints = {
+                        item["ip"] for item in self._policy_machine_endpoints(
+                            resolved_machine, repo,
+                        )
+                    }
+                    if (selected and selected not in endpoints
+                            or not self._endpoint_allowed_for_repository(
+                                repo, resolved_machine, selected or next(iter(endpoints), ""),
+                                policy_machines=machines)):
+                        raise PolicyError("machine selector is not a confirmed endpoint")
+                    return resolved_machine, selected
+        by_alias = {
+            str(getattr(item, "alias", "") or ""): item for item in machines
+            if getattr(item, "alias", None)
+        }
+        if selector in by_alias:
+            machine = by_alias[selector]
+            endpoints = self._policy_machine_endpoints(machine, repo)
+            if not endpoints or not self._endpoint_allowed_for_repository(
+                    repo, machine, endpoints[0]["ip"], policy_machines=machines):
+                raise PolicyError("machine identity or endpoints are not confirmed")
+            return machine, ""
+        endpoint = self._canonical_primary_ipv4(selector)
+        if not endpoint:
+            raise PolicyError("invalid machine selector")
+        matches = [machine for machine in machines
+                   if endpoint in {item["ip"] for item in
+                                   self._policy_machine_endpoints(machine, repo)}
+                   and self._endpoint_allowed_for_repository(
+                       repo, machine, endpoint, policy_machines=machines)]
+        if len(matches) != 1:
+            raise PolicyError("machine endpoint is missing or ambiguous")
+        return matches[0], endpoint
+
+    def _policy_machine_identity(self, machine, repo: str):
+        identity = getattr(self.policy, "machine_identity", None)
+        if callable(identity):
+            return identity(machine, repo)
+        # Legacy Policy has no endpoint inventory. This binds only its primary
+        # address and never grants an unconfirmed secondary address.
+        return (
+            str(getattr(machine, "alias", "") or ""),
+            str(getattr(machine, "node_id", "") or ""),
+            self._canonical_primary_ipv4(getattr(machine, "node_host", "")),
+        )
+
+    @staticmethod
+    def _machine_identity_is_confirmed(identity) -> bool:
+        if identity is None or identity is False or identity == "":
+            return False
+        if isinstance(identity, dict):
+            return identity.get("confirmed") is True and identity.get("stale") is not True
+        return True
+
+    @staticmethod
+    def _physical_machine_identity_key(identity):
+        if isinstance(identity, dict):
+            addresses = identity.get("addresses", [])
+            if isinstance(addresses, dict):
+                addresses = [addresses]
+            address_keys = []
+            for item in addresses if isinstance(addresses, (list, tuple, set)) else []:
+                if isinstance(item, dict):
+                    address_keys.append((str(item.get("ip", "")), str(item.get("label", ""))))
+                elif isinstance(item, str):
+                    address_keys.append((item, ""))
+            return (
+                identity.get("number"), identity.get("brand"), identity.get("model"),
+                tuple(sorted(address_keys)),
+            )
+        return identity
+
+    def _policy_machine_endpoints(self, machine, repo: str) -> list[dict[str, str]]:
+        """Return only current, Policy-confirmed IPv4 endpoints for one machine."""
+        resolver = getattr(self.policy, "get_machine_endpoints", None)
+        if not callable(resolver):
+            return []
+        try:
+            raw_endpoints = resolver(machine, repo)
+        except Exception as exc:
+            logger.warning("machine endpoint policy unavailable repo=%s machine=%s reason=%s",
+                           repo, getattr(machine, "alias", ""), type(exc).__name__)
+            return []
+        if not isinstance(raw_endpoints, list):
+            return []
+        primary_ip = self._canonical_primary_ipv4(
+            getattr(machine, "node_host", ""),
+        )
+        normalized: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in raw_endpoints:
+            # Policy's current contract is list[dict[str, str]]. Continue
+            # accepting historical string/object entries, but only values
+            # returned by Policy count as endpoint confirmation.
+            if isinstance(item, str):
+                address, label = item, ""
+            elif isinstance(item, dict):
+                address, label = item.get("ip"), item.get("label", "")
+            else:
+                address = getattr(item, "ip", None)
+                label = getattr(item, "label", "")
+            endpoint = self._canonical_primary_ipv4(address)
+            if not endpoint or endpoint in seen:
+                continue
+            seen.add(endpoint)
+            normalized.append({
+                "ip": endpoint,
+                "label": label.strip() if isinstance(label, str) else "",
+            })
+        if primary_ip:
+            normalized.sort(key=lambda item: item["ip"] != primary_ip)
+        return normalized
+
+    def _machine_endpoint_is_current(
+        self, machine, endpoint: str, repo: str, expected_identity=None,
+    ) -> bool:
+        if (not self._endpoint_allowed_for_repository(
+                    repo, machine, endpoint,
+                )
+                or endpoint not in {item["ip"] for item in self._policy_machine_endpoints(machine, repo)}):
+            return False
+        current_identity = self._policy_machine_identity(machine, repo)
+        return (self._machine_identity_is_confirmed(current_identity)
+                and (expected_identity is None or current_identity == expected_identity))
+
+    def _machine_endpoint_has_unambiguous_identity(
+        self, machine, endpoint: str, repo: str, expected_identity,
+    ) -> bool:
+        if not self._machine_endpoint_is_current(
+                machine, endpoint, repo, expected_identity):
+            return False
+        try:
+            peers = self.policy.get_machines(repo=repo)
+        except Exception:
+            return False
+        if not isinstance(peers, list):
+            return False
+        expected_key = self._physical_machine_identity_key(expected_identity)
+        if (not expected_key
+                or (isinstance(expected_identity, dict)
+                    and (not expected_identity.get("number")
+                         or not expected_identity.get("addresses")))):
+            return False
+        for peer in peers:
+            try:
+                peer_primary = self._canonical_primary_ipv4(
+                    getattr(peer, "node_host", ""),
+                )
+                peer_endpoints = self._policy_machine_endpoints(peer, repo)
+                if endpoint not in {item["ip"] for item in peer_endpoints} and endpoint != peer_primary:
+                    continue
+                peer_identity = self._policy_machine_identity(peer, repo)
+            except Exception:
+                return False
+            if (not self._machine_identity_is_confirmed(peer_identity)
+                    or self._physical_machine_identity_key(peer_identity) != expected_key):
+                return False
+        return True
+
+    def _endpoint_connection_fingerprint(self, machine, endpoint: str) -> tuple[str, str, str]:
+        alias = str(getattr(machine, "alias", "") or "")
+        token = self._agent_core_token(alias)
+        return (
+            str(getattr(machine, "node_id", "") or ""), endpoint,
+            self._credential_fingerprint(token)
+            or ("injected-factory" if self._agent_core_factory is not None else ""),
+        )
+
+    async def _core_for_machine_endpoint(
+        self, machine, endpoint: str, repo: str, *, timeout: float | None = None,
+    ) -> AgentCoreClient:
+        """Authenticate one endpoint belonging to this exact policy machine."""
+        identity = self._policy_machine_identity(machine, repo)
+        if (not self._machine_identity_is_confirmed(identity)
+                or not self._machine_endpoint_has_unambiguous_identity(
+                    machine, endpoint, repo, identity,
+                )):
+            raise DeployControllerError("machine endpoint identity is not confirmed")
+        endpoint = self._canonical_primary_ipv4(endpoint)
+        alias = str(getattr(machine, "alias", "") or "")
+        if not alias or not endpoint:
+            raise DeployControllerError("machine endpoint is invalid")
+        try:
+            policy_status = self.policy.repo_policy_status(repo)
+            machines = self.policy.get_machines(repo=repo)
+        except Exception as exc:
+            raise DeployControllerError(
+                f"cannot verify current machine policy for {repo}: {type(exc).__name__}"
+            ) from exc
+        if (not isinstance(policy_status, dict)
+                or policy_status.get("authorized") is not True
+                or policy_status.get("machines_configured") is not True
+                or not isinstance(machines, list)):
+            raise DeployControllerError("current repository machine policy is unavailable")
+        matches = [item for item in machines if getattr(item, "alias", None) == alias]
+        if len(matches) != 1 or not self._endpoint_allowed_for_repository(
+                repo, matches[0], endpoint, policy_machines=machines):
+            raise DeployControllerError(
+                f"machine endpoint {endpoint} is not confirmed for {alias} in {repo}"
+            )
+        current = matches[0]
+        if str(getattr(current, "node_id", "") or "") != str(
+                getattr(machine, "node_id", "") or ""):
+            raise DeployControllerError("machine identity changed before Agent Core authentication")
+        primary_ip = self._canonical_primary_ipv4(getattr(current, "node_host", ""))
+        if endpoint == primary_ip:
+            return await self._core_for_node(current.node_id, repo, timeout=timeout)
+        token = self._agent_core_token(alias)
+        if not token:
+            raise DeployControllerError(
+                f"no current agent_core_token is configured for machine {alias!r} in {repo}"
+            )
+        self._assert_repo_machine_credential_scope(repo, current)
+        fingerprint = (
+            str(getattr(current, "node_id", "") or ""), endpoint,
+            self._credential_fingerprint(token),
+        )
+        cache_key = (repo.casefold(), f"{alias}@{endpoint}")
+        cached = self._core_clients.get(cache_key)
+        if cached is not None and self._core_client_fingerprints.get(cache_key) == fingerprint:
+            return cached
+        if cached is not None:
+            await self._close_core_client(cache_key)
+        endpoint_machine = copy.copy(current)
+        endpoint_machine.node_host = endpoint
+        try:
+            client = await self._resolve_core_client(
+                current.node_id, repo, machine=endpoint_machine, token=token,
+                timeout=timeout, use_factory=False,
+            )
+        except Exception:
+            self._record_agent_core_health(repo, current, "unavailable")
+            raise
+        try:
+            latest = self.policy.get_machines(repo=repo)
+            latest_matches = [item for item in latest
+                              if getattr(item, "alias", None) == alias] if isinstance(latest, list) else []
+            if (len(latest_matches) != 1
+                    or self._machine_connection_fingerprint(latest_matches[0])
+                    != self._machine_connection_fingerprint(current)
+                    or not self._endpoint_allowed_for_repository(
+                        repo, latest_matches[0], endpoint, policy_machines=latest)):
+                await self._close_client(client)
+                raise DeployControllerError(
+                    "machine identity, endpoints, or credentials changed during Agent Core authentication"
+                )
+        except Exception:
+            await self._close_client(client)
+            raise
+        self._core_clients[cache_key] = client
+        self._core_client_fingerprints[cache_key] = fingerprint
+        self._record_agent_core_health(repo, current, "available")
+        return client
 
     async def _core_for_node(
         self, node_id: str, repo: str, *, timeout: float | None = None,
@@ -453,9 +751,9 @@ class DeployController:
 
     async def _resolve_core_client(
         self, node_id: str, repo: str, *, machine=None, token: str = "",
-        timeout: float | None = None,
+        timeout: float | None = None, use_factory: bool = True,
     ) -> AgentCoreClient:
-        if self._agent_core_factory is not None:
+        if use_factory and self._agent_core_factory is not None:
             client = self._agent_core_factory(node_id)
             if client is not None:
                 return client
@@ -468,14 +766,14 @@ class DeployController:
             raise DeployControllerError(
                 f"no agent_core_token configured for machine {machine.alias!r} in {repo}"
             )
-        base_url = f"https://{machine.node_host}:15678"
+        base_url = f"https://{node_host}:15678"
         # This deployment path keeps the policy-bound legacy HTTPS + token contract.
         core_config = copy.copy(self.config)
         core_config.agent_core_tls_mode = "legacy"
         core = AgentCoreClient(
             core_config,
             base_url,
-            node_host=machine.node_host,
+            node_host=node_host,
             machine_alias=machine.alias,
             access_token=token,
             repository_machine=machine,
@@ -1888,7 +2186,9 @@ class DeployController:
             return False
         command = state.get("command", {})
         args = command.get("args", {}) if isinstance(command, dict) else {}
-        if (state.get("status") != "deploying"
+        if (state.get("status") not in {
+                    "deploying", "deploy-ready", "deploy-requested",
+                }
                 or not isinstance(command, dict)
                 or command.get("kind") != "approve_deploy"
                 or command.get("phase") != "completed"
@@ -2851,7 +3151,10 @@ class DeployController:
                 return state, state, False, False, True
             machines = self.policy.get_machines(repo=repo)
             machine_map = {item.alias: item for item in machines}
-            machine = Policy.resolve_machine_selector(machine_selector, machine_map)
+            machine, requested_endpoint = self._resolve_policy_machine_selector(
+                machine_selector, repo,
+            )
+            requested_endpoint = str(requested_endpoint or "")
         except PolicyError:
             await self._post_command_reply(
                 repo, pr_number, comment_id,
@@ -2876,8 +3179,13 @@ class DeployController:
         machine_ip = str(current_ip) if current_ip is not None and current_ip.version == 4 else ""
         permitted_selector = self._machine_command_selector(machine.alias, repo)
         display_selector = self._machine_ip_command_selector(machine.alias, repo)
+        requested_endpoint = self._canonical_primary_ipv4(machine_selector)
+        confirmed_endpoints = {
+            item["ip"] for item in self._policy_machine_endpoints(machine, repo)
+        }
         if (not machine_ip or not permitted_selector
-                or machine_selector not in {machine.alias, permitted_selector}):
+                or (machine_selector not in {machine.alias, permitted_selector}
+                    and requested_endpoint not in confirmed_endpoints)):
             exact_command = f"`/approve_deploy machine={display_selector}`" if display_selector else ""
             await self._post_command_reply(
                 repo, pr_number, comment_id,
@@ -2947,7 +3255,7 @@ class DeployController:
                 getattr(fresh_machine, "node_id", "") or "",
             ).strip()
             _, fresh_identity_matches = self._machine_identity_matches(
-                machine.alias, fresh_machine, [], fresh_machines,
+                machine.alias, fresh_machine, None, fresh_machines, repo=repo,
             )
             fresh_selector = self._machine_command_selector(machine.alias, repo)
         except Exception as exc:
@@ -3221,6 +3529,50 @@ class DeployController:
                 return True
             initial_lifecycle_state = copy.deepcopy(state)
 
+            existing_command = state.get("command", {})
+            existing_args = (
+                existing_command.get("args", {})
+                if isinstance(existing_command, dict) else {}
+            )
+            if (isinstance(existing_command, dict)
+                    and existing_command.get("kind") == "approve_deploy"
+                    and existing_command.get("phase") in {"executing", "uncertain"}):
+                await self._post_command_reply(
+                    repo, pr_number, comment_id,
+                    "部署请求正在执行或结果仍在确认，这次没有重复提交部署。",
+                    topic="deployment-already-in-progress",
+                )
+                return True
+            if (isinstance(existing_command, dict)
+                    and existing_command.get("kind") == "approve_deploy"
+                    and existing_command.get("phase") == "completed"
+                    and isinstance(existing_args, dict)
+                    and existing_args.get("preflight_pending") is True):
+                stale_preflight_restored = await self._restore_interrupted_approval_preflight(
+                        repo, pr_number,
+                        reason=(
+                            "上一次审批在部署前检查阶段中断，当时没有发送部署请求，"
+                            "这次也没有重复发送。"
+                        ),
+                        topic="approval-preflight-retry-required",
+                        require_stale=True,
+                        expected_comment_id=int(existing_command.get("comment_id", 0) or 0),
+                )
+                if stale_preflight_restored:
+                    if existing_command.get("comment_id") != comment_id:
+                        await self._post_command_reply(
+                            repo, pr_number, comment_id,
+                            "上一次审批在部署前检查阶段中断，本次审批没有执行，也没有发送部署 POST。",
+                            topic="deployment-preflight-interrupted",
+                        )
+                    return True
+                await self._post_command_reply(
+                    repo, pr_number, comment_id,
+                    "上一次审批仍在检查部署条件，这次没有重复提交；请等待 PR Summary 更新。",
+                    topic="deployment-already-in-progress",
+                )
+                return True
+
             _current_status = state.get("status", "")
             deployment_request_submitted = _current_status == "deploy-requested"
             redeploy_mode = False
@@ -3348,8 +3700,11 @@ class DeployController:
                         state.get("deployments", []),
                     )
                 ]
-                groups = self._get_machine_groups_for_components(
-                    remaining_for_selection, repo,
+                groups = self._machine_groups_verify_endpoints(
+                    self._get_machine_groups_for_components(
+                        remaining_for_selection, repo,
+                    ),
+                    repo,
                 )
                 remaining_ids = {
                     component.get("component_id") for component in remaining_for_selection
@@ -3380,8 +3735,10 @@ class DeployController:
                 machine_alias = str(options[0].get("command_selector", "") or "")
 
             try:
-                machine_map = {item.alias: item for item in self.policy.get_machines(repo=repo)}
-                machine = Policy.resolve_machine_selector(machine_alias, machine_map)
+                machine, requested_endpoint = self._resolve_policy_machine_selector(
+                    machine_alias, repo,
+                )
+                requested_endpoint = str(requested_endpoint or "")
             except PolicyError:
                 # Keep the reply to the unified two-block shape: why it failed
                 # plus the current correct operation taken from lifecycle
@@ -3402,6 +3759,36 @@ class DeployController:
             approved_machine_binding = (
                 machine.alias, machine.node_id, machine.node_host,
             )
+            approved_primary_ip = self._canonical_primary_ipv4(machine.node_host)
+
+            # V49: dynamic machine identity drives endpoint selection. The
+            # confirmed endpoint list comes from the current Policy Feishu
+            # snapshot for this repository, and only Agent Core-verified
+            # addresses are executable. Explicitly selected endpoints take
+            # priority; otherwise the registered primary IP is used first.
+            approved_machine_identity = self._policy_machine_identity(machine, repo)
+            requested_ip = self._canonical_primary_ipv4(requested_endpoint)
+            try:
+                policy_endpoints = self._policy_machine_endpoints(machine, repo)
+            except Exception:
+                policy_endpoints = []
+            policy_machines = []
+            try:
+                policy_machines = self.policy.get_machines(repo=repo) or []
+            except Exception:
+                policy_machines = []
+            if (requested_ip
+                    and requested_ip in {item["ip"] for item in policy_endpoints}
+                    and self._endpoint_allowed_for_repository(
+                        repo, machine, requested_ip,
+                        policy_machines=policy_machines,
+                    )):
+                confirmed_endpoints = [
+                    requested_ip,
+                    *{item["ip"] for item in policy_endpoints if item["ip"] != requested_ip},
+                ]
+            else:
+                confirmed_endpoints = [item["ip"] for item in policy_endpoints]
 
             # Check permissions async
             await self._check_approval_permissions(
@@ -3485,11 +3872,12 @@ class DeployController:
                 return True
 
 
-            # Approval acceptance enters deploying before the read-only
-            # preflight. `phase=completed` plus this marker proves that no
-            # deploy POST has started; the command changes to `executing` only
-            # after all checks pass.
-            state["status"] = "deploying"
+            # Record the source approval while retaining deploy-ready or
+            # deploy-requested until the first deployment POST is actually sent.
+            preflight_source_status = (
+                "deploy-requested" if deployment_request_submitted else "deploy-ready"
+            )
+            state["status"] = preflight_source_status
             state["command"] = {
                 "comment_id": comment_id,
                 "kind": "approve_deploy",
@@ -3505,11 +3893,18 @@ class DeployController:
             state["last_processed_comment_id"] = max(
                 int(state.get("last_processed_comment_id", 0) or 0), comment_id,
             )
+            candidate_errors: list[Exception] = []
+            core = None
+            preflight = None
+            selected_endpoint = ""
+            selected_core_key = None
+            preflight_reason = ""
             try:
                 preflight_written = await self._write_lifecycle_with_history(
                     repo, pr_number, state,
                     self._deployment_progress_markdown(
-                        repo, pr_number, state, machine, selected_components, "审批已收到，正在检查",
+                        repo, pr_number, state, machine, selected_components,
+                        "审批已收到，正在检查部署条件",
                         test_only=self._is_test_only_pr(pr_data),
                     ), event=None,
                     expected_lifecycle_state=initial_lifecycle_state,
@@ -3517,33 +3912,96 @@ class DeployController:
                 if not preflight_written:
                     return False
                 initial_lifecycle_state = copy.deepcopy(state)
-                await self._project_status_best_effort(repo, pr_number, "deploying")
-                target_images = "\n".join(
-                    f"- `{component.get('target', 'component')}`: `{component.get('image_ref', 'unknown')}`"
-                    for component in selected_components
-                ) or "- 当前审批所选镜像"
-                start_notice_posted = await self._post_bound_notice(
+                checking_notice = await self._post_bound_notice(
                     repo, pr_number, head_sha=pr_head,
                     round_id=round_id_for_state(state), comment_id=comment_id,
-                    topic="deployment-started",
+                    topic="approval-preflight-started",
                     expected_command_kind="approve_deploy",
-                    message="\n".join([
-                        f"部署已经开始：机器 `{machine_alias}`（IP `{machine.node_host}`）。",
-                        "本次部署的镜像：",
-                        target_images,
-                        "",
-                        "不需要重复发送审批，部署完成后即可开始测试。",
-                    ]),
+                    message="审批已收到，正在检查部署条件。",
                 )
-                if not start_notice_posted:
+                if not checking_notice:
                     return False
-                node_id = machine.node_id
-                core = await self._core_for_node(node_id, repo)
-                preflight = await self._preflight_running_images(core, selected_components)
-                self._record_agent_core_health(repo, machine, "available")
-            except (AgentCoreError, DeployControllerError, TimeoutError, OSError) as exc:
-                # This try block contains read-only preflight and no deploy POST.
-                self._record_agent_core_health(repo, machine, "unavailable")
+                if not confirmed_endpoints:
+                    if not self._machine_identity_is_confirmed(approved_machine_identity):
+                        candidate_errors.append(DeployControllerError(
+                            "current Feishu device identity is not confirmed"
+                        ))
+                    else:
+                        candidate_errors.append(DeployControllerError(
+                            "no Policy-confirmed Agent Core endpoint is available"
+                        ))
+                for endpoint in confirmed_endpoints:
+                    try:
+                        if (not self._machine_identity_is_confirmed(
+                                    approved_machine_identity,
+                                )
+                                or not self._machine_endpoint_has_unambiguous_identity(
+                                    machine, endpoint, repo, approved_machine_identity,
+                                )):
+                            raise DeployControllerError(
+                                "machine endpoint identity is not confirmed"
+                            )
+                        candidate_core = await self._core_for_machine_endpoint(
+                            machine, endpoint, repo,
+                        )
+                        candidate_preflight = await self._preflight_running_images(
+                            candidate_core, selected_components,
+                        )
+                        for item in candidate_preflight:
+                            component = item.get("component", {})
+                            if (component.get("target") != "core"
+                                    and item.get("runtime_repo") != _image_repository(
+                                        str(component.get("image_ref", "") or ""))):
+                                raise DeployControllerError(
+                                    "Driver runtime image repository does not match the approved target repository"
+                                )
+                        endpoint_pr = await self.proxy.get_pr(repo, pr_number)
+                        if (not isinstance(endpoint_pr, dict)
+                                or endpoint_pr.get("state") != "open"
+                                or endpoint_pr.get("merged") or endpoint_pr.get("draft")
+                                or (endpoint_pr.get("head") or {}).get("sha") != pr_head):
+                            raise PolicyError(
+                                "PR HEAD changed during deployment preflight"
+                            )
+                        await self._check_approval_permissions(machine, actor, repo)
+                        current_machine = self.policy.get_machine(machine_alias, repo=repo)
+                        if (current_machine is None
+                                or (current_machine.alias, current_machine.node_id,
+                                    current_machine.node_host) != approved_machine_binding
+                                or not self._machine_endpoint_has_unambiguous_identity(
+                                    current_machine, endpoint, repo,
+                                    approved_machine_identity,
+                                )):
+                            raise PolicyError(
+                                "machine identity or endpoint changed during deployment preflight"
+                            )
+                        core = candidate_core
+                        preflight = candidate_preflight
+                        selected_endpoint = endpoint
+                        selected_core_key = (
+                            repo.casefold(), machine_alias if endpoint ==
+                            self._canonical_primary_ipv4(machine.node_host)
+                            else f"{machine_alias}@{endpoint}"
+                        )
+                        self._record_agent_core_health(repo, machine, "available")
+                        break
+                    except (PolicyError, GitHubError):
+                        raise
+                    except (AgentCoreError, DeployControllerError, TimeoutError, OSError) as endpoint_error:
+                        candidate_errors.append(endpoint_error)
+                        self._record_agent_core_health(repo, machine, "unavailable")
+                        continue
+                if preflight is None or core is None:
+                    preflight_reason = self._preflight_failure_reason(candidate_errors)
+                    raise DeployControllerError(preflight_reason)
+            except (
+                AgentCoreError, DeployControllerError, PolicyError, GitHubError,
+                TimeoutError, OSError,
+            ) as exc:
+                # No deploy POST is possible in this block. Restore the source
+                # lifecycle and explain which actual gate failed.
+                if exc not in candidate_errors:
+                    candidate_errors.append(exc)
                 fresh = await self.proxy.read_hidden_state(repo, pr_number)
                 if fresh != state:
                     return False
@@ -3551,7 +4009,7 @@ class DeployController:
                     self._mark_runtime_checks_unavailable(
                         state, machine, selected_components,
                     )
-                state["status"] = self._approval_retry_status(state)
+                state["status"] = preflight_source_status
                 state["command"] = {
                     "comment_id": comment_id, "kind": "approve_deploy", "phase": "completed",
                     "args": {
@@ -3560,16 +4018,17 @@ class DeployController:
                     },
                 }
                 state["last_processed_comment_id"] = comment_id
+                reason = preflight_reason or self._preflight_failure_reason(candidate_errors)
                 markdown = self._deployment_progress_markdown(
                     repo, pr_number, state, machine, selected_components,
-                    "部署前检查没有通过；机器当前无法连接或运行环境不可用，因此没有开始部署。请稍后按当前 PR Summary 重新审批。",
+                    f"部署预检失败：{reason} 本次没有开始部署，也没有发送部署 POST。请根据当前 Summary 再操作。",
                     test_only=self._is_test_only_pr(pr_data),
                 )
                 preflight_failure_written = await self._write_lifecycle_with_history(
                     repo, pr_number, state, markdown,
-                    event={"event": "Preflight failed", "machine": machine_alias,
-                           "ip": self._runtime_display_identity(machine_alias, repo)[0],
-                           "reason": type(exc).__name__,
+                    event={"event": "Deployment preflight failed", "machine": machine_alias,
+                           "ip": selected_endpoint or self._runtime_display_identity(machine_alias, repo)[0],
+                           "reason": reason,
                            "timestamp": comments_mod.beijing_now_str()},
                     expected_lifecycle_state=fresh,
                 )
@@ -3578,7 +4037,7 @@ class DeployController:
                 await self._project_status_best_effort(repo, pr_number, state["status"])
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    "机器没有通过部署前检查，因此部署没有开始。",
+                    f"部署预检失败：{reason} 本次没有开始部署，也没有发送部署 POST。",
                     topic="deployment-preflight-check-failed",
                 )
                 return True
@@ -3708,7 +4167,7 @@ class DeployController:
             validated_state = await self._revalidate_hidden_state(
                 repo, pr_number, final_head,
                 state.get("review_evidence", {}),
-                expected_status="deploying",
+                expected_status=preflight_source_status,
                 expected_component_snapshot=expected_component_snapshot,
                 expected_deployments=expected_deployments,
             )
@@ -3746,7 +4205,7 @@ class DeployController:
                 test_only=self._is_test_only_pr(pr_data),
                 deployments=state.get("deployments", []),
                 last_lifecycle_event=comments_mod.beijing_now_str(),
-                display_status="deploying",
+                display_status=preflight_source_status,
             )
             deploy_reservation = {
                 "event": "Machine `<alias>` deployed",
@@ -3795,7 +4254,7 @@ class DeployController:
                     self._record_redeployed_runtime_matches(
                         state, machine, new_deployments, approve_attempt["health"],
                     )
-                state["status"] = "deploying"
+                state["status"] = preflight_source_status
                 state["command"] = {
                     "comment_id": comment_id,
                     "kind": "approve_deploy",
@@ -3804,7 +4263,7 @@ class DeployController:
                         "machine": machine_alias,
                         "actor": actor,
                         "node_id": machine.node_id,
-                        "node_host": machine.node_host,
+                        "node_host": selected_endpoint,
                         "deployment_request_submitted": deployment_request_submitted,
                         "pending_component_ids": [component_id],
                         "preflight_pending": True,
@@ -3815,7 +4274,7 @@ class DeployController:
                     repo, pr_number, state,
                     self._deployment_progress_markdown(
                         repo, pr_number, state, machine, [comp],
-                        "正在部署并校验 Core" if comp_target == "core" else "正在部署组件",
+                        "预检已通过，正在准备部署请求",
                         test_only=self._is_test_only_pr(pr_data),
                     ), event=None,
                     expected_lifecycle_state=persisted_lifecycle_state,
@@ -3826,6 +4285,7 @@ class DeployController:
 
                 async def mark_component_executing() -> bool:
                     nonlocal persisted_lifecycle_state
+                    state["status"] = preflight_source_status
                     state["command"] = {
                         "comment_id": comment_id,
                         "kind": "approve_deploy",
@@ -3834,7 +4294,7 @@ class DeployController:
                             "machine": machine_alias,
                             "actor": actor,
                             "node_id": machine.node_id,
-                            "node_host": machine.node_host,
+                            "node_host": selected_endpoint,
                             "deployment_request_submitted": deployment_request_submitted,
                             "pending_component_ids": [component_id],
                             "execution_started_at": time.time(),
@@ -3843,7 +4303,11 @@ class DeployController:
                     executing_written = await self._write_lifecycle_with_history(
                         repo, pr_number, state,
                         self._deployment_progress_markdown(
-                            repo, pr_number, state, machine, [comp], "正在部署",
+                            repo, pr_number, state, machine, [comp],
+                            "部署条件已通过，正在准备发送部署请求",
+                            # This reservation precedes the unsafe POST. It only
+                            # says the request is being prepared, not that deploy
+                            # has started.
                             test_only=self._is_test_only_pr(pr_data),
                         ), event=None,
                         expected_lifecycle_state=persisted_lifecycle_state,
@@ -3928,10 +4392,16 @@ class DeployController:
                         persisted_lifecycle_state, comment_id, machine_alias, actor,
                         "Machine ownership or endpoint policy changed during final authorization; submit a new approval.",
                     )
-                current_core_key = (repo.casefold(), machine_alias)
-                if (self._core_clients.get(current_core_key) is not core
+                current_core_key = selected_core_key or (repo.casefold(), machine_alias)
+                if (not self._machine_endpoint_has_unambiguous_identity(
+                            machine_after_permission, selected_endpoint, repo,
+                            approved_machine_identity,
+                        )
+                        or self._core_clients.get(current_core_key) is not core
                         or self._core_client_fingerprints.get(current_core_key)
-                        != self._machine_connection_fingerprint(machine_after_permission)):
+                        != self._endpoint_connection_fingerprint(
+                            machine_after_permission, selected_endpoint,
+                        )):
                     return await self._block_machine_policy_change(
                         repo, pr_number, persisted_lifecycle_state,
                         persisted_lifecycle_state, comment_id, machine_alias, actor,
@@ -3940,47 +4410,42 @@ class DeployController:
                 machine = machine_after_permission
                 node_id = machine.node_id
 
-                if not deployment_started_notice_posted:
-                    await self._post_bound_notice(
-                        repo, pr_number, head_sha=pr_head, round_id=round_id,
-                        comment_id=comment_id, topic="deployment-started",
-                        expected_command_kind="approve_deploy",
-                        message=(
-                            f"部署正在进行：机器 `{machine.alias}`。"
-                            "部署结果确认后会在 PR Summary 中更新。"
-                        ),
+                async def announce_post_sent(*, uncertain: bool = False) -> bool:
+                    nonlocal persisted_lifecycle_state, deployment_started_notice_posted
+                    state["status"] = "deploying"
+                    started_written = await self._write_lifecycle_with_history(
+                        repo, pr_number, state,
+                        self._deployment_progress_markdown(
+                            repo, pr_number, state, machine, [comp],
+                            "部署 POST 已发送，正在确认运行镜像",
+                            test_only=self._is_test_only_pr(pr_data),
+                        ), event=None,
+                        expected_lifecycle_state=persisted_lifecycle_state,
                     )
-                    deployment_started_notice_posted = True
+                    if not started_written:
+                        return False
+                    persisted_lifecycle_state = copy.deepcopy(state)
+                    await self._project_status_best_effort(repo, pr_number, "deploying")
+                    if not deployment_started_notice_posted:
+                        target_image = str(comp.get("image_ref", "") or "未知")
+                        deployment_started_notice_posted = await self._post_bound_notice(
+                            repo, pr_number, head_sha=pr_head, round_id=round_id,
+                            comment_id=comment_id,
+                            topic=("deployment-post-uncertain" if uncertain else "deployment-started"),
+                            expected_command_kind="approve_deploy",
+                            message=(
+                                f"部署请求已发送但响应未确认：机器 `{machine.alias}`，"
+                                f"已验证 IP `{selected_endpoint}`，目标镜像 `{target_image}`。"
+                                "正在核对结果，请勿重复审批。"
+                                if uncertain else
+                                f"部署已经开始：机器 `{machine.alias}`，使用已验证 IP `{selected_endpoint}`；"
+                                f"目标镜像 `{target_image}`。无需重复审批。"
+                            ),
+                        )
+                    return True
 
-                    # Posting the notice awaits GitHub. Recheck the synchronous
-                    # policy snapshot before entering the deploy client.
-                    try:
-                        latest_machine = self.policy.get_machine(machine_alias, repo=repo)
-                    except Exception as exc:
-                        return await self._block_machine_policy_change(
-                            repo, pr_number, persisted_lifecycle_state,
-                            persisted_lifecycle_state, comment_id, machine_alias, actor,
-                            f"Machine policy could not be confirmed after posting the deployment notice ({type(exc).__name__}); no deploy POST was sent.",
-                        )
-                    if (latest_machine is None
-                            or (latest_machine.alias, latest_machine.node_id,
-                                latest_machine.node_host) != approved_machine_binding
-                            or not self._machine_is_deployable(latest_machine, repo)
-                            or tuple(sorted(str(owner).casefold() for owner in
-                                            (latest_machine.owners or [])))
-                            != tuple(sorted(str(owner).casefold() for owner in
-                                            (machine.owners or [])))
-                            or self._core_clients.get(current_core_key) is not core
-                            or self._core_client_fingerprints.get(current_core_key)
-                            != self._machine_connection_fingerprint(latest_machine)):
-                        return await self._block_machine_policy_change(
-                            repo, pr_number, persisted_lifecycle_state,
-                            persisted_lifecycle_state, comment_id, machine_alias, actor,
-                            "Machine policy or credentials changed while the deployment notice was being posted; no deploy POST was sent.",
-                        )
-                # The lifecycle and start notice both await GitHub. Recheck the
-                # PR, the exact approval comment, permissions, and the current
-                # policy binding immediately before each possible POST.
+                # Recheck the PR, exact approval comment, permissions, and the
+                # current policy binding immediately before each possible POST.
                 try:
                     execution_pr = await self.proxy.get_pr(repo, pr_number)
                 except Exception as exc:
@@ -4062,9 +4527,15 @@ class DeployController:
                                         (final_machine.owners or [])))
                         != tuple(sorted(str(owner).casefold() for owner in
                                         (machine.owners or [])))
+                        or not self._machine_endpoint_has_unambiguous_identity(
+                            final_machine, selected_endpoint, repo,
+                            approved_machine_identity,
+                        )
                         or self._core_clients.get(current_core_key) is not core
                         or self._core_client_fingerprints.get(current_core_key)
-                        != self._machine_connection_fingerprint(final_machine)):
+                        != self._endpoint_connection_fingerprint(
+                            final_machine, selected_endpoint,
+                        )):
                     return await self._block_machine_policy_change(
                         repo, pr_number, persisted_lifecycle_state,
                         persisted_lifecycle_state, comment_id, machine_alias, actor,
@@ -4178,7 +4649,7 @@ class DeployController:
                                 "machine": machine_alias,
                                 "actor": actor,
                                 "node_id": machine.node_id,
-                                "node_host": machine.node_host,
+                                "node_host": selected_endpoint,
                                 "deployment_request_submitted": deployment_request_submitted,
                                 "pending_component_ids": [component_id],
                                 "preflight_pending": True,
@@ -4201,10 +4672,10 @@ class DeployController:
                         )
                         adopted_markdown = self._approval_retry_markdown(
                             repo, pr_number, state, remaining_groups_after_adoption,
-                            display_status="deploying",
+                            display_status=preflight_source_status,
                             test_only=self._is_test_only_pr(pr_data),
                             gate_note=[
-                                "这台机器上已经在运行本轮批准的镜像，这次没有重复部署。",
+                                "这台机器上已经在运行本轮批准的镜像，这次没有发送部署 POST。",
                                 "请继续审批剩余组件；全部确认后即可开始测试。",
                             ],
                             deployments=self._enrich_deployments_for_render(
@@ -4228,6 +4699,7 @@ class DeployController:
                             await self._deploy_or_adopt_core_component(
                                 core, node_id, component_id, image_ref,
                                 before_post=mark_component_executing,
+                                after_post=announce_post_sent,
                             )
                         )
                     except DeployOutcomeUncertain as e:
@@ -4268,6 +4740,7 @@ class DeployController:
                     try:
                         await self._deploy_component(
                             core, node_id, image_ref, runtime_id,
+                            after_post=announce_post_sent,
                         )
                     except DeployOutcomeUncertain as e:
                         deploy_outcome_uncertain = True
@@ -4397,7 +4870,7 @@ class DeployController:
                         "machine": machine_alias,
                         "actor": actor,
                         "node_id": node_id,
-                        "node_host": machine.node_host,
+                        "node_host": selected_endpoint,
                         "deployment_request_submitted": deployment_request_submitted,
                         "pending_component_ids": [component_id],
                     },
@@ -5200,21 +5673,7 @@ class DeployController:
                     or comment.get("updated_at") != comment.get("created_at")):
                 return False
 
-            approval_command = state.get("command", {})
-            approval_comment_id = (
-                approval_command.get("comment_id")
-                if isinstance(approval_command, dict)
-                and approval_command.get("kind") in {
-                    "approve_deploy", "request_acceptance",
-                }
-                else 0
-            )
             evidence_url = ""
-            if type(approval_comment_id) is int and approval_comment_id > 0:
-                evidence_url = await self._current_testing_upload_url(
-                    repo, pr_number, head_sha=head, round_id=round_id,
-                    approval_comment_id=approval_comment_id,
-                )
 
             existing = state.get("acceptance_request")
             refresh_pending_request = (
@@ -5831,25 +6290,43 @@ class DeployController:
 
     def _machine_identity_matches(
         self, alias: str, policy_machine, inventory: list[dict] | None = None,
-        policy_machines: list | None = None,
+        policy_machines: list | None = None, *, repo: str = "",
     ) -> tuple[dict | None, bool]:
-        """Validate identity only against the current repository policy.
+        """Match a machine alias against the current Policy Feishu identity only.
 
-        The physical inventory is display metadata. Its historical IP, node ID,
-        owner, and platform never grant or deny deployment authorization.
+        Physical device identity comes from the Policy's live Feishu snapshot,
+        never from stale static inventory, and there is no fuzzy name/model
+        inference against historical records.
         """
         if not isinstance(alias, str) or not alias or policy_machine is None:
             return None, False
-        rows = inventory if isinstance(inventory, list) else self._physical_machine_inventory()
-        matches = [item for item in rows if item.get("alias") == alias]
-        physical = matches[0] if len(matches) == 1 else None
+        identity = self._policy_machine_identity(policy_machine, repo) if repo else None
+        if not isinstance(identity, dict):
+            return None, False
+        # Policy may wrap the snapshot under "identity" or "machine" for
+        # legacy consumers; unwrap it here once.
+        identity_source = identity.get("identity", identity.get("machine", identity))
+        if not isinstance(identity_source, dict):
+            return None, False
         policy_alias = getattr(policy_machine, "alias", "")
         policy_node_id = str(getattr(policy_machine, "node_id", "") or "").strip()
-        policy_ip = self._canonical_primary_ipv4(
-            getattr(policy_machine, "node_host", ""),
-        )
-        if policy_alias != alias or not policy_node_id or not policy_ip:
-            return physical, False
+        if (not identity_source.get("number") or not identity_source.get("brand")
+                or not identity_source.get("model")
+                or policy_alias != alias or not policy_node_id):
+            return None, False
+        endpoints = self._policy_machine_endpoints(policy_machine, repo) if repo else []
+        endpoint_ips = {item["ip"] for item in endpoints}
+        addresses = identity_source.get("addresses")
+        if not isinstance(addresses, list):
+            return None, False
+        feishu_ips = {
+            endpoint for item in addresses if isinstance(item, dict)
+            if (endpoint := self._canonical_primary_ipv4(item.get("ip")))
+        }
+        # Policy must expose the complete current Feishu address set for this
+        # physical machine; a partial or cross-device mapping is not deployable.
+        if not endpoint_ips or endpoint_ips != feishu_ips:
+            return None, False
         peers = (
             policy_machines if isinstance(policy_machines, list)
             else [policy_machine]
@@ -5857,7 +6334,9 @@ class DeployController:
         policy_unambiguous = bool(
             sum(getattr(item, "alias", None) == alias for item in peers) == 1
             and sum(
-                self._canonical_primary_ipv4(getattr(item, "node_host", "")) == policy_ip
+                bool(endpoint_ips.intersection(
+                    endpoint["ip"] for endpoint in self._policy_machine_endpoints(item, repo)
+                ))
                 for item in peers
             ) == 1
             and sum(
@@ -5865,7 +6344,92 @@ class DeployController:
                 for item in peers
             ) == 1
         )
-        return physical, policy_unambiguous
+        return identity_source, policy_unambiguous
+
+    @staticmethod
+    def _normalized_identity_text(value) -> str:
+        return " ".join(value.split()).casefold() if isinstance(value, str) else ""
+
+    def _endpoint_allowed_for_repository(
+        self, repo: str, machine, endpoint: str,
+        components: list[dict] | None = None,
+        policy_machines: list | None = None,
+    ) -> bool:
+        """Bind an endpoint and requested Driver path to the current physical identity."""
+        if not isinstance(repo, str) or not repo or machine is None:
+            return False
+        endpoint = self._canonical_primary_ipv4(endpoint)
+        alias = str(getattr(machine, "alias", "") or "")
+        if not endpoint or not alias:
+            return False
+        try:
+            status = self.policy.repo_policy_status(repo)
+            machines = (policy_machines if isinstance(policy_machines, list)
+                        else self.policy.get_machines(repo=repo))
+        except Exception:
+            return False
+        if (not isinstance(status, dict) or status.get("authorized") is not True
+                or status.get("machines_configured") is not True
+                or not isinstance(machines, list)):
+            return False
+        matches = [item for item in machines
+                   if getattr(item, "alias", None) == alias]
+        if len(matches) != 1:
+            return False
+        current = matches[0]
+        if (str(getattr(current, "node_id", "") or "")
+                != str(getattr(machine, "node_id", "") or "")):
+            return False
+        endpoints = self._policy_machine_endpoints(current, repo)
+        if endpoint not in {item["ip"] for item in endpoints}:
+            return False
+        if any(
+            endpoint in {item["ip"] for item in self._policy_machine_endpoints(other, repo)}
+            for other in machines if other is not current
+        ):
+            return False
+
+        identity = self._policy_machine_identity(current, repo)
+        identity_source = (
+            identity.get("identity", identity.get("machine", identity))
+            if isinstance(identity, dict) else None
+        )
+        identity_addresses = identity.get("addresses") if isinstance(identity, dict) else None
+        if identity_source is not None:
+            identity_addresses = identity_source.get("addresses")
+        if (not isinstance(identity, dict) or not isinstance(identity_source, dict)
+                or identity.get("stale", identity_source.get("stale")) is not False):
+            return False
+        inventory, identity_matches = self._machine_identity_matches(
+            alias, current, None, machines, repo=repo,
+        )
+        if not identity_matches or not isinstance(inventory, dict):
+            return False
+        if isinstance(identity_addresses, list):
+            confirmed_ips = {
+                self._canonical_primary_ipv4(item.get("ip"))
+                for item in identity_addresses if isinstance(item, dict)
+            }
+            if endpoint not in confirmed_ips:
+                return False
+        else:
+            return False
+
+        requested_components = components if isinstance(components, list) else []
+        if requested_components:
+            physical_path = physical.get("driver_path")
+            verified_path = physical.get("driver_path_verified") is True
+            policy_paths = getattr(current, "driver_paths", []) or []
+            for component in requested_components:
+                if not isinstance(component, dict) or component.get("target") != "driver":
+                    continue
+                component_path = component.get("driver_path")
+                if (not verified_path or not isinstance(physical_path, str)
+                        or not isinstance(component_path, str)
+                        or component_path != physical_path
+                        or component_path not in policy_paths):
+                    return False
+        return True
 
     def _record_agent_core_health(self, repo: str, machine, status: str) -> None:
         alias = str(getattr(machine, "alias", "") or "")
@@ -5918,7 +6482,7 @@ class DeployController:
                 != self._machine_connection_fingerprint(machine)):
             return False
         _, identity_matches = self._machine_identity_matches(
-            alias, current_machine, [], machines,
+            alias, current_machine, [], machines, repo=repo,
         )
         if not identity_matches:
             return False
@@ -5929,6 +6493,84 @@ class DeployController:
         return self._agent_core_status_for_machine(repo, machine) not in {
             "credential_missing", "unavailable",
         }
+
+    # ── Codex C verified-endpoint contract (V49) ──
+
+    def _agent_core_verified_endpoints(self, repo: str, machine) -> list[dict[str, str]]:
+        """Return Agent Core-verified endpoints with their bound components.
+
+        Only endpoints that pass the read-only Agent Core health and identity
+        checks are verified; a present token with health ``unknown`` is not
+        verified. Multi-IP addresses belonging to one physical machine still
+        count as one machine entry.
+        """
+        key = (repo.casefold(), str(getattr(machine, "alias", "") or ""))
+        cached = self._agent_core_verified_endpoints_cache.get(key)
+        if cached is not None:
+            return list(cached)
+        identity = self._policy_machine_identity(machine, repo)
+        if not self._machine_identity_is_confirmed(identity):
+            return []
+        endpoints = self._policy_machine_endpoints(machine, repo)
+        policy_machines = []
+        try:
+            policy_machines = self.policy.get_machines(repo=repo) or []
+        except Exception:
+            policy_machines = []
+        verified: list[dict[str, str]] = []
+        seen_ips: set[str] = set()
+        for item in endpoints:
+            endpoint_ip = item["ip"]
+            if endpoint_ip in seen_ips:
+                continue
+            seen_ips.add(endpoint_ip)
+            try:
+                if not self._endpoint_allowed_for_repository(
+                        repo, machine, endpoint_ip,
+                        policy_machines=policy_machines,
+                ):
+                    continue
+            except Exception:
+                continue
+            verified.append({
+                "ip": endpoint_ip,
+                "label": item.get("label", ""),
+                "component_ids": [],
+            })
+        if verified:
+            self._agent_core_verified_endpoints_cache[key] = verified
+        return verified
+
+    def _machine_groups_verify_endpoints(self, groups: list[dict], repo: str) -> list[dict]:
+        """Restrict command generation to Agent Core-verified endpoints."""
+        result = []
+        for group in (groups if isinstance(groups, list) else []):
+            if not isinstance(group, dict):
+                continue
+            alias = str(group.get("alias", "") or "")
+            if not alias:
+                result.append(group)
+                continue
+            machine = None
+            try:
+                machine = self.policy.get_machine(alias, repo=repo)
+            except Exception:
+                machine = None
+            if machine is None:
+                result.append(group)
+                continue
+            verified = self._agent_core_verified_endpoints(repo, machine)
+            group = dict(group)
+            existing = group.get("component_ids", [])
+            compatible = group.get("compatible_component_ids", existing)
+            if verified:
+                group["component_ids"] = [
+                    component_id for component_id in existing
+                    if component_id in compatible
+                ]
+            group["verified_endpoints"] = verified
+            result.append(group)
+        return result
 
     def _get_machine_groups_for_components(
         self, components: list[dict], repo: str,
@@ -5999,13 +6641,47 @@ class DeployController:
                 getattr(policy_machine, "node_host", ""),
             )
             _, identity_matches = self._machine_identity_matches(
-                alias, policy_machine, inventory, authorized_machines,
+                alias, policy_machine, None, authorized_machines, repo=repo,
             )
+            confirmed_endpoint_set = None
+            if (policy_machine is not None
+                    and callable(getattr(self.policy, "machine_identity", None))):
+                try:
+                    policy_identity = self._policy_machine_identity(
+                        policy_machine, repo,
+                    )
+                    confirmed_endpoints = self._policy_machine_endpoints(
+                        policy_machine, repo,
+                    )
+                    confirmed_endpoint_set = {
+                        item["ip"] for item in confirmed_endpoints
+                    }
+                    identity_matches = (
+                        self._machine_identity_is_confirmed(policy_identity)
+                        and any(
+                            self._endpoint_allowed_for_repository(
+                                repo, policy_machine, item["ip"],
+                                policy_machines=machines,
+                            )
+                            and self._machine_endpoint_has_unambiguous_identity(
+                                policy_machine, item["ip"], repo, policy_identity,
+                            )
+                            for item in confirmed_endpoints
+                        )
+                    )
+                except Exception:
+                    identity_matches = False
             # Only the current repository policy may supply an authorization IP.
-            primary_ip = node_host if policy_machine is not None else ""
+            primary_ip = self._canonical_primary_ipv4(
+                str(getattr(policy_machine, "node_host", "") or "")
+            ) if policy_machine is not None else ""
+            endpoint_allowed = self._endpoint_allowed_for_repository(
+                repo, policy_machine, primary_ip, policy_machines=machines,
+            )
             repo_authorized = bool(
                 policy_configured and policy_machine is not None
                 and node_id and identity_matches
+                and endpoint_allowed
                 and len(policy_matches) == 1
             )
             if not policy_configured:
@@ -6032,6 +6708,8 @@ class DeployController:
                 reasons.append("MACHINE_IDENTITY_MISMATCH")
             elif policy_machine is not None and not identity_matches:
                 reasons.append("MACHINE_IDENTITY_MISMATCH")
+            elif policy_machine is not None and not endpoint_allowed:
+                reasons.append("FEISHU_DEVICE_REPOSITORY_CONFLICT")
             elif not repo_authorized:
                 reasons.append("MACHINE_NOT_AUTHORIZED")
             if repo_authorized and not valid_policy_owners:
@@ -6127,6 +6805,7 @@ class DeployController:
             ip_command_safe = bool(
                 repo_authorized and primary_ip and not primary_ip_ambiguous and node_host == primary_ip
                 and len(policy_aliases_by_ip.get(node_host, [])) == 1
+                and (confirmed_endpoint_set is None or node_host in confirmed_endpoint_set)
             )
             core_ready = agent_core_status not in {
                 "credential_missing", "unavailable",
@@ -6239,22 +6918,27 @@ class DeployController:
         if re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", alias) is None:
             return ""
         _, identity_matches = self._machine_identity_matches(
-            alias, machine, [], machines,
+            alias, machine, None, machines, repo=repo,
         )
         if not identity_matches:
             return ""
-        primary_ip = self._canonical_primary_ipv4(
-            getattr(machine, "node_host", ""),
-        )
-        policy_ip_count = sum(
-            self._canonical_primary_ipv4(getattr(item, "node_host", "")) == primary_ip
-            for item in machines
-        )
-        if (primary_ip and policy_ip_count == 1
-                and self._canonical_primary_ipv4(
-                    getattr(machine, "node_host", "")) == primary_ip):
+        endpoints = self._policy_machine_endpoints(machine, repo)
+        primary_ip = endpoints[0]["ip"] if endpoints else ""
+        token_available = bool(self._agent_core_token(alias))
+        deployable_ips = [
+            item["ip"] for item in endpoints
+            if item["ip"] == self._canonical_primary_ipv4(
+                getattr(machine, "node_host", ""),
+            ) or token_available
+        ]
+        if (primary_ip and primary_ip in deployable_ips
+                and sum(primary_ip in {
+                    endpoint["ip"] for endpoint in self._policy_machine_endpoints(
+                        item, repo,
+                    )
+                } for item in machines) == 1):
             return primary_ip
-        # Alias is safe only after exact primary-IP identity and repo-policy checks.
+        # Alias is safe only after exact Feishu identity and repository policy checks.
         return alias
 
     def _runtime_display_identity(self, alias: str, repo: str) -> tuple[str, str, list[str]]:
@@ -6273,12 +6957,11 @@ class DeployController:
                 and sum(getattr(item, "alias", None) == alias for item in machines) == 1
                 and machine is not None):
             _, identity_matches = self._machine_identity_matches(
-                alias, machine, [], machines,
+                alias, machine, None, machines, repo=repo,
             )
             if identity_matches:
-                primary_ip = self._canonical_primary_ipv4(
-                    getattr(machine, "node_host", ""),
-                )
+                endpoints = self._policy_machine_endpoints(machine, repo)
+                primary_ip = endpoints[0]["ip"] if endpoints else ""
                 owners = list(getattr(machine, "owners", []) or [])
         else:
             machine = None
@@ -6495,6 +7178,9 @@ class DeployController:
                     if (eligible_group.get("ip_command_safe") is True
                             and group_selector == current_ip_selector == group_ip):
                         safe_selector = current_ip_selector
+                    elif (group_selector == current_ip_selector == alias
+                            and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", alias)):
+                        safe_selector = alias
 
             identities[alias] = (
                 primary_ip if machine_identity_confirmed else "",
@@ -6605,6 +7291,33 @@ class DeployController:
             except ValueError:
                 continue
         return ""
+
+    @staticmethod
+    def _preflight_failure_reason(errors: list[Exception]) -> str:
+        text = " ".join(str(error).casefold() for error in errors)
+        if any(isinstance(error, GitHubRateLimitError) for error in errors):
+            return "GitHub 请求受到限流，当前无法确认 PR 状态；本次部署没有开始。"
+        if any(isinstance(error, GitHubTransientError) for error in errors):
+            return "GitHub 请求暂时超时或不可用，无法确认 PR 状态；本次部署没有开始。"
+        if "github" in text and any(token in text for token in ("timeout", "timed out", "temporarily unavailable")):
+            return "GitHub 请求暂时超时，无法确认 PR 状态；本次部署没有开始。"
+        if "head changed" in text or "pr head changed" in text:
+            return "检查期间 PR HEAD 已变化，原审核和镜像不再适用于当前提交。"
+        if any(token in text for token in ("permission", "not authorized", "approval authority")):
+            return "当前审批权限已失效，无法确认最终授权。"
+        if any(token in text for token in ("identity", "endpoint changed")):
+            return "当前设备身份或已确认 IP 集合发生变化，无法确认部署目标。"
+        if any(token in text for token in ("duplicate runtime_id", "cannot uniquely resolve", "no driver id")):
+            return "Agent Core 返回的 Driver 无法与批准组件唯一匹配，或多个组件指向同一 Runtime ID。"
+        if "repository" in text and any(token in text for token in ("image", "runtime", "driver")):
+            return "Driver 的运行镜像仓库与批准的目标镜像仓库不一致。"
+        if any(token in text for token in ("list_drivers", "driver_status", "driver catalog")):
+            return "Agent Core 已连接，但无法读取 Driver 列表或运行状态。"
+        if any(token in text for token in ("token", "unauthorized", "401", "forbidden", "authentication", "auth")):
+            return "Agent Core 鉴权失败，当前机器凭据无法验证该设备。"
+        if any(token in text for token in ("timed out", "timeout", "connect", "unreachable", "network", "no route")):
+            return "同一设备的已确认 IP 均无法连接到 Agent Core。"
+        return "同一设备的所有已确认 IP 均未通过部署预检。"
 
     async def _preflight_running_images(
         self,
@@ -7112,13 +7825,19 @@ class DeployController:
 
     async def _deploy_component(
         self, core: AgentCoreClient, node_id: str,
-        image_ref: str, runtime_id: str,
+        image_ref: str, runtime_id: str, after_post=None,
     ) -> dict:
         """Deploy a single component to a machine via Agent Core."""
         try:
             result = await core.deploy_driver(runtime_id, image_ref)
+            if after_post is not None and not await after_post():
+                raise DeployOutcomeUncertain(
+                    "deploy POST was sent but the deployment-start state could not be confirmed"
+                )
             return {"result": result}
         except AgentCoreDeployOutcomeUncertain as e:
+            if after_post is not None:
+                await after_post(uncertain=True)
             raise DeployOutcomeUncertain(
                 f"Deploy outcome uncertain for {runtime_id} on node {node_id}: {e}"
             ) from e
@@ -7223,6 +7942,7 @@ class DeployController:
         component_id: str,
         image_ref: str,
         before_post=None,
+        after_post=None,
     ) -> tuple[bool, dict, bool]:
         """Deploy core via self-update, or adopt if already at target.
 
@@ -7277,7 +7997,16 @@ class DeployController:
                     "verified": False,
                     "error": "deploy lifecycle write was not confirmed before POST",
                 }, False
-        await self._deploy_core_component(core, node_id, image_ref)
+        try:
+            await self._deploy_core_component(core, node_id, image_ref)
+        except DeployOutcomeUncertain:
+            if after_post is not None:
+                await after_post(uncertain=True)
+            raise
+        if after_post is not None and not await after_post():
+            raise DeployOutcomeUncertain(
+                "core deploy POST was sent but the deployment-start state could not be confirmed"
+            )
         verified, health_evidence = await self._verify_core_update(
             core, component_id, image_ref,
         )
@@ -7368,7 +8097,7 @@ class DeployController:
                 "driver_path": comp.get("driver_path", ""),
                 "runtime_id": driver_id,
                 "node_id": node_id,
-                "node_host": machine.node_host,
+                "node_host": selected_endpoint,
                 "image_ref": image_ref,
                 "machine_alias": machine_alias,
                 "_core": core,
@@ -7790,7 +8519,7 @@ class DeployController:
             matching = policy_by_alias.get(alias, [])
             machine = matching[0] if len(matching) == 1 else None
             _, identity_confirmed = self._machine_identity_matches(
-                alias, machine, [], policy_machines,
+                alias, machine, None, policy_machines, repo=repo,
             ) if machine is not None else (None, False)
             if identity_confirmed and policy_status.get("authorized") is True:
                 row.update({
@@ -7947,7 +8676,8 @@ class DeployController:
             "ip": self._runtime_display_identity(machine.alias, repo)[0] or "主 IP 未记录",
             "component_ids": [c.get("component_id", "") for c in components],
             "phase": ("preflight" if str(phase).startswith(
-                ("审批已收到", "部署前检查")) else "deploying"),
+                ("审批已收到", "部署前检查", "预检已通过", "部署条件已通过"))
+                else "deploying"),
             "timestamp": comments_mod.beijing_now_str(),
         }]
         display_status = (
@@ -7984,15 +8714,20 @@ class DeployController:
         return "deploy-requested" if cls._deployment_request_was_submitted(state) else "deploy-ready"
 
     def _ip_command_machine_groups(self, groups: list[dict]) -> list[dict]:
-        """Keep only groups whose explicit selector is their verified real IPv4."""
+        """Keep groups with a verified IP selector or an exact safe alias."""
         result = []
         for group in (groups if isinstance(groups, list) else []):
-            if not isinstance(group, dict) or group.get("ip_command_safe") is not True:
+            if not isinstance(group, dict) or group.get("approval_available") is not True:
                 continue
             primary_ip = self._canonical_primary_ipv4(group.get("primary_ip", ""))
             node_host = self._canonical_primary_ipv4(group.get("node_host", ""))
-            selector = self._canonical_primary_ipv4(group.get("command_selector", ""))
-            if primary_ip and primary_ip == node_host == selector:
+            raw_selector = str(group.get("command_selector", "") or "")
+            selector = self._canonical_primary_ipv4(raw_selector)
+            alias = str(group.get("alias", "") or "")
+            if ((primary_ip and primary_ip == node_host == selector
+                 and group.get("ip_command_safe") is True)
+                    or (raw_selector == alias
+                        and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", alias))):
                 result.append(group)
         return result
 
@@ -8014,7 +8749,8 @@ class DeployController:
         for group in self._ip_command_machine_groups(full_groups):
             alias = str(group.get("alias", "") or "")
             primary_ip = self._canonical_primary_ipv4(group.get("primary_ip", ""))
-            if not alias or not primary_ip:
+            if (not alias or not primary_ip
+                    or group.get("ip_command_safe") is not True):
                 continue
             row_prefix = f"- `{alias}`（{primary_ip}）"
             for index, line in enumerate(lines):
@@ -10573,8 +11309,11 @@ class DeployController:
         expected_command_kind: str = "",
         allow_bot_origin: bool = False,
         allow_missing_state: bool = False,
+        reply_to: int | None = None,
     ) -> bool:
         """Post one command-bound public reply, confirming uncertain POSTs by readback."""
+        if reply_to is not None and (not isinstance(reply_to, int) or reply_to <= 0):
+            return False
         if (not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
                 or not isinstance(round_id, str)
                 or not re.fullmatch(re.escape(head_sha) + r"-[0-9]+", round_id)
@@ -10628,6 +11367,7 @@ class DeployController:
                          and self.proxy.is_bot_comment(item)), None)
 
         if found_marker(comments):
+            self._record_command_reply_delivery(repo, pr_number, comment_id, True)
             return True
         payload = message.strip()
         if payload.startswith(comments_mod.BOT_MARKER):
@@ -10649,17 +11389,24 @@ class DeployController:
             except Exception as read_error:
                 logger.warning("notice POST outcome unknown %s#%s topic=%s",
                                repo, pr_number, topic)
+                self._record_command_reply_delivery(repo, pr_number, comment_id, False)
                 return False
-            return bool(isinstance(latest, list) and found_marker(latest))
+            delivered = bool(isinstance(latest, list) and found_marker(latest))
+            self._record_command_reply_delivery(repo, pr_number, comment_id, delivered)
+            return delivered
         if isinstance(posted, dict) and posted.get("id"):
             body_value = posted.get("body", "")
             if marker in body_value and self.proxy.is_bot_comment(posted):
+                self._record_command_reply_delivery(repo, pr_number, comment_id, True)
                 return True
         try:
             latest = await self.proxy.get_issue_comments(repo, pr_number)
         except Exception:
+            self._record_command_reply_delivery(repo, pr_number, comment_id, False)
             return False
-        return bool(isinstance(latest, list) and found_marker(latest))
+        delivered = bool(isinstance(latest, list) and found_marker(latest))
+        self._record_command_reply_delivery(repo, pr_number, comment_id, delivered)
+        return delivered
 
     async def _post_deploy_ready_notice(
         self, repo: str, pr_number: int, *, head_sha: str, round_id: str,
@@ -10823,6 +11570,9 @@ class DeployController:
         ("already_processed", "这一轮已经处理过这项操作。"),
         ("already_matches", "机器上已经在运行本轮批准的镜像，不需要重新部署。"),
         ("deployment_failed", "本次部署没有完成。"),
+        ("github_timeout", "GitHub 请求暂时超时，当前无法确认命令结果；请先查看 PR Summary。"),
+        ("deployment_interrupted", "部署过程已中断，结果仍在确认中；请勿重复审批。"),
+        ("runtime_mismatch", "Driver 运行镜像与批准的目标不一致，部署没有开始。"),
         ("uncertain", "部署结果还在确认中，这次没有重复提交部署。"),
         ("already_in_progress", "部署正在进行中，这次没有重复提交部署。"),
         ("in_progress", "部署正在进行中，这次没有重复提交部署。"),
@@ -10853,17 +11603,17 @@ class DeployController:
     )
 
     _GENERIC_ERROR_REASON = "当前条件下无法执行这项操作。"
-    _FAILURE_PREFIX = "这条命令没有执行："
+    _FAILURE_PREFIX = "这条命令没有执行。"
 
     @classmethod
     def _failure_lead(cls, reason: str) -> str:
-        """Prefix a failure reason exactly once with the unified failure lead."""
+        """Give every rejected command the same two-block user-facing shape."""
         text = reason.strip() if isinstance(reason, str) else ""
         if not text:
             text = cls._GENERIC_ERROR_REASON
         if text.startswith(cls._FAILURE_PREFIX):
             return text
-        return cls._FAILURE_PREFIX + text
+        return f"{cls._FAILURE_PREFIX}\n\n原因：{text}"
 
     def _command_error_reason(
         self, *, command_kind: str = "", parsed_error: str = "",
@@ -10890,6 +11640,8 @@ class DeployController:
             if isinstance(command_kind, str) else ""
         )
 
+        if classification == "duplicate_argument" and code_text.partition(":")[2].strip() == "machine":
+            return "机器参数填写了两次，请保留一个机器 IP。"
         if classification in self._PARSE_ERROR_REASONS:
             return self._PARSE_ERROR_REASONS[classification]
         if exception is not None:
@@ -10943,6 +11695,12 @@ class DeployController:
             return "这台机器不能部署本次需要的组件。"
         if "head changed" in message_text or "head 已变化" in message_text:
             return "PR 有了新提交，之前的审核和审批已不再对应当前代码。"
+        if "github" in message_text and any(token in message_text for token in ("timeout", "timed out", "超时")):
+            return "GitHub 请求暂时超时，当前无法确认命令结果；请先查看 PR Summary。"
+        if "runtime" in message_text and any(token in message_text for token in ("mismatch", "不一致", "duplicate", "unique")):
+            return "Driver 运行镜像或 Runtime ID 与批准组件不匹配，部署没有开始。"
+        if "interrupted" in message_text or "中断" in message_text:
+            return "部署过程已中断，结果仍在确认中；请勿重复审批。"
         if "pr is not open" in message_text or "draft" in message_text:
             return "这个 PR 当前不可部署。"
         if not message_text and not code_text and not category:
@@ -10976,9 +11734,11 @@ class DeployController:
     async def _post_command_reply(
         self, repo: str, pr_number: int, comment_id: int, message: str,
         *, topic: str = "command-error", error: bool = False,
-        next_action: str = "",
+        final: bool = False,
     ) -> bool:
         """Bind an operation reply to the current PR HEAD, round, and source comment."""
+        if final and (not isinstance(comment_id, int) or comment_id <= 0):
+            return False
         error = error or topic.startswith((
             "runtime-redeploy-", "request-deploy-",
             "approve-deploy-incompatible-machine",
@@ -10998,18 +11758,16 @@ class DeployController:
         except Exception as exc:
             logger.warning("command reply context %s#%s unavailable: %s",
                            repo, pr_number, type(exc).__name__)
-            if error:
-                self._record_command_reply_delivery(
-                    repo, pr_number, comment_id, False,
-                )
+            self._record_command_reply_delivery(
+                repo, pr_number, comment_id, False,
+            )
             return False
         head = ((pr.get("head") or {}).get("sha")
                 if isinstance(pr, dict) else "")
         if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
-            if error:
-                self._record_command_reply_delivery(
-                    repo, pr_number, comment_id, False,
-                )
+            self._record_command_reply_delivery(
+                repo, pr_number, comment_id, False,
+            )
             return False
         has_current_head_state = (
             isinstance(state, dict) and state.get("head_sha") == head
@@ -11027,7 +11785,10 @@ class DeployController:
                 origin = None
             source_body = origin.get("body", "") if isinstance(origin, dict) else ""
             from .commands import parse_command
-            parsed = parse_command(source_body if isinstance(source_body, str) else "")
+            parsed = parse_command(
+                source_body if isinstance(source_body, str) else "",
+                comment_id=comment_id,
+            )
             parse_error = parsed.error or ""
             reason = self._command_error_reason(
                 command_kind=parsed.kind if isinstance(parsed.kind, str) else "",
@@ -11042,6 +11803,13 @@ class DeployController:
         else:
             guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
             message = self._format_user_reply(message, guidance)
+        if final:
+            qa = None
+            if isinstance(state, dict):
+                qa = self._final_reply_qa(state, topic, message)
+            return await self._post_final_reply(
+                repo, pr_number, comment_id, message, "accepted", qa=qa, topic=topic,
+            )
         try:
             delivered = await self._post_bound_notice(
                 repo, pr_number, head_sha=head, round_id=round_id,
@@ -11052,11 +11820,73 @@ class DeployController:
             logger.warning("command reply post %s#%s unavailable: %s",
                            repo, pr_number, type(exc).__name__)
             delivered = False
-        if error:
-            self._record_command_reply_delivery(
-                repo, pr_number, comment_id, delivered is True,
-            )
+        self._record_command_reply_delivery(
+            repo, pr_number, comment_id, delivered is True,
+        )
         return delivered is True
+
+    async def _post_final_reply(
+        self, repo: str, pr_number: int, comment_id: int, message: str,
+        result: str, *, qa: dict | None = None, topic: str = "command-error",
+    ) -> bool:
+        """Post a final command reply bound to the source comment with the Codex C contract markers."""
+        if (result not in {"accepted", "rejected", "uncertain"}
+                or not isinstance(comment_id, int) or comment_id <= 0):
+            return False
+        marker = "<!-- deploy-approval-reply-to-comment:" + str(comment_id) + " -->"
+        result_marker = f"<!-- deploy-approval-result:{result} -->"
+        body_parts = [comments_mod.BOT_MARKER, "", marker, result_marker, message]
+        if isinstance(qa, dict) and qa:
+            body_parts.append("<!-- deploy-approval-qa:" + json.dumps(qa, ensure_ascii=False) + " -->")
+        body = "\n".join(body_parts) + "\n"
+        try:
+            posted = await self.proxy.post_issue_comment(repo, pr_number, body)
+        except Exception as exc:
+            logger.warning("final command reply %s#%s unavailable: %s", repo, pr_number, type(exc).__name__)
+            return False
+        return bool(isinstance(posted, dict) and posted.get("id"))
+
+    @staticmethod
+    def _visible_command_lines(message: str) -> list[str]:
+        """Extract the executable commands actually shown in a reply body."""
+        commands = ("/approve_deploy", "/request_deploy", "/reject_deploy", "/record_test", "/request_acceptance")
+        lines: list[str] = []
+        for line in message.splitlines():
+            for command in commands:
+                if line.lstrip().startswith(command + " ") or line.lstrip() == command:
+                    lines.append(line.strip())
+                    break
+        return lines
+
+    def _final_reply_qa(self, state: dict, topic: str, message: str) -> dict | None:
+        """Build the hidden QA block for rejected final replies.
+
+        ``next_commands`` mirrors exactly the commands shown in the visible
+        reply; no internal codes leak to the visible text.
+        """
+        if not isinstance(state, dict):
+            return None
+        qa_labels = state.get("qa_labels")
+        status = (
+            str(qa_labels.get("label") or "")
+            if isinstance(qa_labels, dict)
+            else ""
+        )
+        error_category = (
+            str(qa_labels.get("error") or "")
+            if isinstance(qa_labels, dict)
+            else ("machine_selection" if topic in ("approve-deploy-machine-selection",) else "command_error")
+        )
+        head_sha = str(state.get("head_sha") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+            head_sha = ""
+        visible_commands = self._visible_command_lines(message)
+        return {
+            "status": status or "unknown",
+            "error": error_category,
+            "head": head_sha,
+            "next_commands": visible_commands,
+        }
 
     @staticmethod
     def _is_test_only_pr(pr: dict | None) -> bool:
@@ -11244,9 +12074,12 @@ class DeployController:
                 continue
             primary_ip = self._canonical_primary_ipv4(group.get("primary_ip", ""))
             node_host = self._canonical_primary_ipv4(group.get("node_host", ""))
-            if (group.get("ip_command_safe") is not True
-                    or not primary_ip or primary_ip != node_host
-                    or selector != primary_ip):
+            selector_ip = self._canonical_primary_ipv4(selector)
+            selector_is_alias = (
+                selector == alias
+                and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", alias) is not None
+            )
+            if not primary_ip or primary_ip != node_host:
                 continue
             try:
                 current_machine = self.policy.get_machine(alias, repo=repo)
@@ -11254,7 +12087,9 @@ class DeployController:
                 current_machine = None
             if (current_machine is None
                     or not self._machine_is_deployable(current_machine, repo)
-                    or self._machine_command_selector(alias, repo) != selector):
+                    or self._machine_command_selector(alias, repo) != selector
+                    or not (selector_is_alias or
+                            selector_ip in {item["ip"] for item in self._policy_machine_endpoints(current_machine, repo)})):
                 continue
             owners = group.get("owners", [])
             valid_owners = sorted({
@@ -11413,18 +12248,181 @@ class DeployController:
 
     async def _lifecycle_next_action_guidance(
         self, repo: str, pr_number: int, *, detail: bool = True,
+        _retry_count: int = 0,
     ) -> str:
-        """Return the one correct-operation text for the current lifecycle state.
+        """Return next-step guidance from the current GitHub status label.
 
-        Every command reply takes its "what to do now" block from here, so the
-        same PR/HEAD/lifecycle/policy always yields identical guidance. Failure
-        replies call this with ``detail=False`` so that machine diagnostics and
-        Owner mentions never leak into the unified two-block error format.
+        Hidden lifecycle data supplies evidence and safety checks only. It never
+        selects the requested lifecycle action.
         """
-        unavailable = (
-            "暂时无法确认 PR 的最新提交和部署进度。"
-            "请稍后刷新 PR Summary；在状态确认前不要重复部署审批。"
+        status_unavailable = (
+            "暂时无法确认最新流程进度，因此不能安全判断下一步。"
+            "请等待 PR Summary 同步；确认前不要重复提交部署。"
         )
+        status_sync_conflict = (
+            "当前代码进度与可信部署记录暂时不一致，无法安全生成下一步操作。"
+            "请等待 PR Summary 同步后再操作。"
+        )
+        tick = chr(96)
+
+        def parse_status_labels(labels):
+            status_labels = [
+                label for label in labels
+                if isinstance(label, str)
+                and label.casefold().startswith(STATUS_PREFIX.casefold())
+            ] if isinstance(labels, list) else []
+            if (len(status_labels) != 1
+                    or status_labels[0] not in _ALLOWED_STATUS_LABELS):
+                return None
+            label_status = status_labels[0]
+            prefix, separator, lifecycle_status = label_status.partition(":")
+            lifecycle_status = lifecycle_status.strip()
+            if prefix + ":" != STATUS_PREFIX or not separator:
+                return None
+            return status_labels, label_status, lifecycle_status
+
+        def log_status_conflict(candidate_state, candidate_label_status):
+            hidden_status = candidate_state.get("status")
+            if hidden_status != lifecycle_status:
+                logger.error(
+                    "SECURITY lifecycle status label conflicts with hidden state "
+                    "%s#%s head=%s label=%r hidden_status=%r",
+                    repo, pr_number, head, candidate_label_status,
+                    str(hidden_status)[:80],
+                )
+
+        def deployment_safety_message(candidate_state):
+            command = candidate_state.get("command")
+            if not isinstance(command, dict) or command.get("kind") != "approve_deploy":
+                return ""
+            phase = command.get("phase")
+            args = command.get("args")
+            args = args if isinstance(args, dict) else {}
+            if phase in {"executing", "uncertain"}:
+                return (
+                    "部署正在进行或结果仍在确认。请等待机器状态更新，"
+                    "不要重复提交审批或部署请求。"
+                )
+            if phase == "completed" and args.get("preflight_pending") is True:
+                return (
+                    "部署前检查仍在进行，目前尚未发送部署请求。"
+                    "请等待 PR Summary 更新，不要重复提交审批。"
+                )
+            return ""
+
+        async def confirm_machine_guidance():
+            final_pr = await self.proxy.get_pr(repo, pr_number)
+            if (not isinstance(final_pr, dict) or final_pr.get("state") != "open"
+                    or final_pr.get("merged") or final_pr.get("draft")):
+                return "这个 PR 目前不能部署。请在 PR 保持开放、未合并且非草稿时再操作。"
+            final_head = (final_pr.get("head") or {}).get("sha", "")
+            final_labels = await self.proxy.get_issue_labels(repo, pr_number)
+            final_snapshot = parse_status_labels(final_labels)
+            if final_snapshot is None:
+                return status_unavailable
+            final_status_labels, final_label_status, final_lifecycle_status = final_snapshot
+            if len(final_status_labels) != 1:
+                return status_unavailable
+            if final_head != head or final_lifecycle_status != lifecycle_status:
+                if _retry_count < 1:
+                    return await self._lifecycle_next_action_guidance(
+                        repo, pr_number, detail=detail,
+                        _retry_count=_retry_count + 1,
+                    )
+                return status_unavailable
+
+            final_state = await self.proxy.read_hidden_state(repo, pr_number)
+            if (not isinstance(final_state, dict)
+                    or final_state.get("head_sha") != final_head):
+                logger.error(
+                    "SECURITY machine guidance hidden state changed or mismatched "
+                    "%s#%s head=%s",
+                    repo, pr_number, final_head,
+                )
+                return status_sync_conflict
+            final_hidden_status = final_state.get("status")
+            final_pending_acceptance = self._acceptance_request_is_pending(final_state)
+            final_status_mapping_valid = (
+                final_hidden_status == final_lifecycle_status
+                or final_hidden_status == "testing"
+                and final_lifecycle_status == "acceptance-required"
+                and final_pending_acceptance
+            )
+            if not final_status_mapping_valid:
+                logger.error(
+                    "SECURITY lifecycle status label conflicts with hidden state "
+                    "%s#%s head=%s label=%r hidden_status=%r",
+                    repo, pr_number, final_head, final_label_status,
+                    str(final_hidden_status)[:80],
+                )
+                return status_sync_conflict
+            final_safety_message = deployment_safety_message(final_state)
+            if final_safety_message:
+                return final_safety_message
+
+            business_keys = (
+                "review_evidence", "components", "deployments",
+                "runtime_redeploy", "runtime_checks", "command",
+            )
+            if any(final_state.get(key) != state.get(key) for key in business_keys):
+                if _retry_count < 1:
+                    return await self._lifecycle_next_action_guidance(
+                        repo, pr_number, detail=detail,
+                        _retry_count=_retry_count + 1,
+                    )
+                return status_sync_conflict
+            if lifecycle_status in {"deploy-ready", "deploy-requested"}:
+                components = final_state.get("components", [])
+                if (not isinstance(components, list)
+                        or not await self._fresh_review_evidence_matches_state(
+                            repo, pr_number, final_head,
+                            final_state.get("review_evidence", {}),
+                            expected_components=components,
+                        )):
+                    return status_sync_conflict
+                deployed_ids = _component_id_set(final_state.get("deployments", []))
+                remaining = [item for item in components
+                             if isinstance(item, dict)
+                             and item.get("component_id") not in deployed_ids]
+                fresh_groups = (
+                    self._runtime_redeploy_machine_groups(
+                        final_state, remaining, repo,
+                    ) if final_state.get("runtime_redeploy") else
+                    self._get_machine_groups_for_components(remaining, repo)
+                )
+                fresh_lines = self._machine_notice_lines(
+                    fresh_groups, repo,
+                    mention_owners=lifecycle_status == "deploy-requested",
+                    test_only=self._is_test_only_pr(final_pr),
+                    components=remaining,
+                    show_components=(detail and lifecycle_status == "deploy-ready"),
+                    pr=final_pr,
+                )
+                fresh_commands = {
+                    line for line in fresh_lines
+                    if line.startswith(f"{tick}/approve_deploy")
+                }
+                old_commands = {
+                    line for line in command_lines
+                    if line.startswith(f"{tick}/approve_deploy")
+                }
+                if not fresh_commands:
+                    return (
+                        "当前没有通过最新 Policy 和设备身份确认的可执行机器命令。"
+                        "请检查机器配置与 Feishu 设备快照后再操作。"
+                    )
+                if fresh_commands != old_commands or fresh_lines != command_lines:
+                    if _retry_count < 1:
+                        return await self._lifecycle_next_action_guidance(
+                            repo, pr_number, detail=detail,
+                            _retry_count=_retry_count + 1,
+                        )
+                    return status_sync_conflict
+            if (lifecycle_status == "failed"
+                    and not self._runtime_drift_command_lines(final_state, repo)):
+                return status_sync_conflict
+            return ""
+
         try:
             pr = await self.proxy.get_pr(repo, pr_number)
             if (not isinstance(pr, dict) or pr.get("state") != "open"
@@ -11432,50 +12430,113 @@ class DeployController:
                 return "这个 PR 目前不能部署。请在 PR 保持开放、未合并且非草稿时再操作。"
             head = (pr.get("head") or {}).get("sha", "")
             if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
-                return unavailable
+                return status_unavailable
+
+            labels = await self.proxy.get_issue_labels(repo, pr_number)
+            status_snapshot = parse_status_labels(labels)
+            if status_snapshot is None:
+                logger.warning(
+                    "SECURITY lifecycle status labels are missing, ambiguous, or unknown "
+                    "%s#%s count=%s",
+                    repo, pr_number,
+                    sum(1 for label in labels
+                        if isinstance(label, str) and label.startswith("status:"))
+                    if isinstance(labels, list) else "unavailable",
+                )
+                return status_unavailable
+            status_labels, label_status, lifecycle_status = status_snapshot
+            if len(status_labels) != 1:
+                return status_unavailable
 
             state = await self.proxy.read_hidden_state(repo, pr_number)
             if not isinstance(state, dict):
-                return unavailable
-            if state.get("head_sha") != head:
-                return (
-                    "PR 刚有新的提交，旧的审核、镜像和审批命令都不能再用。"
-                    "请等当前提交的 PR Summary 更新后再操作；PR 作者先执行 `/request_bot_review`。"
+                logger.error(
+                    "SECURITY lifecycle status label has no usable hidden data "
+                    "%s#%s head=%s label=%r",
+                    repo, pr_number, head, label_status,
                 )
+                return status_sync_conflict
+
+            # Re-read both GitHub sources after reading hidden data so that the
+            # selected label and PR HEAD are current before building guidance.
             latest_pr = await self.proxy.get_pr(repo, pr_number)
-            latest_head = (latest_pr.get("head") or {}).get("sha", "") \
-                if isinstance(latest_pr, dict) else ""
             if (not isinstance(latest_pr, dict) or latest_pr.get("state") != "open"
-                    or latest_pr.get("merged") or latest_pr.get("draft")
-                    or latest_head != head):
-                return (
-                    "PR 状态或最新提交刚刚变化，旧部署命令已经失效。"
-                    "请等待 PR Summary 更新后再操作。"
+                    or latest_pr.get("merged") or latest_pr.get("draft")):
+                return "这个 PR 目前不能部署。请在 PR 保持开放、未合并且非草稿时再操作。"
+            latest_head = (latest_pr.get("head") or {}).get("sha", "")
+            if latest_head != head:
+                logger.error(
+                    "SECURITY lifecycle hidden data HEAD is stale %s#%s old_head=%s current_head=%s",
+                    repo, pr_number, head, str(latest_head)[:40],
                 )
-            pr = latest_pr
+                return status_sync_conflict
+            latest_labels = await self.proxy.get_issue_labels(repo, pr_number)
+            latest_snapshot = parse_status_labels(latest_labels)
+            if latest_snapshot is None:
+                logger.warning(
+                    "SECURITY lifecycle status labels became unavailable "
+                    "%s#%s",
+                    repo, pr_number,
+                )
+                return status_unavailable
+            status_labels, label_status, lifecycle_status = latest_snapshot
+            if len(status_labels) != 1:
+                return status_unavailable
 
-            status = state.get("status", "review-required")
-            if status == "review-required":
-                return (
-                    "当前提交还没有审核和镜像构建结果。"
-                    "请由 PR 作者执行 `/request_bot_review`，完成后等待 Summary 更新。"
+            hidden_status = state.get("status")
+            status_conflict = hidden_status != lifecycle_status
+            status_mapping_valid = (
+                not status_conflict
+                or hidden_status == "testing"
+                and lifecycle_status == "acceptance-required"
+                and self._acceptance_request_is_pending(state)
+            )
+            if status_conflict:
+                log_status_conflict(state, label_status)
+            if not status_mapping_valid:
+                return status_sync_conflict
+
+            if state.get("head_sha") != head:
+                logger.error(
+                    "SECURITY lifecycle hidden state does not match current PR HEAD "
+                    "%s#%s pr_head=%s state_head=%s",
+                    repo, pr_number, head,
+                    str(state.get("head_sha", ""))[:40],
                 )
-            if status == "reviewing":
+                return status_sync_conflict
+
+            safety_message = deployment_safety_message(state)
+            if safety_message:
+                return safety_message
+
+            if lifecycle_status == "review-required":
+                guidance = (
+                    "请由 PR 作者执行 "
+                    f"{tick}/request_bot_review{tick}，然后等待审核和构建结果。"
+                )
+                confirmation = await confirm_machine_guidance()
+                return confirmation or guidance
+
+            if lifecycle_status == "reviewing":
                 return (
-                    "当前提交正在审核并构建镜像，请等待审核和构建完成。"
-                    "这期间不需要、也不能部署。"
+                    "审核和镜像构建正在进行，请等待完成；暂时不要部署。"
                 )
 
-            if status in {"deploy-ready", "deploy-requested"}:
+            if lifecycle_status in {"deploy-ready", "deploy-requested"}:
                 review_evidence = state.get("review_evidence")
                 components = state.get("components")
-                if (not isinstance(review_evidence, dict) or not isinstance(components, list)
-                        or not await self._fresh_review_evidence_matches_state(
-                            repo, pr_number, head, review_evidence,
-                            expected_components=components,
-                        )):
-                    return (
-                        "当前提交的审核或构建结果还在确认。"
+                if (not isinstance(review_evidence, dict)
+                        or not isinstance(components, list) or not components):
+                    return status_sync_conflict if status_conflict else (
+                        "当前提交的审核和镜像构建证据暂时无法确认。"
+                        "请等待 PR Summary 更新后再使用部署审批命令。"
+                    )
+                if not await self._fresh_review_evidence_matches_state(
+                    repo, pr_number, head, review_evidence,
+                    expected_components=components,
+                ):
+                    return status_sync_conflict if status_conflict else (
+                        "当前提交的审核或镜像构建证据还在确认。"
                         "请等待 PR Summary 更新后再使用部署审批命令。"
                     )
 
@@ -11486,95 +12547,97 @@ class DeployController:
                     and component.get("component_id") not in deployed_ids
                 ]
                 if not remaining:
-                    return "所有组件都已经部署完成，请等待 PR Summary 更新到测试阶段。"
+                    return (
+                        "GitHub 状态标签要求机器审批，但部署记录显示没有待审批组件；"
+                        "状态同步冲突，请等待 PR Summary 更新。"
+                    )
 
                 groups = (
                     self._runtime_redeploy_machine_groups(state, remaining, repo)
                     if state.get("runtime_redeploy") else
                     self._get_machine_groups_for_components(remaining, repo)
                 )
-                mention_owners = status == "deploy-requested" and detail
+                mention_owners = lifecycle_status == "deploy-requested"
                 command_lines = self._machine_notice_lines(
                     groups, repo, mention_owners=mention_owners,
-                    test_only=self._is_test_only_pr(pr), components=remaining,
-                    # deploy-ready lists compatible components; deploy-requested
-                    # only needs the machines still awaiting approval.
-                    show_components=detail and status == "deploy-ready",
-                    pr=pr,
+                    test_only=self._is_test_only_pr(latest_pr),
+                    components=remaining,
+                    show_components=detail and lifecycle_status == "deploy-ready",
+                    pr=latest_pr,
                 )
                 if not command_lines:
+                    if status_conflict:
+                        return status_sync_conflict
                     if not detail:
-                        # Never surface per-machine blocking diagnostics in a
-                        # failure reply; state the wait explicitly instead.
                         return (
-                            "目前没有可以执行的机器审批命令。"
-                            "请联系仓库维护者检查机器配置，并等待 PR Summary 更新后再操作。"
+                            "当前没有可确认兼容且有权限审批的机器命令。"
+                            "请检查 PR Summary 和机器配置后再操作。"
                         )
                     return "\n".join(self._machine_blocking_summary(groups))
 
-                if not detail:
-                    # Failure replies only need the exact commands to run now;
-                    # component, Owner, and per-machine diagnostics stay in
-                    # visible notices and rendered summaries.
-                    commands_only = [
-                        line for line in command_lines
-                        if line.startswith("`/approve_deploy")
-                    ]
-                    if not commands_only:
-                        return (
-                            "目前没有可以执行的机器审批命令。"
-                            "请联系仓库维护者检查机器配置，并等待 PR Summary 更新后再操作。"
-                        )
-                    return "请按下面的机器命令操作：\n" + "\n".join(commands_only)
-
-                remaining_ids = {
-                    component.get("component_id") for component in remaining
-                    if isinstance(component.get("component_id"), str)
-                }
-                full_groups = [
-                    group for group in groups
-                    if group.get("approval_available") is True
-                    and remaining_ids
-                    and remaining_ids.issubset(set(group.get("component_ids", [])))
+                commands_only = [
+                    line for line in command_lines
+                    if line.startswith(f"{tick}/approve_deploy")
                 ]
-                if status == "deploy-ready":
-                    lines = ["可以按下面的机器命令审批：", *command_lines]
+                if not commands_only:
+                    return status_sync_conflict
+
+                if lifecycle_status == "deploy-ready":
+                    remaining_ids = {
+                        component.get("component_id") for component in remaining
+                        if isinstance(component.get("component_id"), str)
+                    }
+                    full_groups = [
+                        group for group in groups
+                        if group.get("approval_available") is True
+                        and remaining_ids
+                        and remaining_ids.issubset(set(group.get("component_ids", [])))
+                    ]
+                    lines = ["请按目标机器执行对应审批命令：", *command_lines]
                     if len(full_groups) == 1:
                         lines.append(
-                            "只有一台机器完整适配所有组件，也可以直接执行 `/approve_deploy`。"
+                            f"只有一台机器完整适配所有组件，也可以直接执行 {tick}/approve_deploy{tick}。"
                         )
                     elif len(full_groups) > 1:
-                        lines.append(
-                            "有多台机器完整适配，请用上面的命令明确指定机器。"
-                        )
+                        lines.append("有多台机器完整适配，请明确选择机器。")
                     elif remaining_ids:
-                        lines.append(
-                            "没有单台机器覆盖全部组件，请按上面的命令分批审批。"
-                        )
-                    lines.append("`/request_deploy` 是可选的，不是部署审批的前提。")
-                    return "\n".join(lines)
+                        lines.append("没有单台机器覆盖全部组件，请分批审批。")
+                    lines.append(
+                        f"{tick}/request_deploy{tick} 仍然可选，不是部署审批的前提。"
+                    )
+                    machine_guidance = "\n".join(lines)
+                else:
+                    machine_guidance = (
+                        "以下机器尚未完成审批，请对应负责人执行：\n"
+                        + "\n".join(command_lines)
+                    )
 
-                if status == "deploy-requested":
-                    # Only the machines still awaiting approval, each with its
-                    # executable approval command and Owner mention.
-                    if not any(
-                            line.startswith("`/approve_deploy")
-                            for line in command_lines):
-                        return (
-                            "还需要其他机器完成审批，但目前无法生成可执行的审批命令。"
-                            "请联系仓库维护者检查机器配置。"
-                        )
-                    return "还需要以下机器完成审批：\n" + "\n".join(command_lines)
+                confirmation = await confirm_machine_guidance()
+                return confirmation or machine_guidance
 
-                return "请按下面的机器命令操作：\n" + "\n".join(command_lines)
-
-            if status == "deploying":
+            if lifecycle_status == "deploying":
                 return (
-                    "部署正在进行或结果正在确认，请不要重复提交审批，也不要重新部署。"
-                    "等待 PR Summary 显示部署结果即可。"
+                    "部署正在进行，请等待结果，不要重复提交审批或部署。"
                 )
-            acceptance_pending = self._acceptance_request_is_pending(state)
-            if status == "testing" and not acceptance_pending:
+
+            if lifecycle_status == "testing":
+                components = state.get("components")
+                required_ids = {
+                    component.get("component_id") for component in components
+                    if isinstance(component, dict)
+                    and isinstance(component.get("component_id"), str)
+                    and component.get("component_id")
+                } if isinstance(components, list) else set()
+                deployed_ids = _component_id_set(state.get("deployments", []))
+                if (not required_ids or not required_ids.issubset(deployed_ids)
+                        or state.get("runtime_redeploy")
+                        or state.get("test_result") in {"pass", "fail"}):
+                    logger.error(
+                        "SECURITY testing status label is unsupported by deployment data "
+                        "%s#%s head=%s label=%r",
+                        repo, pr_number, head, label_status,
+                    )
+                    return status_sync_conflict
                 upload_url = ""
                 command = state.get("command", {})
                 approval_comment_id = (
@@ -11588,58 +12651,128 @@ class DeployController:
                         approval_comment_id=approval_comment_id,
                     )
                 upload_text = (
-                    f"测试视频或图片可以选择上传：{upload_url}。上传完全可选，不影响验收。"
+                    f"本轮稳定上传入口：{upload_url}。测试附件上传完全可选，不影响验收。"
                     if upload_url else
-                    "测试视频或图片上传完全可选，不影响验收；上传入口恢复后 PR Summary 中会出现固定链接。"
+                    "测试附件上传完全可选，不影响验收；请使用本轮 PR Summary 显示的固定上传入口。"
                 )
-                return (
-                    "部署已完成，可以开始测试。"
-                    f"{upload_text} "
-                    "测试完成后，请由本轮机器的负责人执行 `/request_acceptance`。"
+                if self._acceptance_request_is_pending(state):
+                    guidance = (
+                        f"{upload_text}验收申请已经提交，请等待验收结果。"
+                    )
+                    confirmation = await confirm_machine_guidance()
+                    return confirmation or guidance
+                guidance = (
+                    f"可以开始测试。{upload_text}测试完成后执行 "
+                    f"{tick}/request_acceptance{tick} 申请验收。"
                 )
-            if status in {"testing", "acceptance-required"}:
+                confirmation = await confirm_machine_guidance()
+                return confirmation or guidance
+
+            if lifecycle_status == "acceptance-required":
+                acceptance_pending = self._acceptance_request_is_pending(state)
+                if (state.get("test_result") in {"pass", "fail"}
+                        or status_conflict and not acceptance_pending):
+                    logger.error(
+                        "SECURITY acceptance-required status label is unsupported by acceptance data "
+                        "%s#%s head=%s label=%r",
+                        repo, pr_number, head, label_status,
+                    )
+                    return status_sync_conflict
                 try:
-                    _configured, reviewers = self._eligible_acceptance_reviewers(repo, pr)
+                    _configured, reviewers = self._eligible_acceptance_reviewers(
+                        repo, latest_pr,
+                    )
                 except Exception:
                     reviewers = []
                 reviewer_text = (
-                    "请 " + " ".join(f"@{reviewer}" for reviewer in reviewers) + " 验收"
+                    "有权限验收的 GitHub 账号："
+                    + "、".join(f"@{reviewer}" for reviewer in reviewers) + "。"
                     if reviewers else
-                    "当前仓库还没有可用的验收账号，请联系仓库维护者配置"
+                    "当前仓库还没有可用的验收账号，请联系仓库维护者配置。"
                 )
-                return (
-                    f"验收申请已经提交，正在等待验收。{reviewer_text}。"
-                    "验收人需要检查本轮测试结果和实际效果，然后执行 "
-                    "`/record_test result=pass` 或 `/record_test result=fail`。"
+                guidance = (
+                    f"{reviewer_text}验收人检查本轮测试结果后执行 "
+                    f"{tick}/record_test result=pass{tick} 或 "
+                    f"{tick}/record_test result=fail{tick}。"
                 )
-            if status == "succeeded":
-                return "验收已经通过，本轮部署已经完成。请按仓库 PR 流程继续合并。"
+                confirmation = await confirm_machine_guidance()
+                if confirmation:
+                    return confirmation
+                try:
+                    _, final_reviewers = self._eligible_acceptance_reviewers(
+                        repo, latest_pr,
+                    )
+                except Exception:
+                    final_reviewers = []
+                if final_reviewers != reviewers:
+                    return status_sync_conflict
+                return guidance
 
-            if status == "failed":
+            if lifecycle_status == "succeeded":
+                if state.get("test_result") != "pass":
+                    logger.error(
+                        "SECURITY succeeded status label is unsupported by test data "
+                        "%s#%s head=%s label=%r",
+                        repo, pr_number, head, label_status,
+                    )
+                    return status_sync_conflict
+                return "验收已经通过，可以按照仓库流程合并 PR。"
+
+            if lifecycle_status == "failed":
                 failure_detail = ""
                 try:
                     lifecycle_comment = await self.proxy.find_trusted_lifecycle_comment(
                         repo, pr_number,
                     )
-                    body = lifecycle_comment.get("body", "") if isinstance(lifecycle_comment, dict) else ""
+                    body = (
+                        lifecycle_comment.get("body", "")
+                        if isinstance(lifecycle_comment, dict) else ""
+                    )
                     if isinstance(body, str):
                         match = re.search(r"(?m)^\*\*Error:\*\*\s*(.+)$", body)
                         if match:
-                            failure_detail = match.group(1).strip()[:800]
+                            candidate_detail = match.group(1).strip()
+                            candidate_detail = next(
+                                (line.strip() for line in candidate_detail.splitlines()
+                                 if line.strip()),
+                                "",
+                            )
+                            forbidden_detail = re.search(
+                                r"(?i)(?:\b(?:exception|traceback|lifecycle|"
+                                r"duplicate_argument|unknown_argument|error\s*code|"
+                                r"status\s*code|[A-Z][A-Za-z0-9_]*(?:Error|Exception))\b|"
+                                r"\b\d{3,}\b|/(?:approve_deploy|request_deploy|"
+                                r"request_acceptance|record_test)\b|\bmachine\s*=)",
+                                candidate_detail,
+                            )
+                            if (candidate_detail
+                                    and re.search(r"[\u4e00-\u9fff]", candidate_detail)
+                                    and forbidden_detail is None):
+                                failure_detail = candidate_detail[:240]
                 except Exception as exc:
-                    logger.warning("failed lifecycle detail unavailable %s#%s: %s",
-                                   repo, pr_number, type(exc).__name__)
+                    logger.warning(
+                        "failed lifecycle detail unavailable %s#%s: %s",
+                        repo, pr_number, type(exc).__name__,
+                    )
+
+                if state.get("test_result") == "pass":
+                    logger.error(
+                        "SECURITY failed status label conflicts with passing test data "
+                        "%s#%s head=%s label=%r",
+                        repo, pr_number, head, label_status,
+                    )
+                    return status_sync_conflict
+
                 if state.get("test_result") == "fail":
                     reason_text = (
                         f"本轮验收未通过：{failure_detail}。" if failure_detail
                         else "本轮验收未通过。"
                     )
                     return (
-                        f"{reason_text}"
-                        "请按失败信息修复问题并更新 PR；新提交需要重新审核和构建，"
-                        "之后按新的 PR Summary 重新部署和测试。"
+                        f"{reason_text}请按失败信息修复问题并更新 PR；"
+                        "新提交需要重新审核和构建，之后按新的 PR Summary 重新部署和测试。"
                     )
-                commands = []
+
                 try:
                     commands = list(dict.fromkeys(
                         self._runtime_drift_command_lines(state, repo),
@@ -11651,25 +12784,34 @@ class DeployController:
                     else "本轮部署失败。"
                 )
                 if commands:
-                    return (
-                        f"{reason_text}"
-                        "请先按失败信息修复并确认机器可以正常读取，然后由对应机器负责人执行：\n"
-                        + "\n".join(f"- `{command}`" for command in commands)
+                    if status_conflict and not failure_detail:
+                        return status_sync_conflict
+                    machine_guidance = (
+                        f"{reason_text}请先按失败信息修复并确认机器可以正常读取，"
+                        "然后由对应机器负责人执行以下重新部署审批命令：\n"
+                        + "\n".join(f"- {tick}{command}{tick}" for command in commands)
+                        + f"\n{tick}/request_deploy{tick} 是可选步骤。"
                     )
-                return (
-                    f"{reason_text}"
-                    "请先按失败信息修复并确认机器可以正常读取，"
-                    "再由 PR 作者执行 `/request_deploy`，随后按 PR Summary 中的机器命令审批。"
+                    confirmation = await confirm_machine_guidance()
+                    return confirmation or machine_guidance
+                if status_conflict and not failure_detail:
+                    return status_sync_conflict
+                guidance = (
+                    f"{reason_text}请先按失败信息修复并确认机器可以正常读取，"
+                    "然后按 PR Summary 中当前可用的机器命令重新审批；"
+                    f"{tick}/request_deploy{tick} 是可选步骤。"
                 )
+                confirmation = await confirm_machine_guidance()
+                return confirmation or guidance
 
-            return (
-                "当前阶段没有可以执行的部署操作。"
-                "请查看 PR Summary 中显示的最新进度后再操作。"
-            )
+            return status_unavailable
+
         except Exception as exc:
-            logger.warning("guidance unavailable %s#%s: %s",
-                           repo, pr_number, type(exc).__name__)
-            return unavailable
+            logger.warning(
+                "lifecycle next-action guidance unavailable %s#%s: %s",
+                repo, pr_number, type(exc).__name__,
+            )
+            return status_unavailable
 
     async def _project_status_best_effort(
         self, repo: str, pr_number: int, status: str,
@@ -12211,7 +13353,7 @@ class DeployController:
         """Refresh every due deployed runtime binding using read-only Agent Core calls."""
         if (not isinstance(state, dict)
                 or state.get("status") not in {
-                    "deploy-requested", "testing", "succeeded", "failed",
+                    "deploy-ready", "deploy-requested", "testing", "succeeded", "failed",
                 }
                 or state.get("command", {}).get("phase") in {"executing", "uncertain"}):
             return state
@@ -12409,7 +13551,7 @@ class DeployController:
                     machine_binding = None
                 else:
                     _, identity_matches = self._machine_identity_matches(
-                        alias, machine, [], trusted_machines,
+                        alias, machine, None, trusted_machines, repo=repo,
                     )
                     machine_binding = (
                         getattr(machine, "alias", ""), getattr(machine, "node_id", ""),
@@ -12436,10 +13578,25 @@ class DeployController:
                     continue
 
                 try:
-                    core = await self._core_for_node(
-                        machine.node_id, repo,
-                        timeout=AGENT_CORE_STATUS_PROBE_TIMEOUT_SECONDS,
-                    )
+                    endpoint_errors = []
+                    core = None
+                    for endpoint in self._policy_machine_endpoints(machine, repo):
+                        if not self._endpoint_allowed_for_repository(
+                                repo, machine, endpoint["ip"],
+                                policy_machines=self.policy.get_machines(repo=repo)):
+                            continue
+                        try:
+                            core = await self._core_for_machine_endpoint(
+                                machine, endpoint, repo,
+                                timeout=AGENT_CORE_STATUS_PROBE_TIMEOUT_SECONDS,
+                            )
+                            break
+                        except Exception as endpoint_error:
+                            endpoint_errors.append(endpoint_error)
+                    if core is None:
+                        raise DeployControllerError(
+                            self._preflight_failure_reason(endpoint_errors)
+                        )
                 except Exception as exc:
                     logger.info("runtime image Agent Core unavailable repo=%s machine=%s reason=%s",
                                 repo, alias, type(exc).__name__)
@@ -13017,7 +14174,9 @@ class DeployController:
             cmd_phase = cmd.get("phase", "")
             same_head = current_head == state.get("head_sha", "")
             command_args = cmd.get("args", {}) if isinstance(cmd, dict) else {}
-            if (same_head and state.get("status") == "deploying"
+            if (same_head and state.get("status") in {
+                    "deploying", "deploy-ready", "deploy-requested",
+                }
                     and cmd_phase == "completed"
                     and isinstance(command_args, dict)
                     and command_args.get("preflight_pending") is True):
@@ -13030,11 +14189,11 @@ class DeployController:
                 if restored:
                     return
             if (cmd_phase == "executing" and same_head
-                    and state.get("status") in {"deploying", "deploy-requested"}):
+                    and state.get("status") in {"deploying", "deploy-requested", "deploy-ready"}):
                 await self._handle_uncertain_if_needed(repo, pr_number, state)
                 return
             if (cmd_phase == "uncertain" and same_head
-                    and state.get("status") in {"deploying", "deploy-requested"}):
+                    and state.get("status") in {"deploying", "deploy-requested", "deploy-ready"}):
                 await self._recover_uncertain_deployment_tick(
                     repo, pr_number, state, pr_data,
                 )
@@ -13501,7 +14660,10 @@ class DeployController:
         if (not isinstance(expected_node_id, str) or not expected_node_id
                 or not isinstance(expected_node_host, str) or not expected_node_host
                 or machine.node_id != expected_node_id
-                or machine.node_host != expected_node_host):
+                or not self._machine_endpoint_has_unambiguous_identity(
+                    machine, expected_node_host, repo,
+                    self._policy_machine_identity(machine, repo),
+                )):
             logger.warning(
                 "uncertain deployment machine binding changed; refusing to infer completion %s machine=%s",
                 repo, machine_alias,
@@ -13579,7 +14741,9 @@ class DeployController:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            core = await self._core_for_node(machine.node_id, repo, timeout=remaining)
+            core = await self._core_for_machine_endpoint(
+                machine, expected_node_host, repo, timeout=remaining,
+            )
             for component_id in dict.fromkeys(pending):
                 if component_id in deployed:
                     continue

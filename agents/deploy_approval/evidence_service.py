@@ -260,10 +260,7 @@ class EvidenceService:
         page_path = _evidence_path(repo, pr_number).replace(
             '/api/evidence/', '/evidence/', 1,
         )
-        cos_host = getattr(self.store, 'projection_cos_host', '') if self.store else ''
-        # A public comment link may only point at the one persistent origin or
-        # at the configured COS bucket host; any other host (for example a
-        # Quick Tunnel) is not a usable file link.
+        # Notification links must always use the configured stable HTTPS origin.
         from .config import is_stable_public_base_url
         stable_netloc = ''
         configured_base = getattr(self.config, 'evidence_public_base_url', '')
@@ -280,30 +277,17 @@ class EvidenceService:
             if page_path and parsed.path == page_path:
                 # The upload page is never an attachment download link.
                 return False
-            if isinstance(cos_host, str) and cos_host and (
-                    parsed.netloc == cos_host or parsed.netloc.endswith('.' + cos_host)):
-                # A signed COS URL must address this attachment's own object
-                # directory, not just any object in the bucket.
-                if f'/attachments/{attachment_id}/' not in parsed.path:
-                    return False
+            if not stable_netloc or parsed.netloc.lower() != stable_netloc:
+                return False
+            if parsed.path.endswith(f'/attachments/{attachment_id}/download'):
                 download_links += 1
-            elif '/attachments/' in parsed.path:
-                if not stable_netloc or parsed.netloc.lower() != stable_netloc:
-                    # Only the persistent configured origin may serve the
-                    # Controller attachment route.
-                    return False
-                if parsed.path.endswith(f'/attachments/{attachment_id}/download'):
-                    download_links += 1
-                elif parsed.path.endswith(f'/attachments/{attachment_id}/preview'):
-                    # A preview for this exact attachment is the only accepted
-                    # non-download route.
-                    continue
-                else:
-                    # Another attachment's route (or a partial one) must never
-                    # appear in this attachment's success notification.
-                    return False
+            elif parsed.path.endswith(f'/attachments/{attachment_id}/preview'):
+                # A preview for this exact attachment is the only accepted
+                # non-download route.
+                continue
             else:
-                # An unrelated host or the upload page is not a file link.
+                # Another attachment's route (or a partial one) must never
+                # appear in this attachment's success notification.
                 return False
         if download_links < 1:
             return False
@@ -587,57 +571,6 @@ class EvidenceService:
                 return False, NOTIFICATION_FAILED
         return True, ''
 
-    def _cos_display_links(self, repo, pr_number, operation, filename):
-        """Return ``(download_url, preview_url, validator)`` or None.
-
-        Used only while no durable public origin exists. Each URL is signed by
-        the trusted store from the persisted object identity, never from
-        browser input, and the validator re-checks the exact object key and
-        signature window. Quick Tunnel hostnames can never pass because only
-        the configured COS bucket host is accepted by the validator.
-        """
-        store = self.store
-        sign = getattr(store, 'sign_summary_attachment', None)
-        if not callable(sign):
-            return None
-        return store, sign
-
-    async def _temporary_cos_notification_links(self, repo, pr_number, operation, filename):
-        bound = self._cos_display_links(repo, pr_number, operation, filename)
-        if bound is None:
-            return None
-        store, sign = bound
-        try:
-            download = await sign(repo=repo, pr_number=pr_number, operation=operation)
-            preview = await sign(
-                repo=repo, pr_number=pr_number, operation=operation, inline=True,
-            )
-        except Exception as exc:
-            logger.warning(
-                'evidence temporary COS display unavailable %s#%s exception=%s',
-                repo, pr_number, type(exc).__name__,
-            )
-            return None
-        object_key = operation.get('object_key')
-
-        def validator(url, action):
-            try:
-                if action == 'preview':
-                    expiry = store.projection_inline_url_expiry(
-                        url, key=object_key, filename=filename,
-                        attachment_id=operation.get('attachment_id'),
-                    )
-                else:
-                    expiry = store.download_url_expiry(
-                        url, key=object_key, filename=filename,
-                        attachment_id=operation.get('attachment_id'),
-                    )
-            except (TypeError, ValueError, AttributeError):
-                return False
-            return expiry is not None and expiry > int(time.time())
-
-        return download.get('url', ''), preview.get('url', ''), validator
-
     async def _ready_notification_context(self, repo, pr_number, operation):
         """Return ``(state, marker, body)`` for one ready attachment.
 
@@ -647,10 +580,9 @@ class EvidenceService:
         will never produce a visible notification, or ``NOTIFICATION_FAILED``
         when the comment body cannot be built safely.
 
-        A durable Controller origin is preferred. While only an ephemeral
-        ingress exists, a strictly validated COS link is used for display so
-        the already-verified file is never hidden or asked to be re-uploaded;
-        the comment is updated in place when the durable origin appears.
+        A ready attachment stays pending until the configured stable HTTPS
+        origin is reachable. Notification links are built only for that origin;
+        the persisted attachment is retained for automatic backfill.
         """
         if (not isinstance(operation, dict)
                 or str(operation.get('repo', '')).casefold() != str(repo).casefold()
@@ -695,47 +627,30 @@ class EvidenceService:
         from . import comments as comments_mod, evidence_auth
         from .config import is_stable_public_base_url
         public_base = getattr(self.config, 'evidence_public_base_url', '')
-        # Only the one persistent HTTPS origin may back a comment link; a Quick
-        # Tunnel or ephemeral origin is never used here. Reachability of that
-        # origin is enforced where the link is actually consumed — the upload
-        # page, the Summary projection and ``_current_testing_upload_url`` all
-        # require a fresh ``public_https_ingress_ready`` probe — so a dropped
-        # ingress never produces a fresh dead upload entry point.
+        if (not is_stable_public_base_url(public_base)
+                or not evidence_auth.public_https_ingress_ready(self.config)):
+            return NOTIFICATION_PENDING, '', ''
         try:
-            if is_stable_public_base_url(public_base):
-                capability = evidence_auth.issue_capability(
-                    self.config, repo, pr_number, head_sha, round_id,
-                    purpose=DOWNLOAD_PURPOSE,
-                    resource='attachment:' + attachment_id,
-                    expires_at=int(time.time()) + evidence_auth.DOWNLOAD_MAX_LIFETIME_SECONDS,
-                )
-                download_url = comments_mod.stable_attachment_url(
-                    repo, pr_number, attachment_id, capability,
-                    action='download', public_base_url=public_base,
-                )
-                preview_url = comments_mod.stable_attachment_url(
-                    repo, pr_number, attachment_id, capability,
-                    action='preview', public_base_url=public_base,
-                )
-                body = comments_mod.evidence_upload_comment(
-                    repo, pr_number, head_sha, round_id, attachment_id, filename,
-                    download_url=download_url, preview_url=preview_url,
-                    public_base_url=public_base,
-                    uploaded_by=uploaded_by,
-                )
-            else:
-                temporary = await self._temporary_cos_notification_links(
-                    repo, pr_number, operation, filename,
-                )
-                if temporary is None:
-                    return NOTIFICATION_PENDING, '', ''
-                download_url, preview_url, validator = temporary
-                body = comments_mod.evidence_upload_comment(
-                    repo, pr_number, head_sha, round_id, attachment_id, filename,
-                    download_url=download_url, preview_url=preview_url,
-                    public_base_url='', cos_url_validator=validator,
-                    uploaded_by=uploaded_by,
-                )
+            capability = evidence_auth.issue_capability(
+                self.config, repo, pr_number, head_sha, round_id,
+                purpose=DOWNLOAD_PURPOSE,
+                resource='attachment:' + attachment_id,
+                expires_at=int(time.time()) + evidence_auth.DOWNLOAD_MAX_LIFETIME_SECONDS,
+            )
+            download_url = comments_mod.stable_attachment_url(
+                repo, pr_number, attachment_id, capability,
+                action='download', public_base_url=public_base,
+            )
+            preview_url = comments_mod.stable_attachment_url(
+                repo, pr_number, attachment_id, capability,
+                action='preview', public_base_url=public_base,
+            )
+            body = comments_mod.evidence_upload_comment(
+                repo, pr_number, head_sha, round_id, attachment_id, filename,
+                download_url=download_url, preview_url=preview_url,
+                public_base_url=public_base,
+                uploaded_by=uploaded_by,
+            )
         except Exception as exc:
             logger.warning(
                 'evidence ready notification link unavailable %s#%s exception=%s',

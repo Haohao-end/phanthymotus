@@ -160,6 +160,10 @@ class Config:
     test_reviewers_file: str = "/run/deploy-approval/test_reviewers.yaml"
     test_reviewers: list[str] = field(default_factory=list)
 
+    # User OAuth credentials live in a separately mounted writable directory;
+    # access and refresh tokens rotate atomically in this file.
+    feishu_oauth_file: str = "/run/deploy-approval/feishu-oauth/feishu-oauth.json"
+
     # Security
     allow_private_http: bool = False
     http_allowed_cidrs: list[str] = field(default_factory=list)
@@ -474,6 +478,7 @@ def load_config() -> Config:
         ),
         review_comment_author_id=review_trust.get("author_id", ""),
         review_comment_author_login=review_trust.get("author_login", ""),
+        feishu_oauth_file="/run/deploy-approval/feishu-oauth/feishu-oauth.json",
         machine_owners_file="/run/deploy-approval/machines.yaml",
         secrets_file="/run/deploy-approval/secrets.yaml",
         test_reviewers_file=test_reviewers_file,

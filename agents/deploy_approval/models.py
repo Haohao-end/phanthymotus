@@ -9,7 +9,7 @@ github_state_proxy._validate_hidden_state (the production validator).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # Machine owners configuration
@@ -19,6 +19,18 @@ class MachineInfo:
     node_id: str
     owners: list[str]  # GitHub logins (case-insensitive)
     node_host: str = ""
+    # node_host remains the configured Agent Core endpoint. node_hosts may
+    # include additional Feishu-confirmed addresses and must never be used to
+    # infer an Agent Core endpoint.
+    node_hosts: list[str] = field(default_factory=list)
+    node_addresses: list[dict[str, str]] = field(default_factory=list, repr=False)
+    feishu_number: str | None = None
+    feishu_identity_confirmed: bool | None = field(default=None, repr=False)
+    feishu_identity_reason: str = field(default="", repr=False)
+    feishu_stale: bool = field(default=False, repr=False)
+    feishu_brand: str | None = field(default=None, repr=False)
+    feishu_model: str | None = field(default=None, repr=False)
+    feishu_snapshot_generation: int = field(default=0, repr=False)
     targets: list[str] | None = None  # allowed targets (None = all)
     platforms: list[str] | None = None  # allowed platforms (None = all)
     variants: list[str] | None = None  # allowed variants (None = all)

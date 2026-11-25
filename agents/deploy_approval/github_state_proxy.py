@@ -1233,7 +1233,12 @@ class GitHubStateProxy:
         return await self._github.get_comment(repo, comment_id)
 
     async def post_issue_comment(self, repo: str, pr_number: int,
-                                 body: str) -> dict:
+                                 body: str) -> dict | None:
+        if not isinstance(body, str):
+            return None
+        visible_text = re.sub(r"<!--[\s\S]*?-->", "", body).strip()
+        if not visible_text:
+            return None
         return await self._github.post_issue_comment(repo, pr_number, body)
 
     async def update_comment(self, repo: str, comment_id: int,

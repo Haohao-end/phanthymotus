@@ -1588,7 +1588,8 @@ class GitHubCommandWatcher:
             body = listed.get("body")
             if not isinstance(body, str) or not body.strip():
                 continue
-            cmd = commands_mod.parse_command(body)
+            comment_id = listed["id"]
+            cmd = commands_mod.parse_command(body, comment_id=comment_id)
             if not cmd.is_command:
                 likely_intent = commands_mod.detect_deployment_command_intent(body)
                 if likely_intent:
@@ -1596,7 +1597,6 @@ class GitHubCommandWatcher:
                     cmd.raw = body
             if not cmd.is_command:
                 continue
-            comment_id = listed["id"]
             try:
                 fresh_pr = await self.proxy.get_pr(repo, pr_number)
                 fresh_comment = await self.proxy.get_comment(repo, comment_id)
@@ -3962,7 +3962,7 @@ class GitHubCommandWatcher:
                     return
                 continue
 
-            cmd = commands_mod.parse_command(fresh_body)
+            cmd = commands_mod.parse_command(fresh_body, comment_id=comment_id)
             if not cmd.is_command:
                 likely_intent = commands_mod.detect_deployment_command_intent(fresh_body)
                 if likely_intent:
@@ -4403,10 +4403,29 @@ class GitHubCommandWatcher:
                     if reply_delivery is False:
                         self._finish_recent_command(
                             repo, pr_number, comment_id,
-                            failure_reason="command_rejection_notice_not_confirmed",
+                            failure_reason="command_reply_not_confirmed",
                             retryable=True,
                         )
                         return
+                    if reply_delivery is not True:
+                        post_reply = getattr(self.controller, "_post_command_reply", None)
+                        delivered = False
+                        if callable(post_reply):
+                            try:
+                                delivered = await post_reply(
+                                    repo, pr_number, comment_id,
+                                    "命令已处理。",
+                                    topic="command-processed",
+                                )
+                            except Exception:
+                                delivered = False
+                        if delivered is not True:
+                            self._finish_recent_command(
+                                repo, pr_number, comment_id,
+                                failure_reason="command_reply_not_confirmed",
+                                retryable=True,
+                            )
+                            return
                     if await self._consume_comment_cursor(repo, pr_number, comment_id):
                         self._finish_recent_command(repo, pr_number, comment_id)
                     else:
@@ -4532,10 +4551,25 @@ class GitHubCommandWatcher:
                 # identical for the same Lifecycle state. A failed notice is
                 # not fatal here: the outcome is unknown either way, and the
                 # per-comment dedupe keeps any retry from double-posting.
-                await self._post_command_error_notice(
-                    repo, pr_number, comment_id, cmd,
-                    f"command-error-uncertain-{_command_kind(cmd)}",
-                )
+                failure_reason = _github_failure_reason(e)
+                if failure_reason.startswith("github_"):
+                    github_message = (
+                        "GitHub 请求受到限流，当前无法确认命令结果；"
+                        "请查看 PR Summary，在结果确认前不要重复提交可能已经开始的部署审批。"
+                        if failure_reason == "github_rate_limited" else
+                        "GitHub 请求暂时超时，当前无法确认命令结果；"
+                        "请查看 PR Summary，在结果确认前不要重复提交可能已经开始的部署审批。"
+                    )
+                    await self._post_command_error_notice(
+                        repo, pr_number, comment_id, cmd,
+                        f"command-error-github-timeout-{_command_kind(cmd)}",
+                        message=github_message,
+                    )
+                else:
+                    await self._post_command_error_notice(
+                        repo, pr_number, comment_id, cmd,
+                        f"command-error-uncertain-{_command_kind(cmd)}",
+                    )
                 # Transient error — do NOT advance cursor, stop processing this PR
                 return
 

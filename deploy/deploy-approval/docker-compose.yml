@@ -46,6 +46,13 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # Rotating Feishu user OAuth credentials — persistent and writable.
+      - type: bind
+        source: "${DEPLOY_APPROVAL_CONFIG_DIR:?config directory required}/feishu-oauth"
+        target: /run/deploy-approval/feishu-oauth
+        read_only: false
+        bind:
+          create_host_path: false
       # Independent acceptance allowlist; a missing file is a deployment error.
       - type: bind
         source: ./test_reviewers.yaml

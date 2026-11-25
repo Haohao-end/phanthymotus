@@ -440,18 +440,24 @@ def runtime_image_checks_block(
                 else:
                     message = ""
                 if message:
-                    lines.append(f"  - {component}：{message}")
+                    lines.extend([
+                        f"  - {component}：状态：UNAVAILABLE",
+                        f"    审批目标：<code>{_escape(item['target'])}</code>",
+                        f"    当前运行：<code>{_escape(item['observed'])}</code>",
+                        f"    {message}",
+                    ])
                     continue
                 lines.extend([
-                    f"  - {component}",
+                    f"  - {component}：状态：MATCH",
                     f"    审批目标：<code>{_escape(item['target'])}</code>",
                     f"    当前运行：<code>{_escape(item['observed'])}</code>",
                     "    运行镜像与本轮批准镜像一致。",
                 ])
                 continue
             if status == "mismatch":
+                result_label = "MISMATCH" if item["images_confirmed"] else "UNAVAILABLE"
                 lines.extend([
-                    f"  - {component}",
+                    f"  - {component}：状态：{result_label}",
                     f"    审批目标：<code>{_escape(item['target'])}</code>",
                     f"    当前运行：<code>{_escape(item['observed'])}</code>",
                 ])
@@ -474,21 +480,19 @@ def runtime_image_checks_block(
                     )
                     lines.append(f"    {reason}，因此暂时不能生成重新部署命令。")
                 continue
-            if status == "identity_changed":
-                lines.append(
-                    f"  - {component}：机器身份绑定发生变化，暂时无法确认运行镜像；"
-                    "请等待自动检查重新确认。"
-                )
-            elif status == "not_running":
-                lines.append(
-                    f"  - {component}：组件当前未运行，暂时无法确认运行镜像；"
-                    "请等待自动检查重新确认。"
-                )
-            else:
-                lines.append(
-                    f"  - {component}：运行状态暂时无法确认，不能判断镜像是否一致；"
-                    "请等待自动检查完成。"
-                )
+            unavailable_reason = (
+                "机器身份绑定发生变化，暂时无法确认运行镜像。"
+                if status == "identity_changed" else
+                "组件当前未运行，暂时无法确认运行镜像。"
+                if status == "not_running" else
+                "运行状态暂时无法确认，不能判断镜像是否一致。"
+            )
+            lines.extend([
+                f"  - {component}：状态：UNAVAILABLE",
+                f"    审批目标：<code>{_escape(item['target'])}</code>",
+                f"    当前运行：<code>{_escape(item['observed'])}</code>",
+                f"    {unavailable_reason}请等待自动检查重新确认。",
+            ])
         for selector in sorted(selectors):
             selector_ip = ipv4(selector)
             if selector_ip:
@@ -825,8 +829,10 @@ def evidence_upload_comment(
         if (candidate.casefold() not in _NON_ACCOUNT_UPLOADERS
                 and re.fullmatch(
                     r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}(?:\[bot\])?", candidate)):
-            uploader = "@" + candidate
-    author = f"开发者 {uploader} " if uploader else "开发者"
+            uploader = candidate
+    if not uploader:
+        return ""
+    author = f"开发者 @{uploader} "
     if suffix in image_suffixes:
         # The caption names the uploader and the exact file; the inline image is
         # a preview of this attachment and the link is the direct download.
@@ -881,7 +887,7 @@ def _workflow_lines(
     step_defs = [
         ("1. Request Review", 0, "review"),
         ("2. Review Agent completed", 1, "reviewed"),
-        ("3. Request deployment", 2, "request"),
+        ("3. Request deployment (optional)", 2, "request"),
         ("4. Machine approval(s)", 3, "approval"),
         ("5. All required components deployed", 4, "deployment"),
         ("6. Upload test video/images (optional)", 4, "evidence"),
@@ -923,6 +929,10 @@ def _workflow_lines(
             checked = index < failed_first_pending
         else:
             checked = current_level > required_level
+            if step == "request" and current_level >= 2:
+                # The request step is advisory; deploy-ready can proceed
+                # directly to machine approval.
+                checked = True
             if test_like and step == "deployment":
                 # An unset flag means the caller did not assert incompleteness.
                 checked = deployments_complete is not False
@@ -1161,6 +1171,11 @@ def _deploying_next_action(
     elif source_phase == "deployed":
         lines = [
             f"目标镜像已在机器 {machine_label}确认；本轮部署还在汇总其他组件的结果：",
+        ]
+    elif source_phase == "preflight":
+        lines = [
+            f"部署条件检查已通过，正在为机器 {machine_label}准备部署请求；"
+            "部署请求发送前，部署尚未开始：",
         ]
     elif source:
         if machine_label == "机器信息暂不可用":
@@ -2055,22 +2070,17 @@ def _runtime_image_values(check, component):
         or _record_value(check, "runtime_id") == "core"
     )
     if is_core:
-        target_tag = (
-            _record_value(check, "target_tag")
-            or _record_value(component, "target_tag")
-        )
         target_image = (
-            target_tag
-            or _record_value(check, "target_image", "target_digest")
+            _record_value(check, "target_image", "target_digest")
             or _record_value(component, "image_ref")
         )
-        observed_tag = (
-            _record_value(check, "current_tag")
-            or _record_value(check, "observed_image")
+        observed_image = (
+            _record_value(check, "observed_image")
             or _record_value(check, "running_image")
+            or _record_value(check, "current_tag")
             or _record_value(check, "observed_digest")
         )
-        return _runtime_core_tag(target_image), _runtime_core_tag(observed_tag)
+        return _runtime_digest(target_image), _runtime_digest(observed_image)
 
     return (
         _runtime_driver_image(
@@ -2755,7 +2765,7 @@ def testing(
         lifecycle_marker(repo, pr_number),
         "### Deploy Approval \u2014 Lifecycle",
         "",
-        ("**Status:** `testing` · 测试完成 · 待验收"
+        ("**Status:** `acceptance-required` · 测试完成 · 待验收"
          if acceptance_pending else "**Status:** `testing`"),
         "",
         f"**Repository:** <code>{_escape(repo)}</code>",
@@ -2844,13 +2854,14 @@ def failed_comment(
             "请先按上面的失败原因修复问题；修复后需要重新部署并重新测试，"
             "再由验收人重新记录结果。",
             "重新部署时由对应机器的负责人执行该机器的 `/approve_deploy` 命令，"
-            "或由 PR 作者重新提交 `/request_deploy`。",
+            "`/request_deploy` 是可选步骤；如果 Summary 没有可执行的机器命令，"
+            "请按仓库流程重新触发审核和构建。",
         ])
     else:
         lines.extend([
             "请先按上面的失败原因修复问题，并确认目标机器可以正常读取。",
-            "修复后由对应机器的负责人重新执行该机器的 `/approve_deploy` 命令，"
-            "或由 PR 作者重新提交 `/request_deploy`。",
+            "如果 Summary 已列出兼容机器命令，由对应机器的负责人直接重新执行；"
+            "`/request_deploy` 是可选步骤。没有可执行命令时，请按仓库流程重新触发审核和构建。",
         ])
     lines.append("在重新部署之前，不需要执行其他命令。")
     lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
@@ -2978,8 +2989,8 @@ def _status_next_action(
         return [
             "本次部署没有完成。",
             "请先按失败原因修复问题，确认目标机器可以正常读取，"
-            "再由对应机器的负责人重新执行 `/approve_deploy`，"
-            "或由 PR 作者重新提交 `/request_deploy`。",
+            "如果 Summary 已列出兼容机器命令，由对应机器的负责人直接重新执行；"
+            "`/request_deploy` 是可选步骤。没有可执行命令时，请按仓库流程重新触发审核和构建。",
         ]
     return ["请查看当前部署状态，按本 Summary 中的提示操作。"]
 
