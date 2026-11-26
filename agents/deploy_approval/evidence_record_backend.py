@@ -108,7 +108,7 @@ class CosEvidenceRecordBackend:
                     kwargs["verify"] = True
                     headers = kwargs.get("headers") or {}
                     if method.upper() == "PUT":
-                        if headers.get("x-cos-forbid-overwrite") != "true":
+                        if headers.get("x-cos-forbid-overwrite") not in ("true", b"true"):
                             raise EvidenceRecordBackendError(
                                 "x-cos-forbid-overwrite: true header missing from PUT request"
                             )
