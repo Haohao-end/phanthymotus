@@ -40,6 +40,10 @@ from .review_comment_parser import (
 
 logger = logging.getLogger(__name__)
 PR_RECONCILE_CACHE_SECONDS = 120.0
+OPEN_PR_LIST_REFRESH_SECONDS = 30.0
+OPEN_PR_SNAPSHOT_MAX_AGE_SECONDS = 120.0
+OPEN_PR_LIST_QUERY_TIMEOUT_SECONDS = 300.0
+OPEN_PR_LIST_FAILURE_MAX_BACKOFF_SECONDS = 300.0
 PRIORITY_BASELINE_RETRY_BASE_SECONDS = 30.0
 PRIORITY_BASELINE_RETRY_MAX_SECONDS = 300.0
 # Ready-evidence reconcile pacing. Every item is one repo/PR hint, so the
@@ -242,6 +246,7 @@ class GitHubCommandWatcher:
         self._monotonic = time.monotonic  # deterministic clock source
         self._task: asyncio.Task | None = None
         self._recent_discovery_task: asyncio.Task | None = None
+        self._open_pr_listing_scheduler_task: asyncio.Task | None = None
         self._running = False
         # Repos newly (re)activated by an auth refresh.  Each is baselined
         # (cursor = max observed comment id, no dispatch) before normal
@@ -335,6 +340,15 @@ class GitHubCommandWatcher:
         self._evidence_sync_failures: dict[tuple[str, int], int] = {}
         self._evidence_sync_retry_after: dict[tuple[str, int], float] = {}
         self._evidence_sync_seeded_repos: set[str] = set()
+        # Read-only full-list queries run independently per authorized repo.
+        # Their immutable snapshots are only scheduling hints; the serial
+        # writer still re-reads each selected PR before any lifecycle write.
+        self._open_pr_listing_tasks: dict[str, asyncio.Task] = {}
+        self._open_pr_listing_snapshots: dict[str, dict] = {}
+        self._open_pr_listing_next_attempt: dict[str, float] = {}
+        self._open_pr_listing_failures: dict[str, int] = {}
+        self._open_pr_listing_generation: dict[str, int] = {}
+        self._open_pr_listing_status: dict[str, dict] = {}
 
     async def _validated_current_summary_cos_links(self, repo: str, pr_number: int) -> set[str]:
         """Return one-year COS URLs present in the trusted current Summary."""
@@ -779,6 +793,9 @@ class GitHubCommandWatcher:
         self._running = True
         self._task = asyncio.create_task(self._poll_loop())
         self._recent_discovery_task = asyncio.create_task(self._recent_discovery_loop())
+        self._open_pr_listing_scheduler_task = asyncio.create_task(
+            self._open_pr_listing_refresh_loop(),
+        )
 
     def mark_repos_pending_baseline(
         self, repos: list[str], *, startup: bool = True,
@@ -796,9 +813,19 @@ class GitHubCommandWatcher:
             self._pending_baseline_repos.add(repo)
             self._baseline_progress[repo] = set()
             self._repo_baseline_cutoff_utc[repo] = cutoff_utc
+            self._invalidate_open_pr_listing_repo(
+                repo, status="rebaseline_required",
+            )
 
     async def stop(self) -> None:
         self._running = False
+        if self._open_pr_listing_scheduler_task is not None:
+            self._open_pr_listing_scheduler_task.cancel()
+            try:
+                await self._open_pr_listing_scheduler_task
+            except asyncio.CancelledError:
+                pass
+            self._open_pr_listing_scheduler_task = None
         if self._recent_discovery_task is not None:
             self._recent_discovery_task.cancel()
             try:
@@ -813,6 +840,12 @@ class GitHubCommandWatcher:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        listing_tasks = list(self._open_pr_listing_tasks.values())
+        for task in listing_tasks:
+            task.cancel()
+        if listing_tasks:
+            await asyncio.gather(*listing_tasks, return_exceptions=True)
+        self._open_pr_listing_tasks.clear()
 
     async def _recent_discovery_loop(self) -> None:
         """Discover new comments independently; this task never writes PR state."""
@@ -837,6 +870,27 @@ class GitHubCommandWatcher:
             if next_run <= now - interval:
                 next_run = now + interval
             await asyncio.sleep(max(0.0, next_run - now))
+
+    async def _open_pr_listing_refresh_loop(self) -> None:
+        """Schedule independent read-only repository listings on their cadence."""
+        interval = max(1.0, min(5.0, float(self.config.poll_interval_seconds)))
+        while self._running:
+            if self.config.auth_valid is not True:
+                self._invalidate_all_open_pr_listing_snapshots()
+            else:
+                try:
+                    repos = self._authorized_watcher_repos()
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    self.config.auth_valid = False
+                    self._invalidate_all_open_pr_listing_snapshots()
+                    logger.warning(
+                        "watcher PR listing scheduler authorization invalid reason=%s",
+                        type(exc).__name__,
+                    )
+                else:
+                    self._sync_open_pr_listing_repos(repos)
+                    self._schedule_open_pr_listing_refreshes(repos)
+            await asyncio.sleep(interval)
 
     async def _poll_loop(self) -> None:
         while self._running:
@@ -976,6 +1030,7 @@ class GitHubCommandWatcher:
                                      if last_failure else None),
             "oldest_pending_command_age_seconds": round(max(0.0, pending_age), 1),
             "ordinary_prs_skipped_last_cycle": self._last_ordinary_pr_skips,
+            "open_pr_listing_by_repo": self._open_pr_listing_diagnostics(),
             "recent_command_discovery_at": dict(self._recent_discovery_at),
             "last_recent_command_discovery_at": max(
                 self._recent_discovery_at.values(), default=None,
@@ -1010,6 +1065,246 @@ class GitHubCommandWatcher:
         return diagnostics.get(
             "authenticated_backing_off", diagnostics.get("backing_off", False),
         ) is True
+
+    def _open_pr_listing_repo_is_authorized(self, repo: str) -> bool:
+        repo_key = repo.casefold()
+        active = {
+            name.casefold() for name in self.config.active_repos
+            if isinstance(name, str)
+        }
+        allowlist = {
+            name.casefold() for name in self.config.github_repos
+            if isinstance(name, str)
+        }
+        return (
+            self.config.auth_valid is True
+            and repo_key in active
+            and repo_key in allowlist
+        )
+
+    def _authorized_watcher_repos(self) -> list[str]:
+        authorized = set(resolve_authorized_repos(
+            self.config.github_repos, self.config.active_repos,
+        ))
+        return [
+            repo for repo in dict.fromkeys(self.config.active_repos)
+            if repo.casefold() in authorized
+        ]
+
+    def _invalidate_open_pr_listing_repo(
+        self, repo: str, *, status: str = "invalidated", remove: bool = False,
+    ) -> None:
+        self._open_pr_listing_generation[repo] = (
+            self._open_pr_listing_generation.get(repo, 0) + 1
+        )
+        task = self._open_pr_listing_tasks.get(repo)
+        if task is not None and not task.done():
+            task.cancel()
+        self._open_pr_listing_snapshots.pop(repo, None)
+        self._open_pr_listing_failures.pop(repo, None)
+        if remove:
+            self._open_pr_listing_next_attempt.pop(repo, None)
+            self._open_pr_listing_status.pop(repo, None)
+            return
+        self._open_pr_listing_next_attempt[repo] = self._monotonic()
+        previous = self._open_pr_listing_status.get(repo, {})
+        self._open_pr_listing_status[repo] = {
+            "status": status,
+            "last_attempt_at": previous.get("last_attempt_at"),
+            "last_success_at": None,
+            "duration_seconds": previous.get("duration_seconds"),
+            "snapshot_count": 0,
+            "failure_type": previous.get("failure_type")
+            if status == "authorization_unavailable" else None,
+        }
+
+    def _invalidate_all_open_pr_listing_snapshots(self) -> None:
+        repos = set(self._open_pr_listing_tasks)
+        repos.update(self._open_pr_listing_snapshots)
+        repos.update(self._open_pr_listing_status)
+        repos.update(self._open_pr_listing_next_attempt)
+        for repo in repos:
+            task = self._open_pr_listing_tasks.get(repo)
+            if (repo not in self._open_pr_listing_snapshots
+                    and (task is None or task.done())
+                    and self._open_pr_listing_status.get(repo, {}).get("status")
+                    == "authorization_unavailable"):
+                continue
+            self._invalidate_open_pr_listing_repo(
+                repo, status="authorization_unavailable",
+            )
+
+    def _sync_open_pr_listing_repos(self, repos: list[str]) -> None:
+        authorized = set(repos)
+        known = set(self._open_pr_listing_tasks)
+        known.update(self._open_pr_listing_snapshots)
+        known.update(self._open_pr_listing_status)
+        known.update(self._open_pr_listing_next_attempt)
+        for repo in known - authorized:
+            self._invalidate_open_pr_listing_repo(repo, remove=True)
+
+    def _schedule_open_pr_listing_refreshes(self, repos: list[str]) -> None:
+        if self._github_backing_off():
+            return
+        now = self._monotonic()
+        for repo in repos:
+            if not self._open_pr_listing_repo_is_authorized(repo):
+                continue
+            current = self._open_pr_listing_tasks.get(repo)
+            if current is not None and not current.done():
+                continue
+            if current is not None:
+                self._open_pr_listing_tasks.pop(repo, None)
+            if now < self._open_pr_listing_next_attempt.get(repo, 0.0):
+                continue
+            previous = self._open_pr_listing_status.get(repo, {})
+            snapshot = self._open_pr_listing_snapshots.get(repo)
+            self._open_pr_listing_status[repo] = {
+                "status": "running",
+                "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+                "last_success_at": previous.get("last_success_at"),
+                "duration_seconds": previous.get("duration_seconds"),
+                "snapshot_count": len(snapshot.get("prs", []))
+                if isinstance(snapshot, dict) else 0,
+                "failure_type": previous.get("failure_type"),
+            }
+            generation = self._open_pr_listing_generation.get(repo, 0)
+            task = asyncio.create_task(
+                self._refresh_open_pr_listing(repo, generation),
+            )
+            self._open_pr_listing_tasks[repo] = task
+
+    async def _refresh_open_pr_listing(self, repo: str, generation: int) -> None:
+        task = asyncio.current_task()
+        started = self._monotonic()
+        returned_count = 0
+        try:
+            prs = await asyncio.wait_for(
+                self.proxy.get_open_prs(repo),
+                timeout=OPEN_PR_LIST_QUERY_TIMEOUT_SECONDS,
+            )
+            if not isinstance(prs, list):
+                raise TypeError("open PR listing did not return a list")
+            returned_count = len(prs)
+            completed = self._monotonic()
+            if generation != self._open_pr_listing_generation.get(repo, 0):
+                return
+            if not self._open_pr_listing_repo_is_authorized(repo):
+                self._open_pr_listing_snapshots.pop(repo, None)
+                state = self._open_pr_listing_status.get(repo, {})
+                state.update({
+                    "status": "authorization_unavailable",
+                    "last_success_at": None,
+                    "snapshot_count": 0,
+                    "failure_type": None,
+                })
+                return
+            completed_at = datetime.now(timezone.utc).isoformat()
+            duration = max(0.0, completed - started)
+            self._open_pr_listing_snapshots[repo] = {
+                "prs": list(prs),
+                "completed_monotonic": completed,
+                "completed_at": completed_at,
+            }
+            self._open_pr_listing_failures.pop(repo, None)
+            self._open_pr_listing_next_attempt[repo] = (
+                completed + OPEN_PR_LIST_REFRESH_SECONDS
+            )
+            self._open_pr_listing_status[repo] = {
+                "status": "succeeded",
+                "last_attempt_at": self._open_pr_listing_status.get(repo, {}).get(
+                    "last_attempt_at",
+                ),
+                "last_success_at": completed_at,
+                "duration_seconds": round(duration, 1),
+                "snapshot_count": returned_count,
+                "failure_type": None,
+            }
+            logger.info(
+                "watcher open PR listing completed repo=%s duration_seconds=%.1f returned_count=%s",
+                repo, duration, returned_count,
+            )
+        except asyncio.CancelledError:
+            if (generation == self._open_pr_listing_generation.get(repo, 0)
+                    and self._open_pr_listing_repo_is_authorized(repo)):
+                state = self._open_pr_listing_status.get(repo, {})
+                state["status"] = "cancelled"
+                state["duration_seconds"] = round(
+                    max(0.0, self._monotonic() - started), 1,
+                )
+                self._open_pr_listing_next_attempt[repo] = self._monotonic()
+            raise
+        except Exception as exc:
+            if generation == self._open_pr_listing_generation.get(repo, 0):
+                authorized = self._open_pr_listing_repo_is_authorized(repo)
+                previous = self._open_pr_listing_status.get(repo, {})
+                snapshot = self._open_pr_listing_snapshots.get(repo)
+                failures = self._open_pr_listing_failures.get(repo, 0) + 1
+                self._open_pr_listing_failures[repo] = failures
+                delay = min(
+                    OPEN_PR_LIST_FAILURE_MAX_BACKOFF_SECONDS,
+                    OPEN_PR_LIST_REFRESH_SECONDS * (2 ** min(failures - 1, 8)),
+                )
+                self._open_pr_listing_next_attempt[repo] = self._monotonic() + delay
+                if not authorized:
+                    self._open_pr_listing_snapshots.pop(repo, None)
+                    snapshot = None
+                self._open_pr_listing_status[repo] = {
+                    "status": "failed" if authorized else "authorization_unavailable",
+                    "last_attempt_at": previous.get("last_attempt_at"),
+                    "last_success_at": previous.get("last_success_at")
+                    if authorized else None,
+                    "duration_seconds": round(
+                        max(0.0, self._monotonic() - started), 1,
+                    ),
+                    "snapshot_count": len(snapshot.get("prs", []))
+                    if isinstance(snapshot, dict) else 0,
+                    "failure_type": type(exc).__name__,
+                }
+            logger.warning(
+                "watcher open PR listing failed repo=%s duration_seconds=%.1f returned_count=%s failure_type=%s",
+                repo, max(0.0, self._monotonic() - started), returned_count,
+                type(exc).__name__,
+            )
+        finally:
+            if self._open_pr_listing_tasks.get(repo) is task:
+                self._open_pr_listing_tasks.pop(repo, None)
+
+    def _usable_open_pr_snapshot(self, repo: str) -> dict | None:
+        snapshot = self._open_pr_listing_snapshots.get(repo)
+        if not isinstance(snapshot, dict):
+            return None
+        age = self._monotonic() - snapshot.get("completed_monotonic", 0.0)
+        if 0.0 <= age <= OPEN_PR_SNAPSHOT_MAX_AGE_SECONDS:
+            return snapshot
+        return None
+
+    def _open_pr_listing_diagnostics(self) -> dict:
+        result = {}
+        repos = list(dict.fromkeys(self.config.active_repos))
+        for repo in repos:
+            state = self._open_pr_listing_status.get(repo, {})
+            snapshot = self._open_pr_listing_snapshots.get(repo)
+            age = None
+            fresh = False
+            snapshot_count = 0
+            if isinstance(snapshot, dict):
+                snapshot_count = len(snapshot.get("prs", []))
+                age = max(
+                    0.0,
+                    self._monotonic() - snapshot.get("completed_monotonic", 0.0),
+                )
+                fresh = age <= OPEN_PR_SNAPSHOT_MAX_AGE_SECONDS
+            result[repo] = {
+                "status": state.get("status", "idle"),
+                "last_attempt_at": state.get("last_attempt_at"),
+                "last_success_at": state.get("last_success_at"),
+                "snapshot_count": snapshot_count,
+                "snapshot_age_seconds": round(age, 1) if age is not None else None,
+                "snapshot_fresh": fresh,
+                "failure_type": state.get("failure_type"),
+            }
+        return result
 
     def _public_recent_command_metric(self) -> dict | None:
         key = self._latest_recent_command_key
@@ -2307,6 +2602,7 @@ class GitHubCommandWatcher:
             for repo in removed:
                 self._pending_baseline_repos.discard(repo)
                 self._baseline_progress.pop(repo, None)
+                self._invalidate_open_pr_listing_repo(repo, remove=True)
             newly_active = new_active_set if not old_auth_valid else new_active_set - old_active_set
             self.mark_repos_pending_baseline(sorted(newly_active), startup=False)
         except (GitHubRateLimitError, GitHubTransientError) as e:
@@ -2734,21 +3030,46 @@ class GitHubCommandWatcher:
 
     async def _drain_priority_prs(
         self, priority_done, priority_attempted, recent_attempted,
-        *, allowed_sources, max_items=1,
+        *, allowed_sources, max_items=2,
     ) -> bool:
         """Process a bounded priority tier through the existing serial PR path."""
+        max_items = min(2, max(0, max_items))
         cycle_ok = True
         processed_items = 0
-        queued_items = []
+        for stale in list(self._priority_pr_queue):
+            stale_repo, _ = stale
+            if (stale_repo not in self.config.active_repos
+                    or stale_repo not in self.config.github_repos):
+                self._priority_pr_queue.remove(stale)
+                self._priority_pr_set.discard(stale)
+                self._priority_pr_enqueued_at.pop(stale, None)
+                self._priority_pr_sources.pop(stale, None)
+                self._clear_priority_baseline_retry(stale)
+                self._clear_priority_item_retry(stale)
+        candidates = []
         for source in ("webhook", "recent"):
             if source not in allowed_sources:
                 continue
-            item = next((queued for queued in self._priority_pr_queue
-                         if self._priority_pr_sources.get(queued, "webhook") == source
-                         and self._monotonic() >= self._priority_pr_retry_after.get(queued, 0.0)),
-                        None)
-            if item is not None:
-                queued_items.append(item)
+            candidates.extend(
+                queued for queued in self._priority_pr_queue
+                if self._priority_pr_sources.get(queued, "webhook") == source
+                and self._monotonic() >= self._priority_pr_retry_after.get(queued, 0.0)
+                and queued[1] not in priority_attempted.get(queued[0], [])
+            )
+        queued_items = []
+        selected_repos = set()
+        for item in candidates:
+            if item[0] in selected_repos:
+                continue
+            queued_items.append(item)
+            selected_repos.add(item[0])
+            if len(queued_items) >= max_items:
+                break
+        if len(queued_items) < max_items:
+            queued_items.extend(
+                item for item in candidates if item not in queued_items
+            )
+            queued_items = queued_items[:max_items]
         for item in queued_items:
             if processed_items >= max_items:
                 break
@@ -2777,9 +3098,6 @@ class GitHubCommandWatcher:
             source_attempted = (priority_attempted.setdefault(queued_repo, [])
                                 if source == "webhook"
                                 else recent_attempted.setdefault(queued_repo, []))
-            if len(source_attempted) >= 1:
-                self._queue_priority_pr(item, source)
-                continue
             source_attempted.append(pr_number)
             if source != "webhook":
                 priority_attempted.setdefault(queued_repo, []).append(pr_number)
@@ -2789,7 +3107,11 @@ class GitHubCommandWatcher:
             try:
                 current_pr = await self.proxy.get_pr(queued_repo, pr_number)
             except GitHubRateLimitError as exc:
-                self._queue_priority_pr(item, source)
+                self._retry_priority_item(item, source, "github_rate_limited")
+                self._priority_pr_retry_after[item] = max(
+                    self._priority_pr_retry_after.get(item, 0.0),
+                    self._monotonic() + max(0.0, exc.retry_after_seconds),
+                )
                 self._fail_recent_commands_for_pr(queued_repo, pr_number, "github_rate_limited")
                 self._record_pr_attempt(queued_repo, pr_number, "github_rate_limited")
                 self._scan_failure_reasons.append(
@@ -2814,7 +3136,7 @@ class GitHubCommandWatcher:
                         queued_repo, pr_number, source,
                     )
                     continue
-                self._queue_priority_pr(item, source)
+                self._retry_priority_item(item, source, type(exc).__name__)
                 self._fail_recent_commands_for_pr(queued_repo, pr_number, type(exc).__name__)
                 self._record_pr_attempt(queued_repo, pr_number, type(exc).__name__)
                 self._scan_failure_reasons.append(
@@ -2829,7 +3151,7 @@ class GitHubCommandWatcher:
                     break
                 continue
             except Exception as exc:
-                self._queue_priority_pr(item, source)
+                self._retry_priority_item(item, source, type(exc).__name__)
                 self._fail_recent_commands_for_pr(queued_repo, pr_number, type(exc).__name__)
                 self._record_pr_attempt(queued_repo, pr_number, type(exc).__name__)
                 self._scan_failure_reasons.append(
@@ -2886,7 +3208,7 @@ class GitHubCommandWatcher:
                 terminal_status = self._terminal_pr_reason(current_pr)
                 if terminal_status and not await self._handle_terminal_pr_commands(
                         queued_repo, pr_number, current_pr, terminal_status):
-                    self._queue_priority_pr(item, source)
+                    self._retry_priority_item(item, source, "terminal_command_notice")
                     cycle_ok = False
                     self._scan_failure_reasons.append(
                         f"terminal_command_notice:{queued_repo}#{pr_number}:retry",
@@ -2952,7 +3274,11 @@ class GitHubCommandWatcher:
                     self._monotonic() - attempt_started,
                 )
             except GitHubRateLimitError as exc:
-                self._queue_priority_pr(item, source)
+                self._retry_priority_item(item, source, "github_rate_limited")
+                self._priority_pr_retry_after[item] = max(
+                    self._priority_pr_retry_after.get(item, 0.0),
+                    self._monotonic() + max(0.0, exc.retry_after_seconds),
+                )
                 self._fail_recent_commands_for_pr(queued_repo, pr_number, "github_rate_limited")
                 self._record_pr_attempt(
                     queued_repo, pr_number, "github_rate_limited",
@@ -2979,7 +3305,21 @@ class GitHubCommandWatcher:
 
     async def _poll_once(self) -> None:
         """Drain queued work, then run a bounded fair scan through the single writer."""
-        if not self.config.active_repos or self.config.auth_valid is not True:
+        if self.config.auth_valid is not True:
+            self._invalidate_all_open_pr_listing_snapshots()
+            return
+        try:
+            authorized_repos = self._authorized_watcher_repos()
+        except (TypeError, ValueError, RuntimeError) as exc:
+            self.config.auth_valid = False
+            self._invalidate_all_open_pr_listing_snapshots()
+            logger.warning(
+                "watcher PR listing authorization snapshot invalid reason=%s",
+                type(exc).__name__,
+            )
+            return
+        self._sync_open_pr_listing_repos(authorized_repos)
+        if not authorized_repos:
             return
         cycle_started = self._monotonic()
         self._current_scan_started = cycle_started
@@ -2987,10 +3327,11 @@ class GitHubCommandWatcher:
         self._current_scan_repo = None
         self._current_scan_pr = None
         self._scan_failure_reasons = []
-        repos = list(dict.fromkeys(self.config.active_repos))
+        repos = list(dict.fromkeys(authorized_repos))
         if repos:
             repo_start = self._repo_poll_cursor % len(repos)
             repos = repos[repo_start:] + repos[:repo_start]
+        self._schedule_open_pr_listing_refreshes(authorized_repos)
         priority_done: dict[str, list[int]] = {repo: [] for repo in repos}
         priority_attempted: dict[str, list[int]] = {repo: [] for repo in repos}
         recent_attempted: dict[str, list[int]] = {repo: [] for repo in repos}
@@ -3043,8 +3384,9 @@ class GitHubCommandWatcher:
             cycle_ok = False
             self._scan_failure_reasons.append("authorization_gate_closed")
 
-        # A rate limit is shared across endpoints. Do not burn more calls in
-        # the same cycle after the client has entered its backoff window.
+        # Full PR listings refresh independently in read-only tasks. The
+        # writer only consumes a complete, recent snapshot and never waits for
+        # an in-flight repository query.
         if self._github_backing_off():
             cycle_ok = False
             self._scan_failure_reasons.append("authenticated_github_backoff")
@@ -3052,49 +3394,26 @@ class GitHubCommandWatcher:
             for repo in repos:
                 if interrupt_ordinary_scan_for_new_priority():
                     break
+                if not self._open_pr_listing_repo_is_authorized(repo):
+                    continue
+                snapshot = self._usable_open_pr_snapshot(repo)
+                if snapshot is None:
+                    cycle_ok = False
+                    self._scan_failure_reasons.append(
+                        f"list_prs:{repo}:snapshot_unavailable",
+                    )
+                    continue
                 repo_normal_budget = normal_budget_by_repo.get(repo, 0)
                 if repo_normal_budget <= 0:
                     continue
-                if (self.config.auth_valid is not True or repo not in self.config.active_repos
-                        or repo not in self.config.github_repos):
-                    continue
-                self._current_scan_stage = "listing_open_prs"
+                self._current_scan_stage = "scanning_open_pr_snapshot"
                 self._current_scan_repo = repo
-                try:
-                    list_timeout = max(
-                        8.0, min(20.0, float(self.config.poll_interval_seconds) * 2.0),
-                    )
-                    prs = await asyncio.wait_for(
-                        self.proxy.get_open_prs(repo), timeout=list_timeout,
-                    )
-                except GitHubRateLimitError as exc:
-                    logger.warning("watcher rate limited listing %s; retry_after=%.1f", repo, exc.retry_after_seconds)
-                    self._scan_failure_reasons.append(f"list_prs:{repo}:rate_limited")
+                prs = snapshot.get("prs")
+                if not isinstance(prs, list):
                     cycle_ok = False
-                    break
-                except GitHubError as exc:
-                    logger.warning("watcher list PRs %s: %s", repo, exc)
                     self._scan_failure_reasons.append(
-                        f"list_prs:{repo}:http_{getattr(exc, 'status_code', 'error')}",
+                        f"list_prs:{repo}:snapshot_malformed",
                     )
-                    cycle_ok = False
-                    continue
-                except asyncio.TimeoutError:
-                    self._scan_failure_reasons.append(f"list_prs:{repo}:read_timeout")
-                    logger.warning(
-                        "watcher open PR listing timed out repo=%s timeout_seconds=%.1f; priority work remains available",
-                        repo, list_timeout,
-                    )
-                    cycle_ok = False
-                    continue
-                except Exception as exc:
-                    logger.warning("watcher list PRs %s failed: %s", repo, type(exc).__name__)
-                    self._scan_failure_reasons.append(
-                        f"list_prs:{repo}:{type(exc).__name__}",
-                    )
-                    cycle_ok = False
-                    if self._github_backing_off():
-                        break
                     continue
 
                 valid_prs = []
@@ -3279,6 +3598,12 @@ class GitHubCommandWatcher:
 
                 processed = []
                 for number in selected[:pr_work_budget]:
+                    if self._usable_open_pr_snapshot(repo) is not snapshot:
+                        cycle_ok = False
+                        self._scan_failure_reasons.append(
+                            f"list_prs:{repo}:snapshot_invalidated",
+                        )
+                        break
                     if number in priority_attempted.get(repo, []):
                         if number in priority_done.get(repo, []):
                             processed.append(number)
@@ -3354,10 +3679,18 @@ class GitHubCommandWatcher:
                     if interrupt_ordinary_scan_for_new_priority():
                         break
 
-                if baseline_all:
+                snapshot_still_current = (
+                    self._usable_open_pr_snapshot(repo) is snapshot
+                )
+                if baseline_all and snapshot_still_current:
                     progress = self._baseline_progress.setdefault(repo, set())
                     if all(number in progress for number in baseline_numbers):
                         self._pending_baseline_repos.discard(repo)
+                elif baseline_all:
+                    cycle_ok = False
+                    self._scan_failure_reasons.append(
+                        f"baseline:{repo}:snapshot_invalidated",
+                    )
                 remaining = (
                     sum(number not in self._baseline_progress.get(repo, set()) for number in baseline_numbers)
                     if repo in self._pending_baseline_repos else 0
@@ -3381,6 +3714,12 @@ class GitHubCommandWatcher:
                 )
                 if interrupted_for_new_priority:
                     break
+        for repo in repos:
+            if self._usable_open_pr_snapshot(repo) is None:
+                cycle_ok = False
+                reason = f"list_prs:{repo}:snapshot_unavailable"
+                if reason not in self._scan_failure_reasons:
+                    self._scan_failure_reasons.append(reason)
         if repos:
             self._repo_poll_cursor = (repo_start + 1) % len(repos)
         self._last_ordinary_pr_skips = ordinary_prs_skipped
@@ -3409,9 +3748,15 @@ class GitHubCommandWatcher:
         self._current_scan_stage = None
         self._current_scan_repo = None
         self._current_scan_pr = None
-        if (self._priority_pr_queue and cycle_ok and not self._github_backing_off()
-                and any(self._monotonic() >= self._priority_pr_retry_after.get(item, 0.0)
-                        for item in self._priority_pr_queue)):
+        if (self.config.auth_valid is True and not self._github_backing_off()
+                and any(
+                    self._open_pr_listing_repo_is_authorized(repo)
+                    and self._monotonic() >= self._priority_pr_retry_after.get(
+                        (repo, pr_number), 0.0,
+                    )
+                    and pr_number not in priority_attempted.get(repo, [])
+                    for repo, pr_number in self._priority_pr_queue
+                )):
             self._signal_wakeup()
         metrics = self.diagnostics()
         logger.info(

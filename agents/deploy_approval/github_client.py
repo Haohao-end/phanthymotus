@@ -38,6 +38,8 @@ from .clients_common import (
 )
 
 logger = logging.getLogger(__name__)
+_OPEN_PR_PAGE_SIZE = 50
+_MAX_OPEN_PR_PAGES = 1000
 
 @dataclass
 class PrSnapshot:
@@ -875,76 +877,88 @@ class GitHubClient:
         """List all open PRs for a repo, newest-first, with page overlap dedupe."""
         seen: dict[int, dict] = {}
         page = 1
-        while True:
+        listing_complete = False
+        while page <= _MAX_OPEN_PR_PAGES:
+            page_started = time.monotonic()
+            returned_count = 0
             path = f"/repos/{repo}/pulls"
-            url = self.api(path)
-            require_http_policy(
-                url, self.config,
-                allow_private=self.config.allow_private_http
-            )
-            cached = self._open_pr_pages.get((repo, page))
-            request_headers = {}
-            if isinstance(cached, dict):
-                if cached.get("etag"):
-                    request_headers["If-None-Match"] = cached["etag"]
-                elif cached.get("last_modified"):
-                    request_headers["If-Modified-Since"] = cached["last_modified"]
-            resp = await self._request(
-                "GET", path,
-                params={
+            try:
+                url = self.api(path)
+                require_http_policy(
+                    url, self.config,
+                    allow_private=self.config.allow_private_http
+                )
+                cached = self._open_pr_pages.get((repo, page))
+                request_headers = {}
+                if isinstance(cached, dict):
+                    if cached.get("etag"):
+                        request_headers["If-None-Match"] = cached["etag"]
+                    elif cached.get("last_modified"):
+                        request_headers["If-Modified-Since"] = cached["last_modified"]
+                params = {
                     "state": "open",
                     "sort": "updated",
                     "direction": "desc",
-                    "per_page": 100,
+                    "per_page": _OPEN_PR_PAGE_SIZE,
                     "page": page,
-                }, headers=request_headers, timeout=self.config.total_timeout)
-            if resp.status_code == 304:
-                if cached is None:
+                }
+                resp = await self._request(
+                    "GET", path, params=params, headers=request_headers,
+                    timeout=self.config.total_timeout,
+                )
+                if resp.status_code == 304 and cached is None:
                     # A 304 without a local page is unusable; retry once without
                     # validators instead of treating it as an empty PR page.
                     resp = await self._request(
-                        "GET", path,
-                        params={
-                            "state": "open", "sort": "updated", "direction": "desc",
-                            "per_page": 100, "page": page,
-                        }, timeout=self.config.total_timeout)
-                else:
-                    batch = cached.get("items")
+                        "GET", path, params=params, timeout=self.config.total_timeout,
+                    )
+                if resp.status_code == 304:
+                    batch = cached.get("items") if isinstance(cached, dict) else None
                     if not isinstance(batch, list):
                         raise GitHubError("github cached open PR page is malformed")
-                    if not batch:
-                        break
-                    for pr in batch:
-                        if isinstance(pr, dict):
-                            num = pr.get("number")
-                            if isinstance(num, int) and not isinstance(num, bool) and num > 0:
-                                seen[num] = pr
-                    if len(batch) < 100:
-                        break
-                    page += 1
-                    continue
-            try:
-                require_2xx(resp.status_code, "github list open PRs")
-            except SecurityError as e:
-                raise GitHubError(str(e)) from e
-            batch = await self._read_json_list(resp)
-            self._open_pr_pages[(repo, page)] = {
-                "items": batch,
-                "etag": resp.headers.get("ETag", ""),
-                "last_modified": resp.headers.get("Last-Modified", ""),
-            }
-            if not batch:
-                break
-            for pr in batch:
-                if not isinstance(pr, dict):
-                    continue
-                num = pr.get("number")
-                if isinstance(num, bool) or not isinstance(num, int) or num <= 0:
-                    continue
-                seen[num] = pr
-            if len(batch) < 100:
-                break
-            page += 1
+                else:
+                    try:
+                        require_2xx(resp.status_code, "github list open PRs")
+                    except SecurityError as exc:
+                        raise GitHubError(str(exc)) from exc
+                    batch = await self._read_json_list(resp)
+                    self._open_pr_pages[(repo, page)] = {
+                        "items": batch,
+                        "etag": resp.headers.get("ETag", ""),
+                        "last_modified": resp.headers.get("Last-Modified", ""),
+                    }
+                returned_count = len(batch)
+                if returned_count > _OPEN_PR_PAGE_SIZE:
+                    raise GitHubError("github open PR page exceeded requested page size")
+                for pr in batch:
+                    if not isinstance(pr, dict):
+                        continue
+                    num = pr.get("number")
+                    if isinstance(num, bool) or not isinstance(num, int) or num <= 0:
+                        continue
+                    seen[num] = pr
+
+                if returned_count == _OPEN_PR_PAGE_SIZE and page == _MAX_OPEN_PR_PAGES:
+                    raise GitHubError("github open PR listing exceeded page limit")
+                logger.info(
+                    "github open PR page completed repo=%s page=%s duration_seconds=%.3f returned_count=%s status=%s",
+                    repo, page, max(0.0, time.monotonic() - page_started),
+                    returned_count, resp.status_code,
+                )
+                if returned_count < _OPEN_PR_PAGE_SIZE:
+                    listing_complete = True
+                    break
+                page += 1
+            except Exception as exc:
+                logger.warning(
+                    "github open PR page failed repo=%s page=%s duration_seconds=%.3f returned_count=%s failure_type=%s",
+                    repo, page, max(0.0, time.monotonic() - page_started),
+                    returned_count, type(exc).__name__,
+                )
+                raise
+
+        if not listing_complete:
+            raise GitHubError("github open PR listing did not complete")
 
         def _sort_key(pr: dict):
             updated = pr.get("updated_at")
