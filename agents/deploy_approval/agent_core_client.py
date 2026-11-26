@@ -14,7 +14,7 @@ for configured RFC1918 machines with per-machine tokens. Strict is the default.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -286,6 +286,8 @@ class AgentCoreClient:
         method: str,
         path: str,
         json: dict | None = None,
+        *,
+        on_request_started: Callable[[], None] | None = None,
     ):
         url = self.base_url + path
         try:
@@ -296,18 +298,26 @@ class AgentCoreClient:
         except SecurityError as e:
             raise AgentCoreError(str(e)) from e
         if self.legacy_tls and method.upper() == "POST":
-            await self.verify()
-        resp, data = await self._request_impl(method, path, json, url)
+            await self.verify(on_request_started=on_request_started)
+        resp, data = await self._request_impl(
+            method, path, json, url,
+            on_request_started=on_request_started,
+        )
         self._check_code(data, method, path)
         return data
 
-    async def _request_impl(self, method, path, json, url):
+    async def _request_impl(
+        self, method, path, json, url, *,
+        on_request_started: Callable[[], None] | None = None,
+    ):
+        if on_request_started is not None:
+            on_request_started()
         try:
             resp = await stream_request(
                 self.http, method, url, self.config.max_response_bytes,
                 headers=self._headers(), json=json, timeout=self.config.total_timeout)
         except httpx.HTTPError as e:
-            raise AgentCoreError(f"agent-core request failed: {e}")
+            raise AgentCoreError(f"agent-core request failed: {e}") from e
         except SecurityError as e:
             raise AgentCoreError(str(e)) from e
         try:
@@ -323,7 +333,9 @@ class AgentCoreClient:
             raise AgentCoreError("agent-core returned unexpected payload")
         return resp, data
 
-    async def verify(self) -> dict:
+    async def verify(
+        self, *, on_request_started: Callable[[], None] | None = None,
+    ) -> dict:
         """Hit the auth-verify endpoint and return its raw `data`.
 
         Agent Core's `/api/auth/verify` is the one endpoint that is *not*
@@ -337,12 +349,14 @@ class AgentCoreClient:
             url, self.config, allow_private=self.config.allow_private_http,
             agent_core_node=self.node_host,
         )
+        if on_request_started is not None:
+            on_request_started()
         try:
             resp = await stream_request(
                 self.http, "GET", url, self.config.max_response_bytes,
                 headers=self._headers(), timeout=self.config.total_timeout)
         except httpx.HTTPError as e:
-            raise AgentCoreError(f"agent-core auth verify request failed: {e}")
+            raise AgentCoreError(f"agent-core auth verify request failed: {e}") from e
         except SecurityError as e:
             raise AgentCoreError(str(e)) from e
         try:
@@ -388,8 +402,13 @@ class AgentCoreClient:
                 "valid=true and auth_required=true"
             )
         return data
-    async def list_drivers(self) -> list:
-        data = await self.request("GET", "/api/drivers")
+    async def list_drivers(
+        self, *, on_request_started: Callable[[], None] | None = None,
+    ) -> list:
+        data = await self.request(
+            "GET", "/api/drivers",
+            on_request_started=on_request_started,
+        )
         drivers = data.get("data")
         if not isinstance(drivers, list):
             raise AgentCoreError("agent-core list_drivers data must be a list")
@@ -513,9 +532,15 @@ class AgentCoreClient:
             )
         return data
 
-    async def driver_status(self, driver_id: str) -> dict:
+    async def driver_status(
+        self, driver_id: str, *,
+        on_request_started: Callable[[], None] | None = None,
+    ) -> dict:
         driver_id = _validate_api_path_segment(driver_id, "driver_status driver_id")
-        data = await self.request("GET", f"/api/drivers/{driver_id}/status")
+        data = await self.request(
+            "GET", f"/api/drivers/{driver_id}/status",
+            on_request_started=on_request_started,
+        )
         inner = data.get("data")
         if not isinstance(inner, dict):
             raise AgentCoreError(
@@ -590,7 +615,9 @@ class AgentCoreClient:
             )
         return inner
 
-    async def core_update_check(self) -> dict:
+    async def core_update_check(
+        self, *, on_request_started: Callable[[], None] | None = None,
+    ) -> dict:
         """GET /api/system/update-check — poll core self-update status.
 
         Returns the parsed ``{code, data, message}`` envelope where
@@ -605,12 +632,14 @@ class AgentCoreClient:
             url, self.config, allow_private=self.config.allow_private_http,
             agent_core_node=self.node_host,
         )
+        if on_request_started is not None:
+            on_request_started()
         try:
             resp = await stream_request(
                 self.http, "GET", url, self.config.max_response_bytes,
                 headers=self._headers(), timeout=self.config.total_timeout)
         except httpx.HTTPError as e:
-            raise AgentCoreError(f"agent-core update-check request failed: {e}")
+            raise AgentCoreError(f"agent-core update-check request failed: {e}") from e
         except SecurityError as e:
             raise AgentCoreError(str(e)) from e
         try:

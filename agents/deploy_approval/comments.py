@@ -304,12 +304,12 @@ def _connection_failure_label(value) -> str:
         return "Agent Core 连接超时"
     if any(token in folded for token in ("unreachable", "offline", "refused", "connect", "不可达", "离线")):
         return "Agent Core 当前不可达"
-    return _safe_display_text(text)[:240]
+    return ""
 
 _MACHINE_BLOCK_REASON_TEXT = {
     "AGENT_CORE_CREDENTIAL_MISSING": "Agent Core 鉴权失败",
     "AGENT_CORE_UNAVAILABLE": "Agent Core 当前不可达",
-    "AGENT_CORE_UNKNOWN": "Agent Core 状态尚未确认",
+    "AGENT_CORE_UNKNOWN": "Agent Core 验证未取得确定结果",
     "MACHINE_NOT_AUTHORIZED": "当前仓库没有授权这台机器",
     "REPOSITORY_POLICY_MISSING": "当前仓库机器策略不可用",
     "MACHINE_IDENTITY_MISMATCH": "机器身份与当前仓库策略不匹配",
@@ -324,68 +324,172 @@ _MACHINE_BLOCK_REASON_TEXT = {
 
 def _machine_unavailability_notes(machine: dict) -> list[str]:
     """Describe Service-reported failures without using them as selectors."""
-    if not isinstance(machine, dict):
+    if (not isinstance(machine, dict)
+            or machine.get("repository_scope_authorized") is not True):
+        return []
+    requested_component_ids = machine.get("requested_component_ids")
+    if not isinstance(requested_component_ids, (list, tuple, set)):
+        return []
+    requested_component_ids = {
+        value for value in requested_component_ids
+        if isinstance(value, str) and value
+    }
+    if not requested_component_ids:
         return []
     notes = []
     status = str(machine.get("agent_core_status") or "").strip().casefold().replace("-", "_")
+    request_attempted = machine.get("agent_core_request_attempted") is True
     has_verified_endpoint = bool(
         isinstance(machine.get("verified_endpoints"), list)
         and machine.get("verified_endpoints")
     )
-    status_note = {
-        "credential_missing": "Agent Core 鉴权失败",
-        "unavailable": "Agent Core 当前不可达",
-        "offline": "Agent Core 当前不可达",
-        "unreachable": "Agent Core 当前不可达",
-        "unknown": "Agent Core 状态尚未确认",
-    }.get(status)
-    if has_verified_endpoint and status == "unknown":
-        status_note = ""
-    if status_note:
-        notes.append(status_note)
-    reasons = machine.get("blocking_reasons")
-    if isinstance(reasons, (list, tuple, set)):
-        for reason in reasons:
-            if (has_verified_endpoint and str(reason or "").strip().upper()
-                    == "AGENT_CORE_UNKNOWN"):
+    verified_component_ids = set()
+    verified_endpoints = machine.get("verified_endpoints")
+    if isinstance(verified_endpoints, list):
+        for endpoint in verified_endpoints:
+            if not isinstance(endpoint, dict):
                 continue
-            label = _MACHINE_BLOCK_REASON_TEXT.get(str(reason or "").strip().upper())
-            if label:
-                notes.append(label)
-    for field in ("agent_core_error", "connection_error", "unavailable_reason"):
-        label = _connection_failure_label(machine.get(field))
-        if label:
-            notes.append(label)
+            component_ids = endpoint.get("component_ids")
+            if isinstance(component_ids, (list, tuple, set)):
+                verified_component_ids.update(
+                    value for value in component_ids
+                    if isinstance(value, str) and value in requested_component_ids
+                )
+    all_requested_components_verified = requested_component_ids.issubset(
+        verified_component_ids,
+    )
+    endpoint_rows = []
     for field in (
         "endpoint_diagnostics", "endpoint_checks", "endpoint_failures",
         "unavailable_endpoints", "failed_endpoints",
     ):
         rows = machine.get(field)
-        if not isinstance(rows, list):
+        if isinstance(rows, list):
+            endpoint_rows.extend(row for row in rows if isinstance(row, dict))
+    has_scoped_request_diagnostic = False
+    endpoint_notes = []
+    for endpoint in endpoint_rows:
+        component_id = endpoint.get("component_id")
+        if isinstance(component_id, str) and component_id not in requested_component_ids:
             continue
-        for endpoint in rows:
-            if not isinstance(endpoint, dict):
+        component_ids = endpoint.get("component_ids")
+        if isinstance(component_ids, (list, tuple, set)):
+            component_ids = {
+                value for value in component_ids
+                if isinstance(value, str) and value
+            }
+            if not requested_component_ids.intersection(component_ids):
                 continue
-            state = str(
-                endpoint.get("agent_core_status") or endpoint.get("status")
-                or endpoint.get("state") or ""
-            ).strip().casefold()
-            reachable = endpoint.get("reachable", endpoint.get("agent_core_available"))
-            if reachable is True or state in {"available", "healthy", "reachable", "ok", "match"}:
+        state = str(
+            endpoint.get("agent_core_status") or endpoint.get("status")
+            or endpoint.get("state") or ""
+        ).strip().casefold().replace("-", "_")
+        if endpoint.get("request_attempted") is not True:
+            if state == "not_checked":
+                preflight_reason = str(endpoint.get("reason") or "").strip()
+                preflight_label = {
+                    "Agent Core 凭证未配置，未发起请求。": (
+                        "Agent Core 凭证尚未配置，连接检查没有发起。"
+                    ),
+                    "当前仓库策略无法读取，未发起 Agent Core 请求。": (
+                        "当前仓库机器策略暂时无法读取，连接检查没有发起。"
+                    ),
+                }.get(preflight_reason)
+                if preflight_label:
+                    endpoint_notes.append(preflight_label)
+            continue
+        has_scoped_request_diagnostic = True
+        if all_requested_components_verified:
+            continue
+        if isinstance(component_id, str) and component_id in verified_component_ids:
+            continue
+        if isinstance(component_ids, (list, tuple, set)):
+            scoped_component_ids = {
+                value for value in component_ids
+                if isinstance(value, str) and value in requested_component_ids
+            }
+            if scoped_component_ids and scoped_component_ids.issubset(
+                    verified_component_ids):
                 continue
-            label = _connection_failure_label(
-                endpoint.get("reason") or endpoint.get("error") or state,
+        reachable = endpoint.get("reachable", endpoint.get("agent_core_available"))
+        if state == "runtime_incompatible":
+            if not isinstance(component_id, str):
+                continue
+            endpoint_notes.append(
+                "Agent Core 已连接，但未找到本次部署所需的组件运行实例。"
             )
-            if not label:
+            continue
+        if reachable is True or state in {
+                "available", "healthy", "reachable", "ok", "match", "incompatible"}:
+            continue
+        detail = endpoint.get("reason") or endpoint.get("error")
+        explicit_http_auth_failure = bool(re.search(
+            r"(?:unexpected status|http(?: status)?|status(?: code)?)\s*[:=]?\s*(401|403)\b",
+            str(detail), re.IGNORECASE,
+        ))
+        label = (
+            "Agent Core 鉴权失败" if state == "credential_missing"
+            or explicit_http_auth_failure else
+            _connection_failure_label(detail)
+        )
+        if label == "Agent Core 鉴权失败" and not (
+                state == "credential_missing" or explicit_http_auth_failure):
+            label = ""
+        if label:
+            endpoint_notes.append(label)
+        elif state in {"unavailable", "offline", "unreachable"}:
+            endpoint_notes.append("Agent Core 当前不可达")
+        elif state == "unknown":
+            endpoint_notes.append("Agent Core 验证未取得确定结果")
+    report_agent_core_failure = (
+        request_attempted and not has_verified_endpoint
+        and (not endpoint_rows or has_scoped_request_diagnostic)
+    )
+    notes.extend(endpoint_notes)
+    if report_agent_core_failure and not endpoint_notes:
+        status_note = {
+            "credential_missing": "Agent Core 鉴权失败",
+            "unavailable": "Agent Core 当前不可达",
+            "offline": "Agent Core 当前不可达",
+            "unreachable": "Agent Core 当前不可达",
+            "unknown": "Agent Core 验证未取得确定结果",
+        }.get(status)
+        if status_note:
+            notes.append(status_note)
+    reasons = machine.get("blocking_reasons")
+    if isinstance(reasons, (list, tuple, set)):
+        for reason in reasons:
+            reason_key = str(reason or "").strip().upper()
+            if (reason_key.startswith("AGENT_CORE_")
+                    and (not report_agent_core_failure or endpoint_notes)):
                 continue
-            raw_ip = endpoint.get("ip")
-            try:
-                ip = str(ipaddress.IPv4Address(raw_ip.strip())) if isinstance(raw_ip, str) else ""
-            except ValueError:
-                ip = ""
-            name = str(endpoint.get("label") or "").strip()
-            endpoint_name = "、".join(value for value in (ip, name) if value)
-            notes.append(f"{endpoint_name}：{label}" if endpoint_name else label)
+            if (reason_key == "AGENT_CORE_CREDENTIAL_MISSING"
+                    and status != "credential_missing"):
+                continue
+            if reason_key == "AGENT_CORE_UNAVAILABLE" and status != "unavailable":
+                continue
+            if reason_key == "AGENT_CORE_UNKNOWN" and status != "unknown":
+                continue
+            label = _MACHINE_BLOCK_REASON_TEXT.get(reason_key)
+            if label:
+                notes.append(label)
+    if report_agent_core_failure:
+        for field in ("agent_core_error", "connection_error", "unavailable_reason"):
+            detail = machine.get(field)
+            explicit_http_auth_failure = bool(re.search(
+                r"(?:unexpected status|http(?: status)?|status(?: code)?)\s*[:=]?\s*(401|403)\b",
+                str(detail or ""), re.IGNORECASE,
+            ))
+            label = (
+                "Agent Core 鉴权失败"
+                if status == "credential_missing" or explicit_http_auth_failure
+                else _connection_failure_label(detail)
+            )
+            if label == "Agent Core 鉴权失败" and not (
+                    status == "credential_missing" or explicit_http_auth_failure):
+                label = ""
+            if label:
+                notes.append(label)
     return list(dict.fromkeys(notes))
 
 def _verified_approval_rows(machine_groups, component_ids) -> list[dict]:
@@ -422,19 +526,35 @@ def _verified_approval_rows(machine_groups, component_ids) -> list[dict]:
     ]
 
 def _unavailability_lines(machine_groups) -> list[str]:
-    lines = []
+    aliases_by_reason: dict[str, set[str]] = {}
     for group in machine_groups if isinstance(machine_groups, (list, tuple)) else []:
         if not isinstance(group, dict):
             continue
         reasons = _machine_unavailability_notes(group)
-        if reasons:
-            alias = _machine_alias(group) or "机器"
-            lines.append(
-                f"- `{_escape(alias)}`：" + "；".join(
-                    _escape(reason) for reason in reasons
-                )
-            )
-    return list(dict.fromkeys(lines))
+        alias = _machine_alias(group)
+        if not alias:
+            continue
+        for reason in reasons:
+            aliases_by_reason.setdefault(reason, set()).add(alias)
+
+    detail_reasons = {
+        _MACHINE_BLOCK_REASON_TEXT[key] for key in (
+            "MACHINE_IDENTITY_MISMATCH", "DRIVER_PATH_MISMATCH",
+            "PLATFORM_MISMATCH", "PLATFORM_UNVERIFIED", "VARIANT_MISMATCH",
+            "TARGET_UNSUPPORTED", "PRIMARY_IP_AMBIGUOUS",
+        )
+    }
+    lines = []
+    for reason in sorted(aliases_by_reason, key=str.casefold):
+        aliases = sorted(aliases_by_reason[reason], key=str.casefold)
+        line = f"- {_escape(reason)}：{len(aliases)} 台机器"
+        if reason in detail_reasons:
+            examples = "、".join(f"`{_escape(alias)}`" for alias in aliases[:2])
+            if len(aliases) > 2:
+                examples += " 等"
+            line += f"（{examples}）"
+        lines.append(line)
+    return lines
 
 def runtime_image_checks_block(
     runtime_checks, components, *, lifecycle_status: str = "",
