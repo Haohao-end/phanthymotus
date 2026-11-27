@@ -18,10 +18,10 @@ class MachineInfo:
     alias: str
     node_id: str
     owners: list[str]  # GitHub logins (case-insensitive)
+    # Runtime-only projection from the latest Feishu identity snapshot.
+    # machines.yaml legacy endpoint fields are ignored by policy parsing.
     node_host: str = ""
-    # node_host remains the configured Agent Core endpoint. node_hosts may
-    # include additional Feishu-confirmed addresses and must never be used to
-    # infer an Agent Core endpoint.
+    # All current, non-conflicting Feishu endpoints in snapshot order.
     node_hosts: list[str] = field(default_factory=list)
     node_addresses: list[dict[str, str]] = field(default_factory=list, repr=False)
     feishu_number: str | None = None

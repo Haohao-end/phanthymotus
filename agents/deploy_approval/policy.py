@@ -9,6 +9,9 @@ hard error, never a pass.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+import logging
 import os
 import ipaddress
 import re
@@ -26,6 +29,8 @@ from .config import (
 from .models import MachineInfo
 from .repo_policy import RepositoryPolicyStore
 from .feishu_machine_source import FeishuMachineSource
+
+logger = logging.getLogger(__name__)
 
 
 class PolicyError(Exception):
@@ -176,11 +181,15 @@ def _load_machines_data(raw: Any) -> dict[str, MachineInfo]:
         raise MachineLoadError("machines mapping must not be empty")
     machines: dict[str, MachineInfo] = {}
     node_ids_seen: set[str] = set()
-    node_hosts_seen: dict[str, str] = {}
+    feishu_numbers_seen: set[str] = set()
+    aliases_seen: set[str] = set()
     for alias, entry in machines_raw.items():
         if not isinstance(alias, str) or not alias.strip():
             raise MachineLoadError("machine alias must be a non-empty string")
         alias = alias.strip()
+        if alias in aliases_seen:
+            raise MachineLoadError(f"duplicate machine alias: {alias!r}")
+        aliases_seen.add(alias)
         if not isinstance(entry, dict):
             raise MachineLoadError(
                 f"machine {alias!r} must be a mapping, got {type(entry).__name__}"
@@ -203,35 +212,13 @@ def _load_machines_data(raw: Any) -> dict[str, MachineInfo]:
         owners = list(dict.fromkeys(o.strip().lower() for o in owners_raw if o.strip()))
         if not owners:
             raise MachineLoadError(f"machine {alias!r}: no valid owners after dedup")
-        node_host = str(entry.get("node_host", "") or "").strip()
-        if not node_host:
-            raise MachineLoadError(
-                f"machine {alias!r}: node_host is required and must be non-empty"
-            )
-        node_host = _validate_literal_ip(node_host, alias)
-        configured_hosts_raw = entry.get("node_hosts", [])
-        if not isinstance(configured_hosts_raw, list):
-            raise MachineLoadError(f"machine {alias!r}: node_hosts must be a list")
-        node_hosts = [node_host]
-        for raw_host in configured_hosts_raw:
-            if not isinstance(raw_host, str) or not raw_host.strip():
-                raise MachineLoadError(
-                    f"machine {alias!r}: node_hosts must contain non-empty IPv4 strings"
-                )
-            canonical_host = _validate_literal_ip(raw_host.strip(), alias)
-            if canonical_host not in node_hosts:
-                node_hosts.append(canonical_host)
-        for configured_host in node_hosts:
-            previous_alias = node_hosts_seen.get(configured_host)
-            if previous_alias is not None and previous_alias != alias:
-                raise MachineLoadError(
-                    f"duplicate node host {configured_host!r}: machines "
-                    f"{previous_alias!r} and {alias!r} cannot share one physical IP address"
-                )
-            node_hosts_seen[configured_host] = alias
+        # node_host/node_hosts are legacy runtime fields. Read neither value:
+        # an old address must not select a physical device or block a new IP.
         feishu_number_raw = entry.get("feishu_number")
         feishu_number = None
-        if feishu_number_raw is not None:
+        if feishu_number_raw is not None and not (
+            isinstance(feishu_number_raw, str) and not feishu_number_raw.strip()
+        ):
             if isinstance(feishu_number_raw, bool) or not isinstance(
                     feishu_number_raw, (str, int)):
                 raise MachineLoadError(
@@ -243,6 +230,11 @@ def _load_machines_data(raw: Any) -> dict[str, MachineInfo]:
                     f"machine {alias!r}: feishu_number must be a numeric string"
                 )
             feishu_number = feishu_number_text.zfill(3)
+            if feishu_number in feishu_numbers_seen:
+                raise MachineLoadError(
+                    f"duplicate feishu_number: {feishu_number!r}"
+                )
+            feishu_numbers_seen.add(feishu_number)
         targets_raw = entry.get("targets")
         if not isinstance(targets_raw, list) or not targets_raw:
             raise MachineLoadError(
@@ -292,10 +284,14 @@ def _load_machines_data(raw: Any) -> dict[str, MachineInfo]:
                     f"machine {alias!r}: variants must contain at least one supported variant"
                 )
         machines[alias] = MachineInfo(
-            alias=alias, node_id=node_id, owners=owners, node_host=node_host,
-            node_hosts=node_hosts,
-            node_addresses=[{"ip": host, "label": ""} for host in node_hosts],
+            alias=alias, node_id=node_id, owners=owners,
             feishu_number=feishu_number,
+            feishu_identity_confirmed=False,
+            feishu_identity_reason=(
+                "Feishu number is not configured; pending binding"
+                if feishu_number is None else "Feishu identity has not been refreshed"
+            ),
+            feishu_stale=True,
             targets=targets,
             platforms=platforms,
             variants=variants,
@@ -322,7 +318,15 @@ class Policy:
         self._feishu_machine_source = source
 
     def load_machines(self) -> None:
-        self.machines = load_machines(self.config.machine_owners_file)
+        raw_machines = load_machines(self.config.machine_owners_file)
+        source = self._feishu_machine_source
+        view = source.state if source is not None else None
+        self.machines = {
+            alias: self._with_feishu_identity(
+                machine, None, view=view,
+            )
+            for alias, machine in raw_machines.items()
+        }
 
     def get_machine_by_node_id(
         self, node_id: str, repo: str | None = None,
@@ -411,6 +415,7 @@ class Policy:
         if not isinstance(actual_selector, str) or not actual_selector:
             raise PolicyError("machine selector must be a non-empty string")
         machine = machines.get(actual_selector)
+        selected_by_alias = machine is not None
         if machine is None:
             try:
                 parsed = ipaddress.ip_address(actual_selector)
@@ -443,9 +448,12 @@ class Policy:
                 raise PolicyError(
                     f"ambiguous Feishu IP {canonical_ipv4!r}{owner_text}"
                 )
-            matches = [candidate for candidate in machines.values()
-                       if canonical_ipv4 in (getattr(candidate, "node_hosts", []) or [])
-                       or getattr(candidate, "node_host", "") == canonical_ipv4]
+            matches = [
+                candidate for candidate in machines.values()
+                if getattr(candidate, "feishu_identity_confirmed", None) is True
+                and not getattr(candidate, "feishu_stale", False)
+                and canonical_ipv4 in (getattr(candidate, "node_hosts", []) or [])
+            ]
             if len(matches) == 0:
                 raise PolicyError(f"no machine found with IP {canonical_ipv4!r}")
             if len(matches) > 1:
@@ -455,10 +463,15 @@ class Policy:
                     f"{', '.join(f'`{alias}`' for alias in aliases)}"
                 )
             machine = matches[0]
+        # Legacy policies without an explicit number remain resolvable by
+        # alias so they can be reported as pending binding. Their old IPs are
+        # never selectors and they cannot produce a deployment endpoint.
+        if selected_by_alias and not getattr(machine, "feishu_number", None):
+            return machine
         if getattr(machine, "feishu_stale", False):
             reason = getattr(machine, "feishu_identity_reason", "")
             raise PolicyError(reason or "Feishu machine identity snapshot is stale")
-        if getattr(machine, "feishu_identity_confirmed", None) is False:
+        if getattr(machine, "feishu_identity_confirmed", None) is not True:
             reason = getattr(machine, "feishu_identity_reason", "")
             raise PolicyError(reason or "Feishu machine identity is not confirmed")
         return machine
@@ -482,28 +495,53 @@ class Policy:
 
     def _with_feishu_identity(
         self, machine: MachineInfo, repo: str | None, *, view=None,
+        log_conflicts: bool = True,
     ) -> MachineInfo:
+        """Project one authorized alias onto its exact current Feishu device.
+
+        machines.yaml grants repository permissions only. In particular, its
+        legacy endpoint fields and alias text are never used to infer a device
+        or to keep an old IP alive when the snapshot changes.
+        """
         source = self._feishu_machine_source
+        machine.node_host = ""
+        machine.node_hosts = []
+        machine.node_addresses = []
+        machine.feishu_brand = None
+        machine.feishu_model = None
+        machine.feishu_identity_confirmed = False
+
         if source is None:
             machine.feishu_stale = True
-            machine.feishu_identity_confirmed = False
-            machine.feishu_identity_reason = "Feishu machine source is unavailable"
+            machine.feishu_identity_reason = (
+                "Feishu number is not configured; pending binding"
+                if not machine.feishu_number else
+                "Feishu machine source is unavailable"
+            )
             return machine
         view = view if view is not None else source.state
-        snapshot = view.devices
-        is_stale = view.stale
         machine.feishu_snapshot_generation = view.generation
-        machine.feishu_stale = is_stale
-        machine.feishu_identity_confirmed = False
-        machine.feishu_identity_reason = "Feishu snapshot is stale" if is_stale else ""
-        configured_hosts = list(dict.fromkeys(
-            [host for host in [machine.node_host, *(machine.node_hosts or [])] if host]
-        ))
-        machine.node_hosts = list(configured_hosts)
-        machine.node_addresses = [{"ip": host, "label": ""} for host in configured_hosts]
+        machine.feishu_stale = bool(view.stale)
+
+        if not machine.feishu_number:
+            machine.feishu_identity_reason = (
+                "Feishu number is not configured; pending binding"
+            )
+            return machine
+
+        raw_number = str(machine.feishu_number).strip()
+        if not re.fullmatch(r"[0-9]+", raw_number):
+            machine.feishu_identity_reason = "configured Feishu number is invalid"
+            return machine
+        policy_number = raw_number.zfill(3)
+        machine.feishu_number = policy_number
+
+        is_stale = view.stale
         if is_stale:
             machine.feishu_identity_reason = "Feishu snapshot is stale"
             return machine
+
+        snapshot = view.devices
         if not snapshot:
             machine.feishu_identity_reason = "Feishu snapshot has no successful sync"
             return machine
@@ -514,168 +552,52 @@ class Policy:
                 devices_by_ip.setdefault(address.ip, set()).add(device_number)
         for address, numbers in view.ip_conflicts.items():
             devices_by_ip.setdefault(address, set()).update(numbers)
-        machine.node_addresses = [
-            {
-                "ip": host,
-                "label": "",
-                "ambiguous": "true" if len(devices_by_ip.get(host, set())) > 1 else "false",
-                "ambiguous_owners": ",".join(sorted(devices_by_ip.get(host, set())))
-                if len(devices_by_ip.get(host, set())) > 1 else "",
-            }
-            for host in configured_hosts
-        ]
-        machine.node_hosts = [
-            host for host in configured_hosts
-            if len(devices_by_ip.get(host, set())) <= 1
-        ]
 
-        policy_number = machine.feishu_number
-        device = snapshot.get(policy_number) if policy_number else None
-
-        def log_ip_owners(host: str, owner_numbers: set[str], reason: str) -> None:
-            for owner_number in sorted(owner_numbers):
-                self._log_feishu_conflict(
-                    owner_number, machine.alias, host, reason,
-                    generation=view.generation, repo=repo,
-                )
-
-        configured_conflicts: dict[str, set[str]] = {}
-        for host in configured_hosts:
-            owner_numbers = devices_by_ip.get(host, set())
-            if len(owner_numbers) > 1:
-                configured_conflicts[host] = owner_numbers
-                log_ip_owners(
-                    host, owner_numbers,
-                    "Feishu assigns this IP to multiple device numbers",
-                )
-
-        if policy_number and device is None:
-            observed: set[str] = set()
-            for host in configured_hosts:
-                owner_numbers = devices_by_ip.get(host, set())
-                if owner_numbers:
-                    observed.update(owner_numbers)
-                    log_ip_owners(
-                        host, owner_numbers,
-                        "configured number has no matching Feishu device",
-                    )
-            if observed:
-                machine.feishu_identity_reason = (
-                    f"configured Feishu number {policy_number} is absent; "
-                    f"configured IP belongs to Feishu device(s) {', '.join(sorted(observed))}"
-                )
-            else:
-                machine.feishu_identity_reason = (
-                    f"configured Feishu number {policy_number} is absent from the current snapshot"
-                )
+        device = snapshot.get(policy_number)
+        if device is None or device.number != policy_number:
+            machine.feishu_identity_reason = (
+                f"configured Feishu number {policy_number} is absent from the current snapshot"
+            )
             return machine
 
-        if device is None:
-            observed_numbers = {
-                next(iter(devices_by_ip[host]))
-                for host in configured_hosts if len(devices_by_ip.get(host, set())) == 1
-            }
-            if len(observed_numbers) != 1:
-                if len(observed_numbers) > 1:
-                    for host in configured_hosts:
-                        owner_numbers = devices_by_ip.get(host, set())
-                        if owner_numbers:
-                            log_ip_owners(
-                                host, owner_numbers,
-                                "configured IPs map to different Feishu devices",
-                            )
-                    machine.feishu_identity_reason = (
-                        "configured IPs map to multiple Feishu devices: "
-                        + ", ".join(sorted(observed_numbers))
-                    )
-                elif configured_conflicts:
-                    details = [
-                        f"{host} is shared by {', '.join(sorted(numbers))}"
-                        for host, numbers in sorted(configured_conflicts.items())
-                    ]
-                    machine.feishu_identity_reason = (
-                        "configured IP identity is ambiguous: " + "; ".join(details)
-                    )
-                else:
-                    unmatched_hosts = [
-                        host for host in configured_hosts if host not in devices_by_ip
-                    ]
-                    machine.feishu_identity_reason = (
-                        "no Feishu number is configured and "
-                        + ("configured IPs are absent from the snapshot: "
-                           + ", ".join(unmatched_hosts) if unmatched_hosts else
-                           "no configured IP maps to a unique device")
-                    )
-                return machine
-            device = snapshot[next(iter(observed_numbers))]
-
-        conflict_reasons = [
-            f"configured IP {host} is shared by Feishu devices "
-            f"{', '.join(sorted(numbers))}"
-            for host, numbers in sorted(configured_conflicts.items())
-        ]
-        for host in configured_hosts:
-            owner_numbers = devices_by_ip.get(host, set())
-            if owner_numbers != {device.number}:
-                if owner_numbers:
-                    reason = (
-                        f"configured IP {host} belongs to Feishu device(s) "
-                        f"{', '.join(sorted(owner_numbers))}, not {device.number}"
-                    )
-                else:
-                    reason = (
-                        f"configured IP {host} is absent from Feishu device {device.number}"
-                    )
-                if reason not in conflict_reasons:
-                    conflict_reasons.append(reason)
-                log_ip_owners(host, owner_numbers, reason)
-                if not owner_numbers:
-                    self._log_feishu_conflict(
-                        device.number, machine.alias, host, reason,
-                        generation=view.generation, repo=repo,
-                    )
-        ambiguous_device_ips = [
-            address.ip for address in device.addresses
-            if len(devices_by_ip.get(address.ip, set())) > 1
-        ]
-        if ambiguous_device_ips:
-            for address in ambiguous_device_ips:
-                log_ip_owners(
-                    address, devices_by_ip[address],
-                    "Feishu assigns this device IP to multiple device numbers",
-                )
-        if policy_number and policy_number != device.number:
-            conflict_reasons.append(
-                f"configured Feishu number {policy_number} does not match {device.number}"
-            )
-            self._log_feishu_conflict(
-                device.number, machine.alias, machine.node_host,
-                "configured Feishu number does not match the numbered device",
-                generation=view.generation, repo=repo,
-            )
         machine.feishu_number = device.number
         machine.feishu_brand = device.brand
         machine.feishu_model = device.model
-        ambiguous_ip_set = set(ambiguous_device_ips)
-        machine.node_addresses = [
-            {
+        usable_hosts: list[str] = []
+        observed_ips: set[str] = set()
+        machine.node_addresses = []
+        for address in device.addresses:
+            if address.ip in observed_ips:
+                continue
+            observed_ips.add(address.ip)
+            owners = devices_by_ip.get(address.ip, set())
+            ambiguous = len(owners) > 1
+            if ambiguous:
+                if log_conflicts:
+                    for owner_number in sorted(owners):
+                        self._log_feishu_conflict(
+                            owner_number, machine.alias, address.ip,
+                            "Feishu assigns this IP to multiple device numbers",
+                            generation=view.generation, repo=repo,
+                        )
+            machine.node_addresses.append({
                 "ip": address.ip,
                 "label": address.label,
-                "ambiguous": "true" if address.ip in ambiguous_ip_set else "false",
-                "ambiguous_owners": ",".join(
-                    sorted(devices_by_ip.get(address.ip, set()))
-                ) if address.ip in ambiguous_ip_set else "",
-            }
-            for address in device.addresses
-        ]
-        if machine.node_host in {address["ip"] for address in machine.node_addresses}:
-            machine.node_addresses.sort(key=lambda address: address["ip"] != machine.node_host)
-        machine.node_hosts = [
-            address["ip"] for address in machine.node_addresses
-            if address["ambiguous"] != "true"
-        ]
-        machine.feishu_identity_confirmed = not conflict_reasons and not is_stale
-        machine.feishu_identity_reason = "; ".join(conflict_reasons)
+                "ambiguous": "true" if ambiguous else "false",
+                "ambiguous_owners": ",".join(sorted(owners)) if ambiguous else "",
+            })
+            if not ambiguous:
+                usable_hosts.append(address.ip)
+
+        machine.node_hosts = usable_hosts
+        machine.node_host = usable_hosts[0] if usable_hosts else ""
+        machine.feishu_identity_confirmed = True
+        machine.feishu_identity_reason = (
+            "all current Feishu IP addresses are conflicted"
+            if not usable_hosts else
+            "some Feishu IP addresses were excluded due to conflicts"
+            if len(usable_hosts) != len(machine.node_addresses) else ""
+        )
         return machine
 
     @staticmethod
@@ -714,12 +636,23 @@ class Policy:
                 "alias": str(alias or ""), "number": None,
                 "brand": None, "model": None, "confirmed": False,
                 "stale": bool(view.stale) if view is not None else True,
+                "status": "not_authorized",
                 "reason": "machine is not authorized by this repository", "addresses": [],
             }
         confirmed = (
             resolved.feishu_identity_confirmed is True
             and not resolved.feishu_stale
         )
+        if not resolved.feishu_number:
+            identity_status = "pending_binding"
+        elif resolved.feishu_stale:
+            identity_status = "stale"
+        elif resolved.feishu_identity_confirmed is not True:
+            identity_status = "unconfirmed"
+        elif not resolved.node_hosts:
+            identity_status = "no_unconflicted_ip"
+        else:
+            identity_status = "confirmed"
         return {
             "alias": resolved.alias,
             "number": resolved.feishu_number,
@@ -727,9 +660,85 @@ class Policy:
             "model": resolved.feishu_model,
             "confirmed": confirmed,
             "stale": resolved.feishu_stale,
+            "status": identity_status,
             "reason": resolved.feishu_identity_reason,
             "addresses": self._identity_addresses(resolved),
         }
+
+    def machine_projection_version(self, repo: str) -> str:
+        """Return a stable digest of repository authorization and Feishu view.
+
+        The projection is built only from the current in-memory repository
+        policy and Feishu snapshot. It does not fetch either source, and omits
+        snapshot generation and timestamps so a duplicate sync is stable.
+        """
+        policy_status = self._repository_policies.status(repo)
+        raw_machines = self._repository_policies.machines_for(repo)
+        source = self._feishu_machine_source
+        view = source.state if source is not None else None
+        machines = [
+            self._with_feishu_identity(
+                copy.deepcopy(machine), repo, view=view, log_conflicts=False,
+            )
+            for machine in raw_machines.values()
+        ]
+
+        def optional_list(value):
+            return list(value) if value is not None else None
+
+        machine_rows = []
+        for machine in sorted(machines, key=lambda item: item.alias):
+            machine_rows.append({
+                "authorization": {
+                    "alias": machine.alias,
+                    "node_id": machine.node_id,
+                    "feishu_number": machine.feishu_number,
+                    "owners": list(machine.owners or []),
+                    "targets": optional_list(machine.targets),
+                    "platforms": optional_list(machine.platforms),
+                    "variants": optional_list(machine.variants),
+                    "driver_paths": optional_list(machine.driver_paths),
+                },
+                "identity": {
+                    "number": machine.feishu_number,
+                    "brand": machine.feishu_brand,
+                    "model": machine.feishu_model,
+                    "addresses": [
+                        {
+                            "ip": address.get("ip", ""),
+                            "label": address.get("label", ""),
+                            "ambiguous": address.get("ambiguous", "false"),
+                            "ambiguous_owners": address.get("ambiguous_owners", ""),
+                        }
+                        for address in machine.node_addresses
+                    ],
+                    "node_host": machine.node_host,
+                    "node_hosts": list(machine.node_hosts or []),
+                    "confirmed": machine.feishu_identity_confirmed is True,
+                    "stale": machine.feishu_stale,
+                    "reason": machine.feishu_identity_reason,
+                },
+            })
+
+        snapshot_status = (
+            "unavailable" if view is None else
+            "stale" if view.stale else
+            "empty" if not view.devices else "fresh"
+        )
+        projection = {
+            "repository": repo.casefold() if isinstance(repo, str) else "",
+            "repository_policy": {
+                "authorized": policy_status.get("authorized") is True,
+                "machines_configured": policy_status.get("machines_configured") is True,
+                "machines_yaml_status": policy_status.get("machines_yaml_status", ""),
+            },
+            "feishu_snapshot_status": snapshot_status,
+            "machines": machine_rows,
+        }
+        serialized = json.dumps(
+            projection, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     def machine_supports_target(
         self, alias: str, target: str, repo: str | None = None,

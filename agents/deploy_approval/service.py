@@ -302,6 +302,11 @@ class DeployController:
         self._agent_core_verified_endpoints_cache: dict[
             tuple, tuple[float, dict[str, object]]
         ] = {}
+        self._machine_adaptation_snapshots: dict[
+            tuple, tuple[float, list[dict]]
+        ] = {}
+        self._runtime_projection_versions: dict[tuple[str, int], str] = {}
+        self._observed_machine_projection_versions: dict[str, str] = {}
         self.cos = CosClient(config)
         self._case_runner: CaseRunner | None = None
         self._evidence_lock = asyncio.Lock()
@@ -550,11 +555,8 @@ class DeployController:
             return False
         for peer in peers:
             try:
-                peer_primary = self._canonical_primary_ipv4(
-                    getattr(peer, "node_host", ""),
-                )
                 peer_endpoints = self._policy_machine_endpoints(peer, repo)
-                if endpoint not in {item["ip"] for item in peer_endpoints} and endpoint != peer_primary:
+                if endpoint not in {item["ip"] for item in peer_endpoints}:
                     continue
                 peer_identity = self._policy_machine_identity(peer, repo)
             except Exception:
@@ -564,14 +566,48 @@ class DeployController:
                 return False
         return True
 
-    def _endpoint_connection_fingerprint(self, machine, endpoint: str) -> tuple[str, str, str]:
-        alias = str(getattr(machine, "alias", "") or "")
-        token = self._agent_core_token(alias)
-        return (
-            str(getattr(machine, "node_id", "") or ""), endpoint,
-            self._credential_fingerprint(token)
-            or ("injected-factory" if self._agent_core_factory is not None else ""),
-        )
+    def _machine_projection_version(self, repo: str) -> str:
+        """Return Policy's live authorization and Feishu projection version."""
+        version = getattr(self.policy, "machine_projection_version", None)
+        if not callable(version):
+            raise DeployControllerError(
+                f"current machine projection version is unavailable for {repo}"
+            )
+        try:
+            value = version(repo)
+        except Exception as exc:
+            raise DeployControllerError(
+                f"cannot verify current machine projection for {repo}: {type(exc).__name__}"
+            ) from exc
+        if not isinstance(value, str) or not value:
+            raise DeployControllerError(
+                f"current machine projection version is invalid for {repo}"
+            )
+        self._observe_machine_projection_version(repo, value)
+        return value
+
+    def _observe_machine_projection_version(self, repo: str, version: str) -> None:
+        repo_key = repo.casefold()
+        previous = self._observed_machine_projection_versions.get(repo_key)
+        if previous is not None and previous != version:
+            for cache in (
+                self._agent_core_verified_endpoints_cache,
+                self._machine_adaptation_snapshots,
+            ):
+                for key in list(cache):
+                    if isinstance(key, tuple) and key and key[0] == repo_key:
+                        cache.pop(key, None)
+        self._observed_machine_projection_versions[repo_key] = version
+
+    def _endpoint_connection_fingerprint(
+        self, machine, endpoint: str, repo: str = "",
+    ) -> tuple[str, ...]:
+        endpoint = self._canonical_primary_ipv4(endpoint)
+        primary = self._canonical_primary_ipv4(getattr(machine, "node_host", ""))
+        machine_fingerprint = self._machine_connection_fingerprint(machine, repo)
+        if endpoint and endpoint == primary:
+            return machine_fingerprint
+        return (*machine_fingerprint, endpoint)
 
     async def _core_for_machine_endpoint(
         self, machine, endpoint: str, repo: str, *, timeout: float | None = None,
@@ -623,10 +659,7 @@ class DeployController:
                 f"no current agent_core_token is configured for machine {alias!r} in {repo}"
             )
         self._assert_repo_machine_credential_scope(repo, current)
-        fingerprint = (
-            str(getattr(current, "node_id", "") or ""), endpoint,
-            self._credential_fingerprint(token),
-        )
+        fingerprint = self._endpoint_connection_fingerprint(current, endpoint, repo)
         cache_key = (repo.casefold(), f"{alias}@{endpoint}")
         cached = self._core_clients.get(cache_key)
         if cached is not None and self._core_client_fingerprints.get(cache_key) == fingerprint:
@@ -645,8 +678,8 @@ class DeployController:
             latest_matches = [item for item in latest
                               if getattr(item, "alias", None) == alias] if isinstance(latest, list) else []
             if (len(latest_matches) != 1
-                    or self._machine_connection_fingerprint(latest_matches[0])
-                    != self._machine_connection_fingerprint(current)
+                    or self._machine_connection_fingerprint(latest_matches[0], repo)
+                    != self._machine_connection_fingerprint(current, repo)
                     or not self._endpoint_allowed_for_repository(
                         repo, latest_matches[0], endpoint, policy_machines=latest)):
                 await self._close_client(client)
@@ -679,7 +712,7 @@ class DeployController:
                 f"cannot verify current machine policy for {repo}"
             )
 
-        current_bindings: dict[tuple[str, str], tuple[str, str, str]] = {}
+        current_bindings: dict[tuple[str, str], tuple[str, ...]] = {}
         for current in machines:
             alias = getattr(current, "alias", "")
             current_node_id = getattr(current, "node_id", "")
@@ -687,12 +720,8 @@ class DeployController:
             if not all(isinstance(value, str) and value for value in
                        (alias, current_node_id, node_host)):
                 continue
-            token = self._agent_core_token(alias)
-            credential_fingerprint = self._credential_fingerprint(token)
-            if self._agent_core_factory is not None and not credential_fingerprint:
-                credential_fingerprint = "injected-factory"
-            current_bindings[(repo_key, alias)] = (
-                current_node_id, node_host, credential_fingerprint,
+            current_bindings[(repo_key, alias)] = self._machine_connection_fingerprint(
+                current, repo,
             )
 
         # Policy may refresh machine IPs, node IDs, aliases, or credentials
@@ -724,10 +753,18 @@ class DeployController:
                 f"no current agent_core_token is configured for machine {alias!r} in {repo}; no Agent Core request was sent"
             )
         self._assert_repo_machine_credential_scope(repo, machine)
-        fingerprint = (
-            node_id, node_host,
-            self._credential_fingerprint(token) or "injected-factory",
-        )
+        if not self._endpoint_allowed_for_repository(repo, machine, node_host,
+                                                     policy_machines=machines):
+            raise DeployControllerError(
+                f"machine endpoint {node_host} is not currently authorized for {repo}"
+            )
+        identity = self._policy_machine_identity(machine, repo)
+        if not self._machine_endpoint_has_unambiguous_identity(
+                machine, node_host, repo, identity):
+            raise DeployControllerError(
+                f"machine endpoint {node_host} has no unambiguous current identity"
+            )
+        fingerprint = self._machine_connection_fingerprint(machine, repo)
         key = (repo_key, alias)
         cached = self._core_clients.get(key)
         if cached is not None and self._core_client_fingerprints.get(key) == fingerprint:
@@ -768,7 +805,7 @@ class DeployController:
         refreshed_matches = [item for item in refreshed
                              if getattr(item, "alias", None) == alias]
         if (len(refreshed_matches) != 1
-                or self._machine_connection_fingerprint(refreshed_matches[0]) != fingerprint
+                or self._machine_connection_fingerprint(refreshed_matches[0], repo) != fingerprint
                 or self._credential_fingerprint(self._agent_core_token(alias))
                 != self._credential_fingerprint(token)):
             await self._close_client(client)
@@ -872,29 +909,66 @@ class DeployController:
                     f"cannot confirm machine alias credential scope for {repo}"
                 )
             for other in other_machines:
-                if (getattr(other, "alias", "").casefold()
-                        != getattr(machine, "alias", "").casefold()):
+                other_alias = str(getattr(other, "alias", "") or "")
+                machine_alias = str(getattr(machine, "alias", "") or "")
+                if other_alias.casefold() != machine_alias.casefold():
                     continue
                 # The same physical machine may be independently authorized by
                 # both repositories. Credentials are keyed by the exact alias,
-                # so refuse any alias spelling or endpoint identity drift.
+                # so refuse any alias spelling, Feishu identity, or endpoint
+                # identity drift, including a secondary IP reassignment.
+                try:
+                    current_identity = self._policy_machine_identity(machine, repo)
+                    other_identity = self._policy_machine_identity(other, other_repo)
+                    current_endpoints = {
+                        item["ip"] for item in self._policy_machine_endpoints(machine, repo)
+                    }
+                    other_endpoints = {
+                        item["ip"] for item in self._policy_machine_endpoints(other, other_repo)
+                    }
+                except Exception as exc:
+                    raise DeployControllerError(
+                        f"cannot confirm machine alias credential scope for {repo}: {type(exc).__name__}"
+                    ) from exc
                 if (
-                    getattr(other, "alias", "") == getattr(machine, "alias", "")
+                    other_alias == machine_alias
                     and getattr(other, "node_id", "") == getattr(machine, "node_id", "")
                     and getattr(other, "node_host", "") == getattr(machine, "node_host", "")
+                    and str(getattr(other, "feishu_number", "") or "")
+                    == str(getattr(machine, "feishu_number", "") or "")
+                    and self._machine_identity_is_confirmed(current_identity)
+                    and self._machine_identity_is_confirmed(other_identity)
+                    and self._physical_machine_identity_key(current_identity)
+                    == self._physical_machine_identity_key(other_identity)
+                    and current_endpoints == other_endpoints
                 ):
                     continue
                 raise DeployControllerError(
                     f"machine alias {machine.alias!r} is shared by {repo} and {other_repo} with conflicting machine identity; Agent Core credentials are keyed only by alias"
                 )
 
-    def _machine_connection_fingerprint(self, machine) -> tuple[str, str, str]:
+    def _machine_connection_fingerprint(
+        self, machine, repo: str = "",
+    ) -> tuple[str, ...]:
         alias = getattr(machine, "alias", "")
+        if repo:
+            endpoint_rows = self._policy_machine_endpoints(machine, repo)
+            endpoints = tuple((item["ip"], item["label"]) for item in endpoint_rows)
+            projection = self._machine_projection_version(repo)
+        else:
+            raw_hosts = getattr(machine, "node_hosts", [])
+            endpoints = tuple(sorted({
+                self._canonical_primary_ipv4(value)
+                for value in raw_hosts if self._canonical_primary_ipv4(value)
+            })) if isinstance(raw_hosts, (list, tuple, set)) else ()
+            projection = ""
         return (
             str(getattr(machine, "node_id", "") or ""),
             str(getattr(machine, "node_host", "") or ""),
             self._credential_fingerprint(self._agent_core_token(alias))
             or ("injected-factory" if self._agent_core_factory is not None else ""),
+            str(getattr(machine, "feishu_number", "") or ""),
+            repr(endpoints), projection,
         )
 
     async def _close_core_client(self, key: tuple[str, str]) -> None:
@@ -1699,13 +1773,10 @@ class DeployController:
         all_machine_groups = self._get_machine_groups_for_components(
             candidate["components"], repo,
         )
-        verified_groups = await self._machine_groups_verify_endpoints(
-            all_machine_groups, repo, candidate["components"],
-        )
         markdown = comments_mod.deploy_ready(
             repo, pr_number, current_head, candidate["builds"],
             review_evidence=candidate["snapshot"],
-            machine_groups=verified_groups,
+            machine_groups=all_machine_groups,
             components=candidate["components"],
         )
         try:
@@ -1721,12 +1792,6 @@ class DeployController:
             return state
         if not written:
             return state
-        await self._post_deploy_ready_notice(
-            repo, pr_number, head_sha=current_head,
-            round_id=round_id_for_state(next_state),
-            review_evidence=candidate["snapshot"],
-            components=candidate["components"],
-        )
         return next_state
 
     async def _resolve_commit_prefix_for_head(
@@ -2474,64 +2539,24 @@ class DeployController:
                 if isinstance(component, dict)
                 and component.get("component_id") in pending_ids
             ]
-            candidate_groups = self._get_machine_groups_for_components(
-                drift_components, repo,
+            machine_groups = self._runtime_redeploy_machine_groups(
+                state, drift_components, repo,
             )
-            machine_groups = []
-            for binding in runtime_bindings:
-                if not isinstance(binding, dict):
-                    continue
-                try:
-                    binding_ip = str(ipaddress.ip_address(binding.get("ip", "")))
-                except (TypeError, ValueError):
-                    binding_ip = ""
-                binding_ids = set(binding.get("component_ids", []))
-                binding_components = [
-                    component for component in drift_components
-                    if component.get("component_id") in binding_ids
-                ]
-                try:
-                    binding_machine = self.policy.get_machine(
-                        str(binding.get("machine", "") or ""), repo=repo,
-                    )
-                except Exception:
-                    binding_machine = None
-                endpoint_bound = bool(
-                    binding_machine is not None and binding_ip
-                    and binding_ip in {
-                        item["ip"] for item in self._policy_machine_endpoints(
-                            binding_machine, repo,
-                        )
-                    }
-                    and self._endpoint_allowed_for_repository(
-                        repo, binding_machine, binding_ip,
-                        components=binding_components,
-                    )
-                )
-                group = next((item for item in candidate_groups
-                              if endpoint_bound
-                              and item.get("alias") == binding.get("machine")
-                              and binding_ids.issubset(set(item.get("component_ids", [])))),
-                             None)
-                if group is not None:
-                    machine_groups.append({
-                        **group, "component_ids": sorted(binding_ids),
-                        "required_component_ids": sorted(binding_ids),
-                        "verification_endpoints": [binding_ip],
-                    })
+            verified_machine_groups = await self._machine_groups_verify_endpoints(
+                machine_groups, repo, drift_components,
+            )
             command_lines = await self._machine_notice_lines(
-                machine_groups, repo, mention_owners=True,
+                verified_machine_groups, repo, mention_owners=True,
                 test_only=test_only, components=components, pr=pr,
+                groups_verified=True,
             )
             next_step = (
                 [
                     "请以下机器负责人直接执行对应审批命令；`/request_deploy` 仍是可选的申请操作。",
                     *command_lines,
                 ]
-                if command_lines else self._machine_blocking_summary(candidate_groups)
+                if command_lines else self._machine_blocking_summary(verified_machine_groups)
             )
-            if command_lines and test_only:
-                next_step.append("测试 PR 仅提醒 @Haohao-end。")
             topic = "runtime-redeploy-request-created"
             message = "\n".join([
                 "镜像与当前批准版本不一致，已经为本轮创建了重新部署申请。",
@@ -2552,17 +2577,11 @@ class DeployController:
                 ]
                 if command_lines else self._machine_blocking_summary(machine_groups)
             )
-            if command_lines and test_only:
-                next_step.append("测试 PR 仅提醒 @Haohao-end。")
             topic = "deployment-requested-next-approver"
             message = "\n".join([
                 "部署审批申请已经生效。",
                 *next_step,
             ])
-        if test_only:
-            message = message.replace("@", "＠").replace(
-                "＠Haohao-end", "@Haohao-end",
-            )
         return await self._post_bound_notice(
             repo, pr_number, head_sha=head_sha,
             round_id=round_id_for_state(state), comment_id=comment_id,
@@ -2893,6 +2912,26 @@ class DeployController:
                     return True
                 if not self._confirmed_runtime_drift(fresh_state):
                     fresh_checks = fresh_state.get("runtime_checks", [])
+                    identity_unconfirmed = self._runtime_identity_unconfirmed(
+                        fresh_state,
+                    )
+                    if identity_unconfirmed:
+                        commands = await self._runtime_drift_command_lines(
+                            fresh_state, repo, pr_number=pr_number,
+                        )
+                        message = (
+                            "历史部署记录的设备身份无法确认；这次没有创建重新部署申请。"
+                            "请按当前仓库授权并验证过的地址明确重新确认。"
+                        )
+                        if commands:
+                            message += "\n" + "\n".join(
+                                f"`{command}`" for command in commands
+                            )
+                        await self._post_command_reply(
+                            repo, pr_number, comment_id, message,
+                            topic="runtime-redeploy-request-identity-reconfirmation",
+                        )
+                        return True
                     current_statuses = {
                         check.get("status") for check in fresh_checks
                         if isinstance(check, dict)
@@ -2920,58 +2959,9 @@ class DeployController:
                     component for component in working_state.get("components", [])
                     if component.get("component_id") in drift_ids
                 ]
-                candidate_groups = self._get_machine_groups_for_components(
-                    drift_components, repo,
+                machine_groups = self._runtime_redeploy_machine_groups(
+                    working_state, drift_components, repo,
                 )
-                machine_groups = []
-                for binding in working_state.get("runtime_redeploy", []):
-                    if not isinstance(binding, dict):
-                        continue
-                    try:
-                        binding_ip = str(ipaddress.ip_address(binding.get("ip", "")))
-                    except (TypeError, ValueError):
-                        binding_ip = ""
-                    binding_ids = set(binding.get("component_ids", []))
-                    binding_components = [
-                        component for component in working_state.get("components", [])
-                        if isinstance(component, dict)
-                        and component.get("component_id") in binding_ids
-                    ]
-                    try:
-                        binding_machine = self.policy.get_machine(
-                            str(binding.get("machine", "") or ""), repo=repo,
-                        )
-                    except Exception:
-                        binding_machine = None
-                    endpoint_bound = bool(
-                        binding_machine is not None and binding_ip
-                        and binding_ip in {
-                            item["ip"] for item in self._policy_machine_endpoints(
-                                binding_machine, repo,
-                            )
-                        }
-                        and self._endpoint_allowed_for_repository(
-                            repo, binding_machine, binding_ip,
-                            components=binding_components,
-                        )
-                    )
-                    group = next((item for item in candidate_groups
-                                  if endpoint_bound
-                                  and item.get("alias") == binding.get("machine")
-                                  and binding_ids.issubset(set(item.get("component_ids", [])))),
-                                 None)
-                    if group is None:
-                        await self._post_command_reply(
-                            repo, pr_number, comment_id,
-                            "原来登记的机器已经不能部署这次需要重新部署的组件，这次没有创建重新部署申请。",
-                            topic="runtime-redeploy-request-machine-incompatible",
-                        )
-                        return True
-                    machine_groups.append({
-                        **group, "component_ids": sorted(binding_ids),
-                        "required_component_ids": sorted(binding_ids),
-                        "verification_endpoints": [binding_ip],
-                    })
                 if not machine_groups:
                     await self._post_command_reply(
                         repo, pr_number, comment_id,
@@ -2979,6 +2969,9 @@ class DeployController:
                         topic="runtime-redeploy-request-no-compatible-machine",
                     )
                     return True
+                machine_groups = await self._machine_groups_verify_endpoints(
+                    machine_groups, repo, drift_components,
+                )
                 fresh_request_comment = await self._revalidate_request_deploy_comment(
                     repo, pr_number, comment_id, pr_author_id,
                 )
@@ -3158,138 +3151,35 @@ class DeployController:
         if comment_id <= state.get("last_processed_comment_id", 0):
             return state, state, False, False, True
         if not machine_selector:
-            drift_checks = self._confirmed_runtime_drift(state)
-            component_map = {
-                component.get("component_id"): component
-                for component in state.get("components", [])
-                if isinstance(component, dict)
-            }
-            mismatch_components_by_binding: dict[tuple[str, str], set[str]] = {}
-            for check in drift_checks:
-                alias = check.get("machine")
-                checked_ip = self._canonical_primary_ipv4(check.get("ip", ""))
-                component_id = check.get("component_id")
-                if (not isinstance(alias, str) or not alias
-                        or not checked_ip
-                        or not isinstance(component_id, str) or not component_id):
-                    continue
-                mismatch_components_by_binding.setdefault(
-                    (alias, checked_ip), set(),
-                ).add(component_id)
-            drift_component_ids = {
-                component_id
-                for component_ids in mismatch_components_by_binding.values()
-                for component_id in component_ids
-            }
-            drift_components = [component_map[component_id]
-                                for component_id in drift_component_ids
-                                if component_id in component_map]
-            try:
-                policy_status = self.policy.repo_policy_status(repo)
-                if (not isinstance(policy_status, dict)
-                        or policy_status.get("authorized") is not True
-                        or policy_status.get("machines_configured") is not True):
-                    await self._post_command_reply(
-                        repo, pr_number, comment_id,
-                        "当前仓库还没有可用的机器配置，因此无法重新审批，这次没有发送部署请求。",
-                        topic="runtime-redeploy-policy-unconfigured",
-                    )
-                    return state, state, False, False, True
-                groups = self._get_machine_groups_for_components(
-                    drift_components, repo,
-                ) if drift_components else []
-            except Exception as exc:
-                logger.warning("runtime redeploy machine selection unavailable repo=%s reason=%s",
-                               repo, type(exc).__name__)
+            drift_exists = bool(self._confirmed_runtime_drift(state))
+            identity_unconfirmed = bool(self._runtime_identity_unconfirmed(state))
+            pending_redeploy = bool(self._runtime_redeploy_pending_ids(state))
+            if not (drift_exists or identity_unconfirmed or pending_redeploy):
                 await self._post_command_reply(
                     repo, pr_number, comment_id,
-                    "目前无法确认仓库的机器配置，因此不能安全选择重新部署机器，这次没有发送部署请求。",
-                    topic="runtime-redeploy-machine-selection-unavailable",
+                    "目前没有确认到需要重新部署的镜像差异，这次没有发送部署请求。",
+                    topic="runtime-redeploy-no-confirmed-drift",
                 )
                 return state, state, False, False, True
-            valid_bindings: dict[tuple[str, str], tuple[dict, dict]] = {}
-            if drift_component_ids and len(drift_components) == len(drift_component_ids):
-                for (alias, checked_ip), component_ids in mismatch_components_by_binding.items():
-                    binding_components = [
-                        component_map[component_id]
-                        for component_id in component_ids
-                        if component_id in component_map
-                    ]
-                    if len(binding_components) != len(component_ids):
-                        continue
-                    group = next((
-                        item for item in groups
-                        if isinstance(item, dict)
-                        and item.get("alias") == alias
-                        and item.get("approval_available") is True
-                        and item.get("repo_authorized") is True
-                        and item.get("identity_confirmed") is True
-                        and component_ids.issubset(
-                            set(item.get("component_ids", []))
-                        )
-                    ), None)
-                    if group is None:
-                        continue
-                    try:
-                        candidate_machine = self.policy.get_machine(alias, repo=repo)
-                        endpoint_rows = self._policy_machine_endpoints(
-                            candidate_machine, repo,
-                        ) if candidate_machine is not None else []
-                    except Exception:
-                        candidate_machine = None
-                        endpoint_rows = []
-                    if candidate_machine is None:
-                        continue
-                    if (checked_ip not in {
-                            item.get("ip") for item in endpoint_rows
-                            if isinstance(item, dict)
-                    } or not self._endpoint_allowed_for_repository(
-                            repo, candidate_machine, checked_ip,
-                            components=binding_components,
-                    )):
-                        continue
-                    verified_endpoints = await self._agent_core_verified_endpoints(
-                        repo, candidate_machine, binding_components,
-                        endpoints=[checked_ip],
-                    )
-                    verified_endpoint = next((item for item in verified_endpoints
-                                               if isinstance(item, dict)
-                                               and item.get("ip") == checked_ip
-                                               and component_ids.issubset(set(
-                                                   item.get("component_ids", []),
-                                               ))), None)
-                    if verified_endpoint is not None:
-                        valid_bindings[(alias, checked_ip)] = (
-                            group, verified_endpoint,
-                        )
-            if len(valid_bindings) == 1:
-                _binding, (_selected_group, selected_endpoint) = next(
-                    iter(valid_bindings.items()),
-                )
-                machine_selector = str(selected_endpoint.get("ip", "") or "")
-            elif len(valid_bindings) > 1:
-                commands = sorted({
-                    f"/approve_deploy machine={checked_ip}"
-                    for _alias, checked_ip in valid_bindings
-                })
-                message = "多个已确认镜像差异绑定可用，请明确指定实际检查 IP。"
-                if commands:
-                    message += "\n" + "\n".join(f"`{command}`" for command in commands)
-                topic = "runtime-redeploy-multiple-compatible-machines"
-                await self._post_command_reply(
-                    repo, pr_number, comment_id, message, topic=topic,
-                )
-                return state, state, False, False, True
+            commands = await self._runtime_drift_command_lines(
+                state, repo, pr_number=pr_number,
+            )
+            if drift_exists:
+                message = "已确认运行镜像存在差异，请明确选择当前已授权并验证的机器 IP。"
             else:
                 message = (
-                    "目前没有找到与已确认镜像差异机器、实际检查 IP 和组件完全对应的有效绑定，"
-                    "这次没有发送部署请求。"
+                    "历史部署记录的设备身份和当前地址无法自动确认；这次没有发送部署请求。"
+                    "请明确选择 PR Summary 中当前授权并验证过的机器 IP 重新确认。"
                 )
-                topic = "runtime-redeploy-no-confirmed-machine"
-                await self._post_command_reply(
-                    repo, pr_number, comment_id, message, topic=topic,
+            if commands:
+                message += "\n" + "\n".join(
+                    f"`{command}`" for command in commands
                 )
-                return state, state, False, False, True
+            await self._post_command_reply(
+                repo, pr_number, comment_id, message,
+                topic="runtime-redeploy-requires-current-ip",
+            )
+            return state, state, False, False, True
         try:
             policy_status = self.policy.repo_policy_status(repo)
             if (not isinstance(policy_status, dict)
@@ -3324,22 +3214,44 @@ class DeployController:
             )
             return state, state, False, False, True
 
-        try:
-            current_ip = ipaddress.ip_address(machine.node_host)
-        except (TypeError, ValueError):
-            current_ip = None
-        machine_ip = str(current_ip) if current_ip is not None and current_ip.version == 4 else ""
+        machine_ip = self._canonical_primary_ipv4(
+            getattr(machine, "node_host", ""),
+        )
         permitted_selector = self._machine_command_selector(machine.alias, repo)
         requested_endpoint = self._canonical_primary_ipv4(machine_selector)
-        endpoint_rows = self._policy_machine_endpoints(machine, repo)
+        blocked_historical_ips = self._historical_ips_not_bound_to_current_identity(
+            state, repo,
+        )
+        endpoint_rows = [
+            endpoint for endpoint in self._policy_machine_endpoints(machine, repo)
+            if endpoint.get("ip") not in blocked_historical_ips
+        ]
         confirmed_endpoints = {item["ip"] for item in endpoint_rows}
-        selector_is_alias = machine_selector == machine.alias
-        if (not confirmed_endpoints
-                or (not selector_is_alias
-                    and requested_endpoint not in confirmed_endpoints)):
+        component_map = {
+            item.get("component_id"): item
+            for item in state.get("components", []) if isinstance(item, dict)
+        }
+        current_pending_ids = self._runtime_redeploy_ids_for_alias(
+            state, machine.alias,
+        )
+        current_pending_ids.update(
+            check.get("component_id") for check in (
+                self._confirmed_runtime_drift(state)
+                + self._runtime_identity_unconfirmed(state)
+            )
+            if check.get("machine") == machine.alias
+            and isinstance(check.get("component_id"), str)
+        )
+        drift_components = [component_map[item] for item in current_pending_ids
+                            if item in component_map]
+        if len(drift_components) != len(current_pending_ids):
+            drift_components = []
+        if (not confirmed_endpoints or not requested_endpoint
+                or requested_endpoint not in confirmed_endpoints
+                or not drift_components):
             await self._post_command_reply(
                 repo, pr_number, comment_id,
-                "重新部署审批必须使用当前仓库已确认的实际机器 IP，这次没有发送部署请求。"
+                "重新部署审批必须明确使用当前仓库已确认的实际机器 IP，这次没有发送部署请求。"
                 "请按 PR Summary 中当前可用的 IP 命令操作。",
                 topic="runtime-redeploy-requires-ip",
             )
@@ -3350,46 +3262,9 @@ class DeployController:
                 repo, machine, item["ip"], components=drift_components,
             )
         ]
-        if requested_endpoint:
-            selected_endpoint = (
-                requested_endpoint if requested_endpoint in allowed_endpoints else ""
-            )
-        else:
-            drift_ips = sorted({
-                self._canonical_primary_ipv4(check.get("ip", ""))
-                for check in self._confirmed_runtime_drift(state)
-                if check.get("machine") == machine.alias
-                and self._canonical_primary_ipv4(check.get("ip", ""))
-                in allowed_endpoints
-            })
-            if len(drift_ips) == 1:
-                selected_endpoint = drift_ips[0]
-            elif len(drift_ips) > 1:
-                verified_commands = await self._runtime_drift_command_lines(state, repo)
-                machine_drift_commands = {
-                    f"/approve_deploy machine={ip}" for ip in drift_ips
-                }
-                verified_commands = [
-                    command for command in verified_commands
-                    if command in machine_drift_commands
-                ]
-                suffix = (
-                    "\n" + "\n".join(f"`{line}`" for line in verified_commands)
-                    if verified_commands else ""
-                )
-                await self._post_command_reply(
-                    repo, pr_number, comment_id,
-                    "这台机器有多个地址需要重新部署，请明确指定实际检查 IP。"
-                    + suffix,
-                    topic="runtime-redeploy-requires-machine-ip",
-                )
-                return state, state, False, False, True
-            elif machine_ip in allowed_endpoints:
-                selected_endpoint = machine_ip
-            elif len(allowed_endpoints) == 1:
-                selected_endpoint = allowed_endpoints[0]
-            else:
-                selected_endpoint = ""
+        selected_endpoint = (
+            requested_endpoint if requested_endpoint in allowed_endpoints else ""
+        )
         if not selected_endpoint:
             await self._post_command_reply(
                 repo, pr_number, comment_id,
@@ -3513,6 +3388,15 @@ class DeployController:
                           if isinstance(check, dict)
                           and check.get("machine") == machine.alias
                           and check.get("ip") == selected_endpoint]
+        reconfirmation_checks = [
+            check for check in current_checks
+            if check.get("status") == "identity_changed"
+            and check.get("identity_reason") in {
+                "identity_unrecorded", "device_changed", "snapshot_unavailable",
+                "historical_ip_reassigned", "address_changed",
+                "deployment_ip_unrecorded",
+            }
+        ]
         current_drift = self._runtime_drift_checks_for_machine(
             fresh_state, machine.alias, selected_endpoint,
         )
@@ -3559,7 +3443,7 @@ class DeployController:
                     topic="runtime-redeploy-component-incompatible",
                 )
                 return fresh_state, fresh_state, False, False, True
-        if not current_drift and not current_pending_ids:
+        if not current_drift and not current_pending_ids and not reconfirmation_checks:
             if current_checks and all(check.get("status") == "match" for check in current_checks):
                 message = "重新检查确认机器上已经在运行本轮批准的镜像，不需要重新部署。"
                 topic = "runtime-redeploy-already-matches"
@@ -3586,7 +3470,7 @@ class DeployController:
             )
             return fresh_state, fresh_state, False, False, True
 
-        if not current_drift and current_pending_ids:
+        if not current_drift and current_pending_ids and not reconfirmation_checks:
             if current_checks and all(
                     check.get("status") == "match" for check in current_checks):
                 message = "重新检查确认机器上已经在运行本轮批准的镜像，不需要重新部署。"
@@ -3611,6 +3495,11 @@ class DeployController:
             if isinstance(check.get("component_id"), str)
             and check.get("component_id")
         }
+        current_drift_ids.update(
+            check.get("component_id") for check in reconfirmation_checks
+            if isinstance(check.get("component_id"), str)
+            and check.get("component_id")
+        )
         component_map = {
             component.get("component_id"): component
             for component in fresh_state.get("components", [])
@@ -3687,11 +3576,14 @@ class DeployController:
                    for field in ("machine", "ip", "component_id"))
         }
         has_unbound_mismatch = bool(current_mismatch_bindings - pending_bindings)
-        if has_unbound_mismatch or (current_pending_ids and fresh_status == "failed"):
+        if (has_unbound_mismatch
+                or current_pending_ids and fresh_status == "failed"
+                or reconfirmation_checks):
             working_state = self._new_runtime_redeploy_round(
                 fresh_state, comment_id=comment_id,
                 command_kind="approve_deploy", actor=actor,
                 machine=machine.alias,
+                reconfirmation_checks=reconfirmation_checks,
             )
             working_state.setdefault("command", {}).setdefault("args", {})[
                 "node_host"
@@ -3810,6 +3702,7 @@ class DeployController:
             redeploy_mode = False
             new_redeploy_round = False
             runtime_drift_checks = self._confirmed_runtime_drift(state)
+            runtime_identity_unconfirmed = self._runtime_identity_unconfirmed(state)
             pending_redeploy = state.get("runtime_redeploy", [])
             if not isinstance(pending_redeploy, list):
                 pending_redeploy = []
@@ -3829,7 +3722,8 @@ class DeployController:
                     return True
             if (_current_status in {"testing", "succeeded", "failed"}
                     or _current_status in {"deploy-ready", "deploy-requested"}
-                    and (runtime_drift_checks or pending_redeploy)):
+                    and (runtime_drift_checks or runtime_identity_unconfirmed
+                         or pending_redeploy)):
                 (state, initial_lifecycle_state, redeploy_mode,
                  new_redeploy_round, handled) = await self._prepare_runtime_redeploy_approval(
                     repo, pr_number, comment_id, machine_alias, actor,
@@ -3956,7 +3850,7 @@ class DeployController:
                 }
                 full_groups = [
                     group for group in groups
-                    if remaining_ids and remaining_ids.issubset(set(group.get("component_ids", [])))
+                    if self._has_verified_endpoint_covering(group, remaining_ids)
                 ]
                 if len(full_groups) == 1:
                     options = full_groups
@@ -4021,6 +3915,16 @@ class DeployController:
             # addresses are executable. Explicitly selected endpoints take
             # priority; otherwise the registered primary IP is used first.
             approved_machine_identity = self._policy_machine_identity(machine, repo)
+            approved_deployment_identity = self._deployment_identity_binding(
+                machine, repo, approved_machine_identity,
+            )
+            if approved_deployment_identity is None:
+                await self._post_command_reply(
+                    repo, pr_number, comment_id,
+                    "当前飞书设备身份无法绑定到部署记录；本次没有发送部署 POST。",
+                    topic="deployment-feishu-identity-unconfirmed", error=True,
+                )
+                return True
             requested_ip = self._canonical_primary_ipv4(requested_endpoint)
             try:
                 policy_endpoints = self._policy_machine_endpoints(machine, repo)
@@ -4031,6 +3935,19 @@ class DeployController:
                 policy_machines = self.policy.get_machines(repo=repo) or []
             except Exception:
                 policy_machines = []
+            blocked_historical_ips = self._historical_ips_not_bound_to_current_identity(
+                state, repo, policy_machines,
+            )
+            if machine_selector_ip in blocked_historical_ips:
+                await self._post_command_reply(
+                    repo, pr_number, comment_id,
+                    "这个地址属于无法确认或已经换绑设备的历史部署 IP；"
+                    "本次没有查询该地址或发送部署请求。请使用 PR Summary 中当前验证过的新地址。",
+                    topic="historical-deployment-ip-reassigned",
+                )
+                return True
+            policy_endpoints = [item for item in policy_endpoints
+                                if item.get("ip") not in blocked_historical_ips]
             if machine_selector_ip:
                 confirmed_endpoints = (
                     [machine_selector_ip]
@@ -4055,10 +3972,9 @@ class DeployController:
                         repo, machine, requested_ip,
                         policy_machines=policy_machines,
                     )):
-                confirmed_endpoints = [
-                    requested_ip,
-                    *{item["ip"] for item in policy_endpoints if item["ip"] != requested_ip},
-                ]
+                # An explicit IP selector is an exact approval target. If it
+                # fails verification, never silently deploy through another IP.
+                confirmed_endpoints = [requested_ip]
             else:
                 confirmed_endpoints = [item["ip"] for item in policy_endpoints]
 
@@ -4088,6 +4004,17 @@ class DeployController:
                 c for c in components
                 if c.get("component_id") not in existing_deployed
             ]
+            redeploy_component_ids = (
+                self._runtime_redeploy_ids_for_machine(
+                    state, machine.alias, requested_ip or machine.node_host,
+                ) if redeploy_mode else set()
+            )
+            if redeploy_mode:
+                undeployed_components = [
+                    component for component in components
+                    if isinstance(component, dict)
+                    and component.get("component_id") in redeploy_component_ids
+                ]
             if not undeployed_components:
                 await self._post_error(
                     repo, pr_number,
@@ -4109,9 +4036,7 @@ class DeployController:
                 if c.get("component_id", "") in compatible_remaining_ids
             ]
             if pending_drift_ids:
-                machine_drift_ids = self._runtime_redeploy_ids_for_machine(
-                    state, machine.alias, requested_ip or machine.node_host,
-                )
+                machine_drift_ids = redeploy_component_ids
                 # A runtime redeploy round is bound only to components whose
                 # latest read-only check confirmed MISMATCH. Do not fold other
                 # undeployed components into this approval.
@@ -4146,6 +4071,7 @@ class DeployController:
                 "args": {
                     "machine": machine_alias,
                     "actor": actor,
+                    **approved_deployment_identity,
                     "deployment_request_submitted": deployment_request_submitted,
                     "preflight_pending": True,
                     "preflight_started_at": time.time(),
@@ -4222,6 +4148,7 @@ class DeployController:
                             repo, machine, verification_components,
                             endpoints=[endpoint],
                             endpoint_diagnostics=endpoint_diagnostics,
+                            force_refresh=True,
                         )
                         verified_component_ids = {
                             component_id
@@ -4693,7 +4620,9 @@ class DeployController:
 
                 # Persist verified earlier components and narrow restart
                 # recovery to the next POST that may actually be attempted.
-                state["deployments"] = list(existing_deployments) + list(new_deployments)
+                state["deployments"] = self._merge_deployment_rows(
+                    existing_deployments, new_deployments,
+                )
                 if redeploy_mode and new_deployments:
                     self._record_redeployed_runtime_matches(
                         state, machine, new_deployments, approve_attempt["health"],
@@ -4708,6 +4637,7 @@ class DeployController:
                         "actor": actor,
                         "node_id": machine.node_id,
                         "node_host": selected_endpoint,
+                        **approved_deployment_identity,
                         "deployment_request_submitted": deployment_request_submitted,
                         "pending_component_ids": [component_id],
                         "preflight_pending": True,
@@ -4739,6 +4669,7 @@ class DeployController:
                             "actor": actor,
                             "node_id": machine.node_id,
                             "node_host": selected_endpoint,
+                            **approved_deployment_identity,
                             "deployment_request_submitted": deployment_request_submitted,
                             "pending_component_ids": [component_id],
                             "execution_started_at": time.time(),
@@ -4848,7 +4779,7 @@ class DeployController:
                         or self._core_clients.get(current_core_key) is not core
                         or self._core_client_fingerprints.get(current_core_key)
                         != self._endpoint_connection_fingerprint(
-                            machine_after_permission, selected_endpoint,
+                            machine_after_permission, selected_endpoint, repo,
                         )):
                     return await self._block_machine_policy_change(
                         repo, pr_number, persisted_lifecycle_state,
@@ -4984,7 +4915,7 @@ class DeployController:
                         or self._core_clients.get(current_core_key) is not core
                         or self._core_client_fingerprints.get(current_core_key)
                         != self._endpoint_connection_fingerprint(
-                            final_machine, selected_endpoint,
+                            final_machine, selected_endpoint, repo,
                         )):
                     return await self._block_machine_policy_change(
                         repo, pr_number, persisted_lifecycle_state,
@@ -5086,8 +5017,11 @@ class DeployController:
                         new_deployments.append({
                             "machine": machine_alias, "ip": selected_endpoint,
                             "component_ids": [component_id], "phase": "deployed",
+                            **approved_deployment_identity,
                         })
-                        state["deployments"] = list(existing_deployments) + list(new_deployments)
+                        state["deployments"] = self._merge_deployment_rows(
+                            existing_deployments, new_deployments,
+                        )
                         self._record_redeployed_runtime_matches(
                             state, machine, new_deployments, approve_attempt["health"],
                         )
@@ -5183,6 +5117,7 @@ class DeployController:
                         "ip": selected_endpoint,
                         "component_ids": [component_id],
                         "phase": "deployed",
+                        **approved_deployment_identity,
                     })
                 else:
                     if not await mark_component_executing():
@@ -5230,10 +5165,13 @@ class DeployController:
                         "ip": selected_endpoint,
                         "component_ids": [component_id],
                         "phase": "deployed",
+                        **approved_deployment_identity,
                     })
 
             if deploy_preflight_unavailable:
-                state["deployments"] = list(existing_deployments) + list(new_deployments)
+                state["deployments"] = self._merge_deployment_rows(
+                    existing_deployments, new_deployments,
+                )
                 if redeploy_mode:
                     self._record_redeployed_runtime_matches(
                         state, machine, new_deployments, approve_attempt["health"],
@@ -5307,7 +5245,9 @@ class DeployController:
                 return True
 
             if deploy_outcome_uncertain:
-                state["deployments"] = list(existing_deployments) + list(new_deployments)
+                state["deployments"] = self._merge_deployment_rows(
+                    existing_deployments, new_deployments,
+                )
                 if redeploy_mode:
                     self._record_redeployed_runtime_matches(
                         state, machine, new_deployments, approve_attempt["health"],
@@ -5323,6 +5263,7 @@ class DeployController:
                     "actor": actor,
                     "node_id": node_id,
                     "node_host": selected_endpoint,
+                    **approved_deployment_identity,
                     "deployment_request_submitted": deployment_request_submitted,
                     "pending_component_ids": [component_id],
                 }
@@ -5375,10 +5316,18 @@ class DeployController:
                     "部署请求已经发出，但还没有确认结果。",
                     topic="deployment-outcome-uncertain", error=True,
                 )
+                if new_deployments:
+                    await self._reconcile_runtime_image_checks(
+                        repo, pr_number, state, pr_data, force=True,
+                        machine_filter=(machine_alias, selected_endpoint),
+                        allow_uncertain_completed=True,
+                    )
                 return True
 
             if deploy_error is not None:
-                state["deployments"] = list(existing_deployments) + list(new_deployments)
+                state["deployments"] = self._merge_deployment_rows(
+                    existing_deployments, new_deployments,
+                )
                 if redeploy_mode:
                     self._record_redeployed_runtime_matches(
                         state, machine, new_deployments, approve_attempt["health"],
@@ -5514,7 +5463,9 @@ class DeployController:
                 return True
 
             # Merge into existing deployments
-            state["deployments"] = list(existing_deployments) + list(new_deployments)
+            state["deployments"] = self._merge_deployment_rows(
+                existing_deployments, new_deployments,
+            )
             if redeploy_mode:
                 self._record_redeployed_runtime_matches(
                     state, machine, new_deployments, approve_attempt["health"],
@@ -6672,17 +6623,6 @@ class DeployController:
             return ""
         return str(address) if address.version == 4 else ""
 
-    @staticmethod
-    def _explicit_feishu_number_from_alias(alias: str) -> str:
-        """Read only an explicit leading device number encoded in a legacy alias."""
-        if not isinstance(alias, str):
-            return ""
-        match = re.fullmatch(
-            r"(?i)(?:rm75[-_ ]*)?([0-9]{3})(?:$|[^0-9].*)",
-            alias.strip(),
-        )
-        return match.group(1).zfill(3) if match else ""
-
     def _physical_machine_inventory(self) -> list[dict]:
         """Read the physical inventory without using either repository policy."""
         try:
@@ -6748,12 +6688,6 @@ class DeployController:
                 "platform_verified": self._inventory_field(
                     item, "platform_verified", default=None,
                 ),
-                "driver_path": self._inventory_field(
-                    item, "driver_path", default=None,
-                ),
-                "driver_path_verified": self._inventory_field(
-                    item, "driver_path_verified", default=False,
-                ),
                 "raw": item,
             })
         return inventory
@@ -6780,18 +6714,17 @@ class DeployController:
             return None, False
         policy_alias = getattr(policy_machine, "alias", "")
         policy_node_id = str(getattr(policy_machine, "node_id", "") or "").strip()
+        bound_number = str(getattr(policy_machine, "feishu_number", "") or "").strip()
+        identity_number = str(identity_source.get("number", "") or "").strip()
+        if bound_number.isdigit():
+            bound_number = bound_number.zfill(3)
+        if identity_number.isdigit():
+            identity_number = identity_number.zfill(3)
         if (not identity_source.get("number") or not identity_source.get("brand")
                 or not identity_source.get("model")
+                or not bound_number or not identity_number
+                or bound_number != identity_number
                 or policy_alias != alias or not policy_node_id):
-            return None, False
-        alias_number = self._explicit_feishu_number_from_alias(alias)
-        identity_number = str(identity_source.get("number", "")).strip().zfill(3)
-        if alias_number and alias_number != identity_number:
-            logger.warning(
-                "SECURITY machine alias device number conflicts with Feishu identity "
-                "repo=%s alias=%s alias_number=%s feishu_number=%s",
-                repo, alias, alias_number, identity_number,
-            )
             return None, False
         endpoints = self._policy_machine_endpoints(policy_machine, repo) if repo else []
         endpoint_ips = {item["ip"] for item in endpoints}
@@ -6842,6 +6775,216 @@ class DeployController:
         )
         return identity_source, policy_unambiguous
 
+    def _deployment_identity_binding(
+        self, machine, repo: str, identity=None,
+    ) -> dict[str, str] | None:
+        """Capture the stable Feishu device identity for a successful deployment."""
+        try:
+            identity = identity if identity is not None else self._policy_machine_identity(
+                machine, repo,
+            )
+        except Exception:
+            return None
+        source = (
+            identity.get("identity", identity.get("machine", identity))
+            if isinstance(identity, dict) else None
+        )
+        configured = str(getattr(machine, "feishu_number", "") or "").strip()
+        observed = str(source.get("number", "") or "").strip() \
+            if isinstance(source, dict) else ""
+        if configured.isdigit():
+            configured = configured.zfill(3)
+        if observed.isdigit():
+            observed = observed.zfill(3)
+        if (not self._machine_identity_is_confirmed(identity)
+                or not isinstance(source, dict)
+                or identity.get("stale") is not False
+                or not configured or configured != observed):
+            return None
+        binding = hashlib.sha256(
+            ("feishu-device-v1\0" + observed).encode("utf-8"),
+        ).hexdigest()
+        return {"feishu_number": observed, "identity_binding": binding}
+
+    @staticmethod
+    def _deployment_identity_matches(
+        deployment: dict, identity_binding: dict[str, str] | None,
+    ) -> bool:
+        return bool(
+            identity_binding
+            and deployment.get("feishu_number") == identity_binding.get("feishu_number")
+            and deployment.get("identity_binding") == identity_binding.get("identity_binding")
+        )
+
+    def _historical_ip_reassigned(
+        self, machine_alias: str, ip_value: str, repo: str,
+        machines: list, expected_feishu_number: str = "",
+    ) -> bool:
+        if not ip_value:
+            return False
+        for peer in machines:
+            peer_alias = str(getattr(peer, "alias", "") or "")
+            if not peer_alias:
+                continue
+            try:
+                identity = self._policy_machine_identity(peer, repo)
+            except Exception:
+                continue
+            if not isinstance(identity, dict) or identity.get("stale") is not False:
+                continue
+            source = (
+                identity.get("identity", identity.get("machine", identity))
+                if isinstance(identity, dict) else None
+            )
+            peer_number = str(source.get("number", "") or "").strip() \
+                if isinstance(source, dict) else ""
+            if peer_number.isdigit():
+                peer_number = peer_number.zfill(3)
+            expected_number = str(expected_feishu_number or "").strip()
+            if expected_number.isdigit():
+                expected_number = expected_number.zfill(3)
+            if not expected_number or peer_number == expected_number:
+                continue
+            addresses = source.get("addresses", []) if isinstance(source, dict) else []
+            if any(
+                isinstance(item, dict)
+                and self._canonical_primary_ipv4(item.get("ip")) == ip_value
+                for item in addresses if isinstance(addresses, (list, tuple, set))
+            ):
+                return True
+        return False
+
+    def _historical_ips_not_bound_to_current_identity(
+        self, state: dict, repo: str, machines: list | None = None,
+    ) -> set[str]:
+        """Exclude old endpoints whose recorded Feishu identity is no longer provable."""
+        if not isinstance(machines, list):
+            try:
+                machines = self.policy.get_machines(repo=repo)
+            except Exception:
+                machines = []
+        if not isinstance(state, dict):
+            return set()
+        machines_by_alias: dict[str, list] = {}
+        for machine in machines:
+            alias = str(getattr(machine, "alias", "") or "")
+            if alias:
+                machines_by_alias.setdefault(alias, []).append(machine)
+        blocked = set()
+        for deployment in state.get("deployments", []):
+            if not isinstance(deployment, dict) or deployment.get("phase") != "deployed":
+                continue
+            ip_value = self._canonical_primary_ipv4(deployment.get("ip", ""))
+            alias = deployment.get("machine")
+            if not ip_value or not isinstance(alias, str) or not alias:
+                continue
+            matches = machines_by_alias.get(alias, [])
+            machine = matches[0] if len(matches) == 1 else None
+            current_identity = (
+                self._deployment_identity_binding(machine, repo)
+                if machine is not None else None
+            )
+            if (not self._deployment_identity_matches(deployment, current_identity)
+                    or self._historical_ip_reassigned(
+                        alias, ip_value, repo, machines,
+                        str(deployment.get("feishu_number", "") or ""),
+                    )):
+                blocked.add(ip_value)
+        return blocked
+
+    def _exclude_unconfirmed_history_endpoints(
+        self, groups: list[dict], state: dict, repo: str,
+        machines: list | None = None,
+    ) -> list[dict]:
+        """Keep historical addresses with changed identity out of every probe set."""
+        try:
+            current_machines = (
+                machines if isinstance(machines, list)
+                else self.policy.get_machines(repo=repo)
+            )
+        except Exception:
+            current_machines = []
+        if not isinstance(current_machines, list):
+            current_machines = []
+        blocked_ips = self._historical_ips_not_bound_to_current_identity(
+            state, repo, current_machines,
+        )
+        machines_by_alias: dict[str, list] = {}
+        for machine in current_machines:
+            alias = str(getattr(machine, "alias", "") or "")
+            if alias:
+                machines_by_alias.setdefault(alias, []).append(machine)
+        result = []
+        for source in groups if isinstance(groups, list) else []:
+            if not isinstance(source, dict):
+                continue
+            group = copy.deepcopy(source)
+            alias = group.get("alias")
+            matches = machines_by_alias.get(alias, []) if isinstance(alias, str) else []
+            machine = matches[0] if len(matches) == 1 else None
+            try:
+                allowed_ips = {
+                    endpoint.get("ip") for endpoint in self._policy_machine_endpoints(
+                        machine, repo,
+                    )
+                } if machine is not None else set()
+            except Exception:
+                allowed_ips = set()
+            group["verification_endpoints"] = sorted(
+                ip_value for ip_value in allowed_ips
+                if isinstance(ip_value, str) and ip_value not in blocked_ips
+            )
+            result.append(group)
+        return result
+
+    def _machine_identity_blocking_reason(
+        self, machine, repo: str, identity=None,
+    ) -> str:
+        """Name the current Feishu binding failure without alias inference."""
+        if machine is None:
+            return "MACHINE_NOT_BOUND"
+        configured_number = str(getattr(machine, "feishu_number", "") or "").strip()
+        if not configured_number:
+            return "MACHINE_NOT_BOUND"
+        if configured_number.isdigit():
+            configured_number = configured_number.zfill(3)
+        try:
+            identity = identity if identity is not None else self._policy_machine_identity(
+                machine, repo,
+            )
+        except Exception:
+            identity = None
+        if identity is None:
+            return "FEISHU_SNAPSHOT_UNAVAILABLE"
+        source = (
+            identity.get("identity", identity.get("machine", identity))
+            if isinstance(identity, dict) else None
+        )
+        reason = ""
+        observed_number = ""
+        stale = True
+        if isinstance(identity, dict):
+            stale = identity.get("stale") is True
+            reason = str(identity.get("reason", "") or "")
+        if isinstance(source, dict):
+            observed_number = str(source.get("number", "") or "").strip()
+            if observed_number.isdigit():
+                observed_number = observed_number.zfill(3)
+            reason = str(source.get("reason", reason) or reason)
+            stale = stale or source.get("stale") is True
+        folded = reason.casefold()
+        if any(token in folded for token in ("shared", "ambiguous", "conflict", "multiple")):
+            return "IP_CONFLICT"
+        if any(token in folded for token in ("absent", "not found", "does not exist")):
+            return "FEISHU_DEVICE_NOT_FOUND"
+        if stale or not self._machine_identity_is_confirmed(identity):
+            if observed_number and observed_number != configured_number:
+                return "FEISHU_DEVICE_NOT_FOUND"
+            return "FEISHU_SNAPSHOT_UNAVAILABLE"
+        if not observed_number or observed_number != configured_number:
+            return "FEISHU_DEVICE_NOT_FOUND"
+        return "MACHINE_NOT_BOUND"
+
     @staticmethod
     def _normalized_identity_text(value) -> str:
         return " ".join(value.split()).casefold() if isinstance(value, str) else ""
@@ -6880,9 +7023,7 @@ class DeployController:
         if endpoint not in {item["ip"] for item in endpoints}:
             return False
         if any(
-            endpoint == self._canonical_primary_ipv4(
-                getattr(other, "node_host", ""),
-            ) or endpoint in {
+            endpoint in {
                 item["ip"] for item in self._policy_machine_endpoints(other, repo)
             }
             for other in machines if other is not current
@@ -6900,10 +7041,10 @@ class DeployController:
         if (not isinstance(identity, dict) or not isinstance(identity_source, dict)
                 or identity.get("stale", identity_source.get("stale")) is not False):
             return False
-        inventory, identity_matches = self._machine_identity_matches(
+        identity_source, identity_matches = self._machine_identity_matches(
             alias, current, None, machines, repo=repo,
         )
-        if not identity_matches or not isinstance(inventory, dict):
+        if not identity_matches or not isinstance(identity_source, dict):
             return False
         if isinstance(identity_addresses, list):
             confirmed_ips = {
@@ -6922,29 +7063,10 @@ class DeployController:
             if isinstance(component, dict) and component.get("target") == "driver"
         ]
         if driver_components:
-            physical_rows = [
-                item for item in self._physical_machine_inventory()
-                if item.get("alias") == alias
-            ]
-            if len(physical_rows) != 1:
-                return False
-            physical = physical_rows[0]
-            physical_path = physical.get("driver_path")
-            verified_path = physical.get("driver_path_verified") is True
-            physical_raw = physical.get("raw")
-            physical_number = self._inventory_field(
-                physical_raw, "number", "feishu_number", default="",
-            )
-            if (not isinstance(physical_number, str)
-                    or not physical_number.strip()
-                    or physical_number.strip() != str(identity_source.get("number", "")).strip()):
-                return False
             policy_paths = getattr(current, "driver_paths", []) or []
             for component in driver_components:
                 component_path = component.get("driver_path")
-                if (not verified_path or not isinstance(physical_path, str)
-                        or not isinstance(component_path, str)
-                        or component_path != physical_path
+                if (not isinstance(component_path, str)
                         or component_path not in policy_paths):
                     return False
         return True
@@ -6954,7 +7076,7 @@ class DeployController:
         if not alias:
             return
         self._agent_core_health[(repo.casefold(), alias)] = (
-            time.monotonic(), self._machine_connection_fingerprint(machine), status,
+            time.monotonic(), self._machine_connection_fingerprint(machine, repo), status,
         )
 
     def _agent_core_status_for_machine(self, repo: str, machine) -> str:
@@ -6973,11 +7095,12 @@ class DeployController:
         if not entry:
             return "unknown"
         checked_at, fingerprint, status = entry
-        if (fingerprint != self._machine_connection_fingerprint(machine)
+        if (fingerprint != self._machine_connection_fingerprint(machine, repo)
                 or time.monotonic() - checked_at >= RUNTIME_IMAGE_CHECK_INTERVAL_SECONDS):
             return "unknown"
         return status if status in {
             "available", "unavailable", "credential_missing",
+            "authentication_failed", "network_failed",
         } else "unknown"
 
     async def _machine_is_deployable(
@@ -7000,8 +7123,8 @@ class DeployController:
                 or current_machine is None
                 or not isinstance(machines, list)
                 or sum(getattr(item, "alias", None) == alias for item in machines) != 1
-                or self._machine_connection_fingerprint(current_machine)
-                != self._machine_connection_fingerprint(machine)):
+                or self._machine_connection_fingerprint(current_machine, repo)
+                != self._machine_connection_fingerprint(machine, repo)):
             return False
         _, identity_matches = self._machine_identity_matches(
             alias, current_machine, [], machines, repo=repo,
@@ -7030,6 +7153,7 @@ class DeployController:
         self, repo: str, machine, components: list[dict] | None = None,
         *, endpoints: list[str] | None = None,
         endpoint_diagnostics: list[dict] | None = None,
+        force_refresh: bool = False,
     ) -> list[dict[str, object]]:
         """Authenticate and read each candidate endpoint's actual runtimes."""
         alias = str(getattr(machine, "alias", "") or "")
@@ -7095,10 +7219,8 @@ class DeployController:
         policy_matches = [item for item in policy_machines
                           if getattr(item, "alias", None) == alias]
         if (len(policy_matches) != 1
-                or self._machine_connection_fingerprint(policy_matches[0])
-                != self._machine_connection_fingerprint(machine)
-                or getattr(policy_matches[0], "feishu_snapshot_generation", 0)
-                != getattr(machine, "feishu_snapshot_generation", 0)):
+                or self._machine_connection_fingerprint(policy_matches[0], repo)
+                != self._machine_connection_fingerprint(machine, repo)):
             record_preflight_diagnostic(
                 "incompatible",
                 "仓库授权或机器身份绑定发生变化，未发起 Agent Core 请求。",
@@ -7118,18 +7240,18 @@ class DeployController:
                 "machines_configured", "authorized",
             )
         }, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+        projection_version = self._machine_projection_version(repo)
         identity_digest = hashlib.sha256(json.dumps(
             self._physical_machine_identity_key(identity),
             sort_keys=True, separators=(",", ":"), default=str,
         ).encode()).hexdigest()
-        generation = getattr(current_machine, "feishu_snapshot_generation", 0)
         credential_fingerprint = (
             self._credential_fingerprint(self._agent_core_token(alias))
             or ("injected-factory" if self._agent_core_factory is not None else "")
         )
         if not credential_fingerprint:
             record_preflight_diagnostic(
-                "not_checked", "Agent Core 凭证未配置，未发起请求。",
+                "credential_missing", "Agent Core 凭证未配置，未发起请求。",
             )
             return []
         allowed_ips = {
@@ -7203,20 +7325,34 @@ class DeployController:
             if type(status_code) is int:
                 if status_code in {401, 403}:
                     return (
-                        "credential_missing",
+                        "authentication_failed",
                         f"Agent Core 鉴权失败（HTTP {status_code}）",
+                        True,
+                    )
+                if status_code >= 500:
+                    return (
+                        "network_failed",
+                        f"Agent Core 服务请求失败（HTTP {status_code}）",
                         True,
                     )
                 if 100 <= status_code <= 599:
                     return "unknown", "Agent Core 请求未取得确定结果", True
+            if any(token in folded for token in (
+                    "auth verify did not return", "auth verify valid",
+                    "authentication failed", "unauthorized", "forbidden")):
+                return "authentication_failed", "Agent Core 鉴权失败", True
             if "timeout" in folded or "deadline" in folded:
-                return "unavailable", "Agent Core 连接超时", True
+                return "network_failed", "Agent Core 网络连接超时", True
             if "tls" in folded or "ssl" in folded or "certificate verify failed" in folded:
-                return "unavailable", "Agent Core TLS 连接失败", True
+                return "network_failed", "Agent Core TLS 连接失败", True
             if "connect" in folded or "network" in folded or "socket" in folded:
-                return "unavailable", "Agent Core 网络连接失败", True
+                return "network_failed", "Agent Core 网络连接失败", True
             if "unreachable" in folded or "offline" in folded:
-                return "unavailable", "Agent Core 网络连接失败", True
+                return "network_failed", "Agent Core 网络连接失败", True
+            if any(token in folded for token in (
+                    "dns", "resolve", "getaddrinfo", "name or service not known",
+                    "temporary failure in name resolution")):
+                return "network_failed", "Agent Core 网络地址解析失败", True
             return "unknown", "Agent Core 请求未取得确定结果", True
 
         def policy_binding_changed(endpoint_ip: str = "") -> bool:
@@ -7236,13 +7372,14 @@ class DeployController:
                     "machines_configured", "authorized",
                 )
             }, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+            latest_projection_version = self._machine_projection_version(repo)
             matches = [entry for entry in latest_machines
                        if getattr(entry, "alias", None) == alias]
-            if (latest_policy_version != policy_version or len(matches) != 1
-                    or self._machine_connection_fingerprint(matches[0])
-                    != self._machine_connection_fingerprint(current_machine)
-                    or getattr(matches[0], "feishu_snapshot_generation", 0)
-                    != generation
+            if (latest_policy_version != policy_version
+                    or latest_projection_version != projection_version
+                    or len(matches) != 1
+                    or self._machine_connection_fingerprint(matches[0], repo)
+                    != self._machine_connection_fingerprint(current_machine, repo)
                     or self._policy_machine_identity(matches[0], repo) != identity
                     or not self._machine_identity_is_confirmed(
                         self._policy_machine_identity(matches[0], repo),
@@ -7300,11 +7437,12 @@ class DeployController:
             request_attempted = False
             cache_key = (
                 repo.casefold(), alias, identity_digest, endpoint_ip,
-                credential_fingerprint, generation, policy_version,
+                credential_fingerprint, policy_version,
+                projection_version,
                 component_signature,
             )
             cached = self._agent_core_verified_endpoints_cache.get(cache_key)
-            if (cached is not None
+            if (not force_refresh and cached is not None
                     and now - cached[0] < AGENT_CORE_ENDPOINT_CACHE_TTL_SECONDS):
                 for diagnostic in cached[1].get("_endpoint_diagnostics", []):
                     if isinstance(endpoint_diagnostics, list) and isinstance(diagnostic, dict):
@@ -7343,6 +7481,7 @@ class DeployController:
                     )
                     continue
                 supported_ids: list[str] = []
+                runtime_observations: dict[str, dict[str, str]] = {}
                 runtime_failures: list[tuple[str, str, str]] = []
                 if requested_components:
                     for component in requested_components:
@@ -7380,6 +7519,29 @@ class DeployController:
                                     )
                             if runtime_ok:
                                 supported_ids.append(component_id)
+                                observed_image = ""
+                                observed_status = ""
+                                if target == "core":
+                                    observed_image = self._current_core_image(runtime)
+                                    observed_status = "running" if observed_image else ""
+                                    runtime_id = "core"
+                                elif isinstance(runtime_binding, dict):
+                                    runtime_id = str(runtime_binding.get("runtime_id", "") or "")
+                                    observed_status = str(runtime.get("status", "") or "") \
+                                        if isinstance(runtime, dict) else ""
+                                    candidate_image = runtime.get("running_image", "") \
+                                        if isinstance(runtime, dict) else ""
+                                    if isinstance(candidate_image, str) and candidate_image:
+                                        try:
+                                            observed_image = validate_image_ref(candidate_image)
+                                        except ValueError:
+                                            observed_image = ""
+                                if runtime_id and (observed_image or observed_status):
+                                    runtime_observations[component_id] = {
+                                        "runtime_id": runtime_id,
+                                        "status": observed_status,
+                                        "observed_image": observed_image,
+                                    }
                             else:
                                 component_label = (
                                     str(component.get("driver_path") or "")
@@ -7407,6 +7569,7 @@ class DeployController:
                                 continue
                             if status in {
                                     "not_checked", "credential_missing",
+                                    "authentication_failed", "network_failed",
                                     "unavailable", "unknown",
                             }:
                                 raise
@@ -7460,6 +7623,8 @@ class DeployController:
                     "label": item.get("label", ""),
                     "component_ids": supported_ids,
                 }
+                if runtime_observations:
+                    result["runtime_observations"] = runtime_observations
                 self._agent_core_verified_endpoints_cache[cache_key] = (
                     time.monotonic(), copy.deepcopy(result),
                 )
@@ -7523,6 +7688,7 @@ class DeployController:
 
     async def _machine_groups_verify_endpoints(
         self, groups: list[dict], repo: str, components: list[dict] | None = None,
+        *, force_refresh: bool = False,
     ) -> list[dict]:
         """Restrict command generation to live, runtime-verified endpoints."""
         result = []
@@ -7583,11 +7749,15 @@ class DeployController:
             has_owner = bool(self._runtime_transition_owner_labels(
                 owner_rows if isinstance(owner_rows, list) else []
             ))
-            core_only_reasons = {"AGENT_CORE_UNKNOWN", "AGENT_CORE_UNAVAILABLE"}
+            core_only_reasons = {
+                "AGENT_CORE_UNKNOWN", "AGENT_CORE_UNAVAILABLE",
+                "AGENT_CORE_AUTH_FAILED", "AGENT_CORE_NETWORK_FAILED",
+            }
             probe_blocking_reasons = {
                 "MACHINE_NOT_AUTHORIZED", "REPOSITORY_POLICY_MISSING",
-                "MACHINE_IDENTITY_MISMATCH", "FEISHU_DEVICE_REPOSITORY_CONFLICT",
-                "OWNER_NOT_CONFIGURED", "AGENT_CORE_CREDENTIAL_MISSING",
+                "MACHINE_NOT_BOUND", "FEISHU_DEVICE_NOT_FOUND",
+                "FEISHU_SNAPSHOT_UNAVAILABLE",
+                "MACHINE_CONFIGURATION_CHANGED", "OWNER_NOT_CONFIGURED",
             }
             can_probe = bool(
                 group.get("repo_authorized") is True
@@ -7627,7 +7797,7 @@ class DeployController:
                 group["ip_command_safe"] = False
                 group["approval_available"] = False
                 group["blocking_reasons"] = list(dict.fromkeys(
-                    [*group.get("blocking_reasons", []), "MACHINE_IDENTITY_MISMATCH"]
+                    [*group.get("blocking_reasons", []), "MACHINE_NOT_BOUND"]
                 ))
                 result.append(group)
                 continue
@@ -7645,8 +7815,8 @@ class DeployController:
                     or current_policy_status.get("authorized") is not True
                     or current_policy_status.get("machines_configured") is not True
                     or len(policy_matches) != 1
-                    or self._machine_connection_fingerprint(policy_matches[0])
-                    != self._machine_connection_fingerprint(machine)
+                    or self._machine_connection_fingerprint(policy_matches[0], repo)
+                    != self._machine_connection_fingerprint(machine, repo)
                     or str(getattr(machine, "node_id", "") or "")
                     != str(group.get("node_id", "") or "")
                     or current_primary != self._canonical_primary_ipv4(
@@ -7662,8 +7832,21 @@ class DeployController:
                 group["command_selector"] = ""
                 group["ip_command_safe"] = False
                 group["approval_available"] = False
+                if (not isinstance(current_policy_status, dict)
+                        or current_policy_status.get("authorized") is not True):
+                    current_reason = "MACHINE_NOT_AUTHORIZED"
+                elif current_policy_status.get("machines_configured") is not True:
+                    current_reason = "REPOSITORY_POLICY_MISSING"
+                elif len(policy_matches) != 1:
+                    current_reason = "MACHINE_NOT_BOUND"
+                elif not self._machine_identity_is_confirmed(current_identity):
+                    current_reason = self._machine_identity_blocking_reason(
+                        machine, repo, current_identity,
+                    )
+                else:
+                    current_reason = "MACHINE_CONFIGURATION_CHANGED"
                 group["blocking_reasons"] = list(dict.fromkeys(
-                    [*group.get("blocking_reasons", []), "MACHINE_IDENTITY_MISMATCH"]
+                    [*group.get("blocking_reasons", []), current_reason]
                 ))
                 result.append(group)
                 continue
@@ -7676,6 +7859,7 @@ class DeployController:
                 "source_sha", "local_sha256", "machines_status",
                 "machines_configured", "authorized",
             ))
+            projection_snapshot = self._machine_projection_version(repo)
             endpoint_diagnostics: list[dict] = []
             verification_endpoints = group.get("verification_endpoints")
             if verification_endpoints is not None:
@@ -7688,7 +7872,12 @@ class DeployController:
                 repo, machine, requested,
                 endpoints=verification_endpoints,
                 endpoint_diagnostics=endpoint_diagnostics,
+                force_refresh=force_refresh,
             )
+            latest_status = None
+            latest_matches = []
+            latest_identity = None
+            latest_endpoint_snapshot = set()
             try:
                 latest_status = self.policy.repo_policy_status(repo)
                 latest_machines = self.policy.get_machines(repo=repo)
@@ -7707,26 +7896,31 @@ class DeployController:
                     "source_sha", "local_sha256", "machines_status",
                     "machines_configured", "authorized",
                 )) if isinstance(latest_status, dict) else ()
+                latest_projection_version = self._machine_projection_version(repo)
                 policy_changed_during_probe = bool(
                     not isinstance(latest_status, dict)
                     or latest_status.get("authorized") is not True
                     or latest_status.get("machines_configured") is not True
                     or len(latest_matches) != 1
-                    or self._machine_connection_fingerprint(latest_matches[0])
-                    != self._machine_connection_fingerprint(machine)
-                    or getattr(latest_matches[0], "feishu_snapshot_generation", 0)
-                    != getattr(machine, "feishu_snapshot_generation", 0)
+                    or self._machine_connection_fingerprint(latest_matches[0], repo)
+                    != self._machine_connection_fingerprint(machine, repo)
                     or latest_identity != identity_snapshot
                     or latest_endpoint_snapshot != endpoint_snapshot
                     or latest_policy_snapshot != policy_snapshot
+                    or latest_projection_version != projection_snapshot
                 )
             except Exception:
+                policy_changed_during_probe = True
+            if any(
+                    item.get("status") == "incompatible"
+                    and "发生变化" in str(item.get("reason", ""))
+                    for item in endpoint_diagnostics if isinstance(item, dict)):
                 policy_changed_during_probe = True
             if policy_changed_during_probe:
                 discard_cached_endpoint_results()
                 endpoint_diagnostics.append({
                     "ip": "", "label": "", "status": "incompatible",
-                    "reason": "运行时检查期间仓库授权或机器身份绑定发生变化。",
+                    "reason": "运行时检查期间机器配置或飞书身份发生变化。",
                     "request_attempted": any(
                         item.get("request_attempted") is True
                         for item in endpoint_diagnostics if isinstance(item, dict)
@@ -7744,19 +7938,56 @@ class DeployController:
                 for item in group["endpoint_diagnostics"]
                 if isinstance(item, dict)
             }.values())
-            identity_changed_during_probe = any(
-                item.get("status") == "incompatible"
-                and "身份绑定发生变化" in str(item.get("reason", ""))
-                for item in endpoint_diagnostics if isinstance(item, dict)
-            )
-            if identity_changed_during_probe:
+            if policy_changed_during_probe:
                 discard_cached_endpoint_results()
-                group["repo_authorized"] = False
-                group["identity_confirmed"] = False
-                group["identity_status"] = "mismatch"
+                status_now = latest_status if isinstance(latest_status, dict) else {}
+                identity_now = latest_identity if latest_identity is not None else None
+                identity_is_current = (
+                    len(latest_matches) == 1
+                    and self._machine_identity_is_confirmed(identity_now)
+                )
+                latest_endpoints_allowed = bool(
+                    len(latest_matches) == 1
+                    and any(
+                        self._endpoint_allowed_for_repository(
+                            repo, latest_matches[0], endpoint_ip,
+                            policy_machines=latest_machines
+                            if isinstance(latest_machines, list) else None,
+                        )
+                        and self._machine_endpoint_has_unambiguous_identity(
+                            latest_matches[0], endpoint_ip, repo, identity_now,
+                        )
+                        for endpoint_ip, _label in latest_endpoint_snapshot
+                    )
+                )
+                group["repo_authorized"] = bool(
+                    status_now.get("authorized") is True
+                    and status_now.get("machines_configured") is True
+                    and len(latest_matches) == 1
+                    and identity_is_current
+                    and latest_endpoints_allowed
+                )
+                group["identity_confirmed"] = identity_is_current
+                group["identity_status"] = (
+                    "verified" if identity_is_current else "mismatch"
+                )
+                if status_now.get("authorized") is not True:
+                    changed_reason = "MACHINE_NOT_AUTHORIZED"
+                elif status_now.get("machines_configured") is not True:
+                    changed_reason = "REPOSITORY_POLICY_MISSING"
+                elif len(latest_matches) != 1:
+                    changed_reason = "MACHINE_NOT_BOUND"
+                elif not identity_is_current:
+                    changed_reason = self._machine_identity_blocking_reason(
+                        latest_matches[0], repo, identity_now,
+                    )
+                elif not latest_endpoints_allowed:
+                    changed_reason = "IP_CONFLICT"
+                else:
+                    changed_reason = "MACHINE_CONFIGURATION_CHANGED"
                 group["blocking_reasons"] = list(dict.fromkeys(
                     [*group.get("blocking_reasons", []),
-                     "MACHINE_IDENTITY_MISMATCH"]
+                     changed_reason]
                 ))
                 group["verified_endpoints"] = []
                 group["component_ids"] = []
@@ -7807,38 +8038,43 @@ class DeployController:
                     for endpoint in endpoint_diagnostics
                     if isinstance(endpoint, dict)
                 }
-                if any(
-                        endpoint.get("status") == "credential_missing"
-                        and endpoint.get("request_attempted") is True
-                        for endpoint in endpoint_diagnostics
-                        if isinstance(endpoint, dict)
-                ):
+                if "credential_missing" in statuses:
                     group["agent_core_status"] = "credential_missing"
                     group["blocking_reasons"] = list(dict.fromkeys(
                         [*group.get("blocking_reasons", []),
                          "AGENT_CORE_CREDENTIAL_MISSING"]
                     ))
-                elif request_attempted and "runtime_incompatible" in statuses:
-                    group["agent_core_status"] = "available"
-                    group["blocking_reasons"] = [
-                        value for value in group.get("blocking_reasons", [])
-                        if value not in core_only_reasons
-                    ]
-                elif request_attempted and "unavailable" in statuses:
-                    group["agent_core_status"] = "unavailable"
-                    group["blocking_reasons"] = list(dict.fromkeys(
-                        [*group.get("blocking_reasons", []), "AGENT_CORE_UNAVAILABLE"]
-                    ))
-                elif request_attempted and "unknown" in statuses:
-                    group["agent_core_status"] = "unknown"
-                    group["blocking_reasons"] = list(dict.fromkeys(
-                        [*group.get("blocking_reasons", []), "AGENT_CORE_UNKNOWN"]
-                    ))
-                elif request_attempted:
-                    # A successful authenticated response may still fail to
-                    # confirm the requested component runtime. It is not a
-                    # network failure, and no endpoint is approved from it.
-                    group["agent_core_status"] = "available"
+                else:
+                    if request_attempted and "authentication_failed" in statuses:
+                        group["agent_core_status"] = "authentication_failed"
+                        group["blocking_reasons"] = list(dict.fromkeys(
+                            [*group.get("blocking_reasons", []), "AGENT_CORE_AUTH_FAILED"]
+                        ))
+                    if request_attempted and (
+                            "network_failed" in statuses or "unavailable" in statuses):
+                        if group.get("agent_core_status") != "authentication_failed":
+                            group["agent_core_status"] = "network_failed"
+                        group["blocking_reasons"] = list(dict.fromkeys(
+                            [*group.get("blocking_reasons", []), "AGENT_CORE_NETWORK_FAILED"]
+                        ))
+                    if request_attempted and "runtime_incompatible" in statuses:
+                        if group.get("agent_core_status") in {"not_checked", "unknown"}:
+                            group["agent_core_status"] = "available"
+                        group["blocking_reasons"] = list(dict.fromkeys(
+                            [*group.get("blocking_reasons", []), "COMPONENT_INCOMPATIBLE"]
+                        ))
+                    if request_attempted and "unknown" in statuses:
+                        if group.get("agent_core_status") in {"not_checked", "unknown"}:
+                            group["agent_core_status"] = "unknown"
+                        group["blocking_reasons"] = list(dict.fromkeys(
+                            [*group.get("blocking_reasons", []), "AGENT_CORE_UNKNOWN"]
+                        ))
+                    if request_attempted and not statuses.intersection({
+                            "authentication_failed", "network_failed", "unavailable",
+                            "runtime_incompatible", "unknown"}):
+                        # Authenticated response without component support is
+                        # distinct from a network failure.
+                        group["agent_core_status"] = "available"
             result.append(group)
         return result
 
@@ -7876,50 +8112,54 @@ class DeployController:
             machine_alias = str(getattr(machine, "alias", "") or "")
             if machine_alias:
                 authorized_by_alias.setdefault(machine_alias, []).append(machine)
-            machine_ip = self._canonical_primary_ipv4(
-                getattr(machine, "node_host", ""),
-            )
-            if machine_ip and machine_alias:
-                policy_aliases_by_ip.setdefault(machine_ip, []).append(machine_alias)
-        inventory = self._physical_machine_inventory() if authorized_by_alias else []
-        authorized_aliases = set(authorized_by_alias)
-        display_by_alias: dict[str, dict] = {}
-        for physical in inventory:
-            alias = str(physical.get("alias", "") or "")
-            if alias in authorized_aliases and alias not in display_by_alias:
-                display_by_alias[alias] = physical
+            for endpoint in self._policy_machine_endpoints(machine, repo):
+                machine_ip = endpoint.get("ip", "")
+                if machine_ip and machine_alias:
+                    policy_aliases_by_ip.setdefault(machine_ip, []).append(machine_alias)
         groups = []
-        # machines.yaml supplies the candidate aliases. The physical inventory
-        # can provide descriptions, but it never contributes another candidate;
-        # each policy alias still passes the normal identity checks below.
-        entries: list[tuple[dict | None, str]] = [
-            (display_by_alias.get(alias), alias)
-            for alias in authorized_by_alias
-        ]
+        # Repository Policy supplies the candidate aliases. The descriptive
+        # physical inventory does not participate in identity or adaptation.
+        entries = list(authorized_by_alias)
         requested_component_ids = [
             component["component_id"] for component in components
             if isinstance(component, dict)
             and isinstance(component.get("component_id"), str)
             and component.get("component_id")
         ] if isinstance(components, list) else []
-        for physical, alias in entries:
-            physical = physical or {}
+        for alias in entries:
             policy_matches = authorized_by_alias.get(alias, [])
             policy_machine = policy_matches[0] if len(policy_matches) == 1 else None
             node_id = str(getattr(policy_machine, "node_id", "") or "")
             node_host = self._canonical_primary_ipv4(
                 getattr(policy_machine, "node_host", ""),
             )
+            policy_identity = None
             _, identity_matches = self._machine_identity_matches(
                 alias, policy_machine, None, authorized_machines, repo=repo,
             )
             confirmed_endpoint_set = None
+            feishu_ambiguous_ips: set[str] = set()
             if (policy_machine is not None
                     and callable(getattr(self.policy, "machine_identity", None))):
                 try:
                     policy_identity = self._policy_machine_identity(
                         policy_machine, repo,
                     )
+                    identity_source = (
+                        policy_identity.get(
+                            "identity", policy_identity.get("machine", policy_identity),
+                        ) if isinstance(policy_identity, dict) else None
+                    )
+                    identity_addresses = (
+                        identity_source.get("addresses", [])
+                        if isinstance(identity_source, dict) else []
+                    )
+                    feishu_ambiguous_ips = {
+                        self._canonical_primary_ipv4(item.get("ip"))
+                        for item in identity_addresses if isinstance(item, dict)
+                        and str(item.get("ambiguous", "false")).casefold() == "true"
+                        and self._canonical_primary_ipv4(item.get("ip"))
+                    } if isinstance(identity_addresses, (list, tuple, set)) else set()
                     confirmed_endpoints = self._policy_machine_endpoints(
                         policy_machine, repo,
                     )
@@ -7978,11 +8218,35 @@ class DeployController:
             elif not policy_configured:
                 reasons.append("REPOSITORY_POLICY_MISSING")
             elif len(policy_matches) > 1:
-                reasons.append("MACHINE_IDENTITY_MISMATCH")
+                duplicate_ips = {
+                    endpoint for duplicate in policy_matches
+                    for endpoint in [
+                        item.get("ip", "")
+                        for item in self._policy_machine_endpoints(duplicate, repo)
+                    ] if endpoint
+                }
+                reasons.append(
+                    "IP_CONFLICT" if any(
+                        len(policy_aliases_by_ip.get(ip, [])) > 1
+                        for ip in duplicate_ips
+                    ) else "MACHINE_NOT_BOUND"
+                )
             elif policy_machine is not None and not identity_matches:
-                reasons.append("MACHINE_IDENTITY_MISMATCH")
+                identity_reason = self._machine_identity_blocking_reason(
+                    policy_machine, repo, policy_identity,
+                )
+                if (identity_reason == "MACHINE_NOT_BOUND"
+                        and (
+                            bool(feishu_ambiguous_ips)
+                            or any(
+                                len(policy_aliases_by_ip.get(ip, [])) > 1
+                                for ip in (confirmed_endpoint_set or set())
+                            )
+                        )):
+                    identity_reason = "IP_CONFLICT"
+                reasons.append(identity_reason)
             elif policy_machine is not None and not endpoint_allowed:
-                reasons.append("FEISHU_DEVICE_REPOSITORY_CONFLICT")
+                reasons.append("IP_CONFLICT")
             elif not repo_authorized:
                 reasons.append("MACHINE_NOT_AUTHORIZED")
             if repo_authorized and not valid_policy_owners:
@@ -8057,15 +8321,19 @@ class DeployController:
             if driver_path_mismatch:
                 reasons.append("DRIVER_PATH_MISMATCH")
 
+            current_endpoint_ips = set(confirmed_endpoint_set or set())
+            has_ip_conflict = any(
+                len(policy_aliases_by_ip.get(ip, [])) > 1 or ip in feishu_ambiguous_ips
+                for ip in current_endpoint_ips | feishu_ambiguous_ips
+            )
             primary_ip_ambiguous = bool(
                 primary_ip and (
                     len(policy_aliases_by_ip.get(primary_ip, [])) > 1
+                    or primary_ip in feishu_ambiguous_ips
                 )
-            ) or bool(
-                node_host and len(policy_aliases_by_ip.get(node_host, [])) > 1
             )
-            if primary_ip_ambiguous:
-                reasons.append("PRIMARY_IP_AMBIGUOUS")
+            if has_ip_conflict:
+                reasons.append("IP_CONFLICT")
             ip_command_safe = bool(
                 repo_authorized and primary_ip and not primary_ip_ambiguous and node_host == primary_ip
                 and len(policy_aliases_by_ip.get(node_host, [])) == 1
@@ -8117,6 +8385,11 @@ class DeployController:
                 "variant_component_ids": variant_ids,
                 "driver_path_component_ids": driver_path_ids,
                 "compatible_component_ids": compatible_ids,
+                "conflicting_ips": sorted(
+                    ip for ip in current_endpoint_ips | feishu_ambiguous_ips
+                    if (len(policy_aliases_by_ip.get(ip, [])) > 1
+                        or ip in feishu_ambiguous_ips)
+                ),
                 "component_ids": compatible_ids if approval_available else [],
                 # A machine may be assigned only a subset of the PR's
                 # components. Verify that assigned set on one endpoint; the
@@ -8130,31 +8403,34 @@ class DeployController:
     def _runtime_redeploy_machine_groups(
         self, state: dict, components: list[dict], repo: str,
     ) -> list[dict]:
-        """Return only currently confirmed drift bindings for a redeploy round."""
+        """Bind pending historical drift to currently authorized machine endpoints."""
         bindings = state.get("runtime_redeploy", []) if isinstance(state, dict) else []
         if not isinstance(bindings, list) or not bindings:
             return []
-        component_ids = {
-            item.get("component_id") for item in components
-            if isinstance(item, dict) and isinstance(item.get("component_id"), str)
+        component_map = {
+            item.get("component_id"): item
+            for item in state.get("components", []) if isinstance(item, dict)
+            and isinstance(item.get("component_id"), str)
         }
-        confirmed = {
-            (check.get("machine"), check.get("ip"), check.get("component_id"))
-            for check in state.get("runtime_checks", [])
-            if isinstance(check, dict)
-            and check.get("status") == "mismatch"
-        }
-        candidates = self._get_machine_groups_for_components(components, repo)
-        result = []
+        ids_by_alias: dict[str, set[str]] = {}
         for binding in bindings:
             if not isinstance(binding, dict):
                 continue
-            alias, ip_value = binding.get("machine"), binding.get("ip")
-            drift_ids = {
+            alias = binding.get("machine")
+            if not isinstance(alias, str) or not alias:
+                continue
+            ids_by_alias.setdefault(alias, set()).update(
                 component_id for component_id in binding.get("component_ids", [])
-                if component_id in component_ids
-                and (alias, ip_value, component_id) in confirmed
-            }
+                if isinstance(component_id, str) and component_id in component_map
+            )
+        component_ids = set().union(*ids_by_alias.values()) if ids_by_alias else set()
+        components = [component_map[item] for item in component_ids]
+        candidates = self._get_machine_groups_for_components(components, repo)
+        blocked_historical_ips = self._historical_ips_not_bound_to_current_identity(
+            state, repo,
+        )
+        result = []
+        for alias, drift_ids in ids_by_alias.items():
             if not drift_ids:
                 continue
             current_machine = None
@@ -8162,27 +8438,31 @@ class DeployController:
                 current_machine = self.policy.get_machine(alias, repo=repo)
             except Exception:
                 pass
-            drift_ip = self._canonical_primary_ipv4(ip_value)
-            endpoint_bound = bool(
-                current_machine is not None and drift_ip
-                and drift_ip in {
-                    item["ip"] for item in self._policy_machine_endpoints(
-                        current_machine, repo,
-                    )
-                }
-                and self._endpoint_allowed_for_repository(
-                    repo, current_machine, drift_ip, components=components,
-                )
+            current_endpoints = (
+                self._policy_machine_endpoints(current_machine, repo)
+                if current_machine is not None else []
             )
+            endpoint_ips = [
+                endpoint["ip"] for endpoint in current_endpoints
+                if endpoint["ip"] not in blocked_historical_ips
+                and self._endpoint_allowed_for_repository(
+                    repo, current_machine, endpoint["ip"],
+                    components=[item for item in components
+                                if item.get("component_id") in drift_ids],
+                )
+            ] if current_machine is not None else []
             match = next((group for group in candidates
-                          if endpoint_bound and group.get("alias") == alias
+                          if endpoint_ips and group.get("alias") == alias
+                          and group.get("repo_authorized") is True
+                          and group.get("identity_confirmed") is True
+                          and group.get("approval_available") is True
                           and drift_ids.issubset(set(group.get("component_ids", [])))),
                          None)
             if match is not None:
                 result.append({
                     **match, "component_ids": sorted(drift_ids),
                     "required_component_ids": sorted(drift_ids),
-                    "verification_endpoints": [drift_ip],
+                    "verification_endpoints": endpoint_ips,
                 })
         return result
 
@@ -8281,6 +8561,7 @@ class DeployController:
     async def _runtime_owner_guidance(
         self, checks: list[dict], components: list[dict],
         repo: str, pr_data: dict | None, lifecycle_status: str = "",
+        verified_machine_groups: list[dict] | None = None,
     ) -> list[str]:
         test_only = pr_data is None or self._is_test_only_pr(pr_data)
         component_by_id = {
@@ -8303,53 +8584,72 @@ class DeployController:
                                    if item in component_by_id]
             selectors: list[str] = []
             if mismatch_ids:
-                current_machine = None
-                try:
-                    current_machine = self.policy.get_machine(alias, repo=repo)
-                except Exception:
-                    pass
-                if current_machine is not None:
-                    for endpoint_ip in sorted({
-                            self._canonical_primary_ipv4(check.get("ip", ""))
-                            for check in machine_checks
-                            if check.get("status") == "mismatch"
-                            and self._canonical_primary_ipv4(check.get("ip", ""))}):
-                        endpoint_ids = {
-                            check.get("component_id") for check in machine_checks
-                            if check.get("status") == "mismatch"
-                            and self._canonical_primary_ipv4(check.get("ip", "")) == endpoint_ip
-                            and isinstance(check.get("component_id"), str)
-                        }
-                        endpoint_components = [component_by_id[item]
-                                               for item in endpoint_ids
-                                               if item in component_by_id]
-                        if (not endpoint_ids or len(endpoint_components) != len(endpoint_ids)
-                                or endpoint_ip not in {
-                                    item["ip"] for item in self._policy_machine_endpoints(
-                                        current_machine, repo,
-                                    )
-                                } or not self._endpoint_allowed_for_repository(
-                                    repo, current_machine, endpoint_ip,
-                                    components=endpoint_components,
-                                )):
-                            continue
-                        verified = await self._agent_core_verified_endpoints(
-                            repo, current_machine, endpoint_components,
-                            endpoints=[endpoint_ip],
-                        )
-                        endpoint_verified_ids = set().union(*(
-                            set(item.get("component_ids", []))
-                            for item in verified if isinstance(item, dict)
-                        )) if verified else set()
-                        eligible_group = next((group for group in
-                            self._get_machine_groups_for_components(endpoint_components, repo)
-                            if group.get("alias") == alias
-                            and group.get("approval_available") is True
-                            and endpoint_ids.issubset(set(group.get("component_ids", [])))), None)
-                        if (eligible_group is not None
-                                and endpoint_ids.issubset(endpoint_verified_ids)):
-                            selectors.append(endpoint_ip)
-                            owners = list(eligible_group.get("owners", []) or owners)
+                if verified_machine_groups is not None:
+                    group = next((item for item in verified_machine_groups
+                                  if isinstance(item, dict)
+                                  and item.get("alias") == alias
+                                  and item.get("repo_authorized") is True
+                                  and item.get("identity_confirmed") is True), None)
+                    if group is not None:
+                        for endpoint in group.get("verified_endpoints", []):
+                            if (isinstance(endpoint, dict)
+                                    and mismatch_ids.intersection(set(
+                                        endpoint.get("component_ids", []),
+                                    ))):
+                                endpoint_ip = self._canonical_primary_ipv4(
+                                    endpoint.get("ip", ""),
+                                )
+                                if endpoint_ip:
+                                    selectors.append(endpoint_ip)
+                        owners = list(group.get("owners", []) or owners)
+                else:
+                    current_machine = None
+                    try:
+                        current_machine = self.policy.get_machine(alias, repo=repo)
+                    except Exception:
+                        pass
+                    if current_machine is not None:
+                        for endpoint_ip in sorted({
+                                self._canonical_primary_ipv4(check.get("ip", ""))
+                                for check in machine_checks
+                                if check.get("status") == "mismatch"
+                                and self._canonical_primary_ipv4(check.get("ip", ""))}):
+                            endpoint_ids = {
+                                check.get("component_id") for check in machine_checks
+                                if check.get("status") == "mismatch"
+                                and self._canonical_primary_ipv4(check.get("ip", "")) == endpoint_ip
+                                and isinstance(check.get("component_id"), str)
+                            }
+                            endpoint_components = [component_by_id[item]
+                                                   for item in endpoint_ids
+                                                   if item in component_by_id]
+                            if (not endpoint_ids or len(endpoint_components) != len(endpoint_ids)
+                                    or endpoint_ip not in {
+                                        item["ip"] for item in self._policy_machine_endpoints(
+                                            current_machine, repo,
+                                        )
+                                    } or not self._endpoint_allowed_for_repository(
+                                        repo, current_machine, endpoint_ip,
+                                        components=endpoint_components,
+                                    )):
+                                continue
+                            verified = await self._agent_core_verified_endpoints(
+                                repo, current_machine, endpoint_components,
+                                endpoints=[endpoint_ip],
+                            )
+                            endpoint_verified_ids = set().union(*(
+                                set(item.get("component_ids", []))
+                                for item in verified if isinstance(item, dict)
+                            )) if verified else set()
+                            eligible_group = next((group for group in
+                                self._get_machine_groups_for_components(endpoint_components, repo)
+                                if group.get("alias") == alias
+                                and group.get("approval_available") is True
+                                and endpoint_ids.issubset(set(group.get("component_ids", [])))), None)
+                            if (eligible_group is not None
+                                    and endpoint_ids.issubset(endpoint_verified_ids)):
+                                selectors.append(endpoint_ip)
+                                owners = list(eligible_group.get("owners", []) or owners)
             valid_owners = sorted({
                 owner.strip() for owner in owners
                 if isinstance(owner, str) and _LOGIN_RE.fullmatch(owner.strip())
@@ -8408,9 +8708,11 @@ class DeployController:
     async def _add_runtime_owner_guidance(
         self, markdown: str, checks: list[dict], components: list[dict],
         repo: str, pr_data: dict | None, lifecycle_status: str = "",
+        verified_machine_groups: list[dict] | None = None,
     ) -> str:
         lines = await self._runtime_owner_guidance(
             checks, components, repo, pr_data, lifecycle_status,
+            verified_machine_groups,
         )
         if not lines or "<!-- deploy-approval-runtime-checks:end -->" not in markdown:
             return markdown
@@ -8420,6 +8722,7 @@ class DeployController:
     async def _render_runtime_checks_for_display(
         self, markdown: str, checks: list[dict], components: list[dict],
         repo: str, lifecycle_status: str, pr_data: dict | None,
+        verified_machine_groups: list[dict] | None = None,
     ) -> str:
         test_only = pr_data is None or self._is_test_only_pr(pr_data)
         if pr_data is None:
@@ -8433,8 +8736,12 @@ class DeployController:
             if isinstance(check, dict) and isinstance(check.get("machine"), str):
                 checks_by_alias.setdefault(check["machine"], []).append(check)
 
+        has_verified_projection = isinstance(verified_machine_groups, list)
         try:
-            policy_status = self.policy.repo_policy_status(repo)
+            policy_status = (
+                self.policy.repo_policy_status(repo)
+                if has_verified_projection else None
+            )
         except Exception as exc:
             logger.warning(
                 "runtime display repository policy unavailable repo=%s reason=%s",
@@ -8448,7 +8755,8 @@ class DeployController:
         )
         try:
             policy_machines = (
-                self.policy.get_machines(repo=repo) if repository_authorized else []
+                self.policy.get_machines(repo=repo)
+                if has_verified_projection and repository_authorized else []
             )
             if not isinstance(policy_machines, list):
                 policy_machines = []
@@ -8462,7 +8770,9 @@ class DeployController:
         identities: dict[str, tuple[str, list[str], bool, str]] = {}
         diagnostics = []
         for alias, machine_checks in checks_by_alias.items():
-            primary_ip, selector, owners = self._runtime_display_identity(alias, repo)
+            primary_ip, owners = "", []
+            if has_verified_projection:
+                primary_ip, _, owners = self._runtime_display_identity(alias, repo)
             machine_repository_authorized = (
                 repository_authorized
                 and sum(getattr(item, "alias", None) == alias for item in policy_machines) == 1
@@ -8492,6 +8802,23 @@ class DeployController:
                 "repository_authorized": machine_repository_authorized,
                 "identity_confirmed": machine_identity_confirmed,
             })
+
+        display_component_ids = {
+            item.get("component_id") for item in checks
+            if isinstance(item, dict) and isinstance(item.get("component_id"), str)
+        }
+        display_components = [component for component_id, component in component_by_id.items()
+                              if component_id in display_component_ids]
+        if has_verified_projection:
+            reconfirmation_groups = self._verified_groups_for_components(
+                verified_machine_groups, display_components,
+            )
+        else:
+            # Lifecycle writes outside the serialized projection refresh may
+            # still carry older runtime rows. Render those rows without
+            # launching an unrelated Agent Core scan or offering approvals
+            # from a projection that was not verified for this write.
+            reconfirmation_groups = []
 
         display_checks = []
         for check in checks:
@@ -8523,31 +8850,23 @@ class DeployController:
             item["ip"] = check_ip if endpoint_current else ""
             selector = ""
             component_compatible = False
-            if (endpoint_current and item.get("status") == "mismatch"
-                    and isinstance(component, dict)
-                    and self._endpoint_allowed_for_repository(
-                        repo, current_machine, check_ip, components=[component],
-                        policy_machines=policy_machines,
-                    )):
-                eligible = next((group for group in self._get_machine_groups_for_components(
-                    [component], repo,
-                ) if group.get("alias") == alias
-                    and group.get("approval_available") is True
-                    and component.get("component_id") in set(group.get("component_ids", []))),
-                    None)
+            if item.get("status") == "mismatch" and isinstance(component, dict):
+                eligible = next((group for group in reconfirmation_groups
+                                 if group.get("alias") == alias
+                                 and group.get("approval_available") is True
+                                 and group.get("identity_confirmed") is True
+                                 and group.get("repo_authorized") is True), None)
+                component_id = component.get("component_id")
                 if eligible is not None:
-                    verified = await self._agent_core_verified_endpoints(
-                        repo, current_machine, [component], endpoints=[check_ip],
-                    )
-                    component_id = component.get("component_id")
-                    if any(
-                        isinstance(endpoint, dict)
-                        and endpoint.get("ip") == check_ip
-                        and component_id in set(endpoint.get("component_ids", []))
-                        for endpoint in verified
-                    ):
-                        selector = check_ip
-                        component_compatible = True
+                    selector_endpoint = next((endpoint for endpoint in
+                        eligible.get("verified_endpoints", [])
+                        if isinstance(endpoint, dict)
+                        and component_id in set(endpoint.get("component_ids", []))), None)
+                    if selector_endpoint is not None:
+                        selector = self._canonical_primary_ipv4(
+                            selector_endpoint.get("ip", ""),
+                        )
+                        component_compatible = bool(selector)
             item["command_selector"] = selector
             item["approval_available"] = bool(selector)
             item["component_compatible"] = component_compatible
@@ -8558,6 +8877,7 @@ class DeployController:
         updated = comments_mod.update_runtime_image_checks(
             markdown, display_checks, components,
             lifecycle_status=lifecycle_status,
+            machine_groups=reconfirmation_groups,
             machine_diagnostics=diagnostics,
             machine_inventory=self._physical_machine_inventory(),
             test_only=test_only,
@@ -8591,6 +8911,7 @@ class DeployController:
                 updated = updated[:start] + "\n".join(lines) + updated[end + len(end_marker):]
         return await self._add_runtime_owner_guidance(
             updated, display_checks, components, repo, pr_data, lifecycle_status,
+            reconfirmation_groups,
         )
 
     def _enrich_deployments_for_render(
@@ -8603,17 +8924,16 @@ class DeployController:
             if not isinstance(dep, dict):
                 enriched.append(dep)
                 continue
-            machine_alias = dep.get("machine", "")
-            ip = dep.get("ip", "")
+            ip = self._canonical_primary_ipv4(dep.get("ip", ""))
+            identity_unconfirmed = not bool(ip) and dep.get("phase") == "deployed"
             if historical:
-                ip = "历史主 IP 未记录"
+                ip = ip or "历史主 IP 未记录"
             else:
-                ip = self._canonical_primary_ipv4(ip) or (
-                    "实际部署 IP 未记录"
-                )
+                ip = ip or "实际部署 IP 未记录"
             enriched.append({
                 **dep,
                 "ip": ip,
+                "historical_identity_unconfirmed": identity_unconfirmed,
             })
         return enriched
 
@@ -9782,10 +10102,19 @@ class DeployController:
         suppress_approval_commands = bool(
             kwargs.pop("_suppress_approval_commands", False)
         )
+        machine_groups_verified = bool(
+            kwargs.pop("_machine_groups_verified", False)
+        )
+        runtime_machine_groups = kwargs.pop("_runtime_machine_groups", None)
+        mention_owners = kwargs.pop("_mention_owners", False)
         if display_status == "deploy-requested" and not suppress_approval_commands:
-            command_groups = await self._machine_groups_verify_endpoints(
-                machine_groups if isinstance(machine_groups, list) else [],
-                repo, components,
+            command_groups = (
+                machine_groups if machine_groups_verified
+                and isinstance(machine_groups, list) else
+                await self._machine_groups_verify_endpoints(
+                    machine_groups if isinstance(machine_groups, list) else [],
+                    repo, components,
+                )
             )
         try:
             parameters = inspect.signature(renderer).parameters
@@ -9798,6 +10127,9 @@ class DeployController:
             supports_display_status = False
             parameters = {}
         render_kwargs = dict(kwargs)
+        if runtime_machine_groups is not None:
+            render_kwargs["runtime_machine_groups"] = runtime_machine_groups
+        render_kwargs.setdefault("mention_owners", bool(mention_owners))
         machine_context = self._machine_comment_context(
             components, command_groups, repo, test_only=test_only,
         )
@@ -9847,12 +10179,11 @@ class DeployController:
                 if not isinstance(policy_machines, list):
                     policy_machines = []
                 for machine in policy_machines:
-                    machine_ip = self._canonical_primary_ipv4(
-                        getattr(machine, "node_host", ""),
-                    )
                     machine_alias = str(getattr(machine, "alias", "") or "")
-                    if machine_ip and machine_alias:
-                        policy_aliases_by_ip.setdefault(machine_ip, []).append(machine_alias)
+                    for endpoint in self._policy_machine_endpoints(machine, repo):
+                        machine_ip = endpoint.get("ip", "")
+                        if machine_ip and machine_alias:
+                            policy_aliases_by_ip.setdefault(machine_ip, []).append(machine_alias)
         except Exception:
             policy_status = {}
             policy_machines = []
@@ -9920,7 +10251,10 @@ class DeployController:
             agent_core_status = str(group.get("agent_core_status", "unknown"))
             agent_core_available = (
                 True if agent_core_status == "available" else
-                False if agent_core_status in {"credential_missing", "unavailable"} else
+                False if agent_core_status in {
+                    "credential_missing", "unavailable", "authentication_failed",
+                    "network_failed",
+                } else
                 None
             )
             reasons = []
@@ -9929,10 +10263,18 @@ class DeployController:
                     "REPOSITORY_POLICY_MISSING": "当前仓库还没有可用的机器配置。",
                     "MACHINE_NOT_AUTHORIZED": "当前仓库 main 未授权这台机器。",
                     "OWNER_NOT_CONFIGURED": "当前仓库机器负责人待配置。",
-                    "MACHINE_IDENTITY_MISMATCH": "当前仓库机器策略中的 alias、node_id 或主 IP 缺失或重复。",
+                    "MACHINE_NOT_BOUND": "设备尚未绑定到当前仓库机器策略。",
+                    "FEISHU_DEVICE_NOT_FOUND": "飞书快照中不存在已绑定的设备编号。",
+                    "FEISHU_SNAPSHOT_UNAVAILABLE": "当前飞书设备快照无法确认。",
+                    "IP_CONFLICT": "飞书设备 IP 存在冲突，冲突地址不会用于连接。",
+                    "MACHINE_CONFIGURATION_CHANGED": "机器配置在验证期间发生变化。",
+                    "MACHINE_IDENTITY_MISMATCH": "机器身份与当前仓库策略不匹配。",
                     "AGENT_CORE_CREDENTIAL_MISSING": "Agent Core 凭证未配置。",
+                    "AGENT_CORE_AUTH_FAILED": "Agent Core 鉴权失败。",
+                    "AGENT_CORE_NETWORK_FAILED": "Agent Core 网络连接失败。",
                     "AGENT_CORE_UNAVAILABLE": "Agent Core 当前无法连接。",
                     "AGENT_CORE_UNKNOWN": "Agent Core 尚未确认；审批时会先执行只读预检。",
+                    "COMPONENT_INCOMPATIBLE": "Agent Core 未确认本次组件运行实例。",
                     "PLATFORM_UNVERIFIED": "机器平台未确认。",
                     "PLATFORM_MISMATCH": "机器平台与当前构建不匹配。",
                     "TARGET_UNSUPPORTED": "机器不支持当前构建目标。",
@@ -9941,7 +10283,16 @@ class DeployController:
                     "PRIMARY_IP_AMBIGUOUS": "主 IP 有重复，无法显示安全的机器审批命令。",
                 }.get(reason, str(reason)))
             ip = group.get("primary_ip", "")
-            ip_conflicts = list(policy_aliases_by_ip.get(ip, [])) if ip else []
+            conflict_ips = (
+                selected.get("conflicting_ips", group.get("conflicting_ips", []))
+                if isinstance(selected, dict) else group.get("conflicting_ips", [])
+            )
+            if not isinstance(conflict_ips, (list, tuple, set)):
+                conflict_ips = []
+            ip_conflicts = list(dict.fromkeys(
+                alias_name for conflict_ip in conflict_ips
+                for alias_name in policy_aliases_by_ip.get(conflict_ip, [])
+            ))
             policy_owners = list(group.get("owners", []))
             policy_platforms = list(getattr(policy_machine, "platforms", []) or []) \
                 if policy_machine is not None else []
@@ -9972,7 +10323,10 @@ class DeployController:
                     and selected.get("command_selector")
                     and selected.get("component_ids")
                 ),
-                "duplicate_ip": "PRIMARY_IP_AMBIGUOUS" in group.get("blocking_reasons", []),
+                "duplicate_ip": bool(conflict_ips) or (
+                    "IP_CONFLICT" in group.get("blocking_reasons", [])
+                    or "PRIMARY_IP_AMBIGUOUS" in group.get("blocking_reasons", [])
+                ),
                 "ip_conflicts": list(dict.fromkeys(ip_conflicts)),
                 "reasons": reasons,
             })
@@ -10102,8 +10456,7 @@ class DeployController:
         }
         full_groups = [
             group for group in all_groups if isinstance(group, dict)
-            and group.get("approval_available") is True and component_ids
-            and component_ids.issubset(set(group.get("component_ids", [])))
+            and self._has_verified_endpoint_covering(group, component_ids)
         ]
         if len(full_groups) <= 1:
             return markdown
@@ -10184,6 +10537,9 @@ class DeployController:
             and command_args.get("preflight_pending") is True
         ) or (isinstance(command, dict)
               and command.get("phase") in {"executing", "uncertain"})
+        machine_groups = self._exclude_unconfirmed_history_endpoints(
+            machine_groups, state, repo,
+        )
         verified_groups = (
             await self._machine_groups_verify_endpoints(
                 machine_groups, repo, remaining,
@@ -11869,6 +12225,7 @@ class DeployController:
         write_guard: Any | None = None,
         archive_reason: str = "Lifecycle snapshot replaced",
         runtime_projection_only: bool = False,
+        verified_machine_groups: list[dict] | None = None,
     ) -> bool:
         """Write lifecycle comment with automatic history management.
 
@@ -11908,6 +12265,7 @@ class DeployController:
                 source_visible,
                 runtime_checks if isinstance(runtime_checks, list) else [],
                 state.get("components", []), repo, state.get("status", ""), display_pr,
+                verified_machine_groups,
             )
             before_bounds = comments_mod._next_action_body_bounds(source_visible)
             outside_changed = True
@@ -11978,6 +12336,7 @@ class DeployController:
             new_visible_markdown,
             runtime_checks if isinstance(runtime_checks, list) else [],
             state.get("components", []), repo, state.get("status", ""), display_pr,
+            verified_machine_groups,
         )
         archive_source = None
         projection_state_expected = copy.deepcopy(state) if evidence_projection_only else None
@@ -12860,24 +13219,366 @@ class DeployController:
         self._record_command_reply_delivery(repo, pr_number, comment_id, delivered)
         return delivered
 
+    def _machine_adaptation_cache_key(
+        self, repo: str, pr_number: int, head_sha: str, round_id: str,
+        status: str, components: list[dict], projection_version: str,
+    ) -> tuple:
+        component_digest = hashlib.sha256(json.dumps(
+            self._canonical_component_snapshot(components),
+            sort_keys=True, separators=(",", ":"), default=str,
+        ).encode("utf-8")).hexdigest()
+        try:
+            machines = self.policy.get_machines(repo=repo)
+            if not isinstance(machines, list):
+                machines = []
+            bindings = sorted(
+                (
+                    str(getattr(machine, "alias", "") or ""),
+                    self._machine_connection_fingerprint(machine, repo),
+                )
+                for machine in machines
+                if isinstance(getattr(machine, "alias", None), str)
+            )
+        except Exception:
+            bindings = [("unavailable",)]
+        binding_digest = hashlib.sha256(json.dumps(
+            bindings, sort_keys=True, separators=(",", ":"), default=str,
+        ).encode("utf-8")).hexdigest()
+        return (
+            repo.casefold(), pr_number, head_sha, round_id, status,
+            projection_version, component_digest, binding_digest,
+        )
+
+    @staticmethod
+    def _verified_groups_for_components(
+        groups: list[dict], components: list[dict],
+    ) -> list[dict]:
+        component_ids = {
+            item.get("component_id") for item in components
+            if isinstance(item, dict) and isinstance(item.get("component_id"), str)
+        }
+        result = []
+        for source in groups if isinstance(groups, list) else []:
+            if not isinstance(source, dict):
+                continue
+            group = copy.deepcopy(source)
+            for field in ("component_ids", "required_component_ids",
+                          "compatible_component_ids"):
+                values = group.get(field)
+                if isinstance(values, (list, tuple, set)):
+                    group[field] = sorted(set(values).intersection(component_ids))
+            endpoints = []
+            for endpoint in group.get("verified_endpoints", []):
+                if not isinstance(endpoint, dict):
+                    continue
+                endpoint_ids = set(endpoint.get("component_ids", [])) & component_ids
+                if endpoint_ids:
+                    endpoints.append({**endpoint, "component_ids": sorted(endpoint_ids)})
+            group["verified_endpoints"] = endpoints
+            required = set(group.get("required_component_ids", []))
+            selected = next((endpoint for endpoint in endpoints
+                             if required and required.issubset(
+                                 set(endpoint.get("component_ids", [])))), None)
+            if selected is None and endpoints:
+                selected = max(endpoints, key=lambda item: len(item.get("component_ids", [])))
+            group["command_selector"] = selected.get("ip", "") if selected else ""
+            group["ip_command_safe"] = bool(group["command_selector"])
+            group["approval_available"] = bool(endpoints)
+            group["component_ids"] = sorted(
+                set().union(*(set(item.get("component_ids", [])) for item in endpoints))
+                if endpoints else set(),
+            )
+            result.append(group)
+        return result
+
+    @staticmethod
+    def _has_verified_endpoint_covering(
+        group: dict, component_ids: set[str],
+    ) -> bool:
+        if (not isinstance(group, dict) or not component_ids
+                or group.get("approval_available") is not True):
+            return False
+        return any(
+            isinstance(endpoint, dict)
+            and component_ids.issubset(set(endpoint.get("component_ids", [])))
+            for endpoint in group.get("verified_endpoints", [])
+        )
+
+    def _cached_machine_adaptation(
+        self, cache_key: tuple,
+    ) -> list[dict] | None:
+        now = time.monotonic()
+        for key, (checked_at, _groups) in list(self._machine_adaptation_snapshots.items()):
+            if now - checked_at >= AGENT_CORE_ENDPOINT_CACHE_TTL_SECONDS:
+                self._machine_adaptation_snapshots.pop(key, None)
+        cached = self._machine_adaptation_snapshots.get(cache_key)
+        if (cached is None
+                or now - cached[0] >= AGENT_CORE_ENDPOINT_CACHE_TTL_SECONDS):
+            return None
+        return copy.deepcopy(cached[1])
+
+    def _remember_machine_adaptation(
+        self, cache_key: tuple, groups: list[dict],
+    ) -> None:
+        self._machine_adaptation_snapshots[cache_key] = (
+            time.monotonic(), copy.deepcopy(groups),
+        )
+        while len(self._machine_adaptation_snapshots) > 256:
+            oldest = min(
+                self._machine_adaptation_snapshots,
+                key=lambda key: self._machine_adaptation_snapshots[key][0],
+            )
+            self._machine_adaptation_snapshots.pop(oldest, None)
+
+    def _cached_machine_projection_for_state(
+        self, repo: str, pr_number: int, state: dict, projection_version: str,
+    ) -> list[dict] | None:
+        components = state.get("components", []) if isinstance(state, dict) else []
+        if not isinstance(components, list) or not isinstance(state, dict):
+            return None
+        blocked_ips = self._historical_ips_not_bound_to_current_identity(state, repo)
+        history_scope = hashlib.sha256(json.dumps(
+            sorted(blocked_ips), separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        cache_key = self._machine_adaptation_cache_key(
+            repo, pr_number, str(state.get("head_sha", "") or ""),
+            round_id_for_state(state), "machine-projection:" + history_scope,
+            components, projection_version,
+        )
+        return self._cached_machine_adaptation(cache_key)
+
+    async def refresh_machine_projection(self, repo: str, pr_number: int) -> str:
+        """Serially refresh machine compatibility, runtime images, and lifecycle projection."""
+        try:
+            pr_data = await self.proxy.get_pr(repo, pr_number)
+            state = await self.proxy.read_hidden_state(repo, pr_number)
+        except Exception as exc:
+            logger.warning("machine projection read failed %s#%s reason=%s",
+                           repo, pr_number, type(exc).__name__)
+            return "incomplete"
+        if not isinstance(pr_data, dict):
+            return "incomplete"
+        if (pr_data.get("state") != "open" or pr_data.get("merged")
+                or pr_data.get("draft")):
+            return "stale"
+        relevant_statuses = {
+            "deploy-ready", "deploy-requested", "testing", "succeeded", "failed",
+        }
+        if not isinstance(state, dict) or state.get("status") not in relevant_statuses:
+            return "stale"
+        head_sha = (pr_data.get("head") or {}).get("sha")
+        if (not isinstance(head_sha, str) or state.get("head_sha") != head_sha):
+            return "stale"
+        if (state.get("command", {}).get("phase") in {"executing", "uncertain"}
+                or state.get("command", {}).get("args", {}).get("preflight_pending") is True):
+            return "incomplete"
+        if not await self._fresh_review_evidence_matches_state(
+                repo, pr_number, head_sha, state.get("review_evidence", {}),
+                expected_components=state.get("components", [])):
+            return "incomplete"
+        try:
+            projection_before = self._machine_projection_version(repo)
+        except Exception:
+            return "incomplete"
+        components = state.get("components", [])
+        if not isinstance(components, list) or not components:
+            return "incomplete"
+        blocked_historical_ips = self._historical_ips_not_bound_to_current_identity(
+            state, repo,
+        )
+        history_scope = hashlib.sha256(json.dumps(
+            sorted(blocked_historical_ips), separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        cache_key = self._machine_adaptation_cache_key(
+            repo, pr_number, head_sha, round_id_for_state(state),
+            "machine-projection:" + history_scope, components, projection_before,
+        )
+        verified_groups = self._cached_machine_adaptation(cache_key)
+        if verified_groups is None:
+            try:
+                base_groups = self._get_machine_groups_for_components(components, repo)
+                base_groups = self._exclude_unconfirmed_history_endpoints(
+                    base_groups, state, repo,
+                )
+                verified_groups = await self._machine_groups_verify_endpoints(
+                    base_groups, repo, components,
+                )
+            except Exception as exc:
+                logger.warning("machine projection verification failed %s#%s reason=%s",
+                               repo, pr_number, type(exc).__name__)
+                return "incomplete"
+            try:
+                projection_after = self._machine_projection_version(repo)
+            except Exception:
+                return "incomplete"
+            if projection_after != projection_before:
+                return "incomplete"
+            self._remember_machine_adaptation(cache_key, verified_groups)
+        else:
+            try:
+                if self._machine_projection_version(repo) != projection_before:
+                    return "incomplete"
+            except Exception:
+                return "incomplete"
+
+        projection_key = (repo.casefold(), pr_number)
+        projection_changed = (
+            self._runtime_projection_versions.get(projection_key)
+            != projection_before
+        )
+        deployments = [item for item in state.get("deployments", [])
+                       if isinstance(item, dict)
+                       and item.get("phase") == "deployed"]
+        runtime_refresh_incomplete = False
+        if deployments:
+            prior_state = copy.deepcopy(state)
+            try:
+                refreshed_state = await self._reconcile_runtime_image_checks(
+                    repo, pr_number, state, pr_data,
+                    force=projection_changed,
+                    verified_machine_groups=verified_groups,
+                )
+            except Exception as exc:
+                logger.warning("runtime projection failed %s#%s reason=%s",
+                               repo, pr_number, type(exc).__name__)
+                return "incomplete"
+            if refreshed_state == prior_state:
+                checks = [item for item in state.get("runtime_checks", [])
+                          if isinstance(item, dict)]
+                missing_or_due = projection_changed
+                latest_deployment_by_component = {}
+                for deployment in deployments:
+                    for component_id in deployment.get("component_ids", []):
+                        if isinstance(component_id, str):
+                            latest_deployment_by_component[component_id] = deployment
+                for component_id, deployment in latest_deployment_by_component.items():
+                    deployment_ip = self._canonical_primary_ipv4(
+                        deployment.get("ip", ""),
+                    )
+                    if not deployment_ip:
+                        continue
+                    identity_binding = str(
+                        deployment.get("identity_binding", "") or "",
+                    )
+                    related = [check for check in checks
+                               if check.get("machine") == deployment.get("machine")
+                               and check.get("component_id") == component_id
+                               and check.get("deployment_ip", check.get("ip"))
+                               == deployment_ip
+                               and check.get("deployment_identity_binding", "")
+                               == identity_binding]
+                    latest_check = max(
+                        related,
+                        key=lambda item: str(item.get("checked_at", "")),
+                        default=None,
+                    )
+                    if self._runtime_check_is_due(
+                            latest_check, datetime.now(timezone.utc)):
+                        missing_or_due = True
+                    if missing_or_due:
+                        break
+                if missing_or_due:
+                    runtime_refresh_incomplete = True
+            else:
+                state = refreshed_state
+            try:
+                persisted_state = await self.proxy.read_hidden_state(repo, pr_number)
+                if persisted_state != state:
+                    return "incomplete"
+            except Exception:
+                return "incomplete"
+
+        if state.get("status") in {"deploy-ready", "deploy-requested"}:
+            try:
+                summary_written = await self._refresh_machine_adaptation_summary(
+                    repo, pr_number, state, pr_data,
+                    verified_groups=verified_groups,
+                    projection_version=projection_before,
+                )
+            except Exception as exc:
+                logger.warning("machine summary projection failed %s#%s reason=%s",
+                               repo, pr_number, type(exc).__name__)
+                return "incomplete"
+            if not summary_written:
+                return "incomplete"
+            if state.get("status") == "deploy-ready":
+                try:
+                    notice_written = await self._post_deploy_ready_notice(
+                        repo, pr_number, head_sha=head_sha,
+                        round_id=round_id_for_state(state),
+                        review_evidence=state.get("review_evidence", {}),
+                        components=components,
+                        verified_groups=verified_groups,
+                        projection_version=projection_before,
+                    )
+                except Exception as exc:
+                    logger.warning("machine notice projection failed %s#%s reason=%s",
+                                   repo, pr_number, type(exc).__name__)
+                    return "incomplete"
+                if not notice_written:
+                    return "incomplete"
+
+        try:
+            latest_pr = await self.proxy.get_pr(repo, pr_number)
+            latest_state = await self.proxy.read_hidden_state(repo, pr_number)
+            latest_projection = self._machine_projection_version(repo)
+        except Exception:
+            return "incomplete"
+        if (not isinstance(latest_pr, dict)
+                or latest_pr.get("state") != "open"
+                or latest_pr.get("merged") or latest_pr.get("draft")):
+            return "stale"
+        if (not isinstance(latest_state, dict)
+                or latest_pr.get("head", {}).get("sha") != head_sha
+                or latest_state.get("head_sha") != head_sha
+                or latest_state != state
+                or latest_projection != projection_before):
+            return "incomplete"
+        if not await self._fresh_review_evidence_matches_state(
+                repo, pr_number, head_sha, state.get("review_evidence", {}),
+                expected_components=components):
+            return "incomplete"
+        transient_projection_failure = runtime_refresh_incomplete or any(
+            isinstance(group, dict)
+            and group.get("agent_core_status") in {
+                "credential_missing", "authentication_failed", "network_failed",
+                "unknown", "unavailable",
+            }
+            for group in verified_groups
+        ) or any(
+            isinstance(check, dict)
+            and (check.get("status") == "unavailable"
+                 or check.get("identity_reason") == "snapshot_unavailable")
+            for check in state.get("runtime_checks", [])
+        )
+        if transient_projection_failure:
+            return "incomplete"
+        return "refreshed"
+
     async def _post_deploy_ready_notice(
         self, repo: str, pr_number: int, *, head_sha: str, round_id: str,
         review_evidence: dict, components: list[dict],
+        verified_groups: list[dict], projection_version: str,
     ) -> bool:
-        """Notify once for one freshly verified Review Agent result."""
+        """Notify once per distinct deploy-ready machine command projection."""
         build_comment_id = review_evidence.get("build_comment_id")
         if type(build_comment_id) is not int or build_comment_id <= 0:
             return False
+        if not isinstance(projection_version, str) or not projection_version:
+            return False
+        if not isinstance(verified_groups, list):
+            return False
+        cache_key = self._machine_adaptation_cache_key(
+            repo, pr_number, head_sha, round_id, "deploy-ready",
+            components, projection_version,
+        )
         event_fingerprint = hashlib.sha256(
             repr(sorted(self._review_evidence_identity(review_evidence).items())).encode(),
         ).hexdigest()
         notice_identity = "\0".join((
             repo, str(pr_number), head_sha, round_id, "deploy-ready",
-            str(build_comment_id), event_fingerprint,
+            str(build_comment_id), event_fingerprint, projection_version,
         ))
-        marker = "<!-- deploy-approval-notice:v1:" + hashlib.sha256(
-            notice_identity.encode("utf-8"),
-        ).hexdigest() + " -->"
 
         async def context_is_current() -> bool:
             try:
@@ -12907,48 +13608,62 @@ class DeployController:
                     or self._canonical_component_snapshot(state.get("components", []))
                     != self._canonical_component_snapshot(components)):
                 return False
+            try:
+                latest_projection = self._machine_projection_version(repo)
+                policy_status = self.policy.repo_policy_status(repo)
+            except Exception:
+                return False
+            if (latest_projection != projection_version
+                    or not isinstance(policy_status, dict)
+                    or policy_status.get("authorized") is not True
+                    or policy_status.get("machines_configured") is not True):
+                return False
+            if self._machine_adaptation_cache_key(
+                    repo, pr_number, head_sha, round_id, "deploy-ready",
+                    components, latest_projection) != cache_key:
+                return False
             return await self._fresh_review_evidence_matches_state(
                 repo, pr_number, head_sha, review_evidence,
                 expected_components=components,
             )
 
-        def marker_exists(comments) -> bool:
+        def latest_notice_marker(comments) -> str:
             if not isinstance(comments, list):
-                return False
-            return any(
-                isinstance(comment, dict)
-                and isinstance(comment.get("body"), str)
-                and marker in comment["body"]
-                and self.proxy.is_bot_comment(comment)
-                for comment in comments
+                return ""
+            marker_re = re.compile(
+                r"<!-- deploy-approval-notice:v1:[0-9a-f]{64} -->",
             )
+            found = []
+            for index, comment in enumerate(comments):
+                if (not isinstance(comment, dict)
+                        or not isinstance(comment.get("body"), str)
+                        or not self.proxy.is_bot_comment(comment)):
+                    continue
+                match = marker_re.search(comment["body"])
+                if match is None:
+                    continue
+                comment_id = comment.get("id")
+                if type(comment_id) is int:
+                    order = (2, comment_id, index)
+                else:
+                    created_at = str(comment.get("created_at", "") or "")
+                    order = (1 if created_at else 0, created_at, index)
+                found.append((order, match.group(0)))
+            return max(found, key=lambda item: item[0])[1] if found else ""
 
         if not await context_is_current():
             return False
-        try:
-            comments = await self.proxy.get_issue_comments(repo, pr_number)
-        except Exception:
-            return False
-        if not isinstance(comments, list):
-            return False
-        if marker_exists(comments):
-            return True
-        # The trusted review may have changed while the marker read waited.
-        if not await context_is_current():
-            return False
-
         try:
             display_pr = await self.proxy.get_pr(repo, pr_number)
         except Exception:
             display_pr = None
         test_only = self._is_test_only_pr(display_pr)
-        all_groups = self._get_machine_groups_for_components(components, repo)
-        verified_groups = await self._machine_groups_verify_endpoints(
-            all_groups, repo, components,
+        verified_groups = self._verified_groups_for_components(
+            verified_groups, components,
         )
         command_lines = await self._machine_notice_lines(
             verified_groups, repo, mention_owners=False, test_only=test_only,
-            components=components,
+            components=components, groups_verified=True,
         )
         required_ids = {
             component.get("component_id") for component in components
@@ -12956,8 +13671,7 @@ class DeployController:
         }
         full_groups = [
             group for group in verified_groups if isinstance(group, dict)
-            and group.get("approval_available") is True and required_ids
-            and required_ids.issubset(set(group.get("component_ids", [])))
+            and self._has_verified_endpoint_covering(group, required_ids)
         ]
         message_lines = ["当前提交的构建和审核已经完成，可以开始部署审批。"]
         if command_lines:
@@ -12971,8 +13685,27 @@ class DeployController:
             elif required_ids:
                 message_lines.append("没有单台机器覆盖全部组件，请按上面的命令分批审批。")
         else:
-            message_lines.extend(self._machine_blocking_summary(all_groups))
+            message_lines.extend(self._machine_blocking_summary(verified_groups))
         message_lines.append("`/request_deploy` 是可选的，不是部署审批的前提。")
+        message_digest = hashlib.sha256(
+            "\n".join(message_lines).encode("utf-8"),
+        ).hexdigest()
+        marker = "<!-- deploy-approval-notice:v1:" + hashlib.sha256(
+            (notice_identity + "\0" + message_digest).encode("utf-8"),
+        ).hexdigest() + " -->"
+        try:
+            comments = await self.proxy.get_issue_comments(repo, pr_number)
+        except Exception:
+            return False
+        if not isinstance(comments, list):
+            return False
+        if latest_notice_marker(comments) == marker:
+            return True
+        # The trusted review and live machine projection may change while the
+        # comments read waits; the lifecycle and Review evidence guard stays
+        # closed until both still match.
+        if not await context_is_current():
+            return False
         body = "\n".join((comments_mod.BOT_MARKER, marker, "", *message_lines))
         if not await context_is_current():
             return False
@@ -12983,7 +13716,7 @@ class DeployController:
                 latest = await self.proxy.get_issue_comments(repo, pr_number)
             except Exception:
                 return False
-            return bool(isinstance(latest, list) and marker_exists(latest))
+            return bool(isinstance(latest, list) and latest_notice_marker(latest) == marker)
         if (isinstance(posted, dict) and marker in posted.get("body", "")
                 and self.proxy.is_bot_comment(posted)):
             return True
@@ -12991,7 +13724,305 @@ class DeployController:
             latest = await self.proxy.get_issue_comments(repo, pr_number)
         except Exception:
             return False
-        return bool(isinstance(latest, list) and marker_exists(latest))
+        return bool(isinstance(latest, list) and latest_notice_marker(latest) == marker)
+
+    async def _refresh_machine_adaptation_summary(
+        self, repo: str, pr_number: int, state: dict, pr_data: dict,
+        *, verified_groups: list[dict] | None = None,
+        projection_version: str | None = None,
+    ) -> bool:
+        """Refresh live machine commands without advancing lifecycle state."""
+        if (not isinstance(state, dict)
+                or state.get("status") not in {"deploy-ready", "deploy-requested"}
+                or not isinstance(pr_data, dict)):
+            return False
+        head_sha = state.get("head_sha", "")
+        pr_head = pr_data.get("head")
+        components = state.get("components")
+        review_evidence = state.get("review_evidence")
+        command = state.get("command", {})
+        command_args = command.get("args", {}) if isinstance(command, dict) else {}
+        if (not isinstance(head_sha, str)
+                or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
+                or not isinstance(pr_head, dict) or pr_head.get("sha") != head_sha
+                or not isinstance(components, list) or not components
+                or not isinstance(review_evidence, dict)
+                or not isinstance(command, dict)
+                or command.get("phase") in {"executing", "uncertain"}
+                or (isinstance(command_args, dict)
+                    and command_args.get("preflight_pending") is True)):
+            return False
+        state_before = copy.deepcopy(state)
+        if not await self._fresh_review_evidence_matches_state(
+                repo, pr_number, head_sha, review_evidence,
+                expected_components=components):
+            return False
+        try:
+            projection_before = projection_version or self._machine_projection_version(repo)
+        except Exception:
+            return False
+
+        deployments = state.get("deployments", [])
+        deployments = deployments if isinstance(deployments, list) else []
+        deployed_ids = _component_id_set(deployments)
+        remaining_components = [
+            item for item in components
+            if isinstance(item, dict)
+            and item.get("component_id") not in deployed_ids
+        ]
+        if state.get("status") == "deploy-requested" and state.get("runtime_redeploy"):
+            pending_ids = self._runtime_redeploy_pending_ids(state)
+            verification_components = [
+                item for item in components
+                if isinstance(item, dict)
+                and item.get("component_id") in pending_ids
+            ]
+            machine_groups = self._runtime_redeploy_machine_groups(
+                state, verification_components, repo,
+            )
+        else:
+            verification_components = (
+                components if state.get("status") == "deploy-ready"
+                else remaining_components
+            )
+            machine_groups = self._get_machine_groups_for_components(
+                verification_components, repo,
+            )
+        cache_key = self._machine_adaptation_cache_key(
+            repo, pr_number, head_sha, round_id_for_state(state),
+            str(state.get("status", "")), verification_components,
+            projection_before,
+        )
+        full_verified_groups = (
+            self._verified_groups_for_components(verified_groups, components)
+            if isinstance(verified_groups, list) else None
+        )
+        cached_groups = self._cached_machine_adaptation(cache_key)
+        if verified_groups is not None:
+            verified_groups = self._verified_groups_for_components(
+                verified_groups, verification_components,
+            )
+        elif cached_groups is not None:
+            verified_groups = cached_groups
+        else:
+            verified_groups = await self._machine_groups_verify_endpoints(
+                machine_groups, repo, verification_components,
+            )
+        if full_verified_groups is None:
+            full_verified_groups = self._verified_groups_for_components(
+                verified_groups, components,
+            )
+        try:
+            projection_after = self._machine_projection_version(repo)
+        except Exception:
+            return False
+        if (projection_after != projection_before
+                or self._machine_adaptation_cache_key(
+                    repo, pr_number, head_sha, round_id_for_state(state),
+                    str(state.get("status", "")), verification_components,
+                    projection_after,
+                ) != cache_key):
+            return False
+        self._remember_machine_adaptation(cache_key, verified_groups)
+
+        if state.get("status") == "deploy-ready":
+            builds = [
+                BuildInfo(
+                    target=str(item.get("target", "") or ""),
+                    driver_path=str(item.get("driver_path", "") or ""),
+                    variant=str(item.get("variant", "") or ""),
+                    success=True,
+                    image_tag=str(item.get("review_image_tag") or item.get("image_ref") or ""),
+                    deployable=True,
+                    component_id=str(item.get("component_id", "") or ""),
+                )
+                for item in components if isinstance(item, dict)
+            ]
+            markdown = comments_mod.deploy_ready(
+                repo, pr_number, head_sha, builds,
+                review_evidence=review_evidence,
+                machine_groups=verified_groups,
+                components=components,
+            )
+        else:
+            markdown = await self._deploy_requested_markdown(
+                repo, pr_number, head_sha, components, verified_groups,
+                display_status="deploy-requested",
+                test_only=self._is_test_only_pr(pr_data),
+                deployments=self._enrich_deployments_for_render(deployments, repo),
+                all_components=components,
+                runtime_checks=state.get("runtime_checks", []),
+                _machine_groups_verified=True,
+                _mention_owners=False,
+                _runtime_machine_groups=full_verified_groups,
+            )
+
+        machine_projection = []
+        for group in verified_groups:
+            if not isinstance(group, dict):
+                continue
+            endpoint_rows = [
+                {
+                    "ip": endpoint.get("ip", ""),
+                    "label": endpoint.get("label", ""),
+                    "component_ids": sorted(
+                        value for value in endpoint.get("component_ids", [])
+                        if isinstance(value, str)
+                    ) if isinstance(endpoint.get("component_ids"), (list, tuple, set)) else [],
+                }
+                for endpoint in group.get("verified_endpoints", [])
+                if isinstance(endpoint, dict)
+            ] if isinstance(group.get("verified_endpoints"), list) else []
+            diagnostic_rows = [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "ip", "label", "status", "reason", "component_id",
+                        "request_attempted",
+                    ) if key in item
+                }
+                for item in group.get("endpoint_diagnostics", [])
+                if isinstance(item, dict)
+            ] if isinstance(group.get("endpoint_diagnostics"), list) else []
+            machine_projection.append({
+                key: group.get(key)
+                for key in (
+                    "alias", "node_id", "primary_ip", "repo_authorized",
+                    "identity_confirmed", "identity_status", "agent_core_status",
+                    "platform_status", "approval_available", "command_selector",
+                    "component_ids", "required_component_ids",
+                    "compatible_component_ids", "blocking_reasons", "conflicting_ips",
+                )
+            } | {
+                "verified_endpoints": sorted(
+                    endpoint_rows,
+                    key=lambda item: (str(item.get("ip", "")), str(item.get("label", ""))),
+                ),
+                "endpoint_diagnostics": sorted(
+                    diagnostic_rows,
+                    key=lambda item: (
+                        str(item.get("ip", "")), str(item.get("status", "")),
+                        str(item.get("component_id", "")), str(item.get("reason", "")),
+                    ),
+                ),
+            })
+        projection_digest = hashlib.sha256(json.dumps({
+            "version": 1,
+            "policy_projection": projection_after,
+            "status": state.get("status"),
+            "components": self._canonical_component_snapshot(components),
+            "deployments": sorted((
+                {
+                    "machine": item.get("machine", ""),
+                    "ip": item.get("ip", ""),
+                    "component_ids": sorted(
+                        cid for cid in item.get("component_ids", [])
+                        if isinstance(cid, str)
+                    ) if isinstance(item.get("component_ids"), list) else [],
+                    "feishu_number": item.get("feishu_number", ""),
+                    "identity_binding": item.get("identity_binding", ""),
+                }
+                for item in state.get("deployments", [])
+                if isinstance(item, dict)
+            ), key=lambda item: (
+                str(item.get("machine", "")), str(item.get("ip", "")),
+                tuple(item.get("component_ids", [])),
+            )),
+            "runtime_checks": sorted((
+                {
+                    key: item.get(key, "")
+                    for key in (
+                        "machine", "ip", "deployment_ip", "component_id",
+                        "runtime_id", "target_image", "observed_image", "status",
+                        "deployment_identity_binding", "identity_reason",
+                    )
+                }
+                for item in state.get("runtime_checks", [])
+                if isinstance(item, dict)
+            ), key=lambda item: (
+                str(item.get("machine", "")), str(item.get("ip", "")),
+                str(item.get("component_id", "")),
+            )),
+            "runtime_redeploy": sorted((
+                {
+                    "machine": item.get("machine", ""),
+                    "ip": item.get("ip", ""),
+                    "deployment_ip": item.get("deployment_ip", ""),
+                    "deployment_identity_binding": item.get(
+                        "deployment_identity_binding", "",
+                    ),
+                    "component_ids": sorted(
+                        cid for cid in item.get("component_ids", [])
+                        if isinstance(cid, str)
+                    ) if isinstance(item.get("component_ids"), list) else [],
+                }
+                for item in state.get("runtime_redeploy", [])
+                if isinstance(item, dict)
+            ), key=lambda item: (
+                str(item.get("machine", "")), str(item.get("ip", "")),
+                tuple(item.get("component_ids", [])),
+            )),
+            "machines": sorted(
+                machine_projection, key=lambda item: str(item.get("alias", "")),
+            ),
+        }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+        projection_marker = (
+            "<!-- deploy-approval-machine-projection:v1:" + projection_digest + " -->"
+        )
+        markdown = re.sub(
+            r"<!-- deploy-approval-machine-projection:v1:[0-9a-f]{64} -->\n?",
+            "", markdown,
+        )
+        history_sentinel = "<!-- deploy-approval-history -->"
+        if history_sentinel in markdown:
+            markdown = markdown.replace(
+                history_sentinel,
+                projection_marker + "\n" + history_sentinel,
+                1,
+            )
+        else:
+            markdown = markdown.rstrip() + "\n\n" + projection_marker
+
+        try:
+            current_comment = await self.proxy.find_trusted_lifecycle_comment(
+                repo, pr_number,
+            )
+        except Exception:
+            return False
+        if (not isinstance(current_comment, dict)
+                or not isinstance(current_comment.get("body"), str)):
+            return False
+        if projection_marker in current_comment["body"]:
+            return True
+
+        async def guard_current_machine_projection() -> bool:
+            if not await self._fresh_review_evidence_matches_state(
+                    repo, pr_number, head_sha, review_evidence,
+                    expected_components=components):
+                return False
+            try:
+                latest_projection = self._machine_projection_version(repo)
+                policy_status = self.policy.repo_policy_status(repo)
+                return (
+                    latest_projection == projection_after
+                    and isinstance(policy_status, dict)
+                    and policy_status.get("authorized") is True
+                    and policy_status.get("machines_configured") is True
+                    and self._machine_adaptation_cache_key(
+                        repo, pr_number, head_sha, round_id_for_state(state),
+                        str(state.get("status", "")), verification_components,
+                        latest_projection,
+                    ) == cache_key
+                )
+            except Exception:
+                return False
+
+        return await self._write_lifecycle_with_history(
+            repo, pr_number, state_before, markdown, event=None,
+            expected_lifecycle_state=state_before,
+            write_guard=guard_current_machine_projection,
+            verified_machine_groups=full_verified_groups,
+        )
 
     _PARSE_ERROR_REASONS = {
         "duplicate_argument": "同一个参数填写了不止一次，请只保留一个值。",
@@ -13127,7 +14158,8 @@ class DeployController:
             "ZERO deploy POST", "MATCH", "MISMATCH", "UNAVAILABLE",
             "Owner：", "Traceback", "Exception", "数据库", "database",
             "/approve_deploy", "/request_deploy", "/request_acceptance",
-            "/record_test", "machine=",
+            "/record_test", "machine=", "参数解析", "解析过程", "错误分类",
+            "严格校验", "按下方命令格式修正后重新提交",
         )
         if raw_message and re.search(r"[\u4e00-\u9fff]", raw_message) \
                 and not any(token in raw_message for token in forbidden):
@@ -13182,7 +14214,7 @@ class DeployController:
         if not lead_text:
             lead_text = "这条命令当前不能执行。"
         if not next_text:
-            next_text = "请按 PR Summary 中当前显示的机器命令操作。"
+            next_text = "请等待 PR Summary 同步后再操作。"
         return f"{lead_text}\n\n{next_text}"
 
     async def _post_command_reply(
@@ -13244,6 +14276,18 @@ class DeployController:
                 repo, pr_number, comment_id, False,
             )
             return False
+        try:
+            labels_before_guidance = await self.proxy.get_issue_labels(repo, pr_number)
+            projection_before_guidance = self._machine_projection_version(repo)
+        except Exception:
+            labels_before_guidance = None
+            projection_before_guidance = ""
+        status_labels_before_guidance = tuple(sorted(
+            label for label in labels_before_guidance
+            if isinstance(label, str)
+            and label.casefold().startswith(STATUS_PREFIX.casefold())
+        )) if isinstance(labels_before_guidance, list) else None
+        state_before_guidance = copy.deepcopy(state)
         has_current_head_state = (
             isinstance(state, dict) and state.get("head_sha") == head
         )
@@ -13254,36 +14298,54 @@ class DeployController:
             # this rejected command to a deterministic event-scoped identity.
             round_id = make_round_id(head, comment_id)
         if error:
-            if topic == "machine-offline-approval-preflight":
-                guidance = await self._lifecycle_next_action_guidance(
-                    repo, pr_number, detail=False,
-                )
-                message = self._format_user_reply(message, guidance)
-            else:
-                try:
-                    origin = await self.proxy.get_comment(repo, comment_id)
-                except Exception:
-                    origin = None
-                source_body = origin.get("body", "") if isinstance(origin, dict) else ""
-                from .commands import parse_command
-                parsed = parse_command(
-                    source_body if isinstance(source_body, str) else "",
-                    comment_id=comment_id,
-                )
-                parse_error = parsed.error or ""
-                reason = self._command_error_reason(
-                    command_kind=parsed.kind if isinstance(parsed.kind, str) else "",
-                    parsed_error=parse_error,
-                    topic=topic,
-                    message=message,
-                )
-                guidance = await self._lifecycle_next_action_guidance(
-                    repo, pr_number, detail=False,
-                )
-                message = self._format_user_reply(self._failure_lead(reason), guidance)
+            try:
+                origin = await self.proxy.get_comment(repo, comment_id)
+            except Exception:
+                origin = None
+            source_body = origin.get("body", "") if isinstance(origin, dict) else ""
+            from .commands import parse_command
+            parsed = parse_command(
+                source_body if isinstance(source_body, str) else "",
+                comment_id=comment_id,
+            )
+            parse_error = parsed.error or ""
+            reason = self._command_error_reason(
+                command_kind=parsed.kind if isinstance(parsed.kind, str) else "",
+                parsed_error=parse_error,
+                topic=topic,
+                message=message,
+            )
+            guidance = await self._lifecycle_next_action_guidance(
+                repo, pr_number, detail=False,
+            )
+            message = self._format_user_reply(self._failure_lead(reason), guidance)
         else:
             guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
             message = self._format_user_reply(message, guidance)
+        try:
+            labels_after_guidance = await self.proxy.get_issue_labels(repo, pr_number)
+            projection_after_guidance = self._machine_projection_version(repo)
+        except Exception:
+            labels_after_guidance = None
+            projection_after_guidance = ""
+        status_labels_after_guidance = tuple(sorted(
+            label for label in labels_after_guidance
+            if isinstance(label, str)
+            and label.casefold().startswith(STATUS_PREFIX.casefold())
+        )) if isinstance(labels_after_guidance, list) else None
+        visible_guidance_commands = self._visible_command_lines(message)
+        if status_labels_before_guidance != status_labels_after_guidance:
+            self._record_command_reply_delivery(repo, pr_number, comment_id, False)
+            return False
+        has_machine_approval_guidance = any(
+            command.startswith("/approve_deploy")
+            for command in visible_guidance_commands
+        )
+        if (has_machine_approval_guidance
+                and (not projection_before_guidance
+                     or projection_before_guidance != projection_after_guidance)):
+            self._record_command_reply_delivery(repo, pr_number, comment_id, False)
+            return False
         if final:
             final_result = result
             if final_result not in {"accepted", "rejected", "uncertain"}:
@@ -13296,7 +14358,16 @@ class DeployController:
                 )
             return await self._post_final_reply(
                 repo, pr_number, comment_id, message, final_result,
-                topic=topic,
+                topic=topic, expected_head=head,
+                expected_state=state_before_guidance,
+                expected_pr_state=pr.get("state") if isinstance(pr, dict) else None,
+                expected_pr_merged=pr.get("merged") if isinstance(pr, dict) else None,
+                expected_pr_draft=pr.get("draft") if isinstance(pr, dict) else None,
+                expected_round_id=round_id,
+                expected_status_labels=status_labels_after_guidance,
+                expected_machine_projection_version=(
+                    projection_after_guidance if has_machine_approval_guidance else ""
+                ),
             )
         try:
             delivered = await self._post_bound_notice(
@@ -13316,6 +14387,12 @@ class DeployController:
     async def _post_final_reply(
         self, repo: str, pr_number: int, comment_id: int, message: str,
         result: str, *, qa: dict | None = None, topic: str = "command-error",
+        expected_head: str = "", expected_state: dict | None = None,
+        expected_pr_state: str | None = None,
+        expected_pr_merged: bool | None = None,
+        expected_pr_draft: bool | None = None,
+        expected_round_id: str = "", expected_status_labels: tuple[str, ...] | None = None,
+        expected_machine_projection_version: str = "",
     ) -> bool:
         """Post a final command reply bound to the source comment with the Codex C contract markers."""
         if (result not in {"accepted", "rejected", "uncertain"}
@@ -13377,6 +14454,51 @@ class DeployController:
         if delivered(comments):
             self._record_command_reply_delivery(repo, pr_number, comment_id, True)
             return True
+        try:
+            final_pr = await self.proxy.get_pr(repo, pr_number)
+            final_state = await self.proxy.read_hidden_state(repo, pr_number)
+            final_labels = await self.proxy.get_issue_labels(repo, pr_number)
+        except Exception as exc:
+            logger.info("final command reply guard unavailable %s#%s reason=%s",
+                        repo, pr_number, type(exc).__name__)
+            return False
+        final_head = (final_pr.get("head") or {}).get("sha", "") \
+            if isinstance(final_pr, dict) else ""
+        final_status_labels = tuple(sorted(
+            label for label in final_labels
+            if isinstance(label, str)
+            and label.casefold().startswith(STATUS_PREFIX.casefold())
+        )) if isinstance(final_labels, list) else None
+        final_round_id = (
+            round_id_for_state(final_state)
+            if isinstance(final_state, dict)
+            and final_state.get("head_sha") == final_head else
+            make_round_id(final_head, comment_id)
+        ) if isinstance(final_head, str) else ""
+        if (not isinstance(final_pr, dict)
+                or final_pr.get("number") != pr_number
+                or final_pr.get("state") != expected_pr_state
+                or final_pr.get("merged") != expected_pr_merged
+                or final_pr.get("draft") != expected_pr_draft
+                or final_head != expected_head
+                or final_state != expected_state
+                or final_round_id != expected_round_id
+                or final_status_labels != expected_status_labels):
+            logger.info("final command reply context changed %s#%s", repo, pr_number)
+            return False
+        if expected_machine_projection_version:
+            try:
+                final_projection = self._machine_projection_version(repo)
+                final_policy_status = self.policy.repo_policy_status(repo)
+            except Exception:
+                return False
+            if (final_projection != expected_machine_projection_version
+                    or not isinstance(final_policy_status, dict)
+                    or final_policy_status.get("authorized") is not True
+                    or final_policy_status.get("machines_configured") is not True):
+                logger.info("final machine command projection changed %s#%s",
+                            repo, pr_number)
+                return False
         body_parts = [comments_mod.BOT_MARKER, "", marker, result_marker, message]
         if isinstance(qa, dict) and qa:
             body_parts.append("<!-- deploy-approval-qa:" + json.dumps(qa, ensure_ascii=False) + " -->")
@@ -13564,12 +14686,26 @@ class DeployController:
          "仓库还没有可用的机器配置，暂时无法生成审批命令；请联系仓库维护者。"),
         ("MACHINE_NOT_AUTHORIZED",
          "机器还没有加入当前仓库的可用机器清单；请联系仓库维护者。"),
+        ("MACHINE_NOT_BOUND",
+         "设备尚未绑定到当前仓库机器策略；请联系仓库维护者确认绑定。"),
+        ("FEISHU_DEVICE_NOT_FOUND",
+         "当前飞书快照中找不到已绑定的设备编号；请检查设备编号。"),
+        ("FEISHU_SNAPSHOT_UNAVAILABLE",
+         "当前飞书设备快照无法确认；请等待设备信息同步后重试。"),
+        ("IP_CONFLICT",
+         "飞书设备 IP 存在冲突，冲突地址不会用于连接或生成命令。"),
+        ("MACHINE_CONFIGURATION_CHANGED",
+         "机器配置在验证期间发生变化，请等待下一轮重新验证。"),
         ("MACHINE_IDENTITY_MISMATCH",
-         "机器登记信息与机器实际身份不一致；请联系仓库维护者核对。"),
+         "机器身份与当前仓库策略不匹配；请联系仓库维护者核对。"),
         ("OWNER_NOT_CONFIGURED",
          "机器还没有可用的负责人账号；请联系仓库维护者配置。"),
         ("AGENT_CORE_CREDENTIAL_MISSING",
-         "机器还没有配置部署访问凭证；请联系仓库维护者处理。"),
+         "Agent Core 凭证尚未配置；请联系仓库维护者处理。"),
+        ("AGENT_CORE_AUTH_FAILED",
+         "Agent Core 鉴权失败；请检查设备凭证配置。"),
+        ("AGENT_CORE_NETWORK_FAILED",
+         "Agent Core 网络连接失败；请检查设备网络后重试。"),
         ("AGENT_CORE_UNAVAILABLE",
          "机器暂时无法连接，请稍后重试。"),
         ("AGENT_CORE_UNKNOWN",
@@ -13584,6 +14720,8 @@ class DeployController:
          "机器不支持本次组件的版本。"),
         ("DRIVER_PATH_MISMATCH",
          "机器不支持本次组件的驱动路径。"),
+        ("COMPONENT_INCOMPATIBLE",
+         "Agent Core 未确认本次组件运行实例，不能为该组件生成命令。"),
         ("PRIMARY_IP_AMBIGUOUS",
          "同一个主 IP 对应了多台机器，暂时无法安全选择。"),
     )
@@ -13639,11 +14777,15 @@ class DeployController:
         self, groups: list[dict], repo: str, *, mention_owners: bool,
         test_only: bool = False, components: list[dict] | None = None,
         show_components: bool = True, pr: dict | None = None,
+        groups_verified: bool = False,
     ) -> list[str]:
         lines: list[str] = []
         seen_endpoint_commands: set[tuple[str, str, tuple[str, ...]]] = set()
-        verified_groups = await self._machine_groups_verify_endpoints(
-            groups if isinstance(groups, list) else [], repo, components,
+        verified_groups = (
+            groups if groups_verified and isinstance(groups, list) else
+            await self._machine_groups_verify_endpoints(
+                groups if isinstance(groups, list) else [], repo, components,
+            )
         )
         for group in verified_groups:
             if (not isinstance(group, dict)
@@ -13682,7 +14824,10 @@ class DeployController:
             ]
             if not verified_endpoints:
                 continue
-            owners = group.get("owners", [])
+            configured_owners = getattr(current_machine, "owners", [])
+            owners = configured_owners if isinstance(
+                configured_owners, (list, tuple, set),
+            ) else []
             valid_owners = sorted({
                 owner.strip() for owner in owners
                 if isinstance(owner, str) and _LOGIN_RE.fullmatch(owner.strip())
@@ -13697,22 +14842,14 @@ class DeployController:
             # Owner reminders belong only to a fresh /request_deploy notice.
             # deploy-ready keeps the machine commands; deploy-requested adds
             # exact @mentions of the configured machine Owners.
-            if test_only:
-                if can_mention_owners and valid_owners:
-                    requester_note = (
-                        "，请机器负责人 " + "、".join(valid_owners) + " 审批"
-                    )
-                elif valid_owners:
-                    requester_note = f"（机器负责人：{' '.join(valid_owners)}）"
-                else:
-                    requester_note = ""
+            if can_mention_owners and valid_owners:
+                requester_note = "，请 " + " ".join(
+                    f"@{owner}" for owner in valid_owners
+                ) + " 审批"
+            elif valid_owners:
+                requester_note = f"（机器负责人：{' '.join(valid_owners)}）"
             else:
-                if can_mention_owners and valid_owners:
-                    requester_note = "，请 " + " ".join(f"@{owner}" for owner in valid_owners) + " 审批"
-                elif valid_owners:
-                    requester_note = f"（机器负责人：{' '.join(valid_owners)}）"
-                else:
-                    requester_note = ""
+                requester_note = ""
             for endpoint in verified_endpoints:
                 endpoint_ip = self._canonical_primary_ipv4(endpoint.get("ip", ""))
                 endpoint_ids = sorted(required_ids.intersection(
@@ -13779,7 +14916,9 @@ class DeployController:
                     )):
                 return "当前提交的审核和构建结果还不能确认，请等 PR Summary 更新。"
             if status in {"testing", "succeeded", "failed"}:
-                drift_commands = await self._runtime_drift_command_lines(state, repo)
+                drift_commands = await self._runtime_drift_command_lines(
+                    state, repo, pr_number=pr_number,
+                )
                 if drift_commands:
                     return "已确认运行镜像需要重新部署，请使用对应机器的审批命令：\n" + "\n".join(
                         f"`{command}`" for command in drift_commands
@@ -13798,7 +14937,9 @@ class DeployController:
                     ])
                 return "机器上已经在运行本次批准的镜像，不需要重新部署。"
             if status == "deploy-requested" and state.get("runtime_redeploy"):
-                drift_commands = await self._runtime_drift_command_lines(state, repo)
+                drift_commands = await self._runtime_drift_command_lines(
+                    state, repo, pr_number=pr_number,
+                )
                 if not drift_commands:
                     unreadable = self._runtime_unreadable_lines(
                         state.get("runtime_checks", []),
@@ -13839,7 +14980,7 @@ class DeployController:
             }
             full_groups = [
                 group for group in groups
-                if required_ids and required_ids.issubset(set(group.get("component_ids", [])))
+                if self._has_verified_endpoint_covering(group, required_ids)
             ]
             if status == "deploy-ready" and len(full_groups) == 1:
                 lines.append("只有一台机器完整适配全部组件，也可以直接执行 `/approve_deploy`。")
@@ -13869,6 +15010,11 @@ class DeployController:
             "请等待 PR Summary 同步后再操作。"
         )
         tick = chr(96)
+        machine_projection_version = ""
+        machine_cache_key = None
+        cache_status = ""
+        cache_components: list[dict] = []
+        verified_guidance_groups: list[dict] = []
 
         def parse_status_labels(labels):
             status_labels = [
@@ -13985,48 +15131,102 @@ class DeployController:
                             expected_components=components,
                         )):
                     return status_sync_conflict
-                deployed_ids = _component_id_set(final_state.get("deployments", []))
-                remaining = [item for item in components
-                             if isinstance(item, dict)
-                             and item.get("component_id") not in deployed_ids]
-                fresh_groups = (
-                    self._runtime_redeploy_machine_groups(
-                        final_state, remaining, repo,
-                    ) if final_state.get("runtime_redeploy") else
-                    self._get_machine_groups_for_components(remaining, repo)
-                )
-                fresh_lines = await self._machine_notice_lines(
-                    fresh_groups, repo,
-                    mention_owners=lifecycle_status == "deploy-requested",
-                    test_only=self._is_test_only_pr(final_pr),
-                    components=remaining,
-                    show_components=(detail and lifecycle_status == "deploy-ready"),
-                    pr=final_pr,
-                )
-                fresh_commands = {
-                    line for line in fresh_lines
-                    if line.startswith(f"{tick}/approve_deploy")
-                }
-                old_commands = {
-                    line for line in command_lines
-                    if line.startswith(f"{tick}/approve_deploy")
-                }
-                if not fresh_commands:
-                    return (
-                        "当前没有通过最新 Policy 和设备身份确认的可执行机器命令。"
-                        "请检查机器配置与 Feishu 设备快照后再操作。"
-                    )
-                if fresh_commands != old_commands or fresh_lines != command_lines:
+                try:
+                    latest_projection = self._machine_projection_version(repo)
+                    latest_policy_status = self.policy.repo_policy_status(repo)
+                except Exception:
+                    return status_unavailable
+                if (latest_projection != machine_projection_version
+                        or not isinstance(latest_policy_status, dict)
+                        or latest_policy_status.get("authorized") is not True
+                        or latest_policy_status.get("machines_configured") is not True):
                     if _retry_count < 1:
                         return await self._lifecycle_next_action_guidance(
                             repo, pr_number, detail=detail,
                             _retry_count=_retry_count + 1,
                         )
+                    return status_unavailable
+                latest_groups = self._cached_machine_adaptation(machine_cache_key)
+                if latest_groups is None or latest_groups != verified_guidance_groups:
+                    return status_unavailable
+                latest_cache_key = self._machine_adaptation_cache_key(
+                    repo, pr_number, final_head, round_id_for_state(final_state),
+                    cache_status, cache_components, latest_projection,
+                )
+                if latest_cache_key != machine_cache_key:
                     return status_sync_conflict
-            if (lifecycle_status == "failed"
-                    and not await self._runtime_drift_command_lines(final_state, repo)):
-                return status_sync_conflict
+            elif lifecycle_status in {
+                    "succeeded", "failed", "testing", "acceptance-required",
+                } \
+                    and machine_projection_version:
+                try:
+                    if self._machine_projection_version(repo) != machine_projection_version:
+                        if _retry_count < 1:
+                            return await self._lifecycle_next_action_guidance(
+                                repo, pr_number, detail=detail,
+                                _retry_count=_retry_count + 1,
+                            )
+                        return status_unavailable
+                    if machine_cache_key is not None:
+                        latest_groups = self._cached_machine_adaptation(machine_cache_key)
+                        if latest_groups is None or latest_groups != verified_guidance_groups:
+                            return status_unavailable
+                        if self._machine_adaptation_cache_key(
+                                repo, pr_number, final_head,
+                                round_id_for_state(final_state), cache_status,
+                                cache_components, machine_projection_version,
+                        ) != machine_cache_key:
+                            return status_sync_conflict
+                except Exception:
+                    return status_unavailable
             return ""
+
+        async def confirmed_runtime_exception_guidance(
+            *, accepted: bool, include_identity: bool = True,
+        ) -> str:
+            """Explain confirmed drift or identity changes using current safe IPs."""
+            nonlocal machine_projection_version
+            drift_checks = self._confirmed_runtime_drift(state)
+            identity_checks = (
+                self._runtime_identity_unconfirmed(state) if include_identity else []
+            )
+            if not drift_checks and not identity_checks:
+                return ""
+            try:
+                machine_projection_version = self._machine_projection_version(repo)
+                commands = list(dict.fromkeys(
+                    await self._runtime_drift_command_lines(
+                        state, repo, pr_number=pr_number,
+                    ),
+                ))
+            except Exception:
+                machine_projection_version = ""
+                commands = []
+
+            accepted_prefix = "验收已通过，但" if accepted else ""
+            if drift_checks:
+                if commands:
+                    return (
+                        f"{accepted_prefix}已确认实际运行镜像与批准镜像不一致，需要重新部署。\n"
+                        "请按当前验证过的机器 IP 直接执行重新审批命令：\n"
+                        + "\n".join(f"`{command}`" for command in commands)
+                        + "\n`/request_deploy` 是可选申请步骤。"
+                    )
+                return (
+                    f"{accepted_prefix}已确认实际运行镜像与批准镜像不一致，需要重新部署，"
+                    "但当前没有可用的重新审批地址。请等待机器恢复或 PR Summary 更新后再操作。"
+                )
+
+            if commands:
+                return (
+                    f"{accepted_prefix}历史部署的设备身份无法确认，需要先按当前授权并验证的地址重新确认。\n"
+                    "可执行的重新确认命令：\n"
+                    + "\n".join(f"`{command}`" for command in commands)
+                )
+            return (
+                f"{accepted_prefix}历史部署的设备身份无法确认，需要重新确认；"
+                "当前没有通过授权和设备验证的可用地址。请等待 PR Summary 更新后再操作。"
+            )
 
         try:
             pr = await self.proxy.get_pr(repo, pr_number)
@@ -14151,34 +15351,81 @@ class DeployController:
                     if isinstance(component, dict)
                     and component.get("component_id") not in deployed_ids
                 ]
+                if lifecycle_status == "deploy-requested" and state.get("runtime_redeploy"):
+                    pending_ids = self._runtime_redeploy_pending_ids(state)
+                    remaining = [component for component in components
+                                 if isinstance(component, dict)
+                                 and component.get("component_id") in pending_ids]
                 if not remaining:
                     return (
                         "GitHub 状态标签要求机器审批，但部署记录显示没有待审批组件；"
                         "状态同步冲突，请等待 PR Summary 更新。"
                     )
 
-                groups = (
-                    self._runtime_redeploy_machine_groups(state, remaining, repo)
-                    if state.get("runtime_redeploy") else
-                    self._get_machine_groups_for_components(remaining, repo)
+                cache_status = lifecycle_status
+                cache_components = list(components) if lifecycle_status == "deploy-ready" else list(remaining)
+                groups_to_verify = (
+                    self._runtime_redeploy_machine_groups(state, cache_components, repo)
+                    if lifecycle_status == "deploy-requested" and state.get("runtime_redeploy") else
+                    self._get_machine_groups_for_components(cache_components, repo)
                 )
-                mention_owners = lifecycle_status == "deploy-requested"
+                try:
+                    machine_projection_version = self._machine_projection_version(repo)
+                except Exception:
+                    return status_unavailable
+                machine_cache_key = self._machine_adaptation_cache_key(
+                    repo, pr_number, head, round_id_for_state(state), cache_status,
+                    cache_components, machine_projection_version,
+                )
+                verified_guidance_groups = self._cached_machine_adaptation(
+                    machine_cache_key,
+                )
+                if verified_guidance_groups is None:
+                    groups_to_verify = self._exclude_unconfirmed_history_endpoints(
+                        groups_to_verify, state, repo,
+                    )
+                    verified_guidance_groups = await self._machine_groups_verify_endpoints(
+                        groups_to_verify, repo, cache_components,
+                    )
+                    try:
+                        if self._machine_projection_version(repo) != machine_projection_version:
+                            return status_unavailable
+                    except Exception:
+                        return status_unavailable
+                    self._remember_machine_adaptation(
+                        machine_cache_key, verified_guidance_groups,
+                    )
+                groups = self._verified_groups_for_components(
+                    verified_guidance_groups, remaining,
+                )
                 command_lines = await self._machine_notice_lines(
-                    groups, repo, mention_owners=mention_owners,
+                    groups, repo, mention_owners=False,
                     test_only=self._is_test_only_pr(latest_pr),
                     components=remaining,
-                    show_components=detail and lifecycle_status == "deploy-ready",
+                    show_components=True,
                     pr=latest_pr,
+                    groups_verified=True,
                 )
                 if not command_lines:
                     if status_conflict:
                         return status_sync_conflict
-                    if not detail:
-                        return (
-                            "当前没有可确认兼容且有权限审批的机器命令。"
-                            "请检查 PR Summary 和机器配置后再操作。"
-                        )
-                    return "\n".join(self._machine_blocking_summary(groups))
+                    blockers = self._machine_blocking_summary(groups)
+                    if blockers:
+                        guidance = "\n".join(blockers)
+                        confirmation = await confirm_machine_guidance()
+                        return confirmation or guidance
+                    try:
+                        repo_status = self.policy.repo_policy_status(repo)
+                    except Exception:
+                        repo_status = None
+                    if isinstance(repo_status, dict) and repo_status.get("authorized") is not True:
+                        guidance = "当前仓库的机器授权不可用，暂时不能生成审批命令。"
+                    elif isinstance(repo_status, dict) and repo_status.get("machines_configured") is not True:
+                        guidance = "当前仓库没有可用的授权机器配置，暂时不能生成审批命令。"
+                    else:
+                        guidance = "当前仓库没有绑定并验证通过的可用机器，暂时不能生成审批命令。"
+                    confirmation = await confirm_machine_guidance()
+                    return confirmation or guidance
 
                 commands_only = [
                     line for line in command_lines
@@ -14194,9 +15441,7 @@ class DeployController:
                     }
                     full_groups = [
                         group for group in groups
-                        if group.get("approval_available") is True
-                        and remaining_ids
-                        and remaining_ids.issubset(set(group.get("component_ids", [])))
+                        if self._has_verified_endpoint_covering(group, remaining_ids)
                     ]
                     lines = ["请按目标机器执行对应审批命令：", *command_lines]
                     if len(full_groups) == 1:
@@ -14234,8 +15479,12 @@ class DeployController:
                     and component.get("component_id")
                 } if isinstance(components, list) else set()
                 deployed_ids = _component_id_set(state.get("deployments", []))
+                mismatch_checks = [
+                    check for check in self._confirmed_runtime_drift(state)
+                    if check.get("component_id") in required_ids
+                ]
                 if (not required_ids or not required_ids.issubset(deployed_ids)
-                        or state.get("runtime_redeploy")
+                        or (bool(state.get("runtime_redeploy")) and not mismatch_checks)
                         or state.get("test_result") in {"pass", "fail"}):
                     logger.error(
                         "SECURITY testing status label is unsupported by deployment data "
@@ -14243,6 +15492,61 @@ class DeployController:
                         repo, pr_number, head, label_status,
                     )
                     return status_sync_conflict
+                if mismatch_checks:
+                    try:
+                        machine_projection_version = self._machine_projection_version(repo)
+                        drift_commands = list(dict.fromkeys(
+                            await self._runtime_drift_command_lines(
+                                state, repo, pr_number=pr_number,
+                            ),
+                        ))
+                    except Exception:
+                        machine_projection_version = ""
+                        drift_commands = []
+                    component_map = {
+                        component.get("component_id"): component
+                        for component in components
+                        if isinstance(component, dict)
+                    }
+                    mismatch_details = []
+                    for check in mismatch_checks:
+                        component_id = str(check.get("component_id", "") or "")
+                        component = component_map.get(component_id, {})
+                        component_label = str(
+                            component.get("target") or component.get("driver_path")
+                            or component_id or "组件",
+                        )
+                        machine_alias = str(check.get("machine", "") or "机器")
+                        machine_ip = str(check.get("ip", "") or "当前地址未确认")
+                        target_image = str(check.get("target_image", "") or "未取得")
+                        observed_image = str(check.get("observed_image", "") or "未读取")
+                        mismatch_details.append(
+                            f"- `{comments_mod._escape(machine_alias)}`（"
+                            f"{comments_mod._escape(machine_ip)}），"
+                            f"{comments_mod._escape(component_label)}：批准镜像 "
+                            f"`{comments_mod._escape(target_image)}`；实际运行镜像 "
+                            f"`{comments_mod._escape(observed_image)}`。"
+                        )
+                    detail_text = "\n".join(dict.fromkeys(mismatch_details))
+                    if drift_commands:
+                        guidance = (
+                            "已确认实际运行镜像与本轮批准镜像不一致，需要重新部署。\n"
+                            f"{detail_text}\n"
+                            "可以直接按当前验证过的机器 IP 执行重新审批命令：\n"
+                            + "\n".join(
+                                f"{tick}{command}{tick}" for command in drift_commands
+                            )
+                            + f"\n{tick}/request_deploy{tick} 是可选申请步骤。"
+                        )
+                    else:
+                        guidance = (
+                            "已确认实际运行镜像与本轮批准镜像不一致，但当前没有通过仓库授权、"
+                            "设备身份和 Agent Core 验证的可用机器 IP，暂时不能生成重新审批命令。\n"
+                            f"{detail_text}\n"
+                            "请等待机器恢复或 PR Summary 更新后再操作。"
+                        )
+                    confirmation = await confirm_machine_guidance()
+                    return confirmation or guidance
                 upload_url = ""
                 command = state.get("command", {})
                 approval_comment_id = (
@@ -14283,6 +15587,12 @@ class DeployController:
                         repo, pr_number, head, label_status,
                     )
                     return status_sync_conflict
+                runtime_guidance = await confirmed_runtime_exception_guidance(
+                    accepted=False, include_identity=False,
+                )
+                if runtime_guidance:
+                    confirmation = await confirm_machine_guidance()
+                    return confirmation or runtime_guidance
                 try:
                     _configured, reviewers = self._eligible_acceptance_reviewers(
                         repo, latest_pr,
@@ -14291,13 +15601,13 @@ class DeployController:
                     reviewers = []
                 reviewer_text = (
                     "有权限验收的 GitHub 账号："
-                    + "、".join(f"@{reviewer}" for reviewer in reviewers) + "。"
+                    + "、".join(reviewers) + "。"
                     if reviewers else
                     "当前仓库还没有可用的验收账号，请联系仓库维护者配置。"
                 )
                 guidance = (
-                    f"{reviewer_text}验收人检查本轮测试结果后执行 "
-                    f"{tick}/record_test result=pass{tick} 或 "
+                    f"{reviewer_text}验收通过后执行 "
+                    f"{tick}/record_test result=pass{tick}；验收未通过后执行 "
                     f"{tick}/record_test result=fail{tick}。"
                 )
                 confirmation = await confirm_machine_guidance()
@@ -14321,7 +15631,14 @@ class DeployController:
                         repo, pr_number, head, label_status,
                     )
                     return status_sync_conflict
-                return "验收已经通过，可以按照仓库流程合并 PR。"
+                runtime_guidance = await confirmed_runtime_exception_guidance(
+                    accepted=True,
+                )
+                if runtime_guidance:
+                    confirmation = await confirm_machine_guidance()
+                    return confirmation or runtime_guidance
+                confirmation = await confirm_machine_guidance()
+                return confirmation or "验收已经通过，可以按照仓库流程合并 PR。"
 
             if lifecycle_status == "failed":
                 failure_detail = ""
@@ -14373,38 +15690,140 @@ class DeployController:
                         f"本轮验收未通过：{failure_detail}。" if failure_detail
                         else "本轮验收未通过。"
                     )
-                    return (
+                    guidance = (
                         f"{reason_text}请按失败信息修复问题并更新 PR；"
                         "新提交需要重新审核和构建，之后按新的 PR Summary 重新部署和测试。"
                     )
+                    confirmation = await confirm_machine_guidance()
+                    return confirmation or guidance
 
                 try:
+                    machine_projection_version = self._machine_projection_version(repo)
                     commands = list(dict.fromkeys(
-                        await self._runtime_drift_command_lines(state, repo),
+                        await self._runtime_drift_command_lines(
+                            state, repo, pr_number=pr_number,
+                        ),
                     ))
                 except Exception:
                     commands = []
+                    machine_projection_version = ""
+                retry_components = [
+                    component for component in state.get("components", [])
+                    if isinstance(component, dict)
+                    and component.get("component_id") not in
+                    _component_id_set(state.get("deployments", []))
+                ]
+                retry_groups: list[dict] = []
+                retry_lines: list[str] = []
+                if retry_components:
+                    try:
+                        retry_projection = self._machine_projection_version(repo)
+                        retry_key = self._machine_adaptation_cache_key(
+                            repo, pr_number, head, round_id_for_state(state),
+                            "failed-retry", retry_components, retry_projection,
+                        )
+                        cached_retry_groups = self._cached_machine_adaptation(retry_key)
+                        retry_groups = cached_retry_groups or []
+                        if cached_retry_groups is None:
+                            projection_groups = self._cached_machine_projection_for_state(
+                                repo, pr_number, state, retry_projection,
+                            )
+                            if projection_groups is not None:
+                                retry_groups = self._verified_groups_for_components(
+                                    projection_groups, retry_components,
+                                )
+                            else:
+                                candidates = self._exclude_unconfirmed_history_endpoints(
+                                    self._get_machine_groups_for_components(
+                                        retry_components, repo,
+                                    ), state, repo,
+                                )
+                                retry_groups = await self._machine_groups_verify_endpoints(
+                                    candidates, repo, retry_components,
+                                )
+                                if self._machine_projection_version(repo) != retry_projection:
+                                    return status_unavailable
+                            self._remember_machine_adaptation(retry_key, retry_groups)
+                        machine_cache_key = retry_key
+                        cache_status = "failed-retry"
+                        cache_components = list(retry_components)
+                        verified_guidance_groups = retry_groups
+                        retry_lines = await self._machine_notice_lines(
+                            retry_groups, repo, mention_owners=False,
+                            test_only=self._is_test_only_pr(latest_pr),
+                            components=retry_components, show_components=True,
+                            pr=latest_pr, groups_verified=True,
+                        )
+                    except Exception:
+                        retry_groups = []
+                        retry_lines = []
+                combined_commands = list(dict.fromkeys([
+                    *commands,
+                    *(match.group(1) for line in retry_lines
+                      if (match := re.fullmatch(
+                          r"`(/approve_deploy machine=[0-9.]+)`", line,
+                      ))),
+                ]))
                 reason_text = (
                     f"本轮部署失败：{failure_detail}。" if failure_detail
                     else "本轮部署失败。"
                 )
-                if commands:
+                if combined_commands:
                     if status_conflict and not failure_detail:
                         return status_sync_conflict
                     machine_guidance = (
                         f"{reason_text}请先按失败信息修复并确认机器可以正常读取，"
                         "然后由对应机器负责人执行以下重新部署审批命令：\n"
-                        + "\n".join(f"- {tick}{command}{tick}" for command in commands)
+                        + "\n".join(f"- {tick}{command}{tick}" for command in combined_commands)
                         + f"\n{tick}/request_deploy{tick} 是可选步骤。"
                     )
                     confirmation = await confirm_machine_guidance()
                     return confirmation or machine_guidance
                 if status_conflict and not failure_detail:
                     return status_sync_conflict
+                retry_blockers = "\n".join(self._machine_blocking_summary(retry_groups))
+                if not retry_blockers:
+                    try:
+                        all_components = [item for item in state.get("components", [])
+                                          if isinstance(item, dict)]
+                        blocked_ips = self._historical_ips_not_bound_to_current_identity(
+                            state, repo,
+                        )
+                        history_scope = hashlib.sha256(json.dumps(
+                            sorted(blocked_ips), separators=(",", ":"),
+                        ).encode("utf-8")).hexdigest()
+                        projection_key = self._machine_adaptation_cache_key(
+                            repo, pr_number, head, round_id_for_state(state),
+                            "machine-projection:" + history_scope, all_components,
+                            machine_projection_version,
+                        )
+                        projected_groups = self._cached_machine_adaptation(projection_key)
+                        if projected_groups is not None:
+                            retry_blockers = "\n".join(self._machine_blocking_summary(
+                                self._verified_groups_for_components(
+                                    projected_groups, all_components,
+                                ),
+                            ))
+                    except Exception:
+                        retry_blockers = ""
+                if not retry_blockers:
+                    try:
+                        retry_policy_status = self.policy.repo_policy_status(repo)
+                    except Exception:
+                        retry_policy_status = None
+                    if (isinstance(retry_policy_status, dict)
+                            and retry_policy_status.get("authorized") is not True):
+                        retry_blockers = "当前仓库的机器授权不可用，暂时不能生成审批命令。"
+                    elif (isinstance(retry_policy_status, dict)
+                          and retry_policy_status.get("machines_configured") is not True):
+                        retry_blockers = "当前仓库没有可用的授权机器配置，暂时不能生成审批命令。"
+                    else:
+                        retry_blockers = (
+                            "当前没有通过机器授权、飞书身份和 Agent Core 运行检查的可用机器。"
+                        )
                 guidance = (
                     f"{reason_text}请先按失败信息修复并确认机器可以正常读取，"
-                    "然后按 PR Summary 中当前可用的机器命令重新审批；"
-                    f"{tick}/request_deploy{tick} 是可选步骤。"
+                    + retry_blockers
                 )
                 confirmation = await confirm_machine_guidance()
                 return confirmation or guidance
@@ -14540,20 +15959,20 @@ class DeployController:
         self, repo: str, pr_number: int, message: str, *, comment_id: int = 0,
     ) -> None:
         """Post a unified failure reply for a command that did not execute."""
-        reason = self._command_error_reason(message=message)
-        guidance = await self._lifecycle_next_action_guidance(
-            repo, pr_number, detail=False,
-        )
-        body_text = self._format_user_reply(self._failure_lead(reason), guidance)
         if comment_id:
-            topic = "command-error-" + hashlib.sha256(
-                body_text.encode("utf-8"),
-            ).hexdigest()[:12]
             await self._post_command_reply(
-                repo, pr_number, comment_id, message, topic=topic, error=True,
+                repo, pr_number, comment_id, message,
+                topic="command-error", error=True,
             )
         else:
             try:
+                reason = self._command_error_reason(message=message)
+                guidance = await self._lifecycle_next_action_guidance(
+                    repo, pr_number, detail=False,
+                )
+                body_text = self._format_user_reply(
+                    self._failure_lead(reason), guidance,
+                )
                 await self._post_bound_plain_notice(repo, pr_number, body_text)
             except GitHubError as e:
                 logger.warning("post error comment %s#%s: %s", repo, pr_number, e)
@@ -14612,9 +16031,12 @@ class DeployController:
     @staticmethod
     def _runtime_check_record(
         machine: str, ip_value: str, component: dict, runtime_id: str,
-        observed_image: str, status: str, checked_at: str,
+        observed_image: str, status: str, checked_at: str, *,
+        deployment_ip: str | None = None,
+        deployment_identity_binding: str = "",
+        identity_reason: str = "",
     ) -> dict:
-        return {
+        record = {
             "machine": machine,
             "ip": ip_value,
             "component_id": component.get("component_id", ""),
@@ -14624,6 +16046,13 @@ class DeployController:
             "status": status,
             "checked_at": checked_at,
         }
+        if deployment_ip and deployment_ip != ip_value:
+            record["deployment_ip"] = deployment_ip
+        if deployment_identity_binding:
+            record["deployment_identity_binding"] = deployment_identity_binding
+        if identity_reason:
+            record["identity_reason"] = identity_reason
+        return record
 
     @staticmethod
     def _runtime_observed_image_for_display(
@@ -14659,18 +16088,39 @@ class DeployController:
         return [check for check in checks if isinstance(check, dict)
                 and check.get("status") == "mismatch"]
 
+    @staticmethod
+    def _runtime_identity_unconfirmed(state: dict) -> list[dict]:
+        checks = state.get("runtime_checks", []) if isinstance(state, dict) else []
+        return [check for check in checks if isinstance(check, dict)
+                and check.get("status") == "identity_changed"]
+
     def _new_runtime_redeploy_round(
         self, state: dict, *, comment_id: int, command_kind: str,
         actor: str = "", machine: str = "",
+        reconfirmation_checks: list[dict] | None = None,
     ) -> dict:
         """Start a fresh round without dropping unresolved machine/component bindings."""
         drift_checks = self._confirmed_runtime_drift(state)
-        if not drift_checks:
+        reconfirmation_checks = [
+            check for check in (reconfirmation_checks or [])
+            if isinstance(check, dict)
+            and check.get("status") == "identity_changed"
+            and check.get("identity_reason") in {
+                "identity_unrecorded", "device_changed", "snapshot_unavailable",
+                "historical_ip_reassigned", "address_changed",
+                "deployment_ip_unrecorded",
+            }
+        ]
+        if not drift_checks and not reconfirmation_checks:
             raise DeployControllerError("no confirmed runtime image drift is available")
 
         # Keep unresolved bindings from the prior round. A new mismatch on B
         # must not erase A's work just because A's latest probe is unavailable.
-        pending_bindings: set[tuple[str, str, str]] = set()
+        pending_bindings: set[tuple[str, str, str, str, str]] = set()
+        reconfirmation_ids = {
+            (check.get("machine"), check.get("component_id"))
+            for check in reconfirmation_checks
+        }
         old_pending = state.get("runtime_redeploy", [])
         if not isinstance(old_pending, list):
             raise DeployControllerError("runtime redeploy bindings are invalid")
@@ -14687,48 +16137,68 @@ class DeployController:
             for component_id in component_ids:
                 if not isinstance(component_id, str) or not component_id:
                     raise DeployControllerError("runtime redeploy component binding is invalid")
-                pending_bindings.add((alias, ip_value, component_id))
+                if (alias, component_id) in reconfirmation_ids:
+                    continue
+                deployment_ip = item.get("deployment_ip", ip_value)
+                if (not isinstance(deployment_ip, str)
+                        or self._canonical_primary_ipv4(deployment_ip) != deployment_ip):
+                    raise DeployControllerError("runtime redeploy history IP is invalid")
+                identity_binding = item.get("deployment_identity_binding", "")
+                if identity_binding and not re.fullmatch(r"[0-9a-f]{64}", identity_binding):
+                    raise DeployControllerError("runtime redeploy identity binding is invalid")
+                pending_bindings.add((
+                    alias, ip_value, deployment_ip, identity_binding, component_id,
+                ))
 
-        mismatch_bindings: set[tuple[str, str, str]] = set()
+        mismatch_bindings: set[tuple[str, str, str, str, str]] = set()
         for check in drift_checks:
             alias = check.get("machine", "")
             ip_value = check.get("ip", "")
             component_id = check.get("component_id", "")
+            deployment_ip = check.get("deployment_ip", ip_value)
             if (not all(isinstance(value, str) and value
                         for value in (alias, ip_value, component_id))
-                    or self._canonical_primary_ipv4(ip_value) != ip_value):
+                    or self._canonical_primary_ipv4(ip_value) != ip_value
+                    or not isinstance(deployment_ip, str)
+                    or self._canonical_primary_ipv4(deployment_ip) != deployment_ip):
                 continue
-            mismatch_bindings.add((alias, ip_value, component_id))
+            identity_binding = check.get("deployment_identity_binding", "")
+            if identity_binding and not re.fullmatch(r"[0-9a-f]{64}", identity_binding):
+                continue
+            mismatch_bindings.add((
+                alias, ip_value, deployment_ip, identity_binding, component_id,
+            ))
         if not mismatch_bindings:
-            raise DeployControllerError("confirmed runtime drift has no trusted machine binding")
+            if not reconfirmation_checks:
+                raise DeployControllerError("confirmed runtime drift has no trusted machine binding")
+        for check in reconfirmation_checks:
+            alias = check.get("machine", "")
+            ip_value = check.get("ip", "")
+            component_id = check.get("component_id", "")
+            deployment_ip = check.get("deployment_ip", ip_value)
+            identity_binding = check.get("deployment_identity_binding", "")
+            if (not all(isinstance(value, str) and value
+                        for value in (alias, ip_value, component_id, deployment_ip))
+                    or self._canonical_primary_ipv4(ip_value) != ip_value
+                    or self._canonical_primary_ipv4(deployment_ip) != deployment_ip
+                    or identity_binding and not re.fullmatch(r"[0-9a-f]{64}", identity_binding)):
+                continue
+            pending_bindings.add((
+                alias, ip_value, deployment_ip, identity_binding, component_id,
+            ))
 
         all_pending_bindings = pending_bindings | mismatch_bindings
-        grouped: dict[tuple[str, str], list[str]] = {}
-        seen_bindings: set[tuple[str, str, str]] = set()
-        for alias, ip_value, component_id in sorted(all_pending_bindings):
-            binding = (alias, ip_value, component_id)
+        grouped: dict[tuple[str, str, str, str], list[str]] = {}
+        seen_bindings: set[tuple[str, str, str, str, str]] = set()
+        for alias, ip_value, deployment_ip, identity_binding, component_id in sorted(
+                all_pending_bindings):
+            binding = (alias, ip_value, deployment_ip, identity_binding, component_id)
             if binding in seen_bindings:
                 continue
             seen_bindings.add(binding)
-            grouped.setdefault((alias, ip_value), []).append(component_id)
-
-        preserved_deployments = []
-        for deployment in state.get("deployments", []):
-            if not isinstance(deployment, dict):
-                continue
-            deployment_machine = deployment.get("machine", "")
-            deployment_ip = self._canonical_primary_ipv4(
-                deployment.get("ip", ""),
-            )
-            kept_ids = [
-                component_id for component_id in deployment.get("component_ids", [])
-                if (deployment_machine, deployment_ip, component_id)
-                not in mismatch_bindings
-            ]
-            if kept_ids:
-                preserved = dict(deployment)
-                preserved["component_ids"] = kept_ids
-                preserved_deployments.append(preserved)
+            grouped.setdefault(
+                (alias, ip_value, deployment_ip, identity_binding), [],
+            ).append(component_id)
 
         deployment_request_submitted = (
             command_kind == "request_deploy"
@@ -14739,15 +16209,21 @@ class DeployController:
             status=("deploy-requested" if deployment_request_submitted else "deploy-ready"),
             review_evidence=state.get("review_evidence", {}),
             components=state.get("components", []),
-            deployments=preserved_deployments,
+            deployments=copy.deepcopy(state.get("deployments", [])),
         )
         new_state["round_id"] = make_round_id(state["head_sha"], comment_id)
         new_state["round_started_at"] = utc_now()
         new_state["round_archive"] = state.get("round_archive")
         new_state["runtime_checks"] = copy.deepcopy(state.get("runtime_checks", []))
         new_state["runtime_redeploy"] = [
-            {"machine": alias, "ip": ip_value, "component_ids": component_ids}
-            for (alias, ip_value), component_ids in grouped.items()
+            {"machine": alias, "ip": ip_value,
+             "component_ids": component_ids,
+             **({"deployment_ip": deployment_ip}
+                if deployment_ip != ip_value else {}),
+             **({"deployment_identity_binding": identity_binding}
+                if identity_binding else {})}
+            for (alias, ip_value, deployment_ip, identity_binding), component_ids
+            in grouped.items()
         ]
         args = {}
         if actor:
@@ -14776,6 +16252,18 @@ class DeployController:
         return result
 
     @staticmethod
+    def _runtime_redeploy_ids_for_alias(
+        state: dict, machine_alias: str,
+    ) -> set[str]:
+        return {
+            component_id
+            for item in state.get("runtime_redeploy", []) if isinstance(item, dict)
+            and item.get("machine") == machine_alias
+            for component_id in item.get("component_ids", [])
+            if isinstance(component_id, str)
+        }
+
+    @staticmethod
     def _runtime_redeploy_pending_ids(state: dict) -> set[str]:
         return {
             component_id
@@ -14801,6 +16289,7 @@ class DeployController:
         check_map = {self._runtime_check_key(item): item for item in checks}
         deployed_ids = _component_id_set(deployed_rows)
         deployed_ips_by_component: dict[str, set[str]] = {}
+        deployment_identity_by_binding: dict[tuple[str, str, str], str] = {}
         for row in deployed_rows:
             if not isinstance(row, dict):
                 continue
@@ -14810,6 +16299,9 @@ class DeployController:
             for component_id in row.get("component_ids", []):
                 if isinstance(component_id, str):
                     deployed_ips_by_component.setdefault(component_id, set()).add(row_ip)
+                    deployment_identity_by_binding[(machine.alias, row_ip, component_id)] = str(
+                        row.get("identity_binding", "") or "",
+                    )
         checked_at = utc_now()
         for component_id in deployed_ids:
             component = component_map.get(component_id)
@@ -14833,32 +16325,73 @@ class DeployController:
             if not runtime_id:
                 continue
             for deployed_ip in deployed_ips_by_component.get(component_id, set()):
+                runtime_ip = self._canonical_primary_ipv4(
+                    health_item.get("ip", deployed_ip),
+                ) or deployed_ip
                 check = self._runtime_check_record(
-                    machine.alias, deployed_ip, component, runtime_id,
-                    observed, "match", checked_at,
+                    machine.alias, runtime_ip, component, runtime_id,
+                    observed, "match", checked_at, deployment_ip=deployed_ip,
+                    deployment_identity_binding=deployment_identity_by_binding.get(
+                        (machine.alias, deployed_ip, component_id), "",
+                    ),
                 )
+                for old_key, old_check in list(check_map.items()):
+                    if (old_check.get("machine") == machine.alias
+                            and old_check.get("component_id") == component_id):
+                        check_map.pop(old_key, None)
                 check_map[self._runtime_check_key(check)] = check
         state["runtime_checks"] = list(check_map.values())[-32:]
         remaining = []
         for item in state.get("runtime_redeploy", []):
             if not isinstance(item, dict):
                 continue
-            item_ip = self._canonical_primary_ipv4(item.get("ip", ""))
             if item.get("machine") != machine.alias:
                 remaining.append(item)
                 continue
             remaining_ids = [component_id for component_id in item.get("component_ids", [])
-                             if not (component_id in deployed_ids
-                                     and item_ip in deployed_ips_by_component.get(
-                                         component_id, set(),
-                                     ))]
+                             if component_id not in deployed_ids]
             if remaining_ids:
                 remaining.append({
                     "machine": item["machine"], "ip": item["ip"],
                     "component_ids": remaining_ids,
+                    **({"deployment_ip": item["deployment_ip"]}
+                       if isinstance(item.get("deployment_ip"), str) else {}),
+                    **({"deployment_identity_binding": item["deployment_identity_binding"]}
+                       if isinstance(item.get("deployment_identity_binding"), str)
+                       and item.get("deployment_identity_binding") else {}),
                 })
         if state.get("runtime_redeploy") is not None:
             state["runtime_redeploy"] = remaining
+
+    @staticmethod
+    def _merge_deployment_rows(existing: list[dict], new_rows: list[dict]) -> list[dict]:
+        """Append actual deployments without rewriting earlier endpoint facts."""
+        result = [copy.deepcopy(item) for item in existing if isinstance(item, dict)]
+        seen = set()
+        for row in result:
+            for component_id in row.get("component_ids", []):
+                if isinstance(component_id, str):
+                    seen.add((
+                        row.get("machine", ""), row.get("ip", ""), component_id,
+                        row.get("feishu_number", ""), row.get("identity_binding", ""),
+                    ))
+        for row in new_rows:
+            if not isinstance(row, dict):
+                continue
+            pending_ids = []
+            for component_id in row.get("component_ids", []):
+                if not isinstance(component_id, str):
+                    continue
+                key = (
+                    row.get("machine", ""), row.get("ip", ""), component_id,
+                    row.get("feishu_number", ""), row.get("identity_binding", ""),
+                )
+                if key not in seen:
+                    seen.add(key)
+                    pending_ids.append(component_id)
+            if pending_ids:
+                result.append({**copy.deepcopy(row), "component_ids": pending_ids})
+        return result
 
     def _mark_runtime_checks_unavailable(
         self, state: dict, machine, components: list[dict], *,
@@ -14880,9 +16413,35 @@ class DeployController:
                 continue
             runtime_id = str(component.get("runtime_id", "") or
                              ("core" if component.get("target") == "core" else "unresolved"))
+            component_id = component.get("component_id", "")
+            pending = next((item for item in state.get("runtime_redeploy", [])
+                            if isinstance(item, dict)
+                            and item.get("machine") == machine.alias
+                            and item.get("ip") == machine_ip
+                            and component_id in item.get("component_ids", [])), None)
+            deployment = next((item for item in reversed(state.get("deployments", []))
+                               if isinstance(item, dict)
+                               and item.get("machine") == machine.alias
+                               and component_id in item.get("component_ids", [])), None)
+            deployment_ip = (
+                pending.get("deployment_ip", deployment.get("ip", machine_ip))
+                if isinstance(pending, dict) and isinstance(deployment, dict)
+                else pending.get("deployment_ip", machine_ip)
+                if isinstance(pending, dict)
+                else deployment.get("ip", machine_ip)
+                if isinstance(deployment, dict) else machine_ip
+            )
+            identity_binding = (
+                pending.get("deployment_identity_binding", "")
+                if isinstance(pending, dict)
+                else deployment.get("identity_binding", "")
+                if isinstance(deployment, dict) else ""
+            )
             record = self._runtime_check_record(
                 machine.alias, machine_ip, component, runtime_id, "",
                 status, checked_at,
+                deployment_ip=deployment_ip,
+                deployment_identity_binding=identity_binding,
             )
             check_map[self._runtime_check_key(record)] = record
         state["runtime_checks"] = list(check_map.values())[-32:]
@@ -14914,59 +16473,138 @@ class DeployController:
         )
 
     async def _runtime_drift_command_lines(
-        self, state: dict, repo: str | None = None,
+        self, state: dict, repo: str | None = None, *, pr_number: int = 0,
     ) -> list[str]:
         if not isinstance(repo, str) or not repo:
             return []
-        lines = []
-        seen = set()
-        drift_checks = self._confirmed_runtime_drift(state)
         component_map = {
             item.get("component_id"): item for item in state.get("components", [])
             if isinstance(item, dict) and isinstance(item.get("component_id"), str)
         }
-        ids_by_machine: dict[tuple[str, str], set[str]] = {}
-        for check in drift_checks:
-            alias = check.get("machine", "")
-            node_host = self._canonical_primary_ipv4(check.get("ip", ""))
-            component_id = check.get("component_id", "")
-            if (isinstance(alias, str) and alias and node_host
-                    and isinstance(component_id, str) and component_id):
-                ids_by_machine.setdefault((alias, node_host), set()).add(component_id)
-        for (alias, ip_value), component_ids in ids_by_machine.items():
-            components = [component_map[item] for item in component_ids
-                          if item in component_map]
-            if len(components) != len(component_ids):
+        ids_by_alias: dict[str, set[str]] = {}
+        for binding in state.get("runtime_redeploy", []) if isinstance(state, dict) else []:
+            if not isinstance(binding, dict):
                 continue
-            candidates = self._get_machine_groups_for_components(components, repo)
-            group = next((item for item in candidates
-                          if item.get("alias") == alias
-                          and item.get("approval_available") is True
-                          and component_ids.issubset(set(item.get("component_ids", [])))), None)
-            if group is None:
+            alias = binding.get("machine")
+            if not isinstance(alias, str) or not alias:
                 continue
-            try:
-                machine = self.policy.get_machine(alias, repo=repo)
-            except Exception:
-                machine = None
-            if (machine is None
-                    or ip_value not in {
-                        item["ip"] for item in self._policy_machine_endpoints(machine, repo)
-                    }
-                    or not self._endpoint_allowed_for_repository(
-                        repo, machine, ip_value, components=components,
-                    )):
-                continue
-            verified = await self._agent_core_verified_endpoints(
-                repo, machine, components, endpoints=[ip_value],
+            ids_by_alias.setdefault(alias, set()).update(
+                component_id for component_id in binding.get("component_ids", [])
+                if isinstance(component_id, str) and component_id in component_map
             )
-            if not any(component_ids.issubset(set(item.get("component_ids", [])))
-                       for item in verified):
+        for check in (
+                self._confirmed_runtime_drift(state)
+                + self._runtime_identity_unconfirmed(state)):
+            alias = check.get("machine")
+            component_id = check.get("component_id")
+            if (isinstance(alias, str) and alias
+                    and isinstance(component_id, str) and component_id in component_map):
+                ids_by_alias.setdefault(alias, set()).add(component_id)
+        if not ids_by_alias:
+            return []
+
+        selected_ids = set().union(*ids_by_alias.values())
+        components = [component_map[item] for item in sorted(selected_ids)
+                      if item in component_map]
+        if len(components) != len(selected_ids):
+            return []
+        scope_digest = hashlib.sha256(json.dumps(
+            [(alias, sorted(component_ids))
+             for alias, component_ids in sorted(ids_by_alias.items())],
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        try:
+            projection_version = self._machine_projection_version(repo)
+            cache_key = self._machine_adaptation_cache_key(
+                repo, pr_number,
+                str(state.get("head_sha", "") or ""),
+                round_id_for_state(state), "runtime-drift:" + scope_digest,
+                components, projection_version,
+            )
+        except Exception:
+            return []
+        verified_groups = self._cached_machine_adaptation(cache_key)
+        if verified_groups is None:
+            projection_groups = self._cached_machine_projection_for_state(
+                repo, pr_number, state, projection_version,
+            )
+            if projection_groups is not None:
+                verified_groups = []
+                for alias, component_ids in sorted(ids_by_alias.items()):
+                    matches = [group for group in projection_groups
+                               if isinstance(group, dict)
+                               and group.get("alias") == alias]
+                    if len(matches) == 1:
+                        selected_components = [component_map[item]
+                                               for item in sorted(component_ids)]
+                        verified_groups.extend(self._verified_groups_for_components(
+                            [matches[0]], selected_components,
+                        ))
+            else:
+                candidates = []
+                for alias, component_ids in sorted(ids_by_alias.items()):
+                    selected_components = [component_map[item]
+                                           for item in sorted(component_ids)]
+                    matches = [group for group in self._get_machine_groups_for_components(
+                        selected_components, repo,
+                    ) if isinstance(group, dict) and group.get("alias") == alias]
+                    if len(matches) != 1:
+                        continue
+                    candidate = copy.deepcopy(matches[0])
+                    compatible_ids = set(candidate.get("compatible_component_ids", []))
+                    required_ids = component_ids.intersection(compatible_ids)
+                    if not required_ids:
+                        continue
+                    candidate["component_ids"] = sorted(required_ids)
+                    candidate["required_component_ids"] = sorted(required_ids)
+                    candidates.append(candidate)
+                candidates = self._exclude_unconfirmed_history_endpoints(
+                    candidates, state, repo,
+                )
+                verified_groups = await self._machine_groups_verify_endpoints(
+                    candidates, repo, components,
+                )
+            try:
+                if self._machine_projection_version(repo) != projection_version:
+                    return []
+            except Exception:
+                return []
+            self._remember_machine_adaptation(cache_key, verified_groups)
+        else:
+            try:
+                if self._machine_projection_version(repo) != projection_version:
+                    return []
+            except Exception:
+                return []
+
+        lines = []
+        seen = set()
+        groups_by_alias: dict[str, list[dict]] = {}
+        for group in verified_groups:
+            if isinstance(group, dict) and isinstance(group.get("alias"), str):
+                groups_by_alias.setdefault(group["alias"], []).append(group)
+        for alias, component_ids in sorted(ids_by_alias.items()):
+            matches = groups_by_alias.get(alias, [])
+            if len(matches) != 1:
                 continue
-            command = f"/approve_deploy machine={ip_value}"
-            if command not in seen:
-                seen.add(command)
-                lines.append(command)
+            verified_group = matches[0]
+            if (verified_group.get("repo_authorized") is not True
+                    or verified_group.get("identity_confirmed") is not True
+                    or verified_group.get("approval_available") is not True):
+                continue
+            for endpoint in verified_group.get("verified_endpoints", []):
+                if (not isinstance(endpoint, dict)
+                        or not component_ids.intersection(
+                            set(endpoint.get("component_ids", []))
+                        )):
+                    continue
+                ip_value = self._canonical_primary_ipv4(endpoint.get("ip", ""))
+                if not ip_value:
+                    continue
+                command = f"/approve_deploy machine={ip_value}"
+                if command not in seen:
+                    seen.add(command)
+                    lines.append(command)
         return lines
 
     @staticmethod
@@ -14982,13 +16620,31 @@ class DeployController:
     async def _reconcile_runtime_image_checks(
         self, repo: str, pr_number: int, state: dict, pr_data: dict,
         *, force: bool = False, machine_filter: tuple[str, str] | None = None,
+        verified_machine_groups: list[dict] | None = None,
+        allow_uncertain_completed: bool = False,
     ) -> dict:
         """Refresh every due deployed runtime binding using read-only Agent Core calls."""
+        command = state.get("command", {}) if isinstance(state, dict) else {}
+        command_args = command.get("args", {}) if isinstance(command, dict) else {}
+        uncertain_completed_only = bool(
+            allow_uncertain_completed and machine_filter is not None
+            and isinstance(command, dict)
+            and command.get("kind") == "approve_deploy"
+            and command.get("phase") == "uncertain"
+            and isinstance(command_args, dict)
+            and command_args.get("machine") == machine_filter[0]
+            and self._canonical_primary_ipv4(command_args.get("node_host", ""))
+            == self._canonical_primary_ipv4(machine_filter[1])
+            and isinstance(command_args.get("pending_component_ids"), list)
+        )
         if (not isinstance(state, dict)
-                or state.get("status") not in {
+                or (state.get("status") not in {
                     "deploy-ready", "deploy-requested", "testing", "succeeded", "failed",
-                }
-                or state.get("command", {}).get("phase") in {"executing", "uncertain"}):
+                } and not (uncertain_completed_only
+                          and state.get("status") == "deploying"))
+                or state.get("command", {}).get("phase") == "executing"
+                or (state.get("command", {}).get("phase") == "uncertain"
+                    and not uncertain_completed_only)):
             return state
         try:
             current_pr = await self.proxy.get_pr(repo, pr_number)
@@ -15040,6 +16696,20 @@ class DeployController:
                     trusted_machine,
                 )
 
+        projection_key = (repo.casefold(), pr_number)
+        try:
+            current_projection_version = self._machine_projection_version(repo)
+        except Exception:
+            logger.info(
+                "runtime image check skipped: machine projection unavailable repo=%s pr=%s",
+                repo, pr_number,
+            )
+            return state
+        previous_projection_version = self._runtime_projection_versions.get(projection_key)
+        runtime_policy_changed = (
+            previous_projection_version != current_projection_version
+        )
+
         def policy_snapshot(machine) -> tuple:
             def values(name: str, *, fold: bool = True):
                 raw = getattr(machine, name, None)
@@ -15068,50 +16738,183 @@ class DeployController:
             if len(machines) == 1
         }
 
-        specs = []
+        if verified_machine_groups is None:
+            filter_alias = machine_filter[0] if machine_filter is not None else ""
+            deployed_components = list({
+                item.get("component_id"): item
+                for item in state.get("components", [])
+                if isinstance(item, dict)
+                and (not filter_alias or any(
+                    isinstance(dep, dict) and dep.get("phase") == "deployed"
+                    and dep.get("machine") == filter_alias
+                    and item.get("component_id") in dep.get("component_ids", [])
+                    for dep in state.get("deployments", [])
+                ))
+                and (not uncertain_completed_only or item.get("component_id") not in set(
+                    command_args.get("pending_component_ids", []),
+                ))
+                and any(isinstance(dep, dict) and dep.get("phase") == "deployed"
+                        and item.get("component_id") in dep.get("component_ids", [])
+                        for dep in state.get("deployments", []))
+            }.values())
+            deployed_groups = self._get_machine_groups_for_components(
+                deployed_components, repo,
+            ) if deployed_components else []
+            if machine_filter is not None:
+                deployed_groups = [group for group in deployed_groups
+                                   if isinstance(group, dict)
+                                   and group.get("alias") == filter_alias]
+            deployed_groups = self._exclude_unconfirmed_history_endpoints(
+                deployed_groups, state, repo, trusted_machines,
+            )
+            verified_machine_groups = await self._machine_groups_verify_endpoints(
+                deployed_groups, repo, deployed_components, force_refresh=force,
+            ) if deployed_components else []
+        verified_by_alias = {
+            str(group.get("alias", "")): group
+            for group in verified_machine_groups if isinstance(group, dict)
+            and isinstance(group.get("alias"), str)
+        }
+
+        latest_deployment_by_component = {}
         for deployment in state.get("deployments", []):
             if not isinstance(deployment, dict) or deployment.get("phase") != "deployed":
                 continue
-            alias = deployment.get("machine")
-            stored_ip = deployment.get("ip", "")
+            for component_id in deployment.get("component_ids", []):
+                if (isinstance(component_id, str) and component_id in component_map
+                        and (not uncertain_completed_only or component_id not in set(
+                            command_args.get("pending_component_ids", []),
+                        ))):
+                    latest_deployment_by_component[component_id] = deployment
+
+        specs = []
+        deployment_ip_by_key = {}
+        deployment_identity_by_key = {}
+        identity_reason_by_key = {}
+        unverified_endpoint_reasons = {}
+        for component_id, deployment in latest_deployment_by_component.items():
+            component = component_map[component_id]
+            alias = deployment.get("machine", "")
+            historical_ip = self._canonical_primary_ipv4(deployment.get("ip", ""))
             if not isinstance(alias, str) or not alias:
                 continue
-            current_machine = None
-            ip_missing = not stored_ip
-            if ip_missing and policy_configured:
-                machine_matches = trusted_machines_by_alias.get(alias, [])
-                current_machine = machine_matches[0] if len(machine_matches) == 1 else None
-                candidate_ip = getattr(current_machine, "node_host", "")
-                try:
-                    parsed_ip = ipaddress.ip_address(candidate_ip)
-                    stored_ip = str(parsed_ip) if parsed_ip.version == 4 else ""
-                except (TypeError, ValueError):
-                    stored_ip = ""
-            try:
-                parsed_ip = ipaddress.ip_address(stored_ip)
-            except (TypeError, ValueError):
-                continue
-            if parsed_ip.version != 4:
-                continue
-            ip_value = str(parsed_ip)
-            for component_id in deployment.get("component_ids", []):
-                component = component_map.get(component_id)
-                if not isinstance(component, dict):
+            matches = trusted_machines_by_alias.get(alias, [])
+            machine = matches[0] if len(matches) == 1 else None
+            current_identity = (
+                self._deployment_identity_binding(machine, repo)
+                if machine is not None else None
+            )
+            identity_matches = self._deployment_identity_matches(
+                deployment, current_identity,
+            )
+            if not identity_matches:
+                reason = ("deployment_ip_unrecorded" if not historical_ip else
+                    "historical_ip_reassigned"
+                    if self._historical_ip_reassigned(
+                        alias, historical_ip, repo, trusted_machines,
+                        str(deployment.get("feishu_number", "") or ""),
+                    ) else
+                    "identity_unrecorded"
+                    if not deployment.get("feishu_number")
+                    or not deployment.get("identity_binding") else
+                    "snapshot_unavailable" if current_identity is None
+                    else "device_changed"
+                )
+                current_group = verified_by_alias.get(alias, {})
+                current_endpoints = [
+                    endpoint for endpoint in current_group.get("verified_endpoints", [])
+                    if isinstance(endpoint, dict)
+                    and component_id in set(endpoint.get("component_ids", []))
+                ] if isinstance(current_group, dict) else []
+                if machine_filter is not None and machine_filter[0] == alias:
+                    filter_ip = self._canonical_primary_ipv4(machine_filter[1])
+                    current_endpoints = [endpoint for endpoint in current_endpoints
+                                         if endpoint.get("ip") == filter_ip]
+                current_endpoint = next((
+                    endpoint for endpoint in current_endpoints
+                    if self._canonical_primary_ipv4(endpoint.get("ip", ""))
+                ), None)
+                runtime_ip = (
+                    self._canonical_primary_ipv4(current_endpoint.get("ip", ""))
+                    if current_endpoint is not None else historical_ip
+                )
+                if not runtime_ip:
                     continue
-                specs.append((alias, ip_value, component, ip_missing))
-        for binding in state.get("runtime_redeploy", []):
-            if not isinstance(binding, dict):
+                spec = (alias, runtime_ip, component, True)
+                specs.append(spec)
+                key = (alias, runtime_ip, component_id)
+                # Older deployment rows may have no recorded IP. Bind a
+                # reconfirmation to the current endpoint without inventing a
+                # historical address; the hidden-state legacy binding remains
+                # explicitly identity_changed until a new deployment succeeds.
+                deployment_ip_by_key[key] = historical_ip or runtime_ip
+                deployment_identity_by_key[key] = str(
+                    deployment.get("identity_binding", "") or "",
+                )
+                identity_reason_by_key[key] = reason
                 continue
-            alias, ip_value = binding.get("machine"), binding.get("ip")
-            for component_id in binding.get("component_ids", []):
-                component = component_map.get(component_id)
-                if (isinstance(alias, str) and isinstance(ip_value, str)
-                        and isinstance(component, dict)):
-                    specs.append((alias, ip_value, component, False))
+
+            group = verified_by_alias.get(alias, {})
+            verified_endpoints = [
+                endpoint for endpoint in group.get("verified_endpoints", [])
+                if isinstance(endpoint, dict)
+                and component_id in set(endpoint.get("component_ids", []))
+            ] if isinstance(group, dict) else []
+            if machine_filter is not None:
+                filter_alias = machine_filter[0]
+                filter_ip = self._canonical_primary_ipv4(machine_filter[1])
+                if alias == filter_alias:
+                    verified_endpoints = [endpoint for endpoint in verified_endpoints
+                                          if endpoint.get("ip") == filter_ip]
+            selected_endpoint = next((
+                endpoint for endpoint in verified_endpoints
+                if self._canonical_primary_ipv4(endpoint.get("ip", ""))
+            ), None)
+            if selected_endpoint is None:
+                candidate_ips = group.get("verification_endpoints", []) \
+                    if isinstance(group, dict) else []
+                candidate_ips = list(dict.fromkeys(
+                    self._canonical_primary_ipv4(value)
+                    for value in candidate_ips
+                    if self._canonical_primary_ipv4(value)
+                )) if isinstance(candidate_ips, (list, tuple, set)) else []
+                if machine_filter is not None and machine_filter[0] == alias:
+                    filter_ip = self._canonical_primary_ipv4(machine_filter[1])
+                    candidate_ips = [value for value in candidate_ips if value == filter_ip]
+                current_ip = candidate_ips[0] if candidate_ips else historical_ip
+                if not current_ip:
+                    continue
+                spec = (alias, current_ip, component, False)
+                specs.append(spec)
+                key = (alias, current_ip, component_id)
+                deployment_ip_by_key[key] = historical_ip or current_ip
+                deployment_identity_by_key[key] = str(
+                    deployment.get("identity_binding", "") or "",
+                )
+                if self._historical_ip_reassigned(
+                        alias, historical_ip, repo, trusted_machines,
+                        str(deployment.get("feishu_number", "") or "")):
+                    identity_reason_by_key[key] = "historical_ip_reassigned"
+                unverified_endpoint_reasons[key] = True
+                continue
+            current_ip = self._canonical_primary_ipv4(selected_endpoint.get("ip", ""))
+            spec = (alias, current_ip, component, False)
+            specs.append(spec)
+            key = (alias, current_ip, component_id)
+            deployment_ip_by_key[key] = historical_ip
+            deployment_identity_by_key[key] = str(
+                deployment.get("identity_binding", "") or "",
+            )
+            if self._historical_ip_reassigned(
+                    alias, historical_ip, repo, trusted_machines,
+                    str(deployment.get("feishu_number", "") or "")):
+                identity_reason_by_key[key] = "historical_ip_reassigned"
+
         specs_by_key = {}
         for spec in specs:
-            alias, ip_value, component, ip_missing = spec
-            specs_by_key[(alias, ip_value, component.get("component_id", ""))] = spec
+            alias, ip_value, component, identity_unconfirmed = spec
+            key = (alias, ip_value, component.get("component_id", ""))
+            specs_by_key[key] = spec
         specs = list(specs_by_key.values())
         if not specs:
             return state
@@ -15128,14 +16931,26 @@ class DeployController:
         # machine poll. Once any stored observation is due (or an immediate
         # post-deploy check is requested), probe every deployed component so a
         # single visible result never mixes fresh and stale machines.
-        check_cycle_due = force or any(
-            ip_missing or self._runtime_check_is_due(
-                old_by_key.get((alias, ip_value, component.get("component_id", ""))),
-                now,
-            )
-            for alias, ip_value, component, ip_missing in specs
-        )
-        selected = list(specs) if check_cycle_due else []
+        if machine_filter is not None:
+            filter_alias = machine_filter[0]
+            filter_ip = self._canonical_primary_ipv4(machine_filter[1])
+            target_specs = [spec for spec in specs
+                            if spec[0] == filter_alias and spec[1] == filter_ip]
+            check_cycle_due = force or any(
+                self._runtime_check_is_due(
+                    old_by_key.get((alias, ip_value, component.get("component_id", ""))),
+                    now,
+                ) for alias, ip_value, component, _ in target_specs
+            ) or runtime_policy_changed or bool(unverified_endpoint_reasons)
+            selected = target_specs if check_cycle_due else []
+        else:
+            check_cycle_due = force or any(
+                self._runtime_check_is_due(
+                    old_by_key.get((alias, ip_value, component.get("component_id", ""))),
+                    now,
+                ) for alias, ip_value, component, _ in specs
+            ) or runtime_policy_changed or bool(unverified_endpoint_reasons)
+            selected = list(specs) if check_cycle_due else []
         if not selected:
             # Retire only checks whose component is no longer deployed in the current round.
             current_keys = {
@@ -15158,22 +16973,128 @@ class DeployController:
                         repo, pr_number)
             return state
 
+        self._runtime_projection_versions[projection_key] = current_projection_version
+
         checked_at = utc_now()
-        # Policy remains repository-scoped; no machine is queried unless its current
-        # alias and literal IP match the deployment record for this component.
+
+        def make_runtime_record(
+            alias: str, ip_value: str, component: dict, runtime_id: str,
+            observed: str, status_value: str,
+        ) -> dict:
+            component_id = str(component.get("component_id", "") or "")
+            key = (alias, ip_value, component_id)
+            return self._runtime_check_record(
+                alias, ip_value, component, runtime_id, observed, status_value,
+                checked_at,
+                deployment_ip=deployment_ip_by_key.get(key, ip_value),
+                deployment_identity_binding=deployment_identity_by_key.get(key, ""),
+                identity_reason=(identity_reason_by_key.get(key, "")
+                                 if status_value == "identity_changed"
+                                 or identity_reason_by_key.get(key) == "historical_ip_reassigned"
+                                 else ""),
+            )
+
+        if machine_filter is not None:
+            filter_alias = machine_filter[0]
+            filter_ip = self._canonical_primary_ipv4(machine_filter[1])
+            matches = trusted_machines_by_alias.get(filter_alias, [])
+            current_machine = matches[0] if len(matches) == 1 else None
+            current_endpoints = {
+                item["ip"] for item in self._policy_machine_endpoints(
+                    current_machine, repo,
+                )
+            } if current_machine is not None else set()
+            for alias, historical_ip, component, _ in specs:
+                if alias != filter_alias or historical_ip == filter_ip:
+                    continue
+                historical_is_current = bool(
+                    current_machine is not None
+                    and historical_ip in current_endpoints
+                    and self._endpoint_allowed_for_repository(
+                        repo, current_machine, historical_ip,
+                        components=[component], policy_machines=trusted_machines,
+                    )
+                )
+                if historical_is_current:
+                    continue
+                runtime_id = str(component.get("runtime_id", "") or
+                                 ("core" if component.get("target") == "core" else "unresolved"))
+                record = self._runtime_check_record(
+                    alias, historical_ip, component, runtime_id, "",
+                    "identity_changed", checked_at,
+                    deployment_ip=deployment_ip_by_key.get(
+                        (alias, historical_ip, component.get("component_id", "")),
+                        historical_ip,
+                    ),
+                    deployment_identity_binding=deployment_identity_by_key.get(
+                        (alias, historical_ip, component.get("component_id", "")),
+                        "",
+                    ),
+                    identity_reason=identity_reason_by_key.get(
+                        (alias, historical_ip, component.get("component_id", "")),
+                        "address_changed",
+                    ),
+                )
+                selected_results[self._runtime_check_key(record)] = record
+        # Historical v1 deployment records do not store Feishu identity. They
+        # are never queried by their stored IP; only an explicit current-IP
+        # machine_filter creates probeable endpoint specs.
         groups: dict[tuple[str, str], list[tuple[dict, bool]]] = {}
-        for alias, ip_value, component, ip_missing in selected:
-            groups.setdefault((alias, ip_value), []).append((component, ip_missing))
+        for alias, ip_value, component, historical_identity_unconfirmed in selected:
+            groups.setdefault((alias, ip_value), []).append(
+                (component, historical_identity_unconfirmed),
+            )
 
         for (alias, ip_value), group in groups.items():
             pair_results = []
             try:
+                unverified_rows = []
+                for component, historical_identity_unconfirmed in group:
+                    component_id = component.get("component_id", "")
+                    component_key = (alias, ip_value, component_id)
+                    if historical_identity_unconfirmed:
+                        unverified_rows.append((component, "identity_changed"))
+                    elif component_key in unverified_endpoint_reasons:
+                        status_value = (
+                            "identity_changed"
+                            if identity_reason_by_key.get(component_key)
+                            == "historical_ip_reassigned" else "unavailable"
+                        )
+                        unverified_rows.append((component, status_value))
+                if unverified_rows:
+                    unverified_component_ids = set()
+                    for component, status_value in unverified_rows:
+                        component_id = component.get("component_id", "")
+                        unverified_component_ids.add(component_id)
+                        runtime_id = str(component.get("runtime_id", "") or
+                                         ("core" if component.get("target") == "core" else "unresolved"))
+                        pair_results.append(make_runtime_record(
+                            alias, ip_value, component, runtime_id, "", status_value,
+                        ))
+                    group = [
+                        (component, historical_identity_unconfirmed)
+                        for component, historical_identity_unconfirmed in group
+                        if component.get("component_id", "") not in unverified_component_ids
+                    ]
+                    if not group:
+                        selected_results.update({
+                            self._runtime_check_key(item): item for item in pair_results
+                        })
+                        continue
                 if not policy_configured:
                     for component, _ in group:
                         runtime_id = str(component.get("runtime_id", "") or
                                          ("core" if component.get("target") == "core" else "unresolved"))
                         pair_results.append(self._runtime_check_record(
                             alias, ip_value, component, runtime_id, "", "unavailable", checked_at,
+                            deployment_ip=deployment_ip_by_key.get(
+                                (alias, ip_value, component.get("component_id", "")),
+                                ip_value,
+                            ),
+                            deployment_identity_binding=deployment_identity_by_key.get(
+                                (alias, ip_value, component.get("component_id", "")),
+                                "",
+                            ),
                         ))
                     selected_results.update({self._runtime_check_key(item): item for item in pair_results})
                     continue
@@ -15204,8 +17125,7 @@ class DeployController:
                                 components=deployed_components,
                                 policy_machines=trusted_machines,
                             )
-                            or not machine_binding[1]
-                            or any(ip_missing for _, ip_missing in group)):
+                            or not machine_binding[1]):
                         status_value = "identity_changed"
                     else:
                         status_value = ""
@@ -15213,9 +17133,8 @@ class DeployController:
                     for component, _ in group:
                         runtime_id = str(component.get("runtime_id", "") or
                                          ("core" if component.get("target") == "core" else "unresolved"))
-                        pair_results.append(self._runtime_check_record(
+                        pair_results.append(make_runtime_record(
                             alias, ip_value, component, runtime_id, "", status_value,
-                            checked_at,
                         ))
                     selected_results.update({self._runtime_check_key(item): item for item in pair_results})
                     continue
@@ -15240,9 +17159,8 @@ class DeployController:
                     for component, _ in group:
                         runtime_id = str(component.get("runtime_id", "") or
                                          ("core" if component.get("target") == "core" else "unresolved"))
-                        pair_results.append(self._runtime_check_record(
+                        pair_results.append(make_runtime_record(
                             alias, ip_value, component, runtime_id, "", "unavailable",
-                            checked_at,
                         ))
                     selected_results.update({self._runtime_check_key(item): item for item in pair_results})
                     continue
@@ -15349,9 +17267,9 @@ class DeployController:
                         status_value = "unavailable"
                         observed = ""
                         agent_core_unavailable = True
-                    pair_results.append(self._runtime_check_record(
+                    pair_results.append(make_runtime_record(
                         alias, ip_value, component, runtime_id, observed,
-                        status_value, checked_at,
+                        status_value,
                     ))
 
                 if agent_core_unavailable:
@@ -15366,16 +17284,22 @@ class DeployController:
                     "runtime image machine check failed repo=%s machine=%s reason=%s",
                     repo, alias, type(exc).__name__,
                 )
-                unavailable_results = []
+                unavailable_results = {
+                    self._runtime_check_key(item): item for item in pair_results
+                }
                 for component, _ in group:
+                    component_key = (
+                        alias, ip_value, component.get("component_id", ""),
+                    )
+                    if component_key in unavailable_results:
+                        continue
                     runtime_id = str(component.get("runtime_id", "") or
                                      ("core" if component.get("target") == "core" else "unresolved"))
-                    unavailable_results.append(self._runtime_check_record(
-                        alias, ip_value, component, runtime_id, "", "unavailable", checked_at,
-                    ))
-                selected_results.update({
-                    self._runtime_check_key(item): item for item in unavailable_results
-                })
+                    record = make_runtime_record(
+                        alias, ip_value, component, runtime_id, "", "unavailable",
+                    )
+                    unavailable_results[self._runtime_check_key(record)] = record
+                selected_results.update(unavailable_results)
 
         # Re-read policy once after probing every deployed machine. A policy
         # refresh during the scan invalidates the whole affected machine result
@@ -15421,11 +17345,11 @@ class DeployController:
                     "identity_changed" if identity_changed else "unavailable"
                 )
                 for component, _ in group:
-                    record = self._runtime_check_record(
+                    record = make_runtime_record(
                         alias, ip_value, component,
                         str(component.get("runtime_id", "") or
                             ("core" if component.get("target") == "core" else "unresolved")),
-                        "", invalid_status, checked_at,
+                        "", invalid_status,
                     )
                     selected_results[self._runtime_check_key(record)] = record
 
@@ -15442,8 +17366,53 @@ class DeployController:
         new_state = copy.deepcopy(state)
         new_state["runtime_checks"] = new_checks
         old_runtime_redeploy = state.get("runtime_redeploy", [])
-        pending_redeploy = copy.deepcopy(old_runtime_redeploy) \
-            if isinstance(old_runtime_redeploy, list) else []
+        pending_rows: dict[tuple[str, str, str, str], list[str]] = {}
+        for item in old_runtime_redeploy if isinstance(old_runtime_redeploy, list) else []:
+            if not isinstance(item, dict):
+                continue
+            alias = item.get("machine")
+            old_ip = item.get("ip")
+            old_deployment_ip = item.get("deployment_ip", old_ip)
+            for component_id in item.get("component_ids", []):
+                candidate_spec = next((spec for spec in specs
+                                       if spec[0] == alias
+                                       and spec[2].get("component_id") == component_id), None)
+                current_ip = candidate_spec[1] if candidate_spec is not None else old_ip
+                deployment_ip = (
+                    deployment_ip_by_key.get((alias, current_ip, component_id),
+                                             old_deployment_ip)
+                    if isinstance(alias, str) and isinstance(current_ip, str)
+                    else old_deployment_ip
+                )
+                identity_binding = (
+                    deployment_identity_by_key.get(
+                        (alias, current_ip, component_id),
+                        item.get("deployment_identity_binding", ""),
+                    )
+                    if isinstance(alias, str) and isinstance(current_ip, str)
+                    else item.get("deployment_identity_binding", "")
+                )
+                if (isinstance(alias, str) and isinstance(current_ip, str)
+                        and isinstance(deployment_ip, str)
+                        and isinstance(identity_binding, str)):
+                    pending_rows.setdefault(
+                        (alias, current_ip, deployment_ip, identity_binding), [],
+                    ).append(component_id)
+        pending_redeploy = [
+            {
+                "machine": alias, "ip": ip_value,
+                "component_ids": sorted(set(component_ids)),
+                **({"deployment_ip": deployment_ip}
+                   if deployment_ip != ip_value else {}),
+                **({"deployment_identity_binding": identity_binding}
+                   if identity_binding else {}),
+            }
+            for (alias, ip_value, deployment_ip, identity_binding), component_ids
+            in pending_rows.items()
+            if component_ids
+        ]
+        if old_runtime_redeploy:
+            new_state["runtime_redeploy"] = pending_redeploy
         pending_bindings = {
             (item.get("machine"), item.get("ip"), component_id)
             for item in pending_redeploy if isinstance(item, dict)
@@ -15456,18 +17425,15 @@ class DeployController:
         if adopted_bindings:
             deployments = list(new_state.get("deployments", []))
             for machine_alias, ip_value, component_id in adopted_bindings:
-                existing = next((item for item in deployments
-                                 if isinstance(item, dict)
-                                 and item.get("machine") == machine_alias
-                                 and item.get("ip") == ip_value
-                                 and item.get("phase") == "deployed"), None)
-                if existing is None:
-                    deployments.append({
-                        "machine": machine_alias, "ip": ip_value,
-                        "component_ids": [component_id], "phase": "deployed",
-                    })
-                elif component_id not in existing.get("component_ids", []):
-                    existing["component_ids"].append(component_id)
+                machine = next(iter(trusted_machines_by_alias.get(machine_alias, [])), None)
+                identity = self._deployment_identity_binding(machine, repo) \
+                    if machine is not None else None
+                row = {
+                    "machine": machine_alias, "ip": ip_value,
+                    "component_ids": [component_id], "phase": "deployed",
+                    **(identity or {}),
+                }
+                deployments = self._merge_deployment_rows(deployments, [row])
             new_state["deployments"] = deployments
             remaining_bindings = []
             for item in pending_redeploy:
@@ -15478,6 +17444,12 @@ class DeployController:
                     remaining_bindings.append({
                         "machine": item["machine"], "ip": item["ip"],
                         "component_ids": kept_ids,
+                        **({"deployment_ip": item["deployment_ip"]}
+                           if isinstance(item.get("deployment_ip"), str) else {}),
+                        **({"deployment_identity_binding": item[
+                            "deployment_identity_binding"]}
+                           if isinstance(item.get("deployment_identity_binding"), str)
+                           and item.get("deployment_identity_binding") else {}),
                     })
             new_state["runtime_redeploy"] = remaining_bindings
             all_ids = {
@@ -15597,6 +17569,7 @@ class DeployController:
                 repo, pr_number, new_state, updated_visible,
                 expected_lifecycle_state=state,
                 runtime_projection_only=not lifecycle_transition,
+                verified_machine_groups=verified_machine_groups,
             )
             if not written:
                 return state
@@ -15657,46 +17630,34 @@ class DeployController:
                             f"`{observed_image or '未读取'}`。"
                         )
                     image_detail = "\n\n" + "\n".join(image_lines) if image_lines else ""
-                    eligible_group = next((group for group in
-                        self._get_machine_groups_for_components(mismatch_components, repo)
-                        if group.get("alias") == machine_alias
-                        and group.get("approval_available") is True
-                        and mismatch_ids.issubset(set(group.get("component_ids", [])))),
-                        None) if (mismatch_ids and len(mismatch_components) == len(mismatch_ids)) else None
-                    try:
-                        current_machine = self.policy.get_machine(machine_alias, repo=repo)
-                    except Exception:
-                        current_machine = None
-                    verified_endpoint = []
-                    if (eligible_group is not None and current_machine is not None
-                            and ip_value in {
-                                item["ip"] for item in self._policy_machine_endpoints(
-                                    current_machine, repo,
-                                )
-                            }
-                            and self._endpoint_allowed_for_repository(
-                                repo, current_machine, ip_value,
-                                components=mismatch_components,
-                            )):
-                        verified_endpoint = await self._agent_core_verified_endpoints(
-                            repo, current_machine, mismatch_components,
-                            endpoints=[ip_value],
-                        )
-                    command_selector = (
-                        ip_value if any(mismatch_ids.issubset(set(item.get(
-                            "component_ids", [],
-                        ))) for item in verified_endpoint) else ""
-                    )
+                    eligible_group = next((group for group in verified_machine_groups
+                        if isinstance(group, dict)
+                        and group.get("alias") == machine_alias
+                        and group.get("repo_authorized") is True
+                        and group.get("identity_confirmed") is True), None) \
+                        if isinstance(verified_machine_groups, list) else None
+                    command_selectors = sorted({
+                        self._canonical_primary_ipv4(endpoint.get("ip", ""))
+                        for endpoint in eligible_group.get("verified_endpoints", [])
+                        if isinstance(endpoint, dict)
+                        and mismatch_ids.intersection(set(endpoint.get("component_ids", [])))
+                        and self._canonical_primary_ipv4(endpoint.get("ip", ""))
+                    }) if eligible_group is not None else []
+                    command_selector = command_selectors[0] if command_selectors else ""
                     if command_selector and eligible_group is not None:
                         owners = list(eligible_group.get("owners", []) or owners)
                         owner_labels = self._runtime_transition_owner_labels(owners)
                         owner_text = " ".join(owner_labels) if owner_labels else ""
-                    if command_selector:
+                    if command_selectors:
+                        command_text = "、".join(
+                            f"`/approve_deploy machine={selector}`"
+                            for selector in command_selectors
+                        )
                         message = (
                             f"机器 `{machine_alias}`（实际检查 IP：`{ip_value}`；主 IP：`{primary_ip or '未记录'}`）上运行的镜像与本次批准的版本不一致，需要重新部署。"
                             f"{image_detail}"
-                            + (f"\n\n请执行 `/approve_deploy machine={command_selector}`。" if not owner_text
-                               else f"\n\n请 {owner_text} 执行 `/approve_deploy machine={command_selector}`。")
+                            + (f"\n\n请执行 {command_text}。" if not owner_text
+                               else f"\n\n请 {owner_text} 执行 {command_text}。")
                         )
                     else:
                         message = (
@@ -15710,9 +17671,45 @@ class DeployController:
                         "暂时无法确认运行镜像。请等待组件恢复运行后重新检查。"
                     )
                 elif status_value == "identity_changed":
+                    reasons = {
+                        "identity_unrecorded": "历史部署没有保存飞书设备身份，不能确认原设备",
+                        "device_changed": "当前飞书设备编号与历史部署记录不同",
+                        "snapshot_unavailable": "当前飞书快照无法确认设备身份",
+                        "historical_ip_reassigned": "历史部署 IP 当前已关联其他飞书设备",
+                        "address_changed": "历史部署地址已变化，需要在当前地址重新确认",
+                    }
+                    reason_texts = list(dict.fromkeys(
+                        reasons.get(str(check.get("identity_reason", "")),
+                                    "设备身份或历史 IP 无法确认")
+                        for check in checks
+                    ))
+                    identity_ids = {
+                        check.get("component_id") for check in checks
+                        if isinstance(check.get("component_id"), str)
+                    }
+                    identity_group = next((group for group in verified_machine_groups
+                        if isinstance(group, dict)
+                        and group.get("alias") == machine_alias
+                        and group.get("repo_authorized") is True
+                        and group.get("identity_confirmed") is True), None) \
+                        if isinstance(verified_machine_groups, list) else None
+                    identity_commands = sorted({
+                        self._canonical_primary_ipv4(endpoint.get("ip", ""))
+                        for endpoint in identity_group.get("verified_endpoints", [])
+                        if isinstance(endpoint, dict)
+                        and identity_ids.intersection(set(endpoint.get("component_ids", [])))
+                        and self._canonical_primary_ipv4(endpoint.get("ip", ""))
+                    }) if identity_group is not None else []
+                    new_ip_note = (
+                        "当前可重新审批地址：" + "、".join(
+                            f"`/approve_deploy machine={ip}`" for ip in identity_commands
+                        ) + "。"
+                        if identity_commands else "当前没有通过授权和 Agent Core 兼容性验证的新地址。"
+                    )
                     message = (
-                        f"机器 `{machine_alias}`（主 IP：`{primary_ip or '未记录'}`）的登记信息发生了变化，"
-                        "暂时无法确认运行镜像。请联系仓库维护者核对机器配置。"
+                        f"机器 `{machine_alias}` 的历史部署 IP `{ip_value}` 未用于查询。"
+                        + "；".join(reason_texts) + "。"
+                        + new_ip_note
                     )
                 else:
                     message = (
@@ -15748,7 +17745,10 @@ class DeployController:
 
     # ── Reconcile ──
 
-    async def reconcile_pr(self, repo: str, pr_number: int) -> None:
+    async def reconcile_pr(
+        self, repo: str, pr_number: int, *,
+        defer_machine_projection: bool = False,
+    ) -> None:
         """Reconcile lifecycle state for a PR.
 
         Called by the watcher before processing commands each cycle.
@@ -15914,19 +17914,9 @@ class DeployController:
                     )
                 return
 
-            if (state.get("status") in {
-                    "deploy-requested", "testing", "succeeded", "failed",
-                }
-                    and isinstance(state.get("deployments"), list)
-                    and any(isinstance(deployment, dict)
-                            and deployment.get("phase") == "deployed"
-                            and deployment.get("component_ids")
-                            for deployment in state["deployments"])):
-                state = await self._reconcile_runtime_image_checks(
-                    repo, pr_number, state, pr_data,
-                )
-
             if state.get("status") in ("succeeded", "failed"):
+                if not defer_machine_projection:
+                    await self.refresh_machine_projection(repo, pr_number)
                 try:
                     await self.proxy.project_status_label(repo, pr_number, state["status"])
                 except Exception as exc:
@@ -15956,11 +17946,17 @@ class DeployController:
                     logger.warning(
                         "reconcile label projection %s#%s: %s", repo, pr_number, e,
                     )
+                if (not defer_machine_projection
+                        and state.get("status") == "deploy-requested"
+                        and state.get("head_sha") == current_head):
+                    await self.refresh_machine_projection(repo, pr_number)
                 return
 
             # Deployment and manual testing are decoupled. Preserve any legacy
             # case_results as history, but never launch automated Cases here.
             if state.get("status") == "testing":
+                if not defer_machine_projection:
+                    await self.refresh_machine_projection(repo, pr_number)
                 try:
                     acceptance = state.get("acceptance_request")
                     pending_acceptance = (
@@ -16122,60 +18118,57 @@ class DeployController:
                 "args": {},
             }
             state["last_processed_comment_id"] = 0
+            meaningful_change = True
         else:
             prev_status = state.get("status", "review-required")
             prev_head = state.get("head_sha", "")
             prev_evidence = state.get("review_evidence", {})
-            state["head_sha"] = current_head
-            state["status"] = desired_status
-            state["review_evidence"] = review_evidence_data
-            state["components"] = components if desired_status == "deploy-ready" else []
-            state["deployments"] = []
-            state["approve_attempts"] = []
-            state["approve_attempts_total"] = 0
-            state["approve_attempts_truncated"] = False
-            state["case_results"] = {}
-            state["test_result"] = ""
-            state["cos"] = {"object_key": "", "sha256": "", "size": 0}
-            state["command"] = {
-                "comment_id": int(state.get("last_processed_comment_id", 0) or 0),
-                "kind": "",
-                "phase": "completed",
-                "args": {},
-            }
-
-        if desired_status == "deploy-ready":
-            build_comment_id = review_evidence_data.get("build_comment_id")
-            if type(build_comment_id) is int and build_comment_id > 0:
-                state["round_id"] = make_round_id(current_head, build_comment_id)
-                state["round_started_at"] = state.get("round_started_at") or utc_now()
-
-        # No-churn: only write lifecycle/history if there is a real change
-        # (prev_status/prev_head/prev_evidence captured BEFORE state mutation above)
-        if state_was_none:
-            meaningful_change = True
-        else:
             meaningful_change = (
                 prev_status != desired_status
                 or prev_head != current_head
                 or prev_evidence != review_evidence_data
             )
+            if meaningful_change:
+                state["head_sha"] = current_head
+                state["status"] = desired_status
+                state["review_evidence"] = review_evidence_data
+                state["components"] = components if desired_status == "deploy-ready" else []
+                state["deployments"] = []
+                state["approve_attempts"] = []
+                state["approve_attempts_total"] = 0
+                state["approve_attempts_truncated"] = False
+                state["case_results"] = {}
+                state["test_result"] = ""
+                state["cos"] = {"object_key": "", "sha256": "", "size": 0}
+                state["command"] = {
+                    "comment_id": int(state.get("last_processed_comment_id", 0) or 0),
+                    "kind": "",
+                    "phase": "completed",
+                    "args": {},
+                }
+            else:
+                # Same lifecycle evidence: keep every durable field byte for
+                # byte, including deployment history and command cursor.
+                state = copy.deepcopy(lifecycle_before_update)
+
+        if desired_status == "deploy-ready" and meaningful_change:
+            build_comment_id = review_evidence_data.get("build_comment_id")
+            if type(build_comment_id) is int and build_comment_id > 0:
+                state["round_id"] = make_round_id(current_head, build_comment_id)
+                state["round_started_at"] = state.get("round_started_at") or utc_now()
 
         if not meaningful_change:
-            # Same state, no meaningful change — only project status label
+            # Same state, no lifecycle transition. Refresh only current
+            # machine adaptation and repair the status label.
             try:
                 await self.proxy.project_status_label(repo, pr_number, desired_status)
             except Exception as e:
                 logger.warning(
                     "reconcile label projection %s#%s: %s", repo, pr_number, e,
                 )
-            if desired_status == "deploy-ready":
-                await self._post_deploy_ready_notice(
-                    repo, pr_number, head_sha=current_head,
-                    round_id=round_id_for_state(state),
-                    review_evidence=state.get("review_evidence", {}),
-                    components=state.get("components", []),
-                )
+            if (not defer_machine_projection
+                    and desired_status in {"deploy-ready", "deploy-requested"}):
+                await self.refresh_machine_projection(repo, pr_number)
         else:
             try:
                 if desired_status == "reviewing":
@@ -16186,13 +18179,10 @@ class DeployController:
                     all_machine_groups = self._get_machine_groups_for_components(
                         components, repo,
                     )
-                    verified_groups = await self._machine_groups_verify_endpoints(
-                        all_machine_groups, repo, components,
-                    )
                     markdown = comments_mod.deploy_ready(
                         repo, pr_number, current_head, build_infos,
                         review_evidence=review_evidence_data,
-                        machine_groups=verified_groups,
+                        machine_groups=all_machine_groups,
                         components=components,
                     )
                 if state_was_none:
@@ -16224,13 +18214,9 @@ class DeployController:
                 await self._project_status_best_effort(
                     repo, pr_number, desired_status,
                 )
-                if desired_status == "deploy-ready":
-                    await self._post_deploy_ready_notice(
-                        repo, pr_number, head_sha=current_head,
-                        round_id=round_id_for_state(state),
-                        review_evidence=review_evidence_data,
-                        components=components,
-                    )
+                if (not defer_machine_projection
+                        and desired_status in {"deploy-ready", "deploy-requested"}):
+                    await self.refresh_machine_projection(repo, pr_number)
             except Exception as e:
                 logger.warning(
                     "reconcile lifecycle %s#%s: %s", repo, pr_number, e,
@@ -16361,13 +18347,21 @@ class DeployController:
             return False
         expected_node_id = args.get("node_id")
         expected_node_host = args.get("node_host")
+        expected_feishu_number = args.get("feishu_number")
+        expected_identity_binding = args.get("identity_binding")
+        expected_identity = {
+            "feishu_number": expected_feishu_number,
+            "identity_binding": expected_identity_binding,
+        }
+        current_identity = self._deployment_identity_binding(machine, repo)
         if (not isinstance(expected_node_id, str) or not expected_node_id
                 or not isinstance(expected_node_host, str) or not expected_node_host
+                or self._canonical_primary_ipv4(expected_node_host) != expected_node_host
+                or not isinstance(expected_feishu_number, str)
+                or not isinstance(expected_identity_binding, str)
+                or current_identity != expected_identity
                 or machine.node_id != expected_node_id
-                or not self._machine_endpoint_has_unambiguous_identity(
-                    machine, expected_node_host, repo,
-                    self._policy_machine_identity(machine, repo),
-                )):
+                ):
             logger.warning(
                 "uncertain deployment machine binding changed; refusing to infer completion %s machine=%s",
                 repo, machine_alias,
@@ -16416,6 +18410,8 @@ class DeployController:
             or old_args.get("actor") != fresh_args.get("actor")
             or old_args.get("node_id") != fresh_args.get("node_id")
             or old_args.get("node_host") != fresh_args.get("node_host")
+            or old_args.get("feishu_number") != fresh_args.get("feishu_number")
+            or old_args.get("identity_binding") != fresh_args.get("identity_binding")
             or old_args.get("pending_component_ids") != fresh_args.get("pending_component_ids")
             or old_args.get("deployment_request_submitted")
             != fresh_args.get("deployment_request_submitted")
@@ -16442,6 +18438,33 @@ class DeployController:
                 or not set(pending).issubset(fresh_by_id)
                 or set(pending).intersection(deployed)):
             return False
+        pending_components = [fresh_by_id[item] for item in pending]
+        recovery_groups = self._get_machine_groups_for_components(
+            pending_components, repo,
+        )
+        recovery_groups = self._exclude_unconfirmed_history_endpoints(
+            recovery_groups, old_state, repo,
+        )
+        recovery_groups = [group for group in recovery_groups
+                           if isinstance(group, dict)
+                           and group.get("alias") == machine_alias]
+        verified_groups = await self._machine_groups_verify_endpoints(
+            recovery_groups, repo, pending_components, force_refresh=True,
+        )
+        pending_set = set(pending)
+        verified_endpoint = next((
+            self._canonical_primary_ipv4(endpoint.get("ip", ""))
+            for group in verified_groups if isinstance(group, dict)
+            and group.get("alias") == machine_alias
+            and group.get("repo_authorized") is True
+            and group.get("identity_confirmed") is True
+            for endpoint in group.get("verified_endpoints", [])
+            if isinstance(endpoint, dict)
+            and endpoint.get("ip") == expected_node_host
+            and pending_set.issubset(set(endpoint.get("component_ids", [])))
+        ), "")
+        if not verified_endpoint:
+            return False
         recovered = []
         unresolved = []
         deadline = time.monotonic() + AGENT_CORE_STATUS_PROBE_TIMEOUT_SECONDS
@@ -16450,7 +18473,7 @@ class DeployController:
             if remaining <= 0:
                 return False
             core = await self._core_for_machine_endpoint(
-                machine, expected_node_host, repo, timeout=remaining,
+                machine, verified_endpoint, repo, timeout=remaining,
             )
             for component_id in dict.fromkeys(pending):
                 if component_id in deployed:
@@ -16556,12 +18579,16 @@ class DeployController:
                 "ip": expected_node_host,
                 "component_ids": [component["component_id"]],
                 "phase": "deployed",
+                **expected_identity,
             }
-            refreshed_state["deployments"].append(row)
+            refreshed_state["deployments"] = self._merge_deployment_rows(
+                refreshed_state["deployments"], [row],
+            )
             recovered_rows.append(row)
             if component.get("target") == "core":
                 recovered_health.append({
                     "component_id": component["component_id"],
+                    "ip": verified_endpoint,
                     "runtime_id": "core", "current_tag": observed_image,
                     "target_tag": image_ref,
                     "verified": True,
@@ -16569,6 +18596,7 @@ class DeployController:
             else:
                 recovered_health.append({
                     "component_id": component["component_id"],
+                    "ip": verified_endpoint,
                     "runtime_id": runtime_id, "running_image": observed_image,
                     "status": "running", "verified": True,
                 })
@@ -16780,6 +18808,26 @@ class DeployController:
         )
         if written:
             if recovered_ids and machine_alias:
+                recovered_endpoint = next((
+                    self._canonical_primary_ipv4(item.get("ip", ""))
+                    for item in reversed(refreshed.get("deployments", []))
+                    if isinstance(item, dict)
+                    and item.get("machine") == machine_alias
+                    and set(item.get("component_ids", [])) & recovered_ids
+                    and self._canonical_primary_ipv4(item.get("ip", ""))
+                ), "")
+                if recovered_endpoint:
+                    try:
+                        await self._reconcile_runtime_image_checks(
+                            repo, pr_number, refreshed, pr_data, force=True,
+                            machine_filter=(machine_alias, recovered_endpoint),
+                            allow_uncertain_completed=True,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "recovered runtime image check failed %s#%s reason=%s",
+                            repo, pr_number, type(exc).__name__,
+                        )
                 try:
                     await self._save_deployed_machine_log(repo, pr_number, refreshed, machine_alias)
                 except Exception:

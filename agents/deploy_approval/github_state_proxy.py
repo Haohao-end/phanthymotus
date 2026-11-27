@@ -489,12 +489,17 @@ def _validate_hidden_state(data: dict) -> dict:
     if not isinstance(deployments, list):
         raise MalformedHiddenStateError("deployments must be a list")
     deployed_cids: set[str] = set()
+    deployed_bindings: set[tuple[str, str, str]] = set()
+    deployed_identity_bindings: set[tuple[str, str, str, str]] = set()
+    seen_deployment_records = set()
     for dep in deployments:
         if not isinstance(dep, dict):
             raise MalformedHiddenStateError("deployment must be a dict")
         if set(dep.keys()) not in (
                 {"machine", "component_ids", "phase"},
-                {"machine", "component_ids", "phase", "ip"}):
+                {"machine", "component_ids", "phase", "ip"},
+                {"machine", "component_ids", "phase", "ip",
+                 "feishu_number", "identity_binding"}):
             raise MalformedHiddenStateError("deployment keys must match the canonical schema")
         machine = dep.get("machine", "")
         if not isinstance(machine, str) or not machine:
@@ -504,6 +509,14 @@ def _validate_hidden_state(data: dict) -> dict:
                 or len(dep["ip"]) > 255
                 or any(ord(char) < 33 or ord(char) == 127 for char in dep["ip"])):
             raise MalformedHiddenStateError("deployment.ip must be a bounded host value")
+        if "feishu_number" in dep:
+            if (not isinstance(dep["feishu_number"], str)
+                    or not re.fullmatch(r"[0-9]{1,32}", dep["feishu_number"])
+                    or not isinstance(dep["identity_binding"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", dep["identity_binding"])):
+                raise MalformedHiddenStateError("deployment Feishu identity binding is invalid")
+            if "ip" not in dep:
+                raise MalformedHiddenStateError("identity-bound deployment requires an IP")
         if dep.get("phase") != "deployed":
             raise MalformedHiddenStateError(f"invalid deployment phase: {dep.get('phase')!r}")
         cids = dep.get("component_ids", [])
@@ -515,19 +528,41 @@ def _validate_hidden_state(data: dict) -> dict:
                 raise MalformedHiddenStateError("deployment component_ids must be strings")
             if cid not in known_cids:
                 raise MalformedHiddenStateError(f"deployment references unknown component {cid!r}")
-            if cid in deployed_cids or cid in seen_in_dep:
-                raise MalformedHiddenStateError(f"component {cid!r} deployed more than once")
+            if cid in seen_in_dep:
+                raise MalformedHiddenStateError(f"component {cid!r} is duplicated in one deployment")
+            binding_ip = dep.get("ip", "")
+            binding = (machine, binding_ip, cid)
+            record = (
+                machine, binding_ip, cid, dep.get("feishu_number", ""),
+                dep.get("identity_binding", ""),
+            )
+            if record in seen_deployment_records:
+                raise MalformedHiddenStateError("duplicate deployment history record")
             seen_in_dep.add(cid)
             deployed_cids.add(cid)
+            deployed_bindings.add(binding)
+            if dep.get("identity_binding"):
+                deployed_identity_bindings.add((
+                    machine, binding_ip, cid, dep["identity_binding"],
+                ))
+            seen_deployment_records.add(record)
 
     runtime_redeploy = data.get("runtime_redeploy", [])
     if not isinstance(runtime_redeploy, list) or len(runtime_redeploy) > 32:
         raise MalformedHiddenStateError("runtime_redeploy must be a bounded list")
     runtime_redeploy_bindings = set()
     runtime_redeploy_components = set()
+    runtime_redeploy_deployment_ips = {}
+    runtime_redeploy_identity_bindings = {}
     for item in runtime_redeploy:
         if (not isinstance(item, dict)
-                or set(item) != {"machine", "ip", "component_ids"}):
+                or set(item) not in (
+                    {"machine", "ip", "component_ids"},
+                    {"machine", "ip", "component_ids", "deployment_ip"},
+                    {"machine", "ip", "component_ids", "deployment_identity_binding"},
+                    {"machine", "ip", "component_ids", "deployment_ip",
+                     "deployment_identity_binding"},
+                )):
             raise MalformedHiddenStateError("runtime_redeploy entry is invalid")
         machine = item.get("machine")
         ip_value = item.get("ip")
@@ -545,12 +580,48 @@ def _validate_hidden_state(data: dict) -> dict:
             raise MalformedHiddenStateError("runtime_redeploy.ip is invalid") from None
         if parsed_ip.version != 4 or str(parsed_ip) != ip_value:
             raise MalformedHiddenStateError("runtime_redeploy.ip must be canonical IPv4")
+        deployment_ip = item.get("deployment_ip", ip_value)
+        try:
+            parsed_deployment_ip = ipaddress.ip_address(deployment_ip)
+        except (TypeError, ValueError):
+            raise MalformedHiddenStateError("runtime_redeploy.deployment_ip is invalid") from None
+        if (parsed_deployment_ip.version != 4
+                or str(parsed_deployment_ip) != deployment_ip):
+            raise MalformedHiddenStateError(
+                "runtime_redeploy.deployment_ip must be canonical IPv4",
+            )
+        deployment_identity_binding = item.get("deployment_identity_binding", "")
+        if ("deployment_identity_binding" in item
+                and (not isinstance(deployment_identity_binding, str)
+                     or not re.fullmatch(r"[0-9a-f]{64}", deployment_identity_binding))):
+            raise MalformedHiddenStateError(
+                "runtime_redeploy deployment identity binding is invalid",
+            )
         if any(not isinstance(cid, str) or cid not in known_cids
                for cid in component_ids):
             raise MalformedHiddenStateError("runtime_redeploy component binding is invalid")
-        if any(cid in deployed_cids for cid in component_ids):
+        if any(
+            cid in deployed_cids and
+            (machine, deployment_ip, cid) not in deployed_bindings
+            and not any(
+                isinstance(deployment, dict)
+                and deployment.get("machine") == machine
+                and "ip" not in deployment
+                and cid in deployment.get("component_ids", [])
+                for deployment in deployments
+            )
+            for cid in component_ids
+        ):
             raise MalformedHiddenStateError(
-                "runtime_redeploy component must not remain marked deployed",
+                "runtime_redeploy component must reference its historical deployment",
+            )
+        if deployment_identity_binding and any(
+                cid in deployed_cids and
+                (machine, deployment_ip, cid, deployment_identity_binding)
+                not in deployed_identity_bindings
+                for cid in component_ids):
+            raise MalformedHiddenStateError(
+                "runtime_redeploy identity must reference its historical deployment",
             )
         if len(set(component_ids)) != len(component_ids):
             raise MalformedHiddenStateError("runtime_redeploy component binding is invalid")
@@ -564,6 +635,8 @@ def _validate_hidden_state(data: dict) -> dict:
             if binding in runtime_redeploy_bindings:
                 raise MalformedHiddenStateError("duplicate runtime_redeploy binding")
             runtime_redeploy_bindings.add(binding)
+            runtime_redeploy_deployment_ips[binding] = deployment_ip
+            runtime_redeploy_identity_bindings[binding] = deployment_identity_binding
             if len(runtime_redeploy_bindings) > 32:
                 raise MalformedHiddenStateError(
                     "runtime_redeploy bindings exceed the bounded limit",
@@ -592,7 +665,11 @@ def _validate_hidden_state(data: dict) -> dict:
                 "machine", "ip", "component_id", "runtime_id", "target_image",
                 "observed_image", "status", "checked_at",
             }
-            if not isinstance(check, dict) or set(check) != required:
+            optional = {
+                "deployment_ip", "deployment_identity_binding", "identity_reason",
+            }
+            if (not isinstance(check, dict) or not required.issubset(set(check))
+                    or set(check) - required - optional):
                 raise MalformedHiddenStateError("runtime_check keys are invalid")
             machine = check.get("machine")
             ip_value = check.get("ip")
@@ -602,6 +679,9 @@ def _validate_hidden_state(data: dict) -> dict:
             observed_image = check.get("observed_image")
             status_value = check.get("status")
             checked_at = check.get("checked_at")
+            deployment_ip = check.get("deployment_ip", ip_value)
+            deployment_identity_binding = check.get("deployment_identity_binding", "")
+            identity_reason = check.get("identity_reason", "")
             if (not isinstance(machine, str)
                     or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", machine)
                     or ".." in machine
@@ -618,8 +698,34 @@ def _validate_hidden_state(data: dict) -> dict:
                     or any(ord(char) < 32 or ord(char) == 127 for char in observed_image)
                     or not isinstance(status_value, str)
                     or status_value not in allowed_runtime_statuses
+                    or not isinstance(identity_reason, str)
                     or not isinstance(checked_at, str) or len(checked_at) > 40):
                 raise MalformedHiddenStateError("runtime_check field is invalid")
+            if ("deployment_identity_binding" in check
+                    and (not isinstance(deployment_identity_binding, str)
+                         or not re.fullmatch(r"[0-9a-f]{64}", deployment_identity_binding))):
+                raise MalformedHiddenStateError(
+                    "runtime_check deployment identity binding is invalid",
+                )
+            if "deployment_ip" in check:
+                try:
+                    parsed_deployment_ip = ipaddress.ip_address(deployment_ip)
+                except (TypeError, ValueError):
+                    raise MalformedHiddenStateError("runtime_check.deployment_ip is invalid") from None
+                if parsed_deployment_ip.version != 4 or str(parsed_deployment_ip) != deployment_ip:
+                    raise MalformedHiddenStateError(
+                        "runtime_check.deployment_ip must be canonical IPv4",
+                    )
+            allowed_identity_reasons = {
+                "identity_unrecorded", "device_changed", "snapshot_unavailable",
+                "historical_ip_reassigned", "address_changed",
+                "deployment_ip_unrecorded",
+            }
+            if identity_reason and (
+                    identity_reason not in allowed_identity_reasons
+                    or status_value != "identity_changed"
+                    and identity_reason != "historical_ip_reassigned"):
+                raise MalformedHiddenStateError("runtime_check identity reason is invalid")
             try:
                 parsed_ip = ipaddress.ip_address(ip_value)
             except ValueError:
@@ -636,6 +742,9 @@ def _validate_hidden_state(data: dict) -> dict:
             except (AttributeError, TypeError, ValueError):
                 raise MalformedHiddenStateError("runtime_check.checked_at is invalid") from None
             binding = (machine, str(parsed_ip), component_id)
+            deployment_binding = (machine, deployment_ip, component_id)
+            pending_deployment_ip = runtime_redeploy_deployment_ips.get(binding)
+            pending_identity_binding = runtime_redeploy_identity_bindings.get(binding, "")
             legacy_alias_binding = (
                 status_value == "identity_changed"
                 and any(isinstance(deployment, dict)
@@ -644,11 +753,35 @@ def _validate_hidden_state(data: dict) -> dict:
                         and component_id in deployment.get("component_ids", [])
                         for deployment in deployments)
             )
-            if (binding not in deployed_bindings
+            if (deployment_binding not in deployed_bindings
                     and binding not in runtime_redeploy_bindings
                     and not legacy_alias_binding):
                 raise MalformedHiddenStateError(
                     "runtime_check is not bound to a deployed machine/component",
+                )
+            if "deployment_identity_binding" in check:
+                exact_deployment = (
+                    machine, deployment_ip, component_id,
+                    deployment_identity_binding,
+                ) in deployed_identity_bindings
+                exact_pending = (
+                    binding in runtime_redeploy_bindings
+                    and pending_deployment_ip == deployment_ip
+                    and pending_identity_binding == deployment_identity_binding
+                )
+                if not (exact_deployment or exact_pending):
+                    raise MalformedHiddenStateError(
+                        "runtime_check identity is not bound to its deployment",
+                    )
+            if (pending_identity_binding
+                    and deployment_identity_binding != pending_identity_binding):
+                raise MalformedHiddenStateError(
+                    "runtime_check identity differs from its redeploy binding",
+                )
+            if (pending_deployment_ip is not None
+                    and pending_deployment_ip != deployment_ip):
+                raise MalformedHiddenStateError(
+                    "runtime_check historical deployment IP differs from its redeploy binding",
                 )
             component = component_by_id.get(component_id)
             if (not isinstance(component, dict)

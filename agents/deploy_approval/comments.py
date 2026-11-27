@@ -131,12 +131,6 @@ _DEPLOYMENT_PHASE_LABELS = {
 
 def _deployment_table(deployments=None, components=None, machine_groups=None) -> str:
     snapshots = {c.get("component_id"): c for c in components or [] if isinstance(c, dict)}
-    machines = {
-        m.get("alias"): (
-            m.get("ip") or m.get("primary_ip") or m.get("node_host") or ""
-        )
-        for m in machine_groups or [] if isinstance(m, dict)
-    }
     lines = ["| 机器 | IP | 组件 | 变体/路径 | 镜像 | 结果 |",
              "|---|---|---|---|---|---|"]
     count = 0
@@ -155,11 +149,15 @@ def _deployment_table(deployments=None, components=None, machine_groups=None) ->
                 if c.get("component_id"):
                     snapshot_ids.append(c["component_id"])
         machine = dep.get("machine") or dep.get("alias") or "机器未提供"
-        ip = dep.get("ip") or machines.get(machine) or "IP 未提供"
+        ip = dep.get("ip") or "实际部署 IP 未记录"
         phase = dep.get("phase") or dep.get("result") or dep.get("status") or ""
         result = _DEPLOYMENT_PHASE_LABELS.get(
             str(phase).strip().casefold(), "状态未确认",
         )
+        if dep.get("historical_identity_unconfirmed") is True:
+            result += " · 历史地址未记录，需要重新确认设备身份"
+        elif not dep.get("feishu_number") or not dep.get("identity_binding"):
+            result += " · 部署时未保存飞书身份，需要重新确认设备身份"
         if dep.get("error"):
             result += "：" + _safe_display_text(dep["error"])
         if dep.get("updated_at") or dep.get("timestamp"):
@@ -307,13 +305,21 @@ def _connection_failure_label(value) -> str:
     return ""
 
 _MACHINE_BLOCK_REASON_TEXT = {
-    "AGENT_CORE_CREDENTIAL_MISSING": "Agent Core 鉴权失败",
+    "AGENT_CORE_CREDENTIAL_MISSING": "Agent Core 凭证未配置",
+    "AGENT_CORE_AUTH_FAILED": "Agent Core 鉴权失败",
+    "AGENT_CORE_NETWORK_FAILED": "Agent Core 网络连接失败",
     "AGENT_CORE_UNAVAILABLE": "Agent Core 当前不可达",
     "AGENT_CORE_UNKNOWN": "Agent Core 验证未取得确定结果",
     "MACHINE_NOT_AUTHORIZED": "当前仓库没有授权这台机器",
     "REPOSITORY_POLICY_MISSING": "当前仓库机器策略不可用",
+    "MACHINE_NOT_BOUND": "设备尚未绑定到当前仓库机器策略",
+    "FEISHU_DEVICE_NOT_FOUND": "飞书快照中不存在已绑定的设备编号",
+    "FEISHU_SNAPSHOT_UNAVAILABLE": "当前飞书设备快照无法确认",
+    "IP_CONFLICT": "当前飞书设备 IP 存在冲突",
+    "MACHINE_CONFIGURATION_CHANGED": "机器配置在验证期间发生变化",
     "MACHINE_IDENTITY_MISMATCH": "机器身份与当前仓库策略不匹配",
     "OWNER_NOT_CONFIGURED": "机器负责人尚未配置",
+    "COMPONENT_INCOMPATIBLE": "机器上的 Agent Core 未确认本次组件运行实例",
     "TARGET_UNSUPPORTED": "机器不支持本次部署目标",
     "PLATFORM_MISMATCH": "机器平台与构建结果不兼容",
     "PLATFORM_UNVERIFIED": "机器平台尚未确认",
@@ -427,14 +433,14 @@ def _machine_unavailability_notes(machine: dict) -> list[str]:
             r"(?:unexpected status|http(?: status)?|status(?: code)?)\s*[:=]?\s*(401|403)\b",
             str(detail), re.IGNORECASE,
         ))
-        label = (
-            "Agent Core 鉴权失败" if state == "credential_missing"
-            or explicit_http_auth_failure else
-            _connection_failure_label(detail)
-        )
-        if label == "Agent Core 鉴权失败" and not (
-                state == "credential_missing" or explicit_http_auth_failure):
-            label = ""
+        if state == "credential_missing":
+            label = "Agent Core 凭证未配置"
+        elif state == "authentication_failed" or explicit_http_auth_failure:
+            label = "Agent Core 鉴权失败"
+        elif state == "network_failed":
+            label = "Agent Core 网络连接失败"
+        else:
+            label = _connection_failure_label(detail)
         if label:
             endpoint_notes.append(label)
         elif state in {"unavailable", "offline", "unreachable"}:
@@ -448,7 +454,9 @@ def _machine_unavailability_notes(machine: dict) -> list[str]:
     notes.extend(endpoint_notes)
     if report_agent_core_failure and not endpoint_notes:
         status_note = {
-            "credential_missing": "Agent Core 鉴权失败",
+            "credential_missing": "Agent Core 凭证未配置",
+            "authentication_failed": "Agent Core 鉴权失败",
+            "network_failed": "Agent Core 网络连接失败",
             "unavailable": "Agent Core 当前不可达",
             "offline": "Agent Core 当前不可达",
             "unreachable": "Agent Core 当前不可达",
@@ -481,13 +489,12 @@ def _machine_unavailability_notes(machine: dict) -> list[str]:
                 str(detail or ""), re.IGNORECASE,
             ))
             label = (
+                "Agent Core 凭证未配置" if status == "credential_missing" else
                 "Agent Core 鉴权失败"
-                if status == "credential_missing" or explicit_http_auth_failure
-                else _connection_failure_label(detail)
+                if status == "authentication_failed" or explicit_http_auth_failure else
+                "Agent Core 网络连接失败" if status == "network_failed" else
+                _connection_failure_label(detail)
             )
-            if label == "Agent Core 鉴权失败" and not (
-                    status == "credential_missing" or explicit_http_auth_failure):
-                label = ""
             if label:
                 notes.append(label)
     return list(dict.fromkeys(notes))
@@ -539,7 +546,9 @@ def _unavailability_lines(machine_groups) -> list[str]:
 
     detail_reasons = {
         _MACHINE_BLOCK_REASON_TEXT[key] for key in (
-            "MACHINE_IDENTITY_MISMATCH", "DRIVER_PATH_MISMATCH",
+            "MACHINE_IDENTITY_MISMATCH", "MACHINE_NOT_BOUND",
+            "FEISHU_DEVICE_NOT_FOUND", "FEISHU_SNAPSHOT_UNAVAILABLE",
+            "IP_CONFLICT", "DRIVER_PATH_MISMATCH",
             "PLATFORM_MISMATCH", "PLATFORM_UNVERIFIED", "VARIANT_MISMATCH",
             "TARGET_UNSUPPORTED", "PRIMARY_IP_AMBIGUOUS",
         )
@@ -576,6 +585,54 @@ def runtime_image_checks_block(
     diagnostic_by_alias = {_machine_alias(row).casefold(): row for row in diagnostics
                            if _machine_alias(row)}
 
+    def runtime_failure_reason(check, group, diagnostic):
+        sources = [source for source in (group, diagnostic) if isinstance(source, dict)]
+        diagnostics_for_check = [
+            item for source in sources
+            for item in source.get("endpoint_diagnostics", [])
+            if isinstance(item, dict)
+            and (not item.get("ip") or item.get("ip") == check.get("ip"))
+            and (not item.get("component_id")
+                 or item.get("component_id") == check.get("component_id"))
+        ]
+        statuses = {
+            str(item.get("status", "")).casefold()
+            for item in diagnostics_for_check
+        }
+        agent_statuses = {
+            str(source.get("agent_core_status", "")).casefold()
+            for source in sources
+        }
+        reasons = {
+            str(value).upper() for source in sources
+            for value in source.get("blocking_reasons", [])
+            if isinstance(value, str)
+        }
+        if "credential_missing" in statuses or "credential_missing" in agent_statuses:
+            return "Agent Core 凭证未配置"
+        if "authentication_failed" in statuses or "authentication_failed" in agent_statuses:
+            return "Agent Core 鉴权失败"
+        if "network_failed" in statuses or "unavailable" in statuses \
+                or "network_failed" in agent_statuses:
+            return "Agent Core 网络连接失败或当前不可达"
+        if "runtime_incompatible" in statuses or "COMPONENT_INCOMPATIBLE" in reasons:
+            return "Agent Core 已连接，但无法确认本次组件的运行状态"
+        for reason in (
+            "MACHINE_NOT_AUTHORIZED", "MACHINE_NOT_BOUND",
+            "FEISHU_DEVICE_NOT_FOUND", "FEISHU_SNAPSHOT_UNAVAILABLE",
+            "IP_CONFLICT", "MACHINE_IDENTITY_MISMATCH",
+            "REPOSITORY_POLICY_MISSING", "OWNER_NOT_CONFIGURED",
+            "PLATFORM_MISMATCH", "PLATFORM_UNVERIFIED", "VARIANT_MISMATCH",
+            "TARGET_UNSUPPORTED", "COMPONENT_INCOMPATIBLE",
+        ):
+            if reason in reasons:
+                return _MACHINE_BLOCK_REASON_TEXT.get(reason, "当前机器条件未通过")
+        for item in diagnostics_for_check:
+            text = _connection_failure_label(item.get("reason", ""))
+            if text:
+                return text
+        return "Agent Core 当前无法读取组件运行状态"
+
     def verified_selectors_for(check, group, component_id):
         if (not isinstance(group, dict)
                 or group.get("approval_available") is not True
@@ -583,13 +640,28 @@ def runtime_image_checks_block(
                 or group.get("repo_authorized") is not True
                 or not isinstance(component_id, str) or not component_id):
             return []
-        if (_field_flag(check, "approval_available", "safe_to_approve", "safe_to_deploy") is False
-                or _field_flag(check, "component_compatible", "components_compatible") is False):
+        historical_identity_unconfirmed = check.get("status") == "identity_changed"
+        if (not historical_identity_unconfirmed and (
+                _field_flag(check, "approval_available", "safe_to_approve", "safe_to_deploy") is False
+                or _field_flag(check, "component_compatible", "components_compatible") is False)):
             return []
         selected = []
         for endpoint in _verified_endpoints_for_machine(group):
             if component_id in endpoint["component_ids"]:
                 selected.append(endpoint["ip"])
+        if not selected and (
+                _field_flag(check, "approval_available", "safe_to_approve", "safe_to_deploy") is True
+                and _field_flag(check, "component_compatible", "components_compatible") is True
+                and _field_flag(check, "repository_authorized", "repo_authorized") is True
+                and _field_flag(check, "identity_confirmed", "machine_identity_confirmed") is True):
+            raw_selector = check.get("command_selector")
+            try:
+                selector = str(ipaddress.IPv4Address(raw_selector.strip())) \
+                    if isinstance(raw_selector, str) else ""
+            except ValueError:
+                selector = ""
+            if selector:
+                selected.append(selector)
         return sorted(set(selected))
 
     grouped: dict[str, dict] = {}
@@ -633,11 +705,11 @@ def runtime_image_checks_block(
         )
         target_image, observed_image = _runtime_image_values(check, component)
         images_confirmed = target_image != "未取得" and observed_image != "未取得"
-        if not images_confirmed:
-            command_selectors = []
         status = str(check.get("status", "unavailable") or "unavailable").casefold()
         if status not in {"match", "mismatch", "not_running", "unavailable", "identity_changed"}:
             status = "unavailable"
+        if not images_confirmed and status != "identity_changed":
+            command_selectors = []
         if (status in {"match", "mismatch"}
                 and (not images_confirmed or identity_confirmed is not True
                      or repo_authorization is not True)):
@@ -658,12 +730,31 @@ def runtime_image_checks_block(
             "identity_confirmed": identity_confirmed,
             "repo_authorization": repo_authorization,
             "verified_ips": verified_ips,
+            "history_ip": (
+                "" if check.get("identity_reason") == "deployment_ip_unrecorded"
+                else check.get("deployment_ip", check.get("ip", ""))
+            ),
+            "identity_reason": check.get("identity_reason", ""),
+            "unavailable_reason": (
+                runtime_failure_reason(check, group, diagnostic)
+                if status == "unavailable" else ""
+            ),
         }
         owners = _owner_names({}, {}, group)
         machine_row = grouped.setdefault(key, {
             "alias": machine, "ips": set(), "checks": [], "owners": owners,
         })
         machine_row["ips"].update(item["verified_ips"])
+        if not item["verified_ips"]:
+            current_ips = group.get("verification_endpoints", []) \
+                if isinstance(group, dict) else []
+            machine_row["ips"].update(
+                value for value in current_ips
+                if isinstance(value, str) and re.fullmatch(
+                    r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
+                    r"(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}", value,
+                )
+            )
         machine_row["checks"].append(item)
 
     if not grouped:
@@ -680,7 +771,7 @@ def runtime_image_checks_block(
         ip_text = "、".join(sorted(ips)) if ips else "IP 未确认"
         owner_text = _owner_label(
             row["owners"], test_only=bool(test_only),
-            mention=(lifecycle_status == "deploy-requested" and not test_only),
+            mention=False,
         )
         lines.append(f"- {row['alias']}（{ip_text}） · 负责人：{owner_text}")
         selectors = set()
@@ -705,6 +796,10 @@ def runtime_image_checks_block(
                     f"    当前运行：<code>{_escape(item['observed'])}</code>",
                     "    运行镜像与本轮批准镜像一致。",
                 ])
+                if item["identity_reason"] == "historical_ip_reassigned":
+                    lines.append(
+                        f"    历史 IP <code>{_escape(item['history_ip'])}</code> 已关联其他飞书设备；未查询该历史地址。"
+                    )
                 continue
             if status == "mismatch":
                 lines.extend([
@@ -719,6 +814,10 @@ def runtime_image_checks_block(
                     )
                 else:
                     lines.append("    镜像不一致，需要重新部署。")
+                if item["identity_reason"] == "historical_ip_reassigned":
+                    lines.append(
+                        f"    历史 IP <code>{_escape(item['history_ip'])}</code> 已关联其他飞书设备；未查询该历史地址。"
+                    )
                 if item["selectors"] and item["images_confirmed"]:
                     selectors.update(item["selectors"])
                 elif item["images_confirmed"]:
@@ -732,12 +831,30 @@ def runtime_image_checks_block(
                     lines.append(f"    {reason}，因此暂时不能生成重新部署命令。")
                 continue
             if status == "identity_changed":
+                identity_reasons = {
+                    "identity_unrecorded": "历史部署没有保存飞书设备身份",
+                    "deployment_ip_unrecorded": "历史部署没有保存实际 IP 和飞书设备身份",
+                    "device_changed": "当前飞书设备编号与历史部署记录不同",
+                    "snapshot_unavailable": "当前飞书快照无法确认设备身份",
+                    "historical_ip_reassigned": "历史部署 IP 当前已关联其他飞书设备",
+                    "address_changed": "历史部署地址已变化，需要在当前地址重新确认",
+                }
+                identity_reason = identity_reasons.get(
+                    item["identity_reason"], "历史部署记录的设备身份或 IP 已无法确认",
+                )
                 lines.extend([
                     f"  - {component}：状态：UNAVAILABLE",
                     f"    审批目标：<code>{_escape(item['target'])}</code>",
                     f"    当前运行：<code>{_escape(item['observed'])}</code>",
-                    "    机器身份绑定发生变化，暂时无法确认运行镜像；请等待自动检查重新确认。",
+                    f"    历史部署地址：<code>{_escape(item['history_ip'] or '未记录')}</code>；{identity_reason}。",
+                    "    没有查询历史 IP；不要复用旧审批命令。",
+                    "    需要按 PR Summary 中当前授权并验证过的地址重新确认。",
                 ])
+                for selector in item["selectors"]:
+                    command = f"/approve_deploy machine={selector}"
+                    if command not in existing_commands and command not in emitted_commands:
+                        emitted_commands.add(command)
+                        lines.append(f"    重新确认命令：<code>{command}</code>")
             elif status == "not_running":
                 lines.extend([
                     f"  - {component}：状态：UNAVAILABLE",
@@ -751,9 +868,8 @@ def runtime_image_checks_block(
                     f"    审批目标：<code>{_escape(item['target'])}</code>",
                     f"    当前运行：<code>{_escape(item['observed'])}</code>",
                 ])
-                lines.append(
-                    "    运行状态暂时无法确认，不能判断镜像是否一致；请等待自动检查完成。"
-                )
+                reason = item.get("unavailable_reason") or "Agent Core 当前无法读取组件运行状态"
+                lines.append(f"    当前运行镜像无法确认：{_escape(reason)}；不能判断镜像是否一致。")
         for selector in sorted(selectors):
             command = f"/approve_deploy machine={selector}"
             if command in existing_commands:
@@ -1874,7 +1990,7 @@ def _owner_label(owners, *, test_only=False, mention=True):
     labels = []
     for owner in owners:
         if _OWNER_LOGIN_RE.fullmatch(owner):
-            labels.append(f"@{owner}" if mention and not test_only else owner)
+            labels.append(f"@{owner}" if mention else owner)
         else:
             labels.append(owner.replace("@", "＠"))
     return " ".join(_escape(owner) for owner in labels) if labels else "负责人待配置"
@@ -2334,6 +2450,8 @@ def deploy_requested(
     machine_diagnostics=None,
     repository_policy_status=None,
     runtime_checks=None,
+    runtime_machine_groups=None,
+    mention_owners: bool = False,
 ) -> str:
     """Render a repository-scoped lifecycle with physical and authorized machines."""
     if (not isinstance(display_status, str)
@@ -2342,14 +2460,11 @@ def deploy_requested(
     inventory_rows = _machine_inventory_records(machine_inventory)
     diagnostic_rows = _machine_diagnostic_rows(machine_diagnostics)
     group_rows = _record_rows(machine_groups)
-    runtime_rows = _record_rows(runtime_checks, ("checks", "runtime_checks", "items"))
-    test_only = _test_only_status(
-        repository_policy_status, machine_diagnostics, group_rows, components,
-    ) or any(
-        isinstance(note, str) and "[test only]" in note.casefold()
-        for note in [last_lifecycle_event, *(gate_note or [])]
+    runtime_group_rows = (
+        _record_rows(runtime_machine_groups)
+        if runtime_machine_groups is not None else group_rows
     )
-
+    runtime_rows = _record_rows(runtime_checks, ("checks", "runtime_checks", "items"))
     components = components if isinstance(components, list) else []
     component_by_id = {
         item.get("component_id"): item for item in components
@@ -2475,7 +2590,8 @@ def deploy_requested(
                 _escape(label) for label in component_labels if label
             ) or "当前适配组件"
             owner_text = _owner_label(
-                state["owners"], test_only=test_only, mention=not test_only,
+                state["owners"],
+                mention=bool(mention_owners),
             )
             pending_lines.append(
                 f"- `{_escape(alias)}`（`{_escape(state['ip'])}`）"
@@ -2501,10 +2617,6 @@ def deploy_requested(
                 "",
                 "审批完成后本 Summary 会自动更新为部署进度；审批前不需要其他操作。",
             ])
-        if len(full_machine_ids) == 1 and not full_machine_identity_missing:
-            lines.append(
-                "只有一台机器完整兼容所有组件，负责人也可以直接执行 `/approve_deploy`。"
-            )
 
     if display_status != "deploying" and unavailable_machine_lines:
         lines.extend([
@@ -2530,12 +2642,9 @@ def deploy_requested(
     if notes:
         lines.extend(["", *notes])
 
-    if test_only and display_status == "deploy-requested":
-        lines.extend(["", f"测试 PR 仅提醒 @{_TEST_ONLY_HAOHAO_REMINDER}。"])
-
     runtime_action = runtime_image_checks_block(
         runtime_rows, components, lifecycle_status=display_status,
-        machine_groups=group_rows, machine_inventory=inventory_rows,
+        machine_groups=runtime_group_rows, machine_inventory=inventory_rows,
         machine_diagnostics=diagnostic_rows,
         existing_commands=seen_commands,
     )
@@ -2551,12 +2660,6 @@ def deploy_requested(
         ),
     ])
     body = _lifecycle_body(lines)
-    if test_only:
-        body = body.replace("@", "＠")
-        body = body.replace(
-            "＠" + _TEST_ONLY_HAOHAO_REMINDER,
-            "@Haohao-end",
-        )
     return body
 
 def testing(
@@ -2824,14 +2927,13 @@ def _status_next_action(
             }
             component_ids -= deployed_ids
         rows = _verified_approval_rows(machine_groups, component_ids)
-        test_only = _test_only_status(machine_groups, components)
         if status == "deploy-ready":
             lines = ["当前提交的代码审核和镜像构建都已完成，可以部署。"]
             lines.append("`/request_deploy` 是可选步骤，可以直接执行下列已验证 IP 命令：")
             mention_owners = False
         else:
             lines = ["部署申请已经提交，现在等待对应机器负责人审批。"]
-            mention_owners = not test_only
+            mention_owners = False
         full_machine_ids = set()
         full_identity_missing = False
         seen = set()
@@ -2858,12 +2960,10 @@ def _status_next_action(
                 "",
                 f"- `{_escape(row['alias'])}`（`{_escape(row['ip'])}`）"
                 + (f" · {_escape(row['label'])}" if row["label"] else ""),
-                f"  负责人：{_owner_label(row['owners'], mention=mention_owners and not test_only)}",
+                f"  负责人：{_owner_label(row['owners'], mention=mention_owners)}",
                 f"  兼容组件：{'、'.join(labels) or '当前适配组件'}",
                 f"  `{command}`",
             ])
-        if test_only and status == "deploy-requested":
-            lines.extend(["", "测试 PR 仅提醒 @Haohao-end。"])
         if not seen and not component_ids:
             lines.extend(["", "所有需要的组件都已部署，无需再次审批。"])
         elif not seen:
@@ -2875,7 +2975,7 @@ def _status_next_action(
             lines.extend(_unavailability_lines(machine_groups))
         elif status == "deploy-requested":
             lines.extend(["", "审批完成后等待 Summary 更新；不要重复审批。"])
-        if (len(full_machine_ids) == 1
+        if (status == "deploy-ready" and len(full_machine_ids) == 1
                 and not full_identity_missing):
             lines.extend(["", "只有一台机器完整兼容所有待部署组件，也可以直接执行 `/approve_deploy`。"])
         return lines

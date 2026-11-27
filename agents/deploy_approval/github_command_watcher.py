@@ -40,6 +40,7 @@ from .review_comment_parser import (
 
 logger = logging.getLogger(__name__)
 PR_RECONCILE_CACHE_SECONDS = 120.0
+MACHINE_PROJECTION_REFRESH_SECONDS = 300.0
 OPEN_PR_LIST_REFRESH_SECONDS = 30.0
 OPEN_PR_SNAPSHOT_MAX_AGE_SECONDS = 120.0
 OPEN_PR_LIST_QUERY_TIMEOUT_SECONDS = 300.0
@@ -273,18 +274,30 @@ class GitHubCommandWatcher:
         self._normal_pr_lane_cursor: dict[str, int] = {}
         self._draft_label_attempts: dict[tuple[str, int], int] = {}
         self._draft_label_retry_after: dict[tuple[str, int], float] = {}
+        self._ordinary_pr_scan_retries: dict[tuple[str, int], dict] = {}
         # Scheduling hints only. Selected PRs still pass through fresh
         # authorization, HEAD, cursor, and compare-and-swap checks.
         self._pr_reconcile_cache: dict[tuple[str, int], dict] = {}
         self._last_ordinary_pr_skips = 0
         self._priority_pr_queue: deque[tuple[str, int]] = deque()
         self._priority_pr_set: set[tuple[str, int]] = set()
+        self._priority_source_repo_cursor: dict[str, int] = {}
         self._priority_pr_enqueued_at: dict[tuple[str, int], float] = {}
         self._priority_pr_sources: dict[tuple[str, int], str] = {}
         self._priority_generation = 0
         self._priority_baseline_failures: dict[tuple[str, int], int] = {}
         self._priority_pr_retry_after: dict[tuple[str, int], float] = {}
         self._priority_baseline_external_bypassed: set[tuple[str, int]] = set()
+        self._new_pr_initialization_attempts: dict[tuple[str, int], int] = {}
+        self._new_pr_initialization_retry_after: dict[tuple[str, int], float] = {}
+        self._new_pr_initialization_snapshot: dict[tuple[str, int], tuple] = {}
+        self._machine_projection_versions: dict[str, object] = {}
+        self._machine_refresh_pending: dict[str, dict] = {}
+        self._machine_refresh_pr_versions: dict[tuple[str, int], object] = {}
+        self._machine_refresh_last_results: dict[tuple[str, int], dict] = {}
+        self._machine_refresh_failures: dict[tuple[str, int], int] = {}
+        self._machine_refresh_retry_after: dict[tuple[str, int], float] = {}
+        self._machine_version_api_missing_repos: set[str] = set()
         # Initialized in start() under the running event loop (Python 3.9 safe).
         self._wakeup = None
         self._last_successful_cycle = None
@@ -464,78 +477,64 @@ class GitHubCommandWatcher:
             self._ready_for_review_at.pop(item, None)
             self._baseline_progress.get(repo, set()).discard(pr_number)
         self._prioritize_new_external_baseline_retry(item)
-        if item in self._priority_pr_set:
-            priority_changed = False
-            if item in self._priority_pr_queue:
-                if self._priority_pr_sources.get(item) != "webhook":
-                    self._priority_pr_queue.remove(item)
-                    self._priority_pr_queue.appendleft(item)
-                    self._priority_pr_sources[item] = "webhook"
-                    self._priority_pr_enqueued_at[item] = self._monotonic()
-                    self._priority_generation += 1
-                    priority_changed = True
-            else:
-                # A webhook can arrive while the same PR is being read. Keep a
-                # fresh queued pass so the new comment is not hidden by dedupe.
-                if self._queue_priority_pr(item, "webhook"):
-                    self._priority_generation += 1
-                    priority_changed = True
-            if priority_changed:
-                self._signal_wakeup()
+        was_queued = item in self._priority_pr_queue
+        previous_source = self._priority_pr_sources.get(item)
+        queued = self._queue_priority_pr(item, "webhook")
+        priority_changed = queued and (
+            not was_queued or previous_source != self._priority_pr_sources.get(item)
+        )
+        if priority_changed:
+            self._priority_generation += 1
+            self._signal_wakeup()
+        return queued
+
+    def _queue_priority_pr(self, item: tuple[str, int], source: str) -> bool:
+        """Requeue one PR hint without duplicates, preserving its strongest trigger."""
+        source_rank = self._priority_source_rank
+        if item in self._priority_pr_queue:
+            current_source = self._priority_pr_sources.get(item, "webhook")
+            if source_rank(source) < source_rank(current_source):
+                self._priority_pr_queue.remove(item)
+                self._priority_pr_sources[item] = source
+                insert_at = next((index for index, queued in enumerate(self._priority_pr_queue)
+                                  if source_rank(
+                                      self._priority_pr_sources.get(queued, "webhook"),
+                                  ) > source_rank(source)), len(self._priority_pr_queue))
+                self._priority_pr_queue.insert(insert_at, item)
             return True
         if len(self._priority_pr_queue) >= 128:
-            evicted = self._priority_pr_queue.pop()
+            evicted = next((queued for queued in reversed(self._priority_pr_queue)
+                            if source_rank(
+                                self._priority_pr_sources.get(queued, "webhook"),
+                            ) > source_rank(source)), None)
+            if evicted is None:
+                return False
+            self._priority_pr_queue.remove(evicted)
             self._priority_pr_set.discard(evicted)
             self._priority_pr_enqueued_at.pop(evicted, None)
             self._priority_pr_sources.pop(evicted, None)
             self._clear_priority_baseline_retry(evicted)
             self._clear_priority_item_retry(evicted)
-        self._priority_pr_queue.appendleft(item)
-        self._priority_pr_set.add(item)
-        self._priority_pr_sources[item] = "webhook"
-        self._priority_pr_enqueued_at[item] = self._monotonic()
-        self._recent_discovery_stats["priority_queued"] += 1
-        self._priority_generation += 1
-        self._signal_wakeup()
-        return True
-
-    def _queue_priority_pr(self, item: tuple[str, int], source: str) -> bool:
-        """Requeue an in-flight hint without duplicates, keeping webhook priority."""
-        if item in self._priority_pr_queue:
-            return True
-        if len(self._priority_pr_queue) >= 128:
-            if source == "webhook":
-                evicted = self._priority_pr_queue.pop()
-                self._priority_pr_set.discard(evicted)
-                self._priority_pr_enqueued_at.pop(evicted, None)
-                self._priority_pr_sources.pop(evicted, None)
-                self._clear_priority_baseline_retry(evicted)
-                self._clear_priority_item_retry(evicted)
-            else:
-                evicted = next((queued for queued in reversed(self._priority_pr_queue)
-                                if self._priority_pr_sources.get(queued) == "recent"), None)
-                if evicted is None:
-                    self._priority_pr_set.discard(item)
-                    self._priority_pr_enqueued_at.pop(item, None)
-                    self._priority_pr_sources.pop(item, None)
-                    self._clear_priority_baseline_retry(item)
-                    self._clear_priority_item_retry(item)
-                    return False
-                self._priority_pr_queue.remove(evicted)
-                self._priority_pr_set.discard(evicted)
-                self._priority_pr_enqueued_at.pop(evicted, None)
-                self._priority_pr_sources.pop(evicted, None)
-                self._clear_priority_baseline_retry(evicted)
-                self._clear_priority_item_retry(evicted)
-        if source == "webhook":
-            self._priority_pr_queue.appendleft(item)
-        else:
-            self._priority_pr_queue.append(item)
+        insert_at = next((index for index, queued in enumerate(self._priority_pr_queue)
+                          if source_rank(
+                              self._priority_pr_sources.get(queued, "webhook"),
+                          ) > source_rank(source)), len(self._priority_pr_queue))
+        self._priority_pr_queue.insert(insert_at, item)
         self._priority_pr_set.add(item)
         self._priority_pr_sources[item] = source
         self._priority_pr_enqueued_at[item] = self._monotonic()
         self._recent_discovery_stats["priority_queued"] += 1
         return True
+
+    @staticmethod
+    def _priority_source_rank(source: str) -> int:
+        return {
+            "command": 0,
+            "webhook": 1,
+            "recent": 2,
+            "machine": 3,
+            "initialization": 4,
+        }.get(source, 2)
 
     def _retry_priority_baseline(self, item: tuple[str, int], source: str) -> None:
         """Back off an incomplete baseline without dropping its priority hint."""
@@ -576,6 +575,24 @@ class GitHubCommandWatcher:
     def _clear_priority_item_retry(self, item: tuple[str, int]) -> None:
         self._priority_item_failures.pop(item, None)
         self._priority_pr_retry_after.pop(item, None)
+
+    def _retry_machine_projection_refresh(
+        self, item: tuple[str, int], reason: str,
+    ) -> None:
+        failures = min(8, self._machine_refresh_failures.get(item, 0) + 1)
+        self._machine_refresh_failures[item] = failures
+        base = max(2.0, float(self.config.poll_interval_seconds))
+        delay = min(300.0, base * (2 ** min(failures - 1, 5)))
+        self._machine_refresh_retry_after[item] = self._monotonic() + delay
+        self._queue_priority_pr(item, "machine")
+        logger.info(
+            "watcher machine projection retry deferred repo=%s pr=%s reason=%s failures=%s delay_seconds=%.1f",
+            item[0], item[1], reason, failures, delay,
+        )
+
+    def _clear_machine_projection_retry(self, item: tuple[str, int]) -> None:
+        self._machine_refresh_failures.pop(item, None)
+        self._machine_refresh_retry_after.pop(item, None)
 
     def _prioritize_new_external_baseline_retry(self, item: tuple[str, int]) -> None:
         """Let one fresh webhook/comment hint bypass an incomplete baseline delay.
@@ -1118,7 +1135,84 @@ class GitHubCommandWatcher:
             if status == "authorization_unavailable" else None,
         }
 
+    def _clear_repo_transient_scheduling_state(self, repo: str) -> None:
+        """Drop volatile work for an unauthorized repo without touching cursors."""
+        self._machine_projection_versions.pop(repo, None)
+        self._machine_refresh_pending.pop(repo, None)
+        self._machine_version_api_missing_repos.discard(repo)
+        for item in [item for item in self._machine_refresh_pr_versions
+                     if item[0] == repo]:
+            self._machine_refresh_pr_versions.pop(item, None)
+        for item in [item for item in self._machine_refresh_last_results
+                     if item[0] == repo]:
+            self._machine_refresh_last_results.pop(item, None)
+        for mapping in (
+            self._machine_refresh_failures, self._machine_refresh_retry_after,
+        ):
+            for item in [item for item in mapping if item[0] == repo]:
+                mapping.pop(item, None)
+        for item in [item for item in self._priority_pr_queue if item[0] == repo]:
+            self._priority_pr_queue.remove(item)
+            self._priority_pr_set.discard(item)
+            self._priority_pr_enqueued_at.pop(item, None)
+            self._priority_pr_sources.pop(item, None)
+        for mapping in (
+            self._priority_baseline_failures,
+            self._priority_pr_retry_after,
+            self._priority_item_failures,
+            self._priority_baseline_external_bypassed,
+            self._new_pr_initialization_attempts,
+            self._new_pr_initialization_retry_after,
+            self._new_pr_initialization_snapshot,
+            self._draft_label_attempts,
+            self._draft_label_retry_after,
+            self._ordinary_pr_scan_retries,
+        ):
+            if isinstance(mapping, set):
+                for item in [item for item in mapping if item[0] == repo]:
+                    mapping.discard(item)
+            else:
+                for item in [item for item in mapping if item[0] == repo]:
+                    mapping.pop(item, None)
+        self._priority_generation += 1
+
+    def _clear_unauthorized_transient_scheduling_state(self) -> None:
+        """Discard queued hints on auth loss; persisted command cursors stay intact."""
+        repos = set(self.config.active_repos) | set(self.config.github_repos)
+        repos.update(self._machine_projection_versions)
+        repos.update(self._machine_refresh_pending)
+        repos.update(repo for repo, _ in self._machine_refresh_pr_versions)
+        repos.update(repo for repo, _ in self._machine_refresh_last_results)
+        repos.update(repo for repo, _ in self._machine_refresh_failures)
+        repos.update(repo for repo, _ in self._machine_refresh_retry_after)
+        repos.update(self._machine_version_api_missing_repos)
+        for mapping in (
+            self._priority_baseline_failures,
+            self._priority_pr_retry_after,
+            self._priority_item_failures,
+            self._priority_baseline_external_bypassed,
+            self._new_pr_initialization_attempts,
+            self._new_pr_initialization_retry_after,
+            self._new_pr_initialization_snapshot,
+            self._draft_label_attempts,
+            self._draft_label_retry_after,
+            self._ordinary_pr_scan_retries,
+        ):
+            repos.update(item[0] for item in mapping)
+        repos.update(repo for repo, _ in self._priority_pr_queue)
+        for repo in repos:
+            self._clear_repo_transient_scheduling_state(repo)
+        # A partially completed authorization generation is re-established by
+        # mark_repos_pending_baseline() on recovery. Keep stored comment cursors
+        # untouched so old commands cannot be replayed by queue cleanup.
+        self._priority_pr_queue.clear()
+        self._priority_pr_set.clear()
+        self._priority_pr_enqueued_at.clear()
+        self._priority_pr_sources.clear()
+        self._priority_source_repo_cursor.clear()
+
     def _invalidate_all_open_pr_listing_snapshots(self) -> None:
+        self._clear_unauthorized_transient_scheduling_state()
         repos = set(self._open_pr_listing_tasks)
         repos.update(self._open_pr_listing_snapshots)
         repos.update(self._open_pr_listing_status)
@@ -1140,8 +1234,30 @@ class GitHubCommandWatcher:
         known.update(self._open_pr_listing_snapshots)
         known.update(self._open_pr_listing_status)
         known.update(self._open_pr_listing_next_attempt)
+        known.update(self._machine_projection_versions)
+        known.update(self._machine_refresh_pending)
+        known.update(repo for repo, _ in self._machine_refresh_pr_versions)
+        known.update(repo for repo, _ in self._machine_refresh_last_results)
+        known.update(repo for repo, _ in self._machine_refresh_failures)
+        known.update(repo for repo, _ in self._machine_refresh_retry_after)
+        known.update(self._machine_version_api_missing_repos)
+        for mapping in (
+            self._priority_baseline_failures,
+            self._priority_pr_retry_after,
+            self._priority_item_failures,
+            self._priority_baseline_external_bypassed,
+            self._new_pr_initialization_attempts,
+            self._new_pr_initialization_retry_after,
+            self._new_pr_initialization_snapshot,
+            self._draft_label_attempts,
+            self._draft_label_retry_after,
+            self._ordinary_pr_scan_retries,
+        ):
+            known.update(item[0] for item in mapping)
+        known.update(repo for repo, _ in self._priority_pr_queue)
         for repo in known - authorized:
             self._invalidate_open_pr_listing_repo(repo, remove=True)
+            self._clear_repo_transient_scheduling_state(repo)
 
     def _schedule_open_pr_listing_refreshes(self, repos: list[str]) -> None:
         if self._github_backing_off():
@@ -1341,12 +1457,13 @@ class GitHubCommandWatcher:
         if metric["over_60_seconds"] and not item.get("_over_60_diagnostic_logged"):
             item["_over_60_diagnostic_logged"] = True
             logger.warning(
-                "watcher recent command processing exceeded 60 seconds repo=%s pr=%s comment_id=%s status=%s comment_created_at=%s discovered_at=%s queued_at=%s dispatch_started_at=%s dispatch_completed_at=%s latency_seconds=%.3f failure_reason=%s",
-                item.get("repo"), item.get("pr_number"), item.get("comment_id"),
-                item.get("status"), item.get("comment_created_at"),
+                "watcher recent command processing exceeded 60 seconds repo=%s pr=%s trigger=%s comment_id=%s status=%s command_wait_seconds=%.3f comment_created_at=%s discovered_at=%s queued_at=%s dispatch_started_at=%s dispatch_completed_at=%s failure_reason=%s",
+                item.get("repo"), item.get("pr_number"), item.get("event_type"),
+                item.get("comment_id"), item.get("status"),
+                created_to_processing, item.get("comment_created_at"),
                 item.get("discovered_at"), item.get("queued_at"),
                 item.get("dispatch_started_at"), item.get("dispatch_completed_at"),
-                created_to_processing, item.get("failure_reason"),
+                item.get("failure_reason"),
             )
         return metric
 
@@ -1359,10 +1476,26 @@ class GitHubCommandWatcher:
         current = self._monotonic() if now is None else now
         return round(max(0.0, discovery_delay + current - discovered_mono), 3)
 
+    def _pending_command_wait(self, repo: str, pr_number: int) -> tuple[int | None, float | None]:
+        pending = [
+            record for (record_repo, record_pr, _comment_id), record
+            in self._recent_command_records.items()
+            if record_repo == repo and record_pr == pr_number
+            and isinstance(record, dict)
+            and record.get("event_type") == "slash_command"
+            and record.get("status") not in {"handled", "already_processed"}
+        ]
+        record = min(
+            pending, key=lambda item: item.get("comment_id", 0), default=None,
+        )
+        if not isinstance(record, dict):
+            return None, None
+        return record.get("comment_id"), self._recent_command_latency(record)
+
     def _log_recent_command_diagnostic(self, event: str, record: dict) -> None:
         logger.info(
-            "watcher recent command event=%s repo=%s pr=%s comment_id=%s comment_created_at=%s discovered_at=%s queued_at=%s dispatch_started_at=%s dispatch_completed_at=%s latency_seconds=%s failure_reason=%s",
-            event, record.get("repo"), record.get("pr_number"),
+            "watcher recent command event=%s repo=%s pr=%s trigger=%s comment_id=%s comment_created_at=%s discovered_at=%s queued_at=%s dispatch_started_at=%s dispatch_completed_at=%s command_wait_seconds=%s failure_reason=%s",
+            event, record.get("repo"), record.get("pr_number"), record.get("event_type"),
             record.get("comment_id"), record.get("comment_created_at"),
             record.get("discovered_at"), record.get("queued_at"),
             record.get("dispatch_started_at"), record.get("dispatch_completed_at"),
@@ -2288,6 +2421,10 @@ class GitHubCommandWatcher:
                     repo, type(exc).__name__,
                 )
                 continue
+            if (self.config.auth_valid is not True
+                    or repo not in self.config.active_repos
+                    or repo not in self.config.github_repos):
+                continue
             self._recent_discovery_at[repo] = datetime.now(timezone.utc).isoformat()
             self._recent_discovery_last_failure[repo] = None
             if not isinstance(comments, list):
@@ -2400,10 +2537,13 @@ class GitHubCommandWatcher:
                     if not was_known and (repo, number) not in newly_discovered_prs:
                         self._recent_discovery_stats["newly_discovered_prs"] += 1
                         newly_discovered_prs.add((repo, number))
+                    source = "recent"
+                    candidate = (
+                        self._priority_source_rank(source), key[2], source, key,
+                    )
                     previous = per_pr.get(number)
-                    if (previous is None or created_at > previous[0]
-                            or created_at == previous[0] and key[2] > previous[1]):
-                        per_pr[number] = (created_at, key[2], key)
+                    if previous is None or candidate[:2] < previous[:2]:
+                        per_pr[number] = candidate
                     continue
                 if not was_known and (is_command or is_review_completion):
                     self._recent_discovery_stats["eligible_commands"] += 1
@@ -2413,104 +2553,41 @@ class GitHubCommandWatcher:
                     if (repo, number) not in newly_discovered_prs:
                         self._recent_discovery_stats["newly_discovered_prs"] += 1
                     newly_discovered_prs.add((repo, number))
+                source = "command" if is_command else "recent"
+                candidate = (
+                    self._priority_source_rank(source), key[2], source, key,
+                )
                 previous = per_pr.get(number)
-                if (previous is None or created_at > previous[0]
-                        or created_at == previous[0] and key[2] > previous[1]):
-                    per_pr[number] = (created_at, key[2], key)
-            for number, (created_at, comment_id, key) in per_pr.items():
-                candidates[(repo, number)] = (created_at, comment_id, key)
+                if previous is None or candidate[:2] < previous[:2]:
+                    per_pr[number] = candidate
+            for number, candidate in per_pr.items():
+                candidates[(repo, number)] = candidate
 
-        # Refresh the order of observed recent hints while leaving webhooks in
-        # their higher-priority prefix. A newly-created comment on an already
-        # queued PR must move that PR ahead of older recent hints.
+        # A source comment can promote one deduplicated PR hint, but cannot
+        # create a second queue entry for that PR. Commands outrank repeated
+        # review prompts; _process_pr still walks all comments by comment_id.
         if newly_discovered_prs:
             for item in newly_discovered_prs:
                 self._prioritize_new_external_baseline_retry(item)
-        existing_recent_enqueued_at = {}
-        for item in list(candidates):
-            repo, number = item
-            if (item in self._priority_pr_set
-                    and self._priority_pr_sources.get(item, "webhook") == "webhook"):
-                if item in self._priority_pr_queue:
-                    comment_key = candidates[item][2]
-                    enqueued = self._priority_pr_enqueued_at.get(item)
-                    queued_at = None
-                    if isinstance(enqueued, (int, float)):
-                        elapsed = max(0.0, self._monotonic() - enqueued)
-                        queued_at = datetime.fromtimestamp(
-                            datetime.now(timezone.utc).timestamp() - elapsed,
-                            timezone.utc,
-                        ).isoformat()
-                    self._mark_recent_command_queued(
-                        repo, number, comment_key[2], queued_at=queued_at,
-                    )
-                    candidates.pop((repo, number), None)
-                    continue
-                if item not in newly_discovered_prs:
-                    candidates.pop((repo, number), None)
-                    continue
-            if item in self._priority_pr_queue:
-                if self._priority_pr_sources.get(item) == "recent":
-                    existing_recent_enqueued_at[item] = self._priority_pr_enqueued_at.get(item)
-                self._priority_pr_queue.remove(item)
-                self._priority_pr_set.discard(item)
-                self._priority_pr_enqueued_at.pop(item, None)
-                self._priority_pr_sources.pop(item, None)
-
-        # Insert oldest first at the fixed position after webhooks; each newer
-        # item is then placed ahead of older discovery hints in the final queue.
-        ordered = sorted(candidates.items(), key=lambda item: (item[1][0], item[1][1]))
-        queued_recent = False
-        for (repo, number), (_created_at, _comment_id, key) in ordered:
+        ordered = sorted(
+            candidates.items(), key=lambda item: (item[1][0], item[1][1]),
+        )
+        queued_priority = False
+        for (repo, number), (_rank, _comment_id, source, key) in ordered:
             item = (repo, number)
-            if item in self._priority_pr_set:
-                if item not in newly_discovered_prs:
-                    continue
-                if (len(self._priority_pr_queue) >= 128
-                        and not any(self._priority_pr_sources.get(queued) == "recent"
-                                    for queued in self._priority_pr_queue)):
-                    # Preserve the in-flight dedupe marker if every queue slot
-                    # belongs to a webhook hint; the fair ordinary scan remains
-                    # the fallback until a queue slot is available.
-                    continue
-                if not self._queue_priority_pr(item, "recent"):
-                    continue
-                queued_recent = True
-                self._mark_recent_command_queued(repo, number, key[2])
+            was_queued = item in self._priority_pr_queue
+            previous_source = self._priority_pr_sources.get(item)
+            if not self._queue_priority_pr(item, source):
                 continue
-            if len(self._priority_pr_queue) >= 128:
-                oldest_recent = next((queued for queued in reversed(self._priority_pr_queue)
-                                      if self._priority_pr_sources.get(queued) == "recent"), None)
-                if oldest_recent is None:
-                    continue
-                self._priority_pr_queue.remove(oldest_recent)
-                self._priority_pr_set.discard(oldest_recent)
-                self._priority_pr_enqueued_at.pop(oldest_recent, None)
-                self._priority_pr_sources.pop(oldest_recent, None)
-                self._clear_priority_baseline_retry(oldest_recent)
-                self._clear_priority_item_retry(oldest_recent)
-            webhook_count = sum(
-                self._priority_pr_sources.get(queued) == "webhook"
-                for queued in self._priority_pr_queue
-            )
-            self._priority_pr_queue.insert(webhook_count, item)
-            self._priority_pr_set.add(item)
-            self._priority_pr_sources[item] = "recent"
-            self._recent_discovery_stats["priority_queued"] += 1
-            prior_enqueued_at = existing_recent_enqueued_at.get(item)
-            self._priority_pr_enqueued_at[item] = (
-                prior_enqueued_at if isinstance(prior_enqueued_at, (int, float))
-                else self._monotonic()
-            )
             self._mark_recent_command_queued(repo, number, key[2])
-            if prior_enqueued_at is None:
-                queued_recent = True
-        if newly_discovered_prs or queued_recent:
+            if not was_queued or previous_source != self._priority_pr_sources.get(item):
+                queued_priority = True
+        if queued_priority:
             self._priority_generation += 1
             # Wake the serial writer and interrupt its ordinary scan after the
             # currently active PR operation yields. Discovery itself stays read-only.
             self._signal_wakeup()
-        return queued_recent
+        return queued_priority
 
     def _record_pr_attempt(
         self, repo: str, pr_number: int, reason: str, duration_seconds: float | None = None,
@@ -2603,6 +2680,7 @@ class GitHubCommandWatcher:
                 self._pending_baseline_repos.discard(repo)
                 self._baseline_progress.pop(repo, None)
                 self._invalidate_open_pr_listing_repo(repo, remove=True)
+                self._clear_repo_transient_scheduling_state(repo)
             newly_active = new_active_set if not old_auth_valid else new_active_set - old_active_set
             self.mark_repos_pending_baseline(sorted(newly_active), startup=False)
         except (GitHubRateLimitError, GitHubTransientError) as e:
@@ -2673,6 +2751,409 @@ class GitHubCommandWatcher:
             cursor[repo] = (index + 1) % len(candidates)
             return number
         return None
+
+    @staticmethod
+    def _pr_snapshot_key(pr: dict) -> tuple:
+        head = pr.get("head")
+        return (
+            pr.get("created_at"), pr.get("updated_at"),
+            head.get("sha") if isinstance(head, dict) else None,
+        )
+
+    def _new_pr_initialization_retry_ready(self, repo: str, pr: dict) -> bool:
+        number = pr.get("number")
+        if type(number) is not int or number <= 0:
+            return False
+        item = (repo, number)
+        snapshot_key = self._pr_snapshot_key(pr)
+        if self._new_pr_initialization_snapshot.get(item) != snapshot_key:
+            self._new_pr_initialization_snapshot[item] = snapshot_key
+            self._new_pr_initialization_attempts.pop(item, None)
+            self._new_pr_initialization_retry_after.pop(item, None)
+        return self._monotonic() >= self._new_pr_initialization_retry_after.get(item, 0.0)
+
+    def _retry_new_pr_initialization(
+        self, repo: str, pr_number: int, pr: dict, reason: str,
+    ) -> None:
+        item = (repo, pr_number)
+        snapshot_key = self._pr_snapshot_key(pr)
+        if self._new_pr_initialization_snapshot.get(item) != snapshot_key:
+            self._new_pr_initialization_attempts[item] = 0
+            self._new_pr_initialization_snapshot[item] = snapshot_key
+        attempts = min(8, self._new_pr_initialization_attempts.get(item, 0) + 1)
+        self._new_pr_initialization_attempts[item] = attempts
+        base = max(30.0, float(self.config.poll_interval_seconds))
+        delay = min(900.0, base * (2 ** min(attempts - 1, 5)))
+        self._new_pr_initialization_retry_after[item] = self._monotonic() + delay
+        while len(self._new_pr_initialization_retry_after) > 4096:
+            oldest = next(iter(self._new_pr_initialization_retry_after))
+            self._new_pr_initialization_retry_after.pop(oldest, None)
+            self._new_pr_initialization_attempts.pop(oldest, None)
+            self._new_pr_initialization_snapshot.pop(oldest, None)
+        logger.warning(
+            "watcher new PR initialization deferred repo=%s pr=%s trigger=new_unlabeled_pr reason=%s attempts=%s retry_seconds=%.1f",
+            repo, pr_number, reason, attempts, delay,
+        )
+
+    def _clear_new_pr_initialization_retry(self, repo: str, pr_number: int) -> None:
+        item = (repo, pr_number)
+        self._new_pr_initialization_attempts.pop(item, None)
+        self._new_pr_initialization_retry_after.pop(item, None)
+        self._new_pr_initialization_snapshot.pop(item, None)
+
+    def _ordinary_pr_scan_retry_ready(self, repo: str, pr: dict) -> bool:
+        number = pr.get("number")
+        if type(number) is not int or number <= 0:
+            return False
+        item = (repo, number)
+        retry = self._ordinary_pr_scan_retries.get(item)
+        if not isinstance(retry, dict):
+            return True
+        snapshot_key = self._pr_snapshot_key(pr)
+        if retry.get("snapshot") != snapshot_key:
+            self._ordinary_pr_scan_retries.pop(item, None)
+            return True
+        return self._monotonic() >= retry.get("retry_after", 0.0)
+
+    def _defer_ordinary_pr_scan(
+        self, repo: str, pr_number: int, pr: dict, reason: str,
+        *, minimum_delay: float = 0.0,
+    ) -> None:
+        item = (repo, pr_number)
+        previous = self._ordinary_pr_scan_retries.get(item, {})
+        snapshot_key = self._pr_snapshot_key(pr)
+        failures = 1
+        if isinstance(previous, dict) and previous.get("snapshot") == snapshot_key:
+            failures = min(8, int(previous.get("attempts", 0)) + 1)
+        base = max(30.0, float(self.config.poll_interval_seconds))
+        delay = min(900.0, base * (2 ** min(failures - 1, 5)))
+        delay = max(delay, min(900.0, max(0.0, minimum_delay)))
+        self._ordinary_pr_scan_retries[item] = {
+            "attempts": failures,
+            "retry_after": self._monotonic() + delay,
+            "snapshot": snapshot_key,
+        }
+        while len(self._ordinary_pr_scan_retries) > 4096:
+            self._ordinary_pr_scan_retries.pop(
+                next(iter(self._ordinary_pr_scan_retries)), None,
+            )
+        logger.info(
+            "watcher ordinary PR scan deferred repo=%s pr=%s reason=%s attempts=%s retry_seconds=%.1f",
+            repo, pr_number, reason, failures, delay,
+        )
+
+    def _clear_ordinary_pr_scan_retry(self, repo: str, pr_number: int) -> None:
+        self._ordinary_pr_scan_retries.pop((repo, pr_number), None)
+
+    def _machine_projection_version(self, repo: str):
+        policy = getattr(self.controller, "policy", None)
+        version_fn = getattr(policy, "machine_projection_version", None)
+        if not callable(version_fn):
+            if repo not in self._machine_version_api_missing_repos:
+                self._machine_version_api_missing_repos.add(repo)
+                logger.warning(
+                    "watcher machine configuration refresh unavailable repo=%s trigger=machine_projection_change result=version_api_missing",
+                    repo,
+                )
+            return None
+        self._machine_version_api_missing_repos.discard(repo)
+        try:
+            version = version_fn(repo)
+        except Exception as exc:
+            logger.warning(
+                "watcher machine configuration version read failed repo=%s trigger=machine_projection_change reason=%s",
+                repo, type(exc).__name__,
+            )
+            return None
+        if version is None or isinstance(version, (dict, list, set)):
+            return None
+        return version
+
+    def _machine_projection_refresh_candidates(self, valid_prs: list[tuple[int, dict]]) -> list[int]:
+        refresh_labels = frozenset({
+            "status: deploy-ready", "status: deploy-requested",
+            "status: testing", "status: acceptance-required",
+            "status: succeeded", "status: failed",
+        })
+        candidates = []
+        for number, pr in valid_prs:
+            if pr.get("draft") is True or not self._pr_labels_are_valid(pr):
+                continue
+            if self._pr_status_labels(pr).intersection(refresh_labels):
+                candidates.append(number)
+        return candidates
+
+    def _machine_projection_pr_signature(self, pr: dict) -> tuple:
+        head = pr.get("head")
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        statuses = tuple(sorted(self._pr_status_labels(pr).intersection({
+            "status: deploy-ready", "status: deploy-requested",
+            "status: testing", "status: acceptance-required",
+            "status: succeeded", "status: failed",
+        })))
+        return head_sha, statuses
+
+    def _queue_machine_projection_refreshes(self, repo: str, *, max_items: int = 2) -> int:
+        pending = self._machine_refresh_pending.get(repo)
+        if not isinstance(pending, dict):
+            return 0
+        numbers = pending.get("numbers")
+        cursor = pending.get("cursor")
+        if not isinstance(numbers, list) or type(cursor) is not int:
+            self._machine_refresh_pending.pop(repo, None)
+            return 0
+        queued = 0
+        if not numbers:
+            self._machine_refresh_pending.pop(repo, None)
+            return 0
+        inspected = 0
+        while inspected < len(numbers) and queued < max_items:
+            index = cursor % len(numbers)
+            number = numbers[index]
+            cursor = (index + 1) % len(numbers)
+            inspected += 1
+            item = (repo, number)
+            if self._monotonic() < self._machine_refresh_retry_after.get(item, 0.0):
+                continue
+            if item not in self._machine_refresh_pr_versions:
+                if len(self._machine_refresh_pr_versions) >= 4096:
+                    continue
+                self._machine_refresh_pr_versions[item] = pending.get("version")
+            elif self._machine_refresh_pr_versions[item] != pending.get("version"):
+                self._machine_refresh_pr_versions[item] = pending.get("version")
+            if item in self._priority_pr_queue:
+                continue
+            if len(self._priority_pr_queue) >= 128:
+                break
+            if self._queue_priority_pr(item, "machine"):
+                queued += 1
+            else:
+                break
+        pending["cursor"] = cursor
+        return queued
+
+    def _observe_machine_projection_change(
+        self, repo: str, valid_prs: list[tuple[int, dict]],
+    ) -> None:
+        version = self._machine_projection_version(repo)
+        if version is None:
+            return
+        candidates = self._machine_projection_refresh_candidates(valid_prs)
+        candidate_set = set(candidates)
+        self._prune_machine_projection_refreshes(repo, candidate_set)
+        if repo not in self._machine_projection_versions:
+            self._machine_projection_versions[repo] = version
+            self._schedule_machine_projection_refreshes(repo, version, candidates)
+            queued = self._queue_machine_projection_refreshes(repo)
+            logger.info(
+                "watcher machine configuration version recorded repo=%s trigger=machine_projection_change result=baseline_recorded candidate_prs=%s queued_prs=%s pending_prs=%s",
+                repo, len(candidates), queued, max(0, len(candidates) - queued),
+            )
+            return
+        previous = self._machine_projection_versions[repo]
+        if version != previous:
+            self._machine_projection_versions[repo] = version
+            self._schedule_machine_projection_refreshes(repo, version, candidates)
+            scheduled = True
+        else:
+            now = self._monotonic()
+            prs_by_number = dict(valid_prs)
+            due = []
+            for number in candidates:
+                item = (repo, number)
+                completed = self._machine_refresh_last_results.get(item)
+                signature = self._machine_projection_pr_signature(prs_by_number[number])
+                if (not isinstance(completed, dict)
+                        or completed.get("version") != version
+                        or completed.get("signature") != signature
+                        or now - completed.get("at", 0.0)
+                        >= MACHINE_PROJECTION_REFRESH_SECONDS):
+                    due.append(number)
+            if due:
+                self._schedule_machine_projection_refreshes(
+                    repo, version, due, replace=False,
+                )
+            scheduled = bool(due)
+        queued = self._queue_machine_projection_refreshes(repo)
+        logger.info(
+            "watcher machine configuration inspection repo=%s trigger=machine_projection_change result=%s candidate_prs=%s queued_prs=%s pending_prs=%s",
+            repo, "scheduled" if scheduled else "unchanged",
+            len(candidates), queued, max(0, len(candidates) - queued),
+        )
+
+    def _schedule_machine_projection_refreshes(
+        self, repo: str, version: object, candidates: list[int], *, replace: bool = True,
+    ) -> None:
+        pending = self._machine_refresh_pending.get(repo)
+        if replace or not isinstance(pending, dict) or pending.get("version") != version:
+            for item in [item for item in self._machine_refresh_pr_versions
+                         if item[0] == repo]:
+                self._machine_refresh_pr_versions.pop(item, None)
+            for item in [item for item in self._machine_refresh_last_results
+                         if item[0] == repo]:
+                self._machine_refresh_last_results.pop(item, None)
+            for item in [item for item in self._machine_refresh_retry_after
+                         if item[0] == repo]:
+                self._clear_machine_projection_retry(item)
+            pending_candidates = list(dict.fromkeys(candidates))
+            candidate_set = set(pending_candidates)
+            for item in [item for item in self._priority_pr_queue
+                         if item[0] == repo
+                         and self._priority_pr_sources.get(item) == "machine"
+                         and item[1] not in candidate_set]:
+                self._priority_pr_queue.remove(item)
+                self._priority_pr_set.discard(item)
+                self._priority_pr_enqueued_at.pop(item, None)
+                self._priority_pr_sources.pop(item, None)
+                self._clear_priority_baseline_retry(item)
+                self._clear_priority_item_retry(item)
+            for item in [item for item in self._priority_pr_queue
+                         if item[0] == repo
+                         and self._priority_pr_sources.get(item) == "machine"]:
+                self._clear_priority_baseline_retry(item)
+                self._clear_priority_item_retry(item)
+            self._machine_refresh_pending[repo] = {
+                "version": version,
+                "numbers": pending_candidates,
+                "cursor": 0,
+            }
+            return
+
+        existing = set(pending.get("numbers", []))
+        pending["numbers"].extend(
+            number for number in dict.fromkeys(candidates)
+            if number not in existing
+        )
+
+    def _prune_machine_projection_refreshes(
+        self, repo: str, eligible_numbers: set[int],
+    ) -> None:
+        for item in [item for item in self._machine_refresh_pr_versions
+                     if item[0] == repo and item[1] not in eligible_numbers]:
+            self._machine_refresh_pr_versions.pop(item, None)
+            self._clear_machine_projection_retry(item)
+            if (item in self._priority_pr_queue
+                    and self._priority_pr_sources.get(item) == "machine"):
+                self._priority_pr_queue.remove(item)
+                self._priority_pr_set.discard(item)
+                self._priority_pr_enqueued_at.pop(item, None)
+                self._priority_pr_sources.pop(item, None)
+                self._clear_priority_baseline_retry(item)
+                self._clear_priority_item_retry(item)
+        for item in [item for item in self._machine_refresh_last_results
+                     if item[0] == repo and item[1] not in eligible_numbers]:
+            self._machine_refresh_last_results.pop(item, None)
+        pending = self._machine_refresh_pending.get(repo)
+        if isinstance(pending, dict):
+            pending["numbers"] = [
+                number for number in pending.get("numbers", [])
+                if number in eligible_numbers
+            ]
+            pending["cursor"] = 0
+            if not pending["numbers"]:
+                self._machine_refresh_pending.pop(repo, None)
+
+    def _log_machine_projection_refresh_result(
+        self, repo: str, pr_number: int, result: str, *, complete: bool,
+    ) -> None:
+        item = (repo, pr_number)
+        if item not in self._machine_refresh_pr_versions:
+            return
+        logger.info(
+            "watcher machine configuration refresh repo=%s pr=%s trigger=machine_projection_change result=%s",
+            repo, pr_number, result,
+        )
+        if complete and result == "refreshed":
+            completed_version = self._machine_refresh_pr_versions.pop(item, None)
+            self._clear_machine_projection_retry(item)
+            pending = self._machine_refresh_pending.get(repo)
+            if (isinstance(pending, dict)
+                    and pending.get("version") == completed_version):
+                pending["numbers"] = [
+                    number for number in pending.get("numbers", [])
+                    if number != pr_number
+                ]
+                pending["cursor"] = 0
+                if not pending["numbers"]:
+                    self._machine_refresh_pending.pop(repo, None)
+
+    def _forget_machine_projection_refresh(self, repo: str, pr_number: int) -> None:
+        """Forget a stale candidate only after the PR is confirmed ineligible."""
+        item = (repo, pr_number)
+        self._machine_refresh_pr_versions.pop(item, None)
+        self._clear_machine_projection_retry(item)
+        pending = self._machine_refresh_pending.get(repo)
+        if isinstance(pending, dict):
+            pending["numbers"] = [
+                number for number in pending.get("numbers", [])
+                if number != pr_number
+            ]
+            pending["cursor"] = 0
+            if not pending["numbers"]:
+                self._machine_refresh_pending.pop(repo, None)
+
+    def _remember_machine_projection_result(
+        self, repo: str, pr_number: int, version: object,
+        pr_data: dict, result: str,
+    ) -> None:
+        item = (repo, pr_number)
+        self._machine_refresh_last_results[item] = {
+            "version": version,
+            "signature": self._machine_projection_pr_signature(pr_data),
+            "at": self._monotonic(),
+            "result": result,
+        }
+        while len(self._machine_refresh_last_results) > 4096:
+            self._machine_refresh_last_results.pop(
+                next(iter(self._machine_refresh_last_results)), None,
+            )
+
+    async def _refresh_machine_adaptation_for_pr(
+        self, repo: str, pr_number: int,
+    ) -> str:
+        """Run the controller's unified machine projection refresh in the writer."""
+        if (not self._open_pr_listing_repo_is_authorized(repo)
+                or (repo, pr_number) not in self._machine_refresh_pr_versions):
+            return "incomplete"
+        queued_version = self._machine_refresh_pr_versions[(repo, pr_number)]
+        version_before = self._machine_projection_version(repo)
+        if version_before is None or version_before != queued_version:
+            return "incomplete"
+        try:
+            pr_data = await self.proxy.get_pr(repo, pr_number)
+        except GitHubError as exc:
+            if exc.status_code == 404:
+                return "stale"
+            raise
+        if (not isinstance(pr_data, dict) or pr_data.get("state") != "open"
+                or pr_data.get("merged") or pr_data.get("draft")):
+            return "stale"
+        state = await self.proxy.read_hidden_state(repo, pr_number)
+        if not isinstance(state, dict):
+            return "incomplete"
+        if state.get("status") == "deploying":
+            self._remember_machine_projection_result(
+                repo, pr_number, version_before, pr_data, "stale",
+            )
+            return "stale"
+        refresh = getattr(self.controller, "refresh_machine_projection", None)
+        if not callable(refresh):
+            logger.warning(
+                "watcher machine projection refresh unavailable repo=%s pr=%s reason=controller_refresh_api_missing",
+                repo, pr_number,
+            )
+            return "incomplete"
+        result = await refresh(repo, pr_number)
+        version_after = self._machine_projection_version(repo)
+        if version_after is None or version_after != version_before:
+            return "incomplete"
+        if result not in {"refreshed", "incomplete", "stale"}:
+            return "incomplete"
+        if result in {"refreshed", "stale"}:
+            self._remember_machine_projection_result(
+                repo, pr_number, version_after, pr_data, result,
+            )
+        return result
 
     def _record_draft_label_attempt(self, repo: str, pr_number: int) -> None:
         key = (repo, pr_number)
@@ -2878,6 +3359,10 @@ class GitHubCommandWatcher:
             queued_repo != repo or queued_pr != pr_number
             for queued_repo, queued_pr in self._priority_pr_queue
             if now >= self._priority_pr_retry_after.get((queued_repo, queued_pr), 0.0)
+            and (self._priority_pr_sources.get((queued_repo, queued_pr)) != "machine"
+                 or now >= self._machine_refresh_retry_after.get(
+                     (queued_repo, queued_pr), 0.0,
+                 ))
         )
 
     async def _process_scheduled_pr(
@@ -3033,7 +3518,7 @@ class GitHubCommandWatcher:
         *, allowed_sources, max_items=2,
     ) -> bool:
         """Process a bounded priority tier through the existing serial PR path."""
-        max_items = min(2, max(0, max_items))
+        max_items = min(4, max(0, max_items))
         cycle_ok = True
         processed_items = 0
         for stale in list(self._priority_pr_queue):
@@ -3046,33 +3531,75 @@ class GitHubCommandWatcher:
                 self._priority_pr_sources.pop(stale, None)
                 self._clear_priority_baseline_retry(stale)
                 self._clear_priority_item_retry(stale)
-        candidates = []
-        for source in ("webhook", "recent"):
-            if source not in allowed_sources:
-                continue
-            candidates.extend(
-                queued for queued in self._priority_pr_queue
-                if self._priority_pr_sources.get(queued, "webhook") == source
-                and self._monotonic() >= self._priority_pr_retry_after.get(queued, 0.0)
-                and queued[1] not in priority_attempted.get(queued[0], [])
-            )
-        queued_items = []
+        sources = ("command", "webhook", "recent", "machine", "initialization")
         selected_repos = set()
-        for item in candidates:
-            if item[0] in selected_repos:
-                continue
-            queued_items.append(item)
-            selected_repos.add(item[0])
-            if len(queued_items) >= max_items:
-                break
-        if len(queued_items) < max_items:
-            queued_items.extend(
-                item for item in candidates if item not in queued_items
+        repo_order = list(dict.fromkeys(self.config.active_repos))
+        machine_items = 0
+        while processed_items < max_items:
+            now = self._monotonic()
+            ready_command_waiting = any(
+                self._priority_pr_sources.get(queued) == "command"
+                and now >= self._priority_pr_retry_after.get(queued, 0.0)
+                for queued in self._priority_pr_queue
             )
-            queued_items = queued_items[:max_items]
-        for item in queued_items:
-            if processed_items >= max_items:
+            if (self._priority_pr_queue and not ready_command_waiting
+                    and self.config.auth_valid is True):
+                try:
+                    await self._discover_recent_command_prs(
+                        list(dict.fromkeys(self.config.active_repos)),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "watcher priority command recheck failed reason=%s",
+                        type(exc).__name__,
+                    )
+            chosen = None
+            chosen_source = None
+            chosen_index = None
+            for source in sources:
+                if source not in allowed_sources or (source == "machine" and machine_items >= 2):
+                    continue
+                source_candidates = [
+                    queued for queued in self._priority_pr_queue
+                    if self._priority_pr_sources.get(queued, "webhook") == source
+                    and self._monotonic() >= self._priority_pr_retry_after.get(queued, 0.0)
+                    and (source != "machine"
+                         or self._monotonic() >= self._machine_refresh_retry_after.get(
+                             queued, 0.0,
+                         ))
+                ]
+                if not source_candidates:
+                    continue
+                start = self._priority_source_repo_cursor.get(source, 0)
+                start = start % len(repo_order) if repo_order else 0
+                for prefer_unselected in (True, False):
+                    for offset in range(len(repo_order)):
+                        index = (start + offset) % len(repo_order)
+                        candidate_repo = repo_order[index]
+                        if prefer_unselected and candidate_repo in selected_repos:
+                            continue
+                        candidate = next((queued for queued in source_candidates
+                                          if queued[0] == candidate_repo), None)
+                        if candidate is not None:
+                            chosen = candidate
+                            chosen_index = index
+                            break
+                    if chosen is not None:
+                        break
+                if chosen is None:
+                    chosen = source_candidates[0]
+                    chosen_index = (
+                        repo_order.index(chosen[0]) if chosen[0] in repo_order else start
+                    )
+                chosen_source = source
                 break
+            if chosen is None:
+                break
+            item = chosen
+            selected_repos.add(item[0])
+            self._priority_source_repo_cursor[chosen_source] = (
+                (chosen_index + 1) % len(repo_order) if repo_order else 0
+            )
             if item not in self._priority_pr_queue:
                 continue
             if self._monotonic() < self._priority_pr_retry_after.get(item, 0.0):
@@ -3081,6 +3608,22 @@ class GitHubCommandWatcher:
             processed_items += 1
             queued_repo, pr_number = item
             source = self._priority_pr_sources.get(item, "webhook")
+            if source == "machine" and item in self._machine_refresh_pr_versions:
+                machine_items += 1
+            trigger = {
+                "webhook": "pull_request_webhook",
+                "command": "new_developer_command",
+                "recent": "review_or_historical_comment",
+                "machine": "machine_projection_change",
+                "initialization": "new_unlabeled_pr",
+            }.get(source, source)
+            pending_comment_id, command_wait = self._pending_command_wait(
+                queued_repo, pr_number,
+            )
+            logger.info(
+                "watcher priority work started repo=%s pr=%s trigger=%s comment_id=%s command_wait_seconds=%s",
+                queued_repo, pr_number, trigger, pending_comment_id, command_wait,
+            )
             if self.config.auth_valid is not True:
                 self._queue_priority_pr(item, source)
                 cycle_ok = False
@@ -3092,14 +3635,13 @@ class GitHubCommandWatcher:
                 self._priority_pr_sources.pop(item, None)
                 self._clear_priority_baseline_retry(item)
                 continue
-            if pr_number in priority_attempted.setdefault(queued_repo, []):
-                self._queue_priority_pr(item, source)
-                continue
             source_attempted = (priority_attempted.setdefault(queued_repo, [])
                                 if source == "webhook"
                                 else recent_attempted.setdefault(queued_repo, []))
-            source_attempted.append(pr_number)
-            if source != "webhook":
+            if pr_number not in source_attempted:
+                source_attempted.append(pr_number)
+            if (source != "webhook"
+                    and pr_number not in priority_attempted.setdefault(queued_repo, [])):
                 priority_attempted.setdefault(queued_repo, []).append(pr_number)
             self._current_scan_stage = "priority_pr_validation"
             self._current_scan_repo = queued_repo
@@ -3125,6 +3667,7 @@ class GitHubCommandWatcher:
                     self._fail_recent_commands_for_pr(
                         queued_repo, pr_number, "pr_not_found", retryable=False,
                     )
+                    self._forget_machine_projection_refresh(queued_repo, pr_number)
                     while item in self._priority_pr_queue:
                         self._priority_pr_queue.remove(item)
                     self._priority_pr_set.discard(item)
@@ -3215,6 +3758,7 @@ class GitHubCommandWatcher:
                     )
                     continue
                 failure_reason = terminal_status or ("pr_is_draft" if draft_pr else "pr_not_open")
+                self._forget_machine_projection_refresh(queued_repo, pr_number)
                 for observed_repo, observed_pr, observed_comment_id in list(
                         self._recent_command_records):
                     if observed_repo == queued_repo and observed_pr == pr_number:
@@ -3258,9 +3802,18 @@ class GitHubCommandWatcher:
                     self._scan_failure_reasons.append(
                         f"baseline:{queued_repo}#{pr_number}:incomplete",
                     )
+                    logger.info(
+                        "watcher priority work finished repo=%s pr=%s trigger=%s result=baseline_incomplete command_wait_seconds=%s",
+                        queued_repo, pr_number, trigger, command_wait,
+                    )
+                    self._log_machine_projection_refresh_result(
+                        queued_repo, pr_number, "retry_baseline_incomplete",
+                        complete=False,
+                    )
                     cycle_ok = False
                     continue
-                priority_done[queued_repo].append(pr_number)
+                if pr_number not in priority_done[queued_repo]:
+                    priority_done[queued_repo].append(pr_number)
                 self._clear_priority_baseline_retry(item)
                 self._clear_priority_item_retry(item)
                 if (baseline_only
@@ -3273,12 +3826,65 @@ class GitHubCommandWatcher:
                     queued_repo, pr_number, "webhook_priority_processed",
                     self._monotonic() - attempt_started,
                 )
-            except GitHubRateLimitError as exc:
-                self._retry_priority_item(item, source, "github_rate_limited")
-                self._priority_pr_retry_after[item] = max(
-                    self._priority_pr_retry_after.get(item, 0.0),
-                    self._monotonic() + max(0.0, exc.retry_after_seconds),
+                logger.info(
+                    "watcher priority work finished repo=%s pr=%s trigger=%s result=processed command_wait_seconds=%s",
+                    queued_repo, pr_number, trigger, command_wait,
                 )
+                if item in self._machine_refresh_pr_versions:
+                    if baseline_only:
+                        self._log_machine_projection_refresh_result(
+                            queued_repo, pr_number, "baseline_only", complete=False,
+                        )
+                    elif self._monotonic() < self._machine_refresh_retry_after.get(
+                            item, 0.0,
+                    ):
+                        self._log_machine_projection_refresh_result(
+                            queued_repo, pr_number, "refresh_backoff", complete=False,
+                        )
+                        self._queue_priority_pr(item, "machine")
+                    elif source != "machine" and machine_items >= 2:
+                        self._log_machine_projection_refresh_result(
+                            queued_repo, pr_number, "refresh_quota_deferred",
+                            complete=False,
+                        )
+                        self._queue_priority_pr(item, "machine")
+                    else:
+                        if source != "machine":
+                            machine_items += 1
+                        self._current_scan_stage = "machine_projection_refresh"
+                        refresh_result = await self._refresh_machine_adaptation_for_pr(
+                            queued_repo, pr_number,
+                        )
+                        if refresh_result == "refreshed":
+                            self._log_machine_projection_refresh_result(
+                                queued_repo, pr_number, "refreshed", complete=True,
+                            )
+                        elif refresh_result == "stale":
+                            self._log_machine_projection_refresh_result(
+                                queued_repo, pr_number, "stale", complete=False,
+                            )
+                            self._forget_machine_projection_refresh(
+                                queued_repo, pr_number,
+                            )
+                        else:
+                            self._log_machine_projection_refresh_result(
+                                queued_repo, pr_number,
+                                "refresh_incomplete", complete=False,
+                            )
+                            self._retry_machine_projection_refresh(
+                                item, "machine_projection_refresh_incomplete",
+                            )
+                            cycle_ok = False
+            except GitHubRateLimitError as exc:
+                if (item in self._machine_refresh_pr_versions
+                        and self._current_scan_stage == "machine_projection_refresh"):
+                    self._retry_machine_projection_refresh(item, "github_rate_limited")
+                else:
+                    self._retry_priority_item(item, source, "github_rate_limited")
+                    self._priority_pr_retry_after[item] = max(
+                        self._priority_pr_retry_after.get(item, 0.0),
+                        self._monotonic() + max(0.0, exc.retry_after_seconds),
+                    )
                 self._fail_recent_commands_for_pr(queued_repo, pr_number, "github_rate_limited")
                 self._record_pr_attempt(
                     queued_repo, pr_number, "github_rate_limited",
@@ -3288,10 +3894,17 @@ class GitHubCommandWatcher:
                     f"priority:{queued_repo}#{pr_number}:rate_limited",
                 )
                 logger.warning("watcher rate limited during priority PR; retry_after=%.1f", exc.retry_after_seconds)
+                self._log_machine_projection_refresh_result(
+                    queued_repo, pr_number, "retry_rate_limited", complete=False,
+                )
                 cycle_ok = False
                 break
             except Exception as exc:
-                self._retry_priority_item(item, source, type(exc).__name__)
+                if (item in self._machine_refresh_pr_versions
+                        and self._current_scan_stage == "machine_projection_refresh"):
+                    self._retry_machine_projection_refresh(item, type(exc).__name__)
+                else:
+                    self._retry_priority_item(item, source, type(exc).__name__)
                 self._fail_recent_commands_for_pr(queued_repo, pr_number, type(exc).__name__)
                 self._record_pr_attempt(
                     queued_repo, pr_number, type(exc).__name__, self._monotonic() - attempt_started,
@@ -3300,6 +3913,9 @@ class GitHubCommandWatcher:
                     f"priority:{queued_repo}#{pr_number}:{type(exc).__name__}",
                 )
                 logger.warning("watcher priority PR %s#%s failed: %s", queued_repo, pr_number, type(exc).__name__)
+                self._log_machine_projection_refresh_result(
+                    queued_repo, pr_number, "retry_error", complete=False,
+                )
                 cycle_ok = False
         return cycle_ok
 
@@ -3338,13 +3954,16 @@ class GitHubCommandWatcher:
         cycle_ok = True
         ordinary_prs_skipped = 0
         normal_prs_processed: dict[str, int] = {repo: 0 for repo in repos}
+        for repo in repos:
+            self._queue_machine_projection_refreshes(repo, max_items=2)
 
         # Discovery is read-only and runs independently; this remains the
         # single serial worker for every Lifecycle or evidence write.
         self._current_scan_stage = "priority_queue"
         cycle_ok = await self._drain_priority_prs(
             priority_done, priority_attempted, recent_attempted,
-            allowed_sources={"webhook", "recent"}, max_items=2,
+            allowed_sources={"webhook", "command", "recent", "machine", "initialization"},
+            max_items=4,
         ) and cycle_ok
         # Ready-evidence hints are bounded and yield to priority work: they
         # only read persisted records and re-project when a link is missing.
@@ -3404,8 +4023,7 @@ class GitHubCommandWatcher:
                     )
                     continue
                 repo_normal_budget = normal_budget_by_repo.get(repo, 0)
-                if repo_normal_budget <= 0:
-                    continue
+                authorization_generation = self._repo_baseline_cutoff_utc.get(repo)
                 self._current_scan_stage = "scanning_open_pr_snapshot"
                 self._current_scan_repo = repo
                 prs = snapshot.get("prs")
@@ -3430,6 +4048,9 @@ class GitHubCommandWatcher:
                 valid_prs.sort(key=lambda item: item[0])
                 open_numbers = [number for number, _ in valid_prs]
                 pr_by_number = {number: pr for number, pr in valid_prs}
+                self._observe_machine_projection_change(repo, valid_prs)
+                if repo_normal_budget <= 0:
+                    continue
                 # Restart recovery: seed a bounded set of recent open PRs so a
                 # ready attachment persisted before the restart is reconciled
                 # without waiting for a new commit or a manual status request.
@@ -3437,7 +4058,13 @@ class GitHubCommandWatcher:
                 baseline_numbers = [
                     number for number, pr in valid_prs if pr.get("draft") is not True
                 ]
+                ordinary_scan_ready = {
+                    number: self._ordinary_pr_scan_retry_ready(repo, pr)
+                    for number, pr in valid_prs
+                }
                 active_pr_numbers = []
+                unlabeled_pr_numbers = []
+                new_initialization_prs = []
                 draft_missing_label_numbers = []
                 for number, pr in valid_prs:
                     labels_valid = self._pr_labels_are_valid(pr)
@@ -3449,18 +4076,38 @@ class GitHubCommandWatcher:
                         if status_labels:
                             self._draft_label_retry_after.pop(draft_key, None)
                             self._draft_label_attempts.pop(draft_key, None)
-                        elif self._draft_label_retry_ready(repo, number):
+                        elif (ordinary_scan_ready.get(number, True)
+                              and self._draft_label_retry_ready(repo, number)):
                             draft_missing_label_numbers.append(number)
                         continue
                     self._draft_label_retry_after.pop((repo, number), None)
                     self._draft_label_attempts.pop((repo, number), None)
+                    if not status_labels:
+                        unlabeled_pr_numbers.append(number)
+                        if (ordinary_scan_ready.get(number, True)
+                                and self._new_pr_initialization_retry_ready(repo, pr)):
+                            new_initialization_prs.append(number)
+                        continue
+                    self._clear_new_pr_initialization_retry(repo, number)
                     terminal_runtime_due = self._terminal_runtime_scan_due(
                         repo, number, pr, status_labels,
                     )
-                    if (not status_labels
-                            or status_labels.intersection(ACTIVE_PROJECTION_STATUS_LABELS)
-                            or terminal_runtime_due):
+                    if (ordinary_scan_ready.get(number, True)
+                            and (status_labels.intersection(ACTIVE_PROJECTION_STATUS_LABELS)
+                                 or terminal_runtime_due)):
                         active_pr_numbers.append(number)
+                new_initialization_prs.sort(
+                    key=lambda number: (
+                        self._parse_comment_time(
+                            pr_by_number[number].get("created_at"),
+                        ).timestamp()
+                        if self._parse_comment_time(
+                            pr_by_number[number].get("created_at"),
+                        ) is not None else float("-inf"),
+                        number,
+                    ),
+                    reverse=True,
+                )
                 baseline_all = repo in self._pending_baseline_repos
                 selected = list(priority_attempted.get(repo, []))
                 priority_count = len(selected)
@@ -3474,57 +4121,87 @@ class GitHubCommandWatcher:
                     queued_number for queued_repo, queued_number in self._priority_pr_queue
                     if queued_repo == repo
                 )
-                reserve_ordinary = min(1, remaining_normal)
+                reserve_ordinary = 0 if remaining_normal == 1 else min(1, remaining_normal)
                 active_selected = 0
+                initialization_selected = 0
                 draft_selected = 0
+                skipped_numbers: set[int] = set()
+                scan_start = self._pr_scan_cursor.get(repo, 0) % len(open_numbers) if open_numbers else 0
+                ordinary = open_numbers[scan_start:] + open_numbers[:scan_start]
+                cursor_after = {}
+                lane_cursor_after: dict[int, tuple[dict[str, int], int]] = {}
 
                 def select_rotating_lane(
                     candidates: list[int], cursor: dict[str, int],
                 ) -> bool:
-                    number = self._next_rotating_pr(repo, candidates, cursor, selected_set)
+                    tentative_cursor = {repo: cursor.get(repo, 0)}
+                    number = self._next_rotating_pr(
+                        repo, candidates, tentative_cursor, selected_set,
+                    )
                     if number is None:
                         return False
                     selected.append(number)
                     selected_set.add(number)
+                    lane_cursor_after[number] = (
+                        cursor, tentative_cursor.get(repo, cursor.get(repo, 0)),
+                    )
                     return True
 
-                if remaining_normal == 1:
-                    lane_start = self._normal_pr_lane_cursor.get(repo, 0) % 3
-                    for offset in range(3):
-                        lane = (lane_start + offset) % 3
-                        if lane == 0 and select_rotating_lane(
-                                active_pr_numbers, self._active_pr_cursor):
-                            active_selected = 1
-                            self._normal_pr_lane_cursor[repo] = 1
+                lane_candidates = (
+                    (0, active_pr_numbers, self._active_pr_cursor),
+                    (1, new_initialization_prs, None),
+                    (2, draft_missing_label_numbers, self._draft_pr_cursor),
+                    (3, None, None),
+                )
+                lane_start = self._normal_pr_lane_cursor.get(repo, 0) % 4
+                special_budget = (
+                    1 if remaining_normal == 1
+                    else max(0, remaining_normal - reserve_ordinary)
+                )
+                selected_special = 0
+                for offset in range(4):
+                    if selected_special >= special_budget:
+                        break
+                    lane, candidates, cursor = lane_candidates[(lane_start + offset) % 4]
+                    if lane == 3:
+                        number = None
+                        for index, candidate in enumerate(ordinary):
+                            if (candidate in selected_set or candidate in unlabeled_pr_numbers
+                                    or candidate in active_pr_numbers
+                                    or pr_by_number[candidate].get("draft") is True
+                                    or not ordinary_scan_ready.get(candidate, True)):
+                                continue
+                            if self._ordinary_pr_cache_fresh(
+                                    repo, candidate, pr_by_number[candidate], force=baseline_all):
+                                skipped_numbers.add(candidate)
+                                continue
+                            number = candidate
+                            cursor_after[number] = (scan_start + index + 1) % len(open_numbers)
                             break
-                        if lane == 1 and select_rotating_lane(
-                                draft_missing_label_numbers, self._draft_pr_cursor):
-                            draft_selected = 1
-                            self._normal_pr_lane_cursor[repo] = 2
-                            break
-                        if lane == 2:
-                            self._normal_pr_lane_cursor[repo] = 0
-                            break
-                elif remaining_normal > 1:
-                    special_budget = remaining_normal - reserve_ordinary
-                    if special_budget >= 2:
-                        active_selected = int(select_rotating_lane(
-                            active_pr_numbers, self._active_pr_cursor,
-                        ))
-                        draft_selected = int(select_rotating_lane(
-                            draft_missing_label_numbers, self._draft_pr_cursor,
-                        ))
-                    elif special_budget == 1:
-                        lane_start = self._normal_pr_lane_cursor.get(repo, 0) % 2
-                        for offset in range(2):
-                            lane = (lane_start + offset) % 2
-                            candidates = active_pr_numbers if lane == 0 else draft_missing_label_numbers
-                            cursor = self._active_pr_cursor if lane == 0 else self._draft_pr_cursor
-                            if select_rotating_lane(candidates, cursor):
-                                active_selected = int(lane == 0)
-                                draft_selected = int(lane == 1)
-                                self._normal_pr_lane_cursor[repo] = (lane + 1) % 2
-                                break
+                        if number is None:
+                            continue
+                        selected.append(number)
+                        selected_set.add(number)
+                    if lane == 3:
+                        pass
+                    elif lane == 1:
+                        number = next((candidate for candidate in candidates
+                                       if candidate not in selected_set), None)
+                        if number is None:
+                            continue
+                        selected.append(number)
+                        selected_set.add(number)
+                        initialization_selected += 1
+                    elif select_rotating_lane(candidates, cursor):
+                        if lane == 0:
+                            active_selected += 1
+                        else:
+                            draft_selected += 1
+                    else:
+                        if lane != 3:
+                            continue
+                    selected_special += 1
+                    self._normal_pr_lane_cursor[repo] = ((lane + 1) % 4)
                 # Rotate the fallback lane across ALL eligible open PRs, not a
                 # recency-capped subset. A fixed top-N window re-selects the
                 # same newest PRs every cycle and starves high-numbered PRs once
@@ -3534,26 +4211,30 @@ class GitHubCommandWatcher:
                 # cycle actually examined, so nothing is skipped.
                 recent_pool = sorted(
                     [(number, pr) for number, pr in valid_prs
-                     if pr.get("draft") is not True and number not in active_pr_numbers],
+                     if pr.get("draft") is not True
+                     and number not in active_pr_numbers
+                     and number not in unlabeled_pr_numbers],
                     # Newest first; equal timestamps fall back to ascending
                     # number so the rotation is deterministic.
                     key=lambda item: (str(item[1].get("updated_at") or ""), -item[0]),
                     reverse=True,
                 )
-                skipped_numbers: set[int] = set()
                 recent_budget = min(
                     fast_lane_size,
                     max(0, remaining_normal - reserve_ordinary
-                        - active_selected - draft_selected),
+                        - active_selected - initialization_selected - draft_selected),
                 )
                 if recent_pool and recent_budget > 0:
                     recent_start = self._recent_pr_cursor.get(repo, 0) % len(recent_pool)
                     recent_order = recent_pool[recent_start:] + recent_pool[:recent_start]
                     recent_examined = 0
+                    recent_cursor_after = {}
+                    recent_selected = False
                     for number, pr in recent_order:
                         if len(selected) >= pr_work_budget or recent_budget <= 0:
                             break
-                        if number in selected_set:
+                        if (number in selected_set
+                                or not ordinary_scan_ready.get(number, True)):
                             continue
                         recent_examined += 1
                         if self._ordinary_pr_cache_fresh(repo, number, pr, force=baseline_all):
@@ -3562,16 +4243,29 @@ class GitHubCommandWatcher:
                         selected.append(number)
                         selected_set.add(number)
                         recent_budget -= 1
-                    if recent_examined:
+                        recent_cursor_after[number] = (
+                            recent_start + recent_examined
+                        ) % len(recent_pool)
+                        recent_selected = True
+                    if recent_examined and not recent_selected:
                         self._recent_pr_cursor[repo] = (
                             recent_start + recent_examined
                         ) % len(recent_pool)
+                else:
+                    recent_cursor_after = {}
 
-                scan_start = self._pr_scan_cursor.get(repo, 0) % len(open_numbers) if open_numbers else 0
-                ordinary = open_numbers[scan_start:] + open_numbers[:scan_start]
+                def advance_pr_cursors(pr_number: int) -> None:
+                    if pr_number in cursor_after:
+                        self._pr_scan_cursor[repo] = cursor_after[pr_number]
+                    if pr_number in recent_cursor_after:
+                        self._recent_pr_cursor[repo] = recent_cursor_after[pr_number]
+                    lane_advance = lane_cursor_after.get(pr_number)
+                    if lane_advance is not None:
+                        cursor, next_index = lane_advance
+                        cursor[repo] = next_index
+
                 already_selected_normal = max(0, len(selected) - priority_count)
                 ordinary_slots = max(0, remaining_normal - already_selected_normal)
-                cursor_after = {}
                 ordinary_cursor_after = scan_start
                 scanned = 0
                 if ordinary_slots:
@@ -3581,7 +4275,9 @@ class GitHubCommandWatcher:
                         if number in selected_set or number in skipped_numbers:
                             continue
                         if (pr_by_number[number].get("draft") is True
-                                or number in active_pr_numbers):
+                                or number in active_pr_numbers
+                                or number in unlabeled_pr_numbers
+                                or not ordinary_scan_ready.get(number, True)):
                             continue
                         if self._ordinary_pr_cache_fresh(
                                 repo, number, pr_by_number[number], force=baseline_all):
@@ -3593,15 +4289,29 @@ class GitHubCommandWatcher:
                         if len(cursor_after) >= ordinary_slots:
                             break
                 ordinary_prs_skipped += len(skipped_numbers)
-                if not cursor_after and scanned:
-                    self._pr_scan_cursor[repo] = ordinary_cursor_after
 
                 processed = []
                 for number in selected[:pr_work_budget]:
-                    if self._usable_open_pr_snapshot(repo) is not snapshot:
+                    snapshot_completed = snapshot.get("completed_monotonic")
+                    snapshot_age = (
+                        self._monotonic() - snapshot_completed
+                        if isinstance(snapshot_completed, (int, float)) else float("inf")
+                    )
+                    current_snapshot = self._usable_open_pr_snapshot(repo)
+                    if ((snapshot_age < 0.0
+                         or snapshot_age > OPEN_PR_SNAPSHOT_MAX_AGE_SECONDS)
+                            and current_snapshot is None):
                         cycle_ok = False
                         self._scan_failure_reasons.append(
-                            f"list_prs:{repo}:snapshot_invalidated",
+                            f"list_prs:{repo}:snapshot_expired",
+                        )
+                        break
+                    if (not self._open_pr_listing_repo_is_authorized(repo)
+                            or self._repo_baseline_cutoff_utc.get(repo)
+                            != authorization_generation):
+                        cycle_ok = False
+                        self._scan_failure_reasons.append(
+                            f"authorization:{repo}:generation_changed",
                         )
                         break
                     if number in priority_attempted.get(repo, []):
@@ -3610,16 +4320,139 @@ class GitHubCommandWatcher:
                         continue
                     if interrupt_ordinary_scan_for_new_priority():
                         break
-                    if (self.config.auth_valid is not True or repo not in self.config.active_repos
-                            or repo not in self.config.github_repos):
+                    if not self._open_pr_listing_repo_is_authorized(repo):
+                        cycle_ok = False
+                        self._scan_failure_reasons.append(
+                            f"authorization:{repo}:invalid_before_pr_read",
+                        )
                         break
+                    selected_pr = pr_by_number[number]
+                    is_initialization = number in new_initialization_prs
+                    processing_trigger = (
+                        "new_unlabeled_pr_initialization"
+                        if is_initialization else "ordinary_scan"
+                    )
+                    pending_comment_id, command_wait = self._pending_command_wait(
+                        repo, number,
+                    )
+                    try:
+                        current_pr = await self.proxy.get_pr(repo, number)
+                    except GitHubError as exc:
+                        if exc.status_code == 404:
+                            processed.append(number)
+                            self._clear_new_pr_initialization_retry(repo, number)
+                            self._clear_ordinary_pr_scan_retry(repo, number)
+                            self._fail_recent_commands_for_pr(
+                                repo, number, "pr_not_found", retryable=False,
+                            )
+                            advance_pr_cursors(number)
+                            logger.info(
+                                "watcher ordinary PR skipped repo=%s pr=%s trigger=%s result=pr_invalid comment_id=%s command_wait_seconds=%s",
+                                repo, number, processing_trigger,
+                                pending_comment_id, command_wait,
+                            )
+                            continue
+                        self._scan_failure_reasons.append(
+                            f"pr_read:{repo}#{number}:http_{exc.status_code}",
+                        )
+                        if is_initialization:
+                            self._retry_new_pr_initialization(
+                                repo, number, selected_pr,
+                                f"http_{exc.status_code}",
+                            )
+                        self._defer_ordinary_pr_scan(
+                            repo, number, selected_pr, f"http_{exc.status_code}",
+                            minimum_delay=(exc.retry_after_seconds
+                                           if isinstance(exc, GitHubRateLimitError)
+                                           else 0.0),
+                        )
+                        logger.warning(
+                            "watcher ordinary PR revalidation failed repo=%s pr=%s trigger=%s result=retry reason=http_%s comment_id=%s command_wait_seconds=%s",
+                            repo, number, processing_trigger, exc.status_code,
+                            pending_comment_id, command_wait,
+                        )
+                        cycle_ok = False
+                        if self._github_backing_off():
+                            break
+                        continue
+                    except Exception as exc:
+                        self._scan_failure_reasons.append(
+                            f"pr_read:{repo}#{number}:{type(exc).__name__}",
+                        )
+                        if is_initialization:
+                            self._retry_new_pr_initialization(
+                                repo, number, selected_pr, type(exc).__name__,
+                            )
+                        self._defer_ordinary_pr_scan(
+                            repo, number, selected_pr, type(exc).__name__,
+                        )
+                        logger.warning(
+                            "watcher ordinary PR revalidation failed repo=%s pr=%s trigger=%s result=retry reason=%s comment_id=%s command_wait_seconds=%s",
+                            repo, number, processing_trigger, type(exc).__name__,
+                            pending_comment_id, command_wait,
+                        )
+                        cycle_ok = False
+                        if self._github_backing_off():
+                            break
+                        continue
+                    if (not self._open_pr_listing_repo_is_authorized(repo)
+                            or self._repo_baseline_cutoff_utc.get(repo)
+                            != authorization_generation):
+                        cycle_ok = False
+                        self._scan_failure_reasons.append(
+                            f"authorization:{repo}:generation_changed_before_pr_processing",
+                        )
+                        break
+                    if (not isinstance(current_pr, dict)
+                            or type(current_pr.get("number")) is not int
+                            or current_pr.get("number") != number
+                            or current_pr.get("state") != "open"
+                            or current_pr.get("merged")):
+                        processed.append(number)
+                        self._clear_new_pr_initialization_retry(repo, number)
+                        self._clear_ordinary_pr_scan_retry(repo, number)
+                        self._fail_recent_commands_for_pr(
+                            repo, number, "pr_not_open", retryable=False,
+                        )
+                        advance_pr_cursors(number)
+                        logger.info(
+                            "watcher ordinary PR skipped repo=%s pr=%s trigger=%s result=pr_invalid comment_id=%s command_wait_seconds=%s",
+                            repo, number, processing_trigger,
+                            pending_comment_id, command_wait,
+                        )
+                        continue
+                    selected_head = (
+                        selected_pr.get("head", {}).get("sha")
+                        if isinstance(selected_pr.get("head"), dict) else None
+                    )
+                    current_head = (
+                        current_pr.get("head", {}).get("sha")
+                        if isinstance(current_pr.get("head"), dict) else None
+                    )
+                    if (isinstance(selected_head, str) and selected_head
+                            and isinstance(current_head, str) and current_head
+                            and selected_head != current_head):
+                        self._scan_failure_reasons.append(
+                            f"pr_snapshot:{repo}#{number}:head_changed",
+                        )
+                        self._defer_ordinary_pr_scan(
+                            repo, number, selected_pr, "head_changed",
+                        )
+                        logger.info(
+                            "watcher ordinary PR deferred repo=%s pr=%s trigger=%s result=snapshot_expired comment_id=%s command_wait_seconds=%s",
+                            repo, number, processing_trigger,
+                            pending_comment_id, command_wait,
+                        )
+                        continue
                     normal_prs_processed[repo] = normal_prs_processed.get(repo, 0) + 1
                     attempt_started = self._monotonic()
                     self._current_scan_stage = "ordinary_pr_processing"
                     self._current_scan_repo = repo
                     self._current_scan_pr = number
+                    initialization_retry_scheduled = False
+                    initialization_snapshot_pr = current_pr
                     try:
-                        if pr_by_number[number].get("draft") is True:
+                        if current_pr.get("draft") is True:
                             # Drafts share the single serial scan, but never
                             # enter baseline dispatch, reconciliation of review
                             # evidence, or command handling. Only the trusted
@@ -3631,38 +4464,116 @@ class GitHubCommandWatcher:
                                 repo, number, "pr_is_draft", retryable=False,
                             )
                             processed.append(number)
+                            if is_initialization:
+                                self._clear_new_pr_initialization_retry(repo, number)
                             self._record_pr_attempt(
                                 repo, number, "draft_status_projected",
                                 self._monotonic() - attempt_started,
                             )
-                            if number in cursor_after:
-                                self._pr_scan_cursor[repo] = cursor_after[number]
+                            self._clear_ordinary_pr_scan_retry(repo, number)
+                            logger.info(
+                                "watcher ordinary PR finished repo=%s pr=%s trigger=draft_status_projection result=processed comment_id=%s command_wait_seconds=%s",
+                                repo, number, pending_comment_id, command_wait,
+                            )
+                            advance_pr_cursors(number)
                             if self._github_backing_off():
                                 cycle_ok = False
                                 break
                             if interrupt_ordinary_scan_for_new_priority():
                                 break
                             continue
+                        if (self.config.auth_valid is not True
+                                or repo not in self.config.active_repos
+                                or repo not in self.config.github_repos
+                                or self._repo_baseline_cutoff_utc.get(repo)
+                                != authorization_generation):
+                            cycle_ok = False
+                            self._scan_failure_reasons.append(
+                                f"authorization:{repo}:changed_before_pr_processing",
+                            )
+                            break
                         succeeded = await self._process_scheduled_pr(repo, number)
-                        processed.append(number)
+                        if succeeded and is_initialization:
+                            projected_pr = await self.proxy.get_pr(repo, number)
+                            if isinstance(projected_pr, dict):
+                                initialization_snapshot_pr = projected_pr
+                            if (not isinstance(projected_pr, dict)
+                                    or projected_pr.get("state") != "open"
+                                    or projected_pr.get("merged")
+                                    or projected_pr.get("draft")
+                                    or not self._pr_status_labels(projected_pr)):
+                                succeeded = False
+                                self._retry_new_pr_initialization(
+                                    repo, number, initialization_snapshot_pr,
+                                    "status_label_not_projected",
+                                )
+                                initialization_retry_scheduled = True
                         self._record_pr_attempt(
                             repo, number,
                             "fallback_processed" if succeeded else "baseline_retry",
                             self._monotonic() - attempt_started,
                         )
                         if not succeeded:
+                            if is_initialization and not initialization_retry_scheduled:
+                                self._retry_new_pr_initialization(
+                                    repo, number, initialization_snapshot_pr,
+                                    "baseline_incomplete",
+                                )
                             cycle_ok = False
                             self._scan_failure_reasons.append(
                                 f"baseline:{repo}#{number}:incomplete",
                             )
+                            self._defer_ordinary_pr_scan(
+                                repo, number, initialization_snapshot_pr,
+                                "baseline_incomplete",
+                            )
+                            logger.info(
+                                "watcher ordinary PR finished repo=%s pr=%s trigger=%s result=retry comment_id=%s command_wait_seconds=%s",
+                                repo, number, processing_trigger,
+                                pending_comment_id, command_wait,
+                            )
+                            if self._github_backing_off():
+                                break
+                            continue
+                        processed.append(number)
+                        self._clear_ordinary_pr_scan_retry(repo, number)
+                        if is_initialization:
+                            self._clear_new_pr_initialization_retry(repo, number)
+                        advance_pr_cursors(number)
+                        logger.info(
+                            "watcher ordinary PR finished repo=%s pr=%s trigger=%s result=processed comment_id=%s command_wait_seconds=%s",
+                            repo, number, processing_trigger,
+                            pending_comment_id, command_wait,
+                        )
                     except GitHubRateLimitError as exc:
+                        if is_initialization:
+                            self._retry_new_pr_initialization(
+                                repo, number, initialization_snapshot_pr,
+                                "github_rate_limited",
+                            )
+                        self._defer_ordinary_pr_scan(
+                            repo, number, initialization_snapshot_pr,
+                            "github_rate_limited",
+                            minimum_delay=exc.retry_after_seconds,
+                        )
                         logger.warning("watcher rate limited processing %s#%s; retry_after=%.1f", repo, number, exc.retry_after_seconds)
                         cycle_ok = False
                         self._scan_failure_reasons.append(
                             f"process:{repo}#{number}:rate_limited",
                         )
-                        break
+                        if self._github_backing_off():
+                            break
+                        continue
                     except Exception as exc:
+                        if is_initialization:
+                            self._retry_new_pr_initialization(
+                                repo, number, initialization_snapshot_pr,
+                                type(exc).__name__,
+                            )
+                        self._defer_ordinary_pr_scan(
+                            repo, number, initialization_snapshot_pr,
+                            type(exc).__name__,
+                        )
                         self._record_pr_attempt(
                             repo, number, type(exc).__name__, self._monotonic() - attempt_started,
                         )
@@ -3671,8 +4582,9 @@ class GitHubCommandWatcher:
                         self._scan_failure_reasons.append(
                             f"process:{repo}#{number}:{type(exc).__name__}",
                         )
-                    if number in cursor_after:
-                        self._pr_scan_cursor[repo] = cursor_after[number]
+                        if self._github_backing_off():
+                            break
+                        continue
                     if self._github_backing_off():
                         cycle_ok = False
                         break
@@ -3680,7 +4592,10 @@ class GitHubCommandWatcher:
                         break
 
                 snapshot_still_current = (
-                    self._usable_open_pr_snapshot(repo) is snapshot
+                    self._open_pr_listing_repo_is_authorized(repo)
+                    and self._repo_baseline_cutoff_utc.get(repo)
+                    == authorization_generation
+                    and self._usable_open_pr_snapshot(repo) is not None
                 )
                 if baseline_all and snapshot_still_current:
                     progress = self._baseline_progress.setdefault(repo, set())
@@ -3689,7 +4604,7 @@ class GitHubCommandWatcher:
                 elif baseline_all:
                     cycle_ok = False
                     self._scan_failure_reasons.append(
-                        f"baseline:{repo}:snapshot_invalidated",
+                        f"baseline:{repo}:snapshot_or_authorization_expired",
                     )
                 remaining = (
                     sum(number not in self._baseline_progress.get(repo, set()) for number in baseline_numbers)
@@ -3754,6 +4669,10 @@ class GitHubCommandWatcher:
                     and self._monotonic() >= self._priority_pr_retry_after.get(
                         (repo, pr_number), 0.0,
                     )
+                    and (self._priority_pr_sources.get((repo, pr_number)) != "machine"
+                         or self._monotonic() >= self._machine_refresh_retry_after.get(
+                             (repo, pr_number), 0.0,
+                         ))
                     and pr_number not in priority_attempted.get(repo, [])
                     for repo, pr_number in self._priority_pr_queue
                 )):
@@ -3848,7 +4767,9 @@ class GitHubCommandWatcher:
             if (not pr_info or pr_info.get("state") != "open"
                     or pr_info.get("merged") or pr_info.get("draft")):
                 if initial_state is None:
-                    await self.controller.reconcile_pr(repo, pr_number)
+                    await self.controller.reconcile_pr(
+                        repo, pr_number, defer_machine_projection=True,
+                    )
                 return False
 
             # BEFORE reconcile: snapshot current comments.
@@ -3872,7 +4793,9 @@ class GitHubCommandWatcher:
 
             # Reconcile (may create lifecycle hidden state).
             try:
-                await self.controller.reconcile_pr(repo, pr_number)
+                await self.controller.reconcile_pr(
+                    repo, pr_number, defer_machine_projection=True,
+                )
             except Exception as e:
                 logger.warning(
                     "watcher reconcile %s#%s: %s \u2014 skip baseline this cycle",
@@ -3941,7 +4864,9 @@ class GitHubCommandWatcher:
             if (not pr_info or pr_info.get("state") != "open"
                     or pr_info.get("merged") or pr_info.get("draft")):
                 if initial_state is None:
-                    await self.controller.reconcile_pr(repo, pr_number)
+                    await self.controller.reconcile_pr(
+                        repo, pr_number, defer_machine_projection=True,
+                    )
                 return False
 
             pr_head = ((pr_info.get("head") or {}).get("sha")
@@ -3973,7 +4898,9 @@ class GitHubCommandWatcher:
                     if not baseline_boundary_current():
                         logger.warning("watcher baseline authorization rejected %s#%s", repo, pr_number)
                         return False
-                    await self.controller.reconcile_pr(repo, pr_number)
+                    await self.controller.reconcile_pr(
+                        repo, pr_number, defer_machine_projection=True,
+                    )
                     state_after = await self.proxy.read_hidden_state(repo, pr_number)
                     pr_after = await self.proxy.get_pr(repo, pr_number)
                 except Exception as e:
@@ -4218,15 +5145,16 @@ class GitHubCommandWatcher:
         if (not isinstance(latest_pr, dict) or latest_pr.get("state") != "open"
                 or latest_pr.get("merged") or latest_pr.get("draft")
                 or (latest_pr.get("head") or {}).get("sha") != expected_head
+                or not isinstance(expected_state, dict)
                 or not isinstance(latest_state, dict)
                 or latest_state.get("head_sha") != expected_head
                 or latest_state.get("status") != expected_status
-                or (expected_state is not initial_state and any(
+                or any(
                     latest_state.get(field) != expected_state.get(field)
                     for field in ("round_archive", "round_id", "command",
                                   "review_evidence", "components", "deployments",
                                   "last_processed_comment_id")
-                ))):
+                )):
             return False
         if not baseline_boundary_current():
             logger.warning(
@@ -4281,7 +5209,9 @@ class GitHubCommandWatcher:
         # archive a second time.
         if post_cursor_reconcile:
             try:
-                await self.controller.reconcile_pr(repo, pr_number)
+                await self.controller.reconcile_pr(
+                    repo, pr_number, defer_machine_projection=True,
+                )
             except Exception as exc:
                 # The cursor is already durable. Keep it intact and retry reconcile
                 # on the next scan; never roll the cursor back to replay commands.
@@ -4331,7 +5261,9 @@ class GitHubCommandWatcher:
             return
 
         # Existing state PR — normal processing path.
-        await self.controller.reconcile_pr(repo, pr_number)
+        await self.controller.reconcile_pr(
+            repo, pr_number, defer_machine_projection=True,
+        )
         state = await self.proxy.read_hidden_state(repo, pr_number)
         if state is None:
             return
