@@ -13332,6 +13332,7 @@ class DeployController:
 
     def _cached_machine_projection_for_state(
         self, repo: str, pr_number: int, state: dict, projection_version: str,
+        *, cache_validation_keys: list[tuple] | None = None,
     ) -> list[dict] | None:
         components = state.get("components", []) if isinstance(state, dict) else []
         if not isinstance(components, list) or not isinstance(state, dict):
@@ -13345,7 +13346,10 @@ class DeployController:
             round_id_for_state(state), "machine-projection:" + history_scope,
             components, projection_version,
         )
-        return self._cached_machine_adaptation(cache_key)
+        groups = self._cached_machine_adaptation(cache_key)
+        if groups is not None and cache_validation_keys is not None:
+            cache_validation_keys.append(cache_key)
+        return groups
 
     async def refresh_machine_projection(self, repo: str, pr_number: int) -> str:
         """Serially refresh machine compatibility, runtime images, and lifecycle projection."""
@@ -14034,10 +14038,17 @@ class DeployController:
         "unknown_argument": "命令包含不支持的参数。",
         "invalid_arguments": "命令参数格式不正确。",
         "parameter_error": "命令参数格式不正确。",
-        "command_not_found": "无法识别这条部署审批命令。",
+        "command_not_found": "无法识别这条命令，请检查拼写后重试。",
         "machine_not_unique": "这个机器选择器对应多台机器，请明确选择一台。",
         "machine_selector_not_found": "找不到你填写的机器。",
     }
+
+    _DETERMINISTIC_PARSE_ERRORS = frozenset({
+        "duplicate_argument", "invalid_ip_format", "extra_parameter",
+        "missing_machine_value", "missing_parameter", "invalid_parameter",
+        "unknown_argument", "invalid_arguments", "parameter_error",
+        "command_not_found",
+    })
 
     _TOPIC_REASONS = (
         ("head_changed", "PR 有了新提交，之前的审核和审批已不再对应当前代码。"),
@@ -14099,6 +14110,25 @@ class DeployController:
         if text.startswith(cls._FAILURE_PREFIX):
             return text
         return f"{cls._FAILURE_PREFIX}\n\n原因：{text}"
+
+    @staticmethod
+    def _parse_command_error(source_body: str, *, comment_id: int = 0):
+        """Return the parsed command and the shared parse-error classification."""
+        from .commands import detect_deployment_command_intent, parse_command
+
+        body = source_body if isinstance(source_body, str) else ""
+        parsed = parse_command(body, comment_id=comment_id)
+        parse_error = parsed.error if isinstance(parsed.error, str) else ""
+        if (not parse_error and parsed.kind == "unknown"
+                and detect_deployment_command_intent(body)):
+            parse_error = "command_not_found"
+        return parsed, parse_error
+
+    @classmethod
+    def _is_deterministic_parse_error(cls, parse_error: str) -> bool:
+        if not isinstance(parse_error, str) or not parse_error:
+            return False
+        return parse_error.partition(":")[0].strip().casefold() in cls._DETERMINISTIC_PARSE_ERRORS
 
     def _command_error_reason(
         self, *, command_kind: str = "", parsed_error: str = "",
@@ -14223,6 +14253,8 @@ class DeployController:
         final: bool = True, result: str | None = None,
     ) -> bool:
         """Bind an operation reply to the current PR HEAD, round, and source comment."""
+        reply_started_at = time.monotonic()
+        context_started_at = reply_started_at
         if not isinstance(comment_id, int) or comment_id <= 0:
             return False
         # Command replies always use the existing comment_id/result contract.
@@ -14259,6 +14291,7 @@ class DeployController:
             }
         )
         error = error or rejected_topic
+        rejected_reply = error or result == "rejected"
         try:
             pr = await self.proxy.get_pr(repo, pr_number)
             state = await self.proxy.read_hidden_state(repo, pr_number)
@@ -14267,6 +14300,10 @@ class DeployController:
                            repo, pr_number, type(exc).__name__)
             self._record_command_reply_delivery(
                 repo, pr_number, comment_id, False,
+            )
+            logger.info(
+                "command reply timing repo=%s pr=%s comment_id=%s phase=context_read elapsed_seconds=%.3f result=failed",
+                repo, pr_number, comment_id, time.monotonic() - context_started_at,
             )
             return False
         head = ((pr.get("head") or {}).get("sha")
@@ -14297,30 +14334,79 @@ class DeployController:
             # No persisted lifecycle round exists for the current HEAD. Bind
             # this rejected command to a deterministic event-scoped identity.
             round_id = make_round_id(head, comment_id)
+        logger.info(
+            "command reply timing repo=%s pr=%s comment_id=%s phase=context_read elapsed_seconds=%.3f result=ready",
+            repo, pr_number, comment_id, time.monotonic() - context_started_at,
+        )
+        parse_error = ""
+        syntax_error = False
+        guidance_cache_keys: list[tuple] | None = None
+        source_comment_identity: tuple[str, str, str] | None = None
         if error:
+            source_context_started_at = time.monotonic()
             try:
                 origin = await self.proxy.get_comment(repo, comment_id)
             except Exception:
                 origin = None
+            logger.info(
+                "command reply timing repo=%s pr=%s comment_id=%s phase=context_read context=source_comment elapsed_seconds=%.3f result=%s",
+                repo, pr_number, comment_id,
+                time.monotonic() - source_context_started_at,
+                "ready" if isinstance(origin, dict) else "unavailable",
+            )
             source_body = origin.get("body", "") if isinstance(origin, dict) else ""
-            from .commands import parse_command
-            parsed = parse_command(
+            source_user = origin.get("user") if isinstance(origin, dict) else None
+            if isinstance(source_user, dict):
+                source_comment_identity = (
+                    source_body if isinstance(source_body, str) else "",
+                    str(source_user.get("id", "")),
+                    str(source_user.get("login", "")).casefold(),
+                )
+            else:
+                source_comment_identity = ("", "", "")
+            classification_started_at = time.monotonic()
+            parsed, parse_error = self._parse_command_error(
                 source_body if isinstance(source_body, str) else "",
                 comment_id=comment_id,
             )
-            parse_error = parsed.error or ""
             reason = self._command_error_reason(
                 command_kind=parsed.kind if isinstance(parsed.kind, str) else "",
                 parsed_error=parse_error,
                 topic=topic,
                 message=message,
             )
-            guidance = await self._lifecycle_next_action_guidance(
-                repo, pr_number, detail=False,
+            syntax_error = self._is_deterministic_parse_error(parse_error)
+            if syntax_error:
+                guidance_cache_keys = []
+            logger.info(
+                "command reply timing repo=%s pr=%s comment_id=%s phase=error_classification elapsed_seconds=%.3f syntax_error=%s",
+                repo, pr_number, comment_id,
+                time.monotonic() - classification_started_at,
+                syntax_error,
             )
+            guidance_started_at = time.monotonic()
+            try:
+                guidance = await self._lifecycle_next_action_guidance(
+                    repo, pr_number, detail=False, cache_only=syntax_error,
+                    cache_validation_keys=guidance_cache_keys,
+                )
+            finally:
+                logger.info(
+                    "command reply timing repo=%s pr=%s comment_id=%s phase=guidance_generation elapsed_seconds=%.3f cache_only=%s",
+                    repo, pr_number, comment_id,
+                    time.monotonic() - guidance_started_at, syntax_error,
+                )
             message = self._format_user_reply(self._failure_lead(reason), guidance)
         else:
-            guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
+            guidance_started_at = time.monotonic()
+            try:
+                guidance = await self._lifecycle_next_action_guidance(repo, pr_number)
+            finally:
+                logger.info(
+                    "command reply timing repo=%s pr=%s comment_id=%s phase=guidance_generation elapsed_seconds=%.3f cache_only=false",
+                    repo, pr_number, comment_id,
+                    time.monotonic() - guidance_started_at,
+                )
             message = self._format_user_reply(message, guidance)
         try:
             labels_after_guidance = await self.proxy.get_issue_labels(repo, pr_number)
@@ -14341,11 +14427,81 @@ class DeployController:
             command.startswith("/approve_deploy")
             for command in visible_guidance_commands
         )
-        if (has_machine_approval_guidance
+        # Cached adaptation evidence is relevant to the reply only when an
+        # executable machine approval command is actually shown.
+        machine_guidance_sensitive = has_machine_approval_guidance
+        if syntax_error and (
+                (machine_guidance_sensitive and not guidance_cache_keys)
+                or any(self._cached_machine_adaptation(key) is None
+                       for key in (guidance_cache_keys or []))):
+            message = self._safe_machine_guidance_reply(
+                message, labels_after_guidance, state_before_guidance,
+            )
+            visible_guidance_commands = self._visible_command_lines(message)
+            has_machine_approval_guidance = False
+            machine_guidance_sensitive = False
+            guidance_cache_keys.clear()
+        if (syntax_error and machine_guidance_sensitive
                 and (not projection_before_guidance
                      or projection_before_guidance != projection_after_guidance)):
-            self._record_command_reply_delivery(repo, pr_number, comment_id, False)
-            return False
+            message = self._safe_machine_guidance_reply(
+                message, labels_after_guidance, state_before_guidance,
+            )
+            visible_guidance_commands = self._visible_command_lines(message)
+            has_machine_approval_guidance = False
+            machine_guidance_sensitive = False
+            guidance_cache_keys.clear()
+        if syntax_error and machine_guidance_sensitive:
+            try:
+                policy_status = self.policy.repo_policy_status(repo)
+            except Exception:
+                policy_status = None
+            if (not isinstance(policy_status, dict)
+                    or policy_status.get("authorized") is not True
+                    or policy_status.get("machines_configured") is not True):
+                message = self._safe_machine_guidance_reply(
+                    message, labels_after_guidance, state_before_guidance,
+                )
+                visible_guidance_commands = self._visible_command_lines(message)
+                has_machine_approval_guidance = False
+                machine_guidance_sensitive = False
+                guidance_cache_keys.clear()
+        if (has_machine_approval_guidance and not syntax_error
+                and (not projection_before_guidance
+                     or projection_before_guidance != projection_after_guidance)):
+            if not rejected_reply:
+                self._record_command_reply_delivery(repo, pr_number, comment_id, False)
+                return False
+            message = self._safe_machine_guidance_reply(
+                message, labels_after_guidance, state_before_guidance,
+            )
+            visible_guidance_commands = self._visible_command_lines(message)
+            has_machine_approval_guidance = False
+            machine_guidance_sensitive = False
+            if guidance_cache_keys is not None:
+                guidance_cache_keys.clear()
+        review_evidence_for_final = None
+        review_invalid_fallback = None
+        if rejected_reply and has_machine_approval_guidance:
+            has_current_review_snapshot = (
+                isinstance(state_before_guidance, dict)
+                and state_before_guidance.get("head_sha") == head
+                and isinstance(state_before_guidance.get("review_evidence"), dict)
+            )
+            if has_current_review_snapshot:
+                review_evidence_for_final = state_before_guidance["review_evidence"]
+            else:
+                message = self._safe_machine_guidance_reply(
+                    message, labels_after_guidance, state_before_guidance,
+                )
+                has_machine_approval_guidance = False
+                machine_guidance_sensitive = False
+                if guidance_cache_keys is not None:
+                    guidance_cache_keys.clear()
+            if has_current_review_snapshot:
+                review_invalid_fallback = self._safe_machine_guidance_reply(
+                    message, labels_after_guidance, state_before_guidance,
+                )
         if final:
             final_result = result
             if final_result not in {"accepted", "rejected", "uncertain"}:
@@ -14356,19 +14512,43 @@ class DeployController:
                         "recovery-waiting", "deployment-interrupted",
                     )) else "rejected" if error else "accepted"
                 )
-            return await self._post_final_reply(
-                repo, pr_number, comment_id, message, final_result,
-                topic=topic, expected_head=head,
-                expected_state=state_before_guidance,
-                expected_pr_state=pr.get("state") if isinstance(pr, dict) else None,
-                expected_pr_merged=pr.get("merged") if isinstance(pr, dict) else None,
-                expected_pr_draft=pr.get("draft") if isinstance(pr, dict) else None,
-                expected_round_id=round_id,
-                expected_status_labels=status_labels_after_guidance,
-                expected_machine_projection_version=(
-                    projection_after_guidance if has_machine_approval_guidance else ""
-                ),
+            final_write_started_at = time.monotonic()
+            try:
+                delivered = await self._post_final_reply(
+                    repo, pr_number, comment_id, message, final_result,
+                    topic=topic, expected_head=head,
+                    expected_state=state_before_guidance,
+                    expected_pr_state=pr.get("state") if isinstance(pr, dict) else None,
+                    expected_pr_merged=pr.get("merged") if isinstance(pr, dict) else None,
+                    expected_pr_draft=pr.get("draft") if isinstance(pr, dict) else None,
+                    expected_round_id=round_id,
+                    expected_status_labels=status_labels_after_guidance,
+                    expected_machine_projection_version=(
+                        projection_after_guidance if machine_guidance_sensitive else ""
+                    ),
+                    expected_parse_error=parse_error if error else None,
+                    expected_machine_adaptation_cache_keys=(
+                        guidance_cache_keys
+                        if syntax_error and machine_guidance_sensitive else None
+                    ),
+                    expected_review_evidence=review_evidence_for_final,
+                    review_invalid_fallback_message=review_invalid_fallback,
+                    expected_source_comment_identity=(
+                        source_comment_identity if syntax_error else None
+                    ),
+                )
+            finally:
+                logger.info(
+                    "command reply timing repo=%s pr=%s comment_id=%s phase=final_reply_write elapsed_seconds=%.3f",
+                    repo, pr_number, comment_id,
+                    time.monotonic() - final_write_started_at,
+                )
+            logger.info(
+                "command reply timing repo=%s pr=%s comment_id=%s phase=total elapsed_seconds=%.3f delivered=%s",
+                repo, pr_number, comment_id,
+                time.monotonic() - reply_started_at, delivered,
             )
+            return delivered
         try:
             delivered = await self._post_bound_notice(
                 repo, pr_number, head_sha=head, round_id=round_id,
@@ -14393,6 +14573,11 @@ class DeployController:
         expected_pr_draft: bool | None = None,
         expected_round_id: str = "", expected_status_labels: tuple[str, ...] | None = None,
         expected_machine_projection_version: str = "",
+        expected_parse_error: str | None = None,
+        expected_machine_adaptation_cache_keys: list[tuple] | None = None,
+        expected_review_evidence: dict | None = None,
+        expected_source_comment_identity: tuple[str, str, str] | None = None,
+        review_invalid_fallback_message: str | None = None,
     ) -> bool:
         """Post a final command reply bound to the source comment with the Codex C contract markers."""
         if (result not in {"accepted", "rejected", "uncertain"}
@@ -14415,6 +14600,20 @@ class DeployController:
                 or origin.get("issue_url") != expected_issue_url
                 or not isinstance(comments, list)):
             return False
+        if expected_source_comment_identity is not None:
+            source_user = origin.get("user")
+            actual_source_identity = (
+                origin.get("body") if isinstance(origin.get("body"), str) else None,
+                str(source_user.get("id", "")) if isinstance(source_user, dict) else "",
+                str(source_user.get("login", "")).casefold()
+                if isinstance(source_user, dict) else "",
+            )
+            if actual_source_identity != expected_source_comment_identity:
+                logger.info(
+                    "final command reply source comment changed %s#%s comment_id=%s",
+                    repo, pr_number, comment_id,
+                )
+                return False
         if result == "rejected":
             try:
                 labels = await self.proxy.get_issue_labels(repo, pr_number)
@@ -14422,17 +14621,17 @@ class DeployController:
                 labels = None
                 logger.info("rejected command labels unavailable %s#%s reason=%s",
                             repo, pr_number, type(exc).__name__)
-            from .commands import parse_command
-            parsed = parse_command(
+            parsed, parse_error = self._parse_command_error(
                 origin.get("body", "") if isinstance(origin.get("body"), str) else "",
                 comment_id=comment_id,
             )
-            from .commands import detect_deployment_command_intent
-            parse_error = parsed.error if isinstance(parsed.error, str) else ""
-            if not parse_error and parsed.kind == "unknown":
-                source = origin.get("body") or ""
-                if detect_deployment_command_intent(source):
-                    parse_error = "command_not_found"
+            if (expected_parse_error is not None
+                    and parse_error != expected_parse_error):
+                logger.info(
+                    "final command reply parse context changed %s#%s comment_id=%s",
+                    repo, pr_number, comment_id,
+                )
+                return False
             qa = self._final_reply_qa(
                 pr, labels, topic, message, parse_error,
             )
@@ -14486,19 +14685,91 @@ class DeployController:
                 or final_status_labels != expected_status_labels):
             logger.info("final command reply context changed %s#%s", repo, pr_number)
             return False
-        if expected_machine_projection_version:
-            try:
-                final_projection = self._machine_projection_version(repo)
-                final_policy_status = self.policy.repo_policy_status(repo)
-            except Exception:
+
+        def machine_guidance_failure() -> str:
+            if expected_machine_projection_version:
+                try:
+                    final_projection = self._machine_projection_version(repo)
+                    final_policy_status = self.policy.repo_policy_status(repo)
+                except Exception:
+                    return "projection_unavailable"
+                if (final_projection != expected_machine_projection_version
+                        or not isinstance(final_policy_status, dict)
+                        or final_policy_status.get("authorized") is not True
+                        or final_policy_status.get("machines_configured") is not True):
+                    return "projection_or_policy_changed"
+            if (expected_machine_adaptation_cache_keys is not None
+                    and any(self._cached_machine_adaptation(key) is None
+                            for key in expected_machine_adaptation_cache_keys)):
+                return "cache_expired"
+            return ""
+
+        machine_failure = machine_guidance_failure()
+        if machine_failure:
+            logger.info(
+                "final machine guidance unavailable %s#%s comment_id=%s reason=%s",
+                repo, pr_number, comment_id, machine_failure,
+            )
+            if result != "rejected":
                 return False
-            if (final_projection != expected_machine_projection_version
-                    or not isinstance(final_policy_status, dict)
-                    or final_policy_status.get("authorized") is not True
-                    or final_policy_status.get("machines_configured") is not True):
-                logger.info("final machine command projection changed %s#%s",
-                            repo, pr_number)
+            message = self._safe_machine_guidance_reply(
+                message, final_labels, final_state,
+            )
+            qa = self._final_reply_qa(
+                final_pr, final_labels, topic, message,
+                expected_parse_error or "",
+            )
+            expected_machine_projection_version = ""
+            expected_machine_adaptation_cache_keys = None
+            expected_review_evidence = None
+        if expected_review_evidence is not None:
+            review_state = final_state if isinstance(final_state, dict) else {}
+            if (review_state.get("review_evidence") != expected_review_evidence
+                    or not await self._current_review_comment_snapshot_matches_state(
+                        repo, pr_number, expected_head, review_state, final_pr,
+                        comments=comments,
+                    )):
+                if not isinstance(review_invalid_fallback_message, str):
+                    logger.info(
+                        "final command reply review evidence changed %s#%s comment_id=%s",
+                        repo, pr_number, comment_id,
+                    )
+                    return False
+                logger.info(
+                    "final command reply review evidence changed; using safe guidance %s#%s comment_id=%s",
+                    repo, pr_number, comment_id,
+                )
+                message = review_invalid_fallback_message
+                expected_machine_projection_version = ""
+                expected_machine_adaptation_cache_keys = None
+                expected_review_evidence = None
+                if result == "rejected":
+                    qa = self._final_reply_qa(
+                        final_pr, final_labels, topic, message,
+                        expected_parse_error or "",
+                    )
+        # Review-source revalidation performs GitHub awaits. Check machine
+        # authorization and cache freshness afterward so syntax-error replies
+        # can be downgraded using the latest local projection immediately
+        # before the write.
+        machine_failure = machine_guidance_failure()
+        if machine_failure:
+            logger.info(
+                "final machine guidance changed during Review revalidation %s#%s comment_id=%s reason=%s",
+                repo, pr_number, comment_id, machine_failure,
+            )
+            if result != "rejected":
                 return False
+            message = self._safe_machine_guidance_reply(
+                message, final_labels, final_state,
+            )
+            qa = self._final_reply_qa(
+                final_pr, final_labels, topic, message,
+                expected_parse_error or "",
+            )
+            expected_machine_projection_version = ""
+            expected_machine_adaptation_cache_keys = None
+            expected_review_evidence = None
         body_parts = [comments_mod.BOT_MARKER, "", marker, result_marker, message]
         if isinstance(qa, dict) and qa:
             body_parts.append("<!-- deploy-approval-qa:" + json.dumps(qa, ensure_ascii=False) + " -->")
@@ -14537,6 +14808,102 @@ class DeployController:
                 for match in pattern.finditer(line)
             )
         return lines
+
+    def _safe_machine_guidance_reply(
+        self, message: str, labels, state: dict | None,
+    ) -> str:
+        """Drop unverified machine operations while retaining the lifecycle step."""
+        lead, separator, guidance = message.partition("\n\n")
+        if separator and guidance.startswith("原因："):
+            reason, _, guidance = guidance.partition("\n\n")
+            lead = f"{lead}\n\n{reason}"
+        elif not separator:
+            guidance = ""
+        status_labels = [
+            label for label in labels
+            if isinstance(label, str)
+            and label.casefold().startswith(STATUS_PREFIX.casefold())
+        ] if isinstance(labels, list) else []
+        status = ""
+        if len(status_labels) == 1 and status_labels[0] in _ALLOWED_STATUS_LABELS:
+            _, _, status = status_labels[0].partition(":")
+            status = status.strip()
+        try:
+            runtime_drift = bool(self._confirmed_runtime_drift(state))
+            identity_unconfirmed = bool(self._runtime_identity_unconfirmed(state))
+        except Exception:
+            runtime_drift = False
+            identity_unconfirmed = False
+
+        if status == "review-required":
+            next_step = (
+                "请由 PR 作者执行 `/request_bot_review`，然后等待审核和构建结果。"
+            )
+        elif status == "reviewing":
+            next_step = "审核和镜像构建正在进行，请等待完成；暂时不要部署。"
+        elif status in {"deploy-ready", "deploy-requested"}:
+            next_step = (
+                "当前阶段需要部署审批。请查看 PR Summary 中最新的机器状态和"
+                "可执行审批指引，再按已验证信息操作。"
+            )
+        elif status == "deploying":
+            next_step = "部署正在进行，请等待结果，不要重复提交审批或部署。"
+        elif status == "testing":
+            runtime_note = (
+                "已确认实际运行镜像与批准镜像不一致，需先按 PR Summary 最新指引处理。"
+                if runtime_drift else
+                "历史设备身份需要重新确认，请先查看 PR Summary 最新状态。"
+                if identity_unconfirmed else ""
+            )
+            if self._acceptance_request_is_pending(state):
+                next_step = (
+                    f"{runtime_note}测试附件上传完全可选，请使用本轮 PR Summary 显示的固定上传入口。"
+                    "验收申请已经提交，请等待结果；新的测试完成后执行 `/request_acceptance`。"
+                )
+            else:
+                test_start = (
+                    "处理完成后可以开始测试。" if runtime_drift or identity_unconfirmed
+                    else "可以开始测试。"
+                )
+                next_step = (
+                    f"{runtime_note}{test_start}测试附件上传完全可选，请使用本轮 PR Summary 显示的固定上传入口。"
+                    "测试完成后执行 `/request_acceptance` 申请验收。"
+                )
+        elif status == "acceptance-required":
+            runtime_note = (
+                "已确认实际运行镜像与批准镜像不一致，请先按 PR Summary 最新指引处理。"
+                if runtime_drift else
+                "历史设备身份需要重新确认，请查看 PR Summary 最新状态。"
+                if identity_unconfirmed else ""
+            )
+            next_step = (
+                f"{runtime_note}请由有权限的验收人完成验收后执行 `/record_test result=pass`，"
+                "验收未通过则执行 `/record_test result=fail`。"
+            )
+        elif status == "succeeded":
+            if runtime_drift:
+                next_step = (
+                    "验收已通过，但检测到运行镜像差异；请查看 PR Summary 中最新机器状态，"
+                    "再按当前验证结果处理。"
+                )
+            elif identity_unconfirmed:
+                next_step = (
+                    "验收已通过，但历史设备身份需要重新确认；"
+                    "请查看 PR Summary 中最新机器状态后再操作。"
+                )
+            else:
+                next_step = "验收已经通过，可以按照仓库流程合并 PR。"
+        elif status == "failed":
+            failure_lines = guidance.split("请先按失败信息", 1)[0].splitlines()
+            failure_line = failure_lines[0].strip() if failure_lines else ""
+            if "本轮部署失败" not in failure_line:
+                failure_line = "本轮部署失败。"
+            next_step = (
+                f"{failure_line}请按失败信息修复，并查看 PR Summary 中最新机器状态和后续指引。"
+            )
+        else:
+            next_step = "请查看 PR Summary 中最新状态后再操作。"
+        return self._format_user_reply(lead, next_step)
 
     def _final_reply_qa(
         self, pr: dict, labels, topic: str, message: str,
@@ -14994,7 +15361,8 @@ class DeployController:
 
     async def _lifecycle_next_action_guidance(
         self, repo: str, pr_number: int, *, detail: bool = True,
-        _retry_count: int = 0,
+        _retry_count: int = 0, cache_only: bool = False,
+        cache_validation_keys: list[tuple] | None = None,
     ) -> str:
         """Return next-step guidance from the current GitHub status label.
 
@@ -15010,6 +15378,9 @@ class DeployController:
             "请等待 PR Summary 同步后再操作。"
         )
         tick = chr(96)
+        cache_validation_keys = (
+            cache_validation_keys if cache_validation_keys is not None else []
+        )
         machine_projection_version = ""
         machine_cache_key = None
         cache_status = ""
@@ -15062,6 +15433,14 @@ class DeployController:
             return ""
 
         async def confirm_machine_guidance():
+            if cache_only:
+                if any(self._cached_machine_adaptation(key) is None
+                       for key in cache_validation_keys):
+                    return (
+                        "机器验证缓存已过期，为避免显示旧地址，"
+                        "请查看 PR Summary 中最新的机器状态和审批命令。"
+                    )
+                return ""
             final_pr = await self.proxy.get_pr(repo, pr_number)
             if (not isinstance(final_pr, dict) or final_pr.get("state") != "open"
                     or final_pr.get("merged") or final_pr.get("draft")):
@@ -15197,6 +15576,8 @@ class DeployController:
                 commands = list(dict.fromkeys(
                     await self._runtime_drift_command_lines(
                         state, repo, pr_number=pr_number,
+                        allow_live_probe=not cache_only,
+                        cache_validation_keys=cache_validation_keys,
                     ),
                 ))
             except Exception:
@@ -15336,10 +15717,11 @@ class DeployController:
                         "当前提交的审核和镜像构建证据暂时无法确认。"
                         "请等待 PR Summary 更新后再使用部署审批命令。"
                     )
-                if not await self._fresh_review_evidence_matches_state(
-                    repo, pr_number, head, review_evidence,
-                    expected_components=components,
-                ):
+                if (not cache_only
+                        and not await self._fresh_review_evidence_matches_state(
+                            repo, pr_number, head, review_evidence,
+                            expected_components=components,
+                        )):
                     return status_sync_conflict if status_conflict else (
                         "当前提交的审核或镜像构建证据还在确认。"
                         "请等待 PR Summary 更新后再使用部署审批命令。"
@@ -15381,6 +15763,11 @@ class DeployController:
                     machine_cache_key,
                 )
                 if verified_guidance_groups is None:
+                    if cache_only:
+                        return (
+                            "部署阶段的机器验证缓存暂不可用；为避免提供未验证或过期地址，"
+                            "请查看 PR Summary 中最新机器状态和可执行审批命令。"
+                        )
                     groups_to_verify = self._exclude_unconfirmed_history_endpoints(
                         groups_to_verify, state, repo,
                     )
@@ -15395,6 +15782,8 @@ class DeployController:
                     self._remember_machine_adaptation(
                         machine_cache_key, verified_guidance_groups,
                     )
+                elif cache_only:
+                    cache_validation_keys.append(machine_cache_key)
                 groups = self._verified_groups_for_components(
                     verified_guidance_groups, remaining,
                 )
@@ -15498,6 +15887,8 @@ class DeployController:
                         drift_commands = list(dict.fromkeys(
                             await self._runtime_drift_command_lines(
                                 state, repo, pr_number=pr_number,
+                                allow_live_probe=not cache_only,
+                                cache_validation_keys=cache_validation_keys,
                             ),
                         ))
                     except Exception:
@@ -15553,7 +15944,7 @@ class DeployController:
                     int(command.get("comment_id", 0) or 0)
                     if isinstance(command, dict) else 0
                 )
-                if approval_comment_id > 0:
+                if approval_comment_id > 0 and not cache_only:
                     upload_url = await self._current_testing_upload_url(
                         repo, pr_number, head_sha=head,
                         round_id=round_id_for_state(state),
@@ -15643,6 +16034,9 @@ class DeployController:
             if lifecycle_status == "failed":
                 failure_detail = ""
                 try:
+                    # This is a read-only GitHub comment lookup. Keep it in
+                    # cache-only guidance so a failed deployment still states
+                    # its recorded cause without probing Agent Core.
                     lifecycle_comment = await self.proxy.find_trusted_lifecycle_comment(
                         repo, pr_number,
                     )
@@ -15702,6 +16096,8 @@ class DeployController:
                     commands = list(dict.fromkeys(
                         await self._runtime_drift_command_lines(
                             state, repo, pr_number=pr_number,
+                            allow_live_probe=not cache_only,
+                            cache_validation_keys=cache_validation_keys,
                         ),
                     ))
                 except Exception:
@@ -15724,14 +16120,19 @@ class DeployController:
                         )
                         cached_retry_groups = self._cached_machine_adaptation(retry_key)
                         retry_groups = cached_retry_groups or []
+                        if cached_retry_groups is not None and cache_only:
+                            cache_validation_keys.append(retry_key)
                         if cached_retry_groups is None:
                             projection_groups = self._cached_machine_projection_for_state(
                                 repo, pr_number, state, retry_projection,
+                                cache_validation_keys=cache_validation_keys,
                             )
                             if projection_groups is not None:
                                 retry_groups = self._verified_groups_for_components(
                                     projection_groups, retry_components,
                                 )
+                            elif cache_only:
+                                retry_groups = []
                             else:
                                 candidates = self._exclude_unconfirmed_history_endpoints(
                                     self._get_machine_groups_for_components(
@@ -15743,7 +16144,8 @@ class DeployController:
                                 )
                                 if self._machine_projection_version(repo) != retry_projection:
                                     return status_unavailable
-                            self._remember_machine_adaptation(retry_key, retry_groups)
+                            if not cache_only:
+                                self._remember_machine_adaptation(retry_key, retry_groups)
                         machine_cache_key = retry_key
                         cache_status = "failed-retry"
                         cache_components = list(retry_components)
@@ -15799,6 +16201,8 @@ class DeployController:
                         )
                         projected_groups = self._cached_machine_adaptation(projection_key)
                         if projected_groups is not None:
+                            if cache_only:
+                                cache_validation_keys.append(projection_key)
                             retry_blockers = "\n".join(self._machine_blocking_summary(
                                 self._verified_groups_for_components(
                                     projected_groups, all_components,
@@ -16474,6 +16878,8 @@ class DeployController:
 
     async def _runtime_drift_command_lines(
         self, state: dict, repo: str | None = None, *, pr_number: int = 0,
+        allow_live_probe: bool = True,
+        cache_validation_keys: list[tuple] | None = None,
     ) -> list[str]:
         if not isinstance(repo, str) or not repo:
             return []
@@ -16527,6 +16933,7 @@ class DeployController:
         if verified_groups is None:
             projection_groups = self._cached_machine_projection_for_state(
                 repo, pr_number, state, projection_version,
+                cache_validation_keys=cache_validation_keys,
             )
             if projection_groups is not None:
                 verified_groups = []
@@ -16541,6 +16948,8 @@ class DeployController:
                             [matches[0]], selected_components,
                         ))
             else:
+                if not allow_live_probe:
+                    return []
                 candidates = []
                 for alias, component_ids in sorted(ids_by_alias.items()):
                     selected_components = [component_map[item]
@@ -16569,8 +16978,11 @@ class DeployController:
                     return []
             except Exception:
                 return []
-            self._remember_machine_adaptation(cache_key, verified_groups)
+            if allow_live_probe:
+                self._remember_machine_adaptation(cache_key, verified_groups)
         else:
+            if cache_validation_keys is not None:
+                cache_validation_keys.append(cache_key)
             try:
                 if self._machine_projection_version(repo) != projection_version:
                     return []
@@ -19415,6 +19827,139 @@ class DeployController:
                 return None
         return state
 
+
+    async def _current_review_comment_snapshot_matches_state(
+        self, repo: str, pr_number: int, head_sha: str, state: dict,
+        pr: dict, *, comments: list[dict] | None = None,
+    ) -> bool:
+        """Revalidate every source comment for a cached Review/run snapshot."""
+        if (not isinstance(state, dict) or state.get("head_sha") != head_sha
+                or not isinstance(pr, dict)
+                or not self._review_recovery_pr_matches(
+                    pr, repo, pr_number, head_sha,
+                )):
+            return False
+        persisted = state.get("review_evidence")
+        components = state.get("components")
+        if (not isinstance(persisted, dict)
+                or persisted.get("resolved_head_sha") != head_sha
+                or not isinstance(components, list) or not components):
+            return False
+        try:
+            if comments is None:
+                comments = await self.proxy.get_issue_comments(repo, pr_number)
+            if not isinstance(comments, list):
+                return False
+            build_comment_id = persisted.get("build_comment_id")
+            if (type(build_comment_id) is not int or build_comment_id <= 0
+                    or self._has_untrusted_newer_review_comment(
+                        comments, build_comment_id,
+                    )):
+                return False
+            evidence = self._extract_trusted_review_evidence(
+                comments, head_sha=head_sha,
+            )
+            if (evidence is None or not evidence.run_binding_valid
+                    or evidence.request_comment is None
+                    or evidence.test_results_block_deployment):
+                return False
+            current_snapshot = self._review_evidence_snapshot(evidence, head_sha)
+            if (self._review_evidence_identity(current_snapshot)
+                    != self._review_evidence_identity(persisted)):
+                return False
+            request = evidence.request_comment
+            request_user = request.get("user") if isinstance(request, dict) else None
+            pr_user = pr.get("user")
+            if (not isinstance(request, dict)
+                    or type(request.get("id")) is not int
+                    or request.get("id") <= 0
+                    or request.get("created_at") != request.get("updated_at")
+                    or not isinstance(request_user, dict)
+                    or not isinstance(pr_user, dict)
+                    or not isinstance(request_user.get("login"), str)
+                    or not isinstance(pr_user.get("login"), str)
+                    or not str(request_user.get("id", "")).isdigit()
+                    or not str(pr_user.get("id", "")).isdigit()):
+                return False
+            request_id = request.get("id")
+            request_login = request_user.get("login")
+            if not self._review_recovery_comment_is_scoped(
+                    repo, pr_number, request_id, request,
+                    str(request_user.get("id", "")), request_login):
+                return False
+
+            # Bind each selected Build, Test, and Code Review comment to the
+            # expected PR and exact trusted bot identity. Capture all selected
+            # source fields so edits, replacements, or a newer run during the
+            # authorization lookup invalidate this cached snapshot.
+            comments_by_id = {
+                comment.get("id"): comment for comment in comments
+                if isinstance(comment, dict)
+            }
+            selected_ids = [evidence.build_comment_id]
+            if evidence.test_comment_id > 0:
+                selected_ids.append(evidence.test_comment_id)
+            selected_ids.append(evidence.code_review_comment_id)
+            selected_ids.append(request_id)
+            expected_fingerprints = {}
+            for comment_id in selected_ids:
+                if type(comment_id) is not int or comment_id <= 0:
+                    return False
+                selected_comment = comments_by_id.get(comment_id)
+                if (comment_id != request_id
+                        and not self._review_recovery_comment_is_scoped(
+                            repo, pr_number, comment_id, selected_comment,
+                            self.config.review_comment_author_id,
+                            self.config.review_comment_author_login,
+                            allow_edited=True,
+                        )):
+                    return False
+                fingerprint = self._review_recovery_comment_fingerprint(
+                    selected_comment,
+                )
+                if fingerprint is None:
+                    return False
+                expected_fingerprints[comment_id] = fingerprint
+
+            same_author = (
+                str(request_user.get("id")) == str(pr_user.get("id"))
+                and request_user["login"].casefold() == pr_user["login"].casefold()
+            )
+            if not same_author:
+                permission = await self.proxy.collaborator_permission(
+                    repo, request_user["login"],
+                )
+                if not Policy.collaborator_can_approve(permission):
+                    return False
+            failure_reason: list[str] = []
+            validated = await self._review_evidence_from_comments(
+                repo, pr_number, head_sha, comments,
+                require_exact_pr_context=True,
+                resolved_head=head_sha,
+                expected_review_comment_fingerprints=expected_fingerprints,
+                failure_reason=failure_reason,
+            )
+            if (validated is None or not validated.run_binding_valid
+                    or validated.head_sha != head_sha):
+                logger.info(
+                    "current review run binding unavailable %s#%s reason=%s",
+                    repo, pr_number,
+                    failure_reason[0] if failure_reason else "review_unconfirmed",
+                )
+                return False
+            validated_snapshot = self._review_evidence_snapshot(
+                validated, head_sha,
+            )
+            return (
+                self._review_evidence_identity(validated_snapshot)
+                == self._review_evidence_identity(persisted)
+            )
+        except Exception as exc:
+            logger.info(
+                "current review comment snapshot unavailable %s#%s reason=%s",
+                repo, pr_number, type(exc).__name__,
+            )
+            return False
 
     async def _fresh_review_evidence_matches_state(
         self, repo: str, pr_number: int, fresh_head: str,

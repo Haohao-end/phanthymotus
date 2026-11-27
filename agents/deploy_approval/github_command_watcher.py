@@ -373,6 +373,8 @@ class GitHubCommandWatcher:
         # only a scheduling nudge and never an instruction.
         self._evidence_sync_queue: deque[tuple[str, int]] = deque()
         self._evidence_sync_set: set[tuple[str, int]] = set()
+        self._evidence_sync_active: set[tuple[str, int]] = set()
+        self._evidence_sync_work: dict[tuple[str, int], dict] = {}
         self._evidence_sync_failures: dict[tuple[str, int], int] = {}
         self._evidence_sync_retry_after: dict[tuple[str, int], float] = {}
         self._evidence_sync_seeded_repos: set[str] = set()
@@ -797,7 +799,53 @@ class GitHubCommandWatcher:
         if self._wakeup is not None:
             self._wakeup.set()
 
-    def schedule_evidence_sync(self, repo: str, pr_number: int) -> bool:
+    def _has_ready_developer_command(self) -> bool:
+        if self.config.auth_valid is not True or self._github_backing_off():
+            return False
+        now = self._monotonic()
+        return any(
+            self._priority_pr_sources.get(item) == "command"
+            and item[0] in self.config.active_repos
+            and item[0] in self.config.github_repos
+            and now >= self._priority_pr_retry_deadline(item)
+            for item in self._priority_pr_queue
+        )
+
+    def _developer_command_waiting_for_other_pr(
+        self, repo: str, pr_number: int,
+    ) -> bool:
+        if self.config.auth_valid is not True or self._github_backing_off():
+            return False
+        now = self._monotonic()
+        return any(
+            item != (repo, pr_number)
+            and self._priority_pr_sources.get(item) == "command"
+            and item[0] in self.config.active_repos
+            and item[0] in self.config.github_repos
+            and now >= self._priority_pr_retry_deadline(item)
+            for item in self._priority_pr_queue
+        )
+
+    def _queue_evidence_sync_work(self, item: tuple[str, int]) -> bool:
+        if item in self._evidence_sync_set:
+            return True
+        if len(self._evidence_sync_queue) >= EVIDENCE_SYNC_QUEUE_MAX:
+            return False
+        self._evidence_sync_queue.append(item)
+        self._evidence_sync_set.add(item)
+        return True
+
+    def _fill_evidence_sync_queue(self) -> None:
+        for item in self._evidence_sync_work:
+            if len(self._evidence_sync_queue) >= EVIDENCE_SYNC_QUEUE_MAX:
+                return
+            if item not in self._evidence_sync_set and item not in self._evidence_sync_active:
+                self._queue_evidence_sync_work(item)
+
+    def schedule_evidence_sync(
+        self, repo: str, pr_number: int, *, force_projection: bool = True,
+        reconcile_ready: bool = True, clear_retry: bool = True,
+    ) -> bool:
         """Queue one bounded ready-attachment reconcile hint for the writer.
 
         Called from the ready event and from read-only polls. The hint carries
@@ -810,20 +858,66 @@ class GitHubCommandWatcher:
                 or repo not in self.config.active_repos
                 or repo not in self.config.github_repos):
             return False
-        # Clear evidence projection cache so ready evidence triggers projection
-        self._last_evidence_projection.pop(item, None)
-        self._clear_evidence_sync_retry(item)
-        if item in self._evidence_sync_set:
+        work = self._evidence_sync_work.get(item)
+        if force_projection:
+            self._last_evidence_projection.pop(item, None)
+        if work is None:
+            if (item not in self._evidence_sync_set
+                    and item not in self._evidence_sync_active
+                    and len(self._evidence_sync_queue) >= EVIDENCE_SYNC_QUEUE_MAX):
+                # Make the PR eligible through the ordinary open-PR scheduler;
+                # a full queue must not turn the upload callback into the only
+                # recovery path for this persisted attachment.
+                if reconcile_ready:
+                    pending_cache = self._pr_reconcile_cache.setdefault(item, {})
+                    pending_cache["requires_reconcile"] = True
+                    pending_cache["evidence_reconcile_pending"] = True
+                if reconcile_ready and clear_retry:
+                    self._clear_evidence_sync_retry(item)
+                logger.warning(
+                    "watcher evidence sync queue full; hint was not queued repo=%s pr=%s",
+                    repo, pr_number,
+                )
+                self._signal_wakeup()
+                return False
+            work = {
+                "stage": "inspect", "force_projection": False,
+                "reconcile_ready": False,
+            }
+            self._evidence_sync_work[item] = work
+        elif reconcile_ready:
+            # A fresh attachment can arrive after this queued task passed its
+            # reconcile stage. Remember another pass in every task state, not
+            # only while the writer is currently inside an await.
+            work["reconcile_again"] = True
+        work["reconcile_ready"] = bool(
+            work.get("reconcile_ready") or reconcile_ready
+        )
+        if force_projection:
+            work["force_projection"] = True
+        if item in self._evidence_sync_active:
+            # A second ready hint arrived while a previous safe unit was in
+            # flight. Preserve it as another reconcile pass after that unit.
+            if reconcile_ready:
+                work["reconcile_again"] = True
+            if force_projection:
+                work["projection_again"] = True
             self._signal_wakeup()
             return True
-        if len(self._evidence_sync_queue) >= EVIDENCE_SYNC_QUEUE_MAX:
-            logger.warning(
-                "watcher evidence sync queue full; hint was not queued repo=%s pr=%s",
-                repo, pr_number,
-            )
+        if item in self._evidence_sync_set:
+            if reconcile_ready and clear_retry:
+                self._clear_evidence_sync_retry(item)
+            self._signal_wakeup()
+            return True
+        if not self._queue_evidence_sync_work(item):
+            if reconcile_ready:
+                pending_cache = self._pr_reconcile_cache.setdefault(item, {})
+                pending_cache["requires_reconcile"] = True
+                pending_cache["evidence_reconcile_pending"] = True
+            self._signal_wakeup()
             return False
-        self._evidence_sync_queue.append(item)
-        self._evidence_sync_set.add(item)
+        if reconcile_ready and clear_retry:
+            self._clear_evidence_sync_retry(item)
         self._signal_wakeup()
         return True
 
@@ -884,11 +978,13 @@ class GitHubCommandWatcher:
             candidates.append((str(pr.get("updated_at") or ""), number))
         candidates.sort(reverse=True)
         for _, number in candidates[:EVIDENCE_SYNC_STARTUP_SEED_PER_REPO]:
-            self.schedule_evidence_sync(repo, number)
+            self.schedule_evidence_sync(repo, number, clear_retry=False)
 
     async def _reconcile_ready_evidence(
-        self, repo: str, pr_number: int, *, projection_quota: bool = False,
-    ) -> bool | str:
+        self, repo: str, pr_number: int, *,
+        pr_data: dict | None = None, defer_projection: bool = False,
+        reconcile_ready: bool = True,
+    ) -> dict:
         """Run the bounded ready-evidence reconcile through the serial writer.
 
         The Summary is re-projected only when a verified ready attachment is
@@ -897,12 +993,12 @@ class GitHubCommandWatcher:
         """
         service = getattr(self, "evidence_service", None) or getattr(self.controller, "evidence_service", None)
         reconcile = getattr(service, "reconcile_ready_evidence", None)
-        if not callable(reconcile):
-            return True
-        pr = await self.proxy.get_pr(repo, pr_number)
+        pr = pr_data if isinstance(pr_data, dict) else await self.proxy.get_pr(repo, pr_number)
         if (not isinstance(pr, dict) or pr.get("state") != "open"
                 or pr.get("merged") or pr.get("draft")):
-            return True
+            return {"ok": True, "skip": True, "needs_projection": False, "pr": pr}
+        if not reconcile_ready or not callable(reconcile):
+            return {"ok": True, "needs_projection": False, "pr": pr}
         self._current_scan_stage = "evidence_sync"
         self._current_scan_repo = repo
         self._current_scan_pr = pr_number
@@ -912,13 +1008,13 @@ class GitHubCommandWatcher:
                 "watcher evidence reconcile returned malformed result %s#%s",
                 repo, pr_number,
             )
-            return False
+            return {"ok": False, "needs_projection": False, "pr": pr}
         if outcome.get("error"):
             logger.warning(
                 "watcher evidence reconcile unavailable %s#%s error=%s",
                 repo, pr_number, outcome.get("error"),
             )
-            return False
+            return {"ok": False, "needs_projection": False, "pr": pr}
         if outcome.get("restore_pending"):
             logger.warning(
                 "watcher evidence COS restore pending %s#%s count=%s",
@@ -926,32 +1022,29 @@ class GitHubCommandWatcher:
             )
         # The Summary link is the primary user-visible requirement, so it is
         # re-projected even when one comment still needs a retry.
-        if outcome.get("needs_projection"):
-            if (not projection_quota
-                    and self._defer_evidence_projection_for_priority(repo, pr_number)):
-                return "deferred"
+        if outcome.get("needs_projection") and not defer_projection:
             self._current_scan_stage = "evidence_sync_projection"
             await self.controller.project_evidence(repo, pr_number)
             self._last_evidence_projection[(repo, pr_number)] = (
-                f"{pr.get('head', {}).get('sha')}:{pr.get('updated_at')}",
+                str(pr.get("head", {}).get("sha") or ""),
                 self._monotonic(),
             )
-        if outcome.get("pending"):
-            # Keep lifecycle commands moving while retrying visible evidence
-            # synchronization and pending COS restoration.
-            return False
-        if outcome.get("failed"):
-            # Temporary GitHub failures stay pending and retry with backoff.
-            return False
-        return True
+        return {
+            "ok": not bool(outcome.get("pending") or outcome.get("failed")),
+            "needs_projection": bool(outcome.get("needs_projection")),
+            "pr": pr,
+        }
 
     async def _drain_evidence_sync(self, *, max_items: int = 2) -> bool:
-        """Process bounded evidence-sync hints on the serial writer."""
+        """Run bounded, resumable evidence work units on the serial writer."""
         if self.config.auth_valid is not True or self._github_backing_off():
             return False
         cycle_ok = True
-        processed = 0
-        while self._evidence_sync_queue and processed < max_items:
+        processed_units = 0
+        self._fill_evidence_sync_queue()
+        while self._evidence_sync_queue and processed_units < max_items:
+            if self._task is not None and not self._running:
+                break
             item = self._evidence_sync_queue[0]
             if self._monotonic() < self._evidence_sync_retry_after.get(item, 0.0):
                 # Rotate the queue so one backed-off PR cannot starve others.
@@ -967,46 +1060,267 @@ class GitHubCommandWatcher:
                     or repo not in self.config.active_repos
                     or repo not in self.config.github_repos):
                 self._clear_evidence_sync_retry(item)
+                self._evidence_sync_work.pop(item, None)
                 continue
-            processed += 1
+            work = self._evidence_sync_work.setdefault(
+                item, {
+                    "stage": "inspect", "force_projection": False,
+                    "reconcile_ready": False,
+                },
+            )
+            stage = work.get("stage", "reconcile")
+            unit_started = self._monotonic()
+            self._current_scan_repo = repo
+            self._current_scan_pr = pr_number
+            self._current_scan_stage = f"evidence_sync_{stage}"
+            self._evidence_sync_active.add(item)
+            failed = False
             try:
-                succeeded = await self._reconcile_ready_evidence(
-                    repo, pr_number, projection_quota=True,
-                )
+                if stage == "inspect":
+                    pr = await self.proxy.get_pr(repo, pr_number)
+                    if (not isinstance(pr, dict) or pr.get("state") != "open"
+                            or pr.get("merged") or pr.get("draft")):
+                        work["stage"] = "done"
+                    else:
+                        work["pr_data"] = pr
+                        work["stage"] = "reconcile"
+                elif stage == "reconcile":
+                    latest_pr = await self.proxy.get_pr(repo, pr_number)
+                    if (not isinstance(latest_pr, dict)
+                            or latest_pr.get("state") != "open"
+                            or latest_pr.get("merged") or latest_pr.get("draft")):
+                        work["stage"] = "done"
+                    else:
+                        head = latest_pr.get("head")
+                        head_sha = head.get("sha") if isinstance(head, dict) else None
+                        previous_head_sha = work.get("head_sha")
+                        if (isinstance(previous_head_sha, str)
+                                and isinstance(head_sha, str)
+                                and previous_head_sha != head_sha):
+                            work["force_projection"] = True
+                            work["reconcile_ready"] = True
+                        work["head_sha"] = head_sha
+                        work["pr_data"] = latest_pr
+                        result = await self._reconcile_ready_evidence(
+                            repo, pr_number, pr_data=latest_pr,
+                            defer_projection=True,
+                            reconcile_ready=bool(work.get("reconcile_ready")),
+                        )
+                        if (not result.get("ok")
+                                and not result.get("needs_projection")):
+                            self._retry_evidence_sync(item)
+                            cycle_ok = False
+                            failed = True
+                        elif result.get("skip"):
+                            work["stage"] = "done"
+                        else:
+                            if not isinstance(head_sha, str) or not head_sha:
+                                work["stage"] = "done"
+                            else:
+                                previous = self._last_evidence_projection.get(item)
+                                now = self._monotonic()
+                                full_projection_due = (
+                                    bool(work.get("force_projection"))
+                                    or previous is None
+                                    or previous[0] != head_sha
+                                    or now - previous[1] >= 6 * 24 * 60 * 60
+                                )
+                                if not result.get("ok"):
+                                    # Preserve the ready-evidence retry while still
+                                    # making its verified Summary link visible first.
+                                    work["reconcile_again"] = True
+                                    work["reconcile_ready"] = True
+                                    work["retry_reconcile_after_maintenance"] = True
+                                work["run_migrations"] = bool(
+                                    full_projection_due or result.get("needs_projection")
+                                )
+                                work["stage"] = (
+                                    "projection_inspect" if work["run_migrations"] else "remember_pr"
+                                )
+                elif stage == "projection_inspect":
+                    pr = await self.proxy.get_pr(repo, pr_number)
+                    if (not isinstance(pr, dict) or pr.get("state") != "open"
+                            or pr.get("merged") or pr.get("draft")):
+                        work["stage"] = "done"
+                    else:
+                        head = pr.get("head")
+                        head_sha = head.get("sha") if isinstance(head, dict) else None
+                        previous_head_sha = work.get("head_sha")
+                        if isinstance(head_sha, str) and head_sha:
+                            work["head_sha"] = head_sha
+                        work["pr_data"] = pr
+                        if (isinstance(previous_head_sha, str)
+                                and isinstance(head_sha, str)
+                                and previous_head_sha != head_sha):
+                            # Reconcile lifecycle against the newly observed
+                            # HEAD before projecting or migrating its Summary.
+                            work["reconcile_ready"] = True
+                            work["force_projection"] = True
+                            work["stage"] = "reconcile"
+                        else:
+                            work["stage"] = "projection"
+                elif stage == "projection":
+                    # The stage may have waited behind a command after
+                    # projection_inspect. Revalidate its HEAD and open state at
+                    # the write boundary while retaining the completed stage.
+                    latest_pr = await self.proxy.get_pr(repo, pr_number)
+                    latest_head = (
+                        latest_pr.get("head", {}).get("sha")
+                        if isinstance(latest_pr, dict)
+                        and isinstance(latest_pr.get("head"), dict) else None
+                    )
+                    expected_head = work.get("head_sha")
+                    if (not isinstance(latest_pr, dict)
+                            or latest_pr.get("state") != "open"
+                            or latest_pr.get("merged") or latest_pr.get("draft")):
+                        work["stage"] = "done"
+                    elif (not isinstance(latest_head, str)
+                          or latest_head != expected_head):
+                        work["head_sha"] = latest_head
+                        work["pr_data"] = latest_pr
+                        work["force_projection"] = True
+                        work["reconcile_ready"] = True
+                        work["stage"] = "reconcile"
+                    else:
+                        await self.controller.project_evidence(repo, pr_number)
+                        if isinstance(expected_head, str) and expected_head:
+                            self._last_evidence_projection[item] = (
+                                expected_head, self._monotonic(),
+                            )
+                        work["stage"] = (
+                            "archive" if work.get("run_migrations") else "remember_pr"
+                        )
+                elif stage == "archive":
+                    await self.proxy.ensure_visible_evidence_archive_comments(
+                        repo, pr_number, limit=2,
+                    )
+                    work["stage"] = "retire_prepare"
+                elif stage == "retire_prepare":
+                    work["valid_cos_links"] = await self._validated_current_summary_cos_links(
+                        repo, pr_number,
+                    )
+                    work["stage"] = "retire"
+                elif stage == "retire":
+                    await self.proxy.retire_legacy_evidence_link_replies(
+                        repo, pr_number,
+                        work.get("valid_cos_links", set()), limit=2,
+                    )
+                    work["stage"] = "remember_pr"
+                elif stage == "remember_pr":
+                    latest_pr = await self.proxy.get_pr(repo, pr_number)
+                    if (isinstance(latest_pr, dict)
+                            and latest_pr.get("state") == "open"
+                            and not latest_pr.get("merged")
+                            and not latest_pr.get("draft")):
+                        work["pr_data"] = latest_pr
+                        work["stage"] = "remember_state"
+                    else:
+                        work["stage"] = "done"
+                elif stage == "remember_state":
+                    pr_data = work.get("pr_data")
+                    await self._remember_pr_schedule(
+                        repo, pr_number,
+                        pr_data if isinstance(pr_data, dict) else {},
+                    )
+                    work["stage"] = "done"
+                else:
+                    work["stage"] = "done"
             except GitHubRateLimitError as exc:
                 self._remember_priority_github_retry(item, exc.retry_after_seconds)
                 logger.warning(
-                    "watcher rate limited during evidence sync %s#%s; retry_after=%.1f",
-                    repo, pr_number, exc.retry_after_seconds,
+                    "watcher rate limited during evidence sync unit repo=%s pr=%s stage=%s retry_after=%.1f",
+                    repo, pr_number, stage, exc.retry_after_seconds,
                 )
-                self._retry_evidence_sync(
-                    item, retry_after=exc.retry_after_seconds,
-                )
-                cycle_ok = False
-                break
+                self._retry_evidence_sync(item, retry_after=exc.retry_after_seconds)
+                failed = True
             except asyncio.CancelledError:
+                # Never cancel an in-flight persistence/projection operation.
+                # Shutdown cancellation is propagated after leaving the work
+                # hint recoverable at its current safe-unit boundary.
+                self._queue_evidence_sync_work(item)
                 raise
             except Exception as exc:
                 logger.warning(
-                    "watcher evidence sync %s#%s failed: %s",
-                    repo, pr_number, type(exc).__name__,
+                    "watcher evidence sync unit failed repo=%s pr=%s stage=%s reason=%s",
+                    repo, pr_number, stage, type(exc).__name__,
                 )
-                self._retry_evidence_sync(item)
+                self._retry_evidence_sync(
+                    item,
+                    retry_after=getattr(exc, "retry_after_seconds", 0.0),
+                )
                 self._scan_failure_reasons.append(
-                    f"evidence_sync:{repo}#{pr_number}:{type(exc).__name__}",
+                    f"evidence_sync:{repo}#{pr_number}:{stage}:{type(exc).__name__}",
                 )
                 cycle_ok = False
-                continue
-            if succeeded == "deferred":
-                # A proactive scheduling yield is not evidence failure and
-                # must not increase exponential retry backoff.
-                self.schedule_evidence_sync(repo, pr_number)
-                continue
-            if succeeded:
+                failed = True
+            finally:
+                self._evidence_sync_active.discard(item)
+
+            elapsed = max(0.0, self._monotonic() - unit_started)
+            logger.info(
+                "watcher nonurgent work unit repo=%s pr=%s kind=evidence_sync stage=%s duration_seconds=%.3f result=%s",
+                repo, pr_number, stage, elapsed,
+                "retry" if failed else "complete",
+            )
+            processed_units += 1
+            if (work.pop("discard_after_unit", False)
+                    or self.config.auth_valid is not True
+                    or repo not in self.config.active_repos
+                    or repo not in self.config.github_repos):
+                self._evidence_sync_work.pop(item, None)
+                self._evidence_sync_set.discard(item)
+                while item in self._evidence_sync_queue:
+                    self._evidence_sync_queue.remove(item)
                 self._clear_evidence_sync_retry(item)
-            else:
-                self._retry_evidence_sync(item)
+                continue
+            if failed:
                 cycle_ok = False
+                if self._github_backing_off():
+                    break
+                continue
+
+            if work.get("stage") == "done":
+                if work.pop("reconcile_again", False):
+                    retry_reconcile = work.pop(
+                        "retry_reconcile_after_maintenance", False,
+                    )
+                    projection_again = work.pop("projection_again", False)
+                    work.update({
+                        "stage": "inspect",
+                        "force_projection": bool(projection_again),
+                        "reconcile_ready": True,
+                    })
+                    if retry_reconcile:
+                        self._retry_evidence_sync(item)
+                    else:
+                        self._queue_evidence_sync_work(item)
+                else:
+                    self._evidence_sync_work.pop(item, None)
+                    self._clear_evidence_sync_retry(item)
+            else:
+                # Round robin between PRs while retaining the exact next duty.
+                self._queue_evidence_sync_work(item)
+            self._fill_evidence_sync_queue()
+
+            if self._task is not None and not self._running:
+                # The current safe unit is complete and its next stage (if any)
+                # is retained above. Shutdown must not select another PR.
+                break
+
+            if self._has_ready_developer_command():
+                command_item = next((queued for queued in self._priority_pr_queue
+                                     if self._priority_pr_sources.get(queued) == "command"
+                                     and self._monotonic() >= self._priority_pr_retry_deadline(queued)), None)
+                command_id, command_wait = self._pending_command_wait(*command_item) \
+                    if command_item is not None else (None, None)
+                logger.info(
+                    "watcher yielded nonurgent work repo=%s pr=%s stage=%s reason=new_developer_command command_repo=%s command_pr=%s comment_id=%s command_wait_seconds=%s unit_duration_seconds=%.3f",
+                    repo, pr_number, stage,
+                    command_item[0] if command_item else None,
+                    command_item[1] if command_item else None,
+                    command_id, command_wait, elapsed,
+                )
+                break
         return cycle_ok
 
 
@@ -1058,6 +1372,7 @@ class GitHubCommandWatcher:
 
     async def stop(self) -> None:
         self._running = False
+        self._signal_wakeup()
         if self._repository_policy_refresh_task is not None:
             self._repository_policy_refresh_task.cancel()
             try:
@@ -1080,11 +1395,10 @@ class GitHubCommandWatcher:
                 pass
             self._recent_discovery_task = None
         if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+            # The serial writer may be inside a deployment POST, lifecycle or
+            # evidence persistence, or a cursor CAS. Let that safe operation
+            # reach its own confirmation boundary before shutdown completes.
+            await self._task
             self._task = None
         repo_policy_tasks = list(self._repository_policy_refresh_repo_tasks.values())
         for task in repo_policy_tasks:
@@ -1165,6 +1479,8 @@ class GitHubCommandWatcher:
                     self._current_scan_stage = None
                     self._current_scan_repo = None
                     self._current_scan_pr = None
+            if not self._running:
+                break
             try:
                 await asyncio.wait_for(
                     self._wakeup.wait(), timeout=self.config.poll_interval_seconds,
@@ -1823,6 +2139,12 @@ class GitHubCommandWatcher:
             self._clear_evidence_sync_retry(item)
             while item in self._evidence_sync_queue:
                 self._evidence_sync_queue.remove(item)
+        for item in [item for item in self._evidence_sync_work if item[0] == repo]:
+            if item in self._evidence_sync_active:
+                self._evidence_sync_work[item]["discard_after_unit"] = True
+            else:
+                self._evidence_sync_work.pop(item, None)
+                self._clear_evidence_sync_retry(item)
         for item in [item for item in self._last_evidence_projection
                      if item[0] == repo]:
             self._last_evidence_projection.pop(item, None)
@@ -1869,6 +2191,8 @@ class GitHubCommandWatcher:
         repos.update(repo for repo, _ in self._review_pr_failures)
         repos.update(repo for repo, _ in self._review_pr_retry_after)
         repos.update(repo for repo, _ in self._evidence_sync_set)
+        repos.update(repo for repo, _ in self._evidence_sync_active)
+        repos.update(repo for repo, _ in self._evidence_sync_work)
         repos.update(repo for repo, _ in self._evidence_sync_failures)
         repos.update(repo for repo, _ in self._evidence_sync_retry_after)
         repos.update(self._evidence_sync_seeded_repos)
@@ -1940,6 +2264,8 @@ class GitHubCommandWatcher:
         known.update(repo for repo, _ in self._review_pr_failures)
         known.update(repo for repo, _ in self._review_pr_retry_after)
         known.update(repo for repo, _ in self._evidence_sync_set)
+        known.update(repo for repo, _ in self._evidence_sync_active)
+        known.update(repo for repo, _ in self._evidence_sync_work)
         known.update(repo for repo, _ in self._evidence_sync_failures)
         known.update(repo for repo, _ in self._evidence_sync_retry_after)
         known.update(self._evidence_sync_seeded_repos)
@@ -2222,10 +2548,12 @@ class GitHubCommandWatcher:
 
     def _log_recent_command_diagnostic(self, event: str, record: dict) -> None:
         logger.info(
-            "watcher recent command event=%s repo=%s pr=%s trigger=%s comment_id=%s comment_created_at=%s discovered_at=%s queued_at=%s dispatch_started_at=%s dispatch_completed_at=%s command_wait_seconds=%s failure_reason=%s",
+            "watcher recent command event=%s repo=%s pr=%s trigger=%s comment_id=%s comment_created_at=%s discovered_at=%s queued_at=%s processing_started_at=%s processing_completed_at=%s processing_duration_seconds=%s dispatch_started_at=%s dispatch_completed_at=%s command_wait_seconds=%s failure_reason=%s",
             event, record.get("repo"), record.get("pr_number"), record.get("event_type"),
             record.get("comment_id"), record.get("comment_created_at"),
             record.get("discovered_at"), record.get("queued_at"),
+            record.get("processing_started_at"), record.get("processing_completed_at"),
+            record.get("processing_duration_seconds"),
             record.get("dispatch_started_at"), record.get("dispatch_completed_at"),
             self._recent_command_latency(record), record.get("failure_reason"),
         )
@@ -2981,7 +3309,9 @@ class GitHubCommandWatcher:
                     retryable=retryable,
                 )
 
-    async def _flush_pending_baseline_notices(self, repo: str, pr_number: int) -> bool:
+    async def _flush_pending_baseline_notices(
+        self, repo: str, pr_number: int, *, yield_for_priority: bool = False,
+    ) -> bool | str:
         """Deliver one rejection notice per pre-baseline command.
 
         These commands are excluded by the fixed authorization cutoff and are
@@ -2997,6 +3327,9 @@ class GitHubCommandWatcher:
         )
         if not pending:
             return True
+        if (yield_for_priority
+                and self._developer_command_waiting_for_other_pr(repo, pr_number)):
+            return "yielded"
 
         # Discovery caches are process-local. After a Controller restart they
         # must not resurrect comments already covered by the durable PR cursor.
@@ -3008,6 +3341,9 @@ class GitHubCommandWatcher:
                 repo, pr_number, type(exc).__name__,
             )
             return False
+        if (yield_for_priority
+                and self._developer_command_waiting_for_other_pr(repo, pr_number)):
+            return "yielded"
         if not isinstance(persisted_state, dict):
             return False
         persisted_cursor = persisted_state.get("last_processed_comment_id")
@@ -3073,6 +3409,13 @@ class GitHubCommandWatcher:
             if delivered is not True:
                 # Leave pending; retry next cycle without moving the cursor.
                 ok = False
+                if (yield_for_priority
+                        and self._developer_command_waiting_for_other_pr(repo, pr_number)):
+                    logger.info(
+                        "watcher yielded baseline notice work repo=%s pr=%s comment_id=%s reason=new_developer_command",
+                        repo, pr_number, comment_id,
+                    )
+                    return "yielded"
                 continue
             self._mark_recent_command_notice_posted(repo, pr_number, comment_id, topic)
             self._posted_error_replies[key] = None
@@ -3089,6 +3432,13 @@ class GitHubCommandWatcher:
                 "watcher pre-baseline command rejection delivered repo=%s pr=%s comment_id=%s",
                 repo, pr_number, comment_id,
             )
+            if (yield_for_priority
+                    and self._developer_command_waiting_for_other_pr(repo, pr_number)):
+                logger.info(
+                    "watcher yielded baseline notice work repo=%s pr=%s comment_id=%s reason=new_developer_command",
+                    repo, pr_number, comment_id,
+                )
+                return "yielded"
         return ok
 
     async def _discover_recent_command_prs(self, repos: list[str]) -> bool:
@@ -4278,6 +4628,7 @@ class GitHubCommandWatcher:
         self._current_scan_stage = "machine_projection_refresh"
         self._current_scan_repo = repo
         self._current_scan_pr = pr_number
+        unit_started = self._monotonic()
         try:
             result = await self._refresh_machine_adaptation_for_pr(
                 repo, pr_number, task_record,
@@ -4296,6 +4647,10 @@ class GitHubCommandWatcher:
             self._scan_failure_reasons.append(
                 f"machine_projection:{repo}#{pr_number}:rate_limited",
             )
+            logger.info(
+                "watcher nonurgent work unit repo=%s pr=%s kind=machine_projection stage=refresh duration_seconds=%.3f result=retry_rate_limited",
+                repo, pr_number, max(0.0, self._monotonic() - unit_started),
+            )
             return False
         except asyncio.CancelledError:
             # Cancellation can happen during shutdown while Controller is
@@ -4313,14 +4668,26 @@ class GitHubCommandWatcher:
             self._scan_failure_reasons.append(
                 f"machine_projection:{repo}#{pr_number}:{type(exc).__name__}",
             )
+            logger.info(
+                "watcher nonurgent work unit repo=%s pr=%s kind=machine_projection stage=refresh duration_seconds=%.3f result=retry_error",
+                repo, pr_number, max(0.0, self._monotonic() - unit_started),
+            )
             return False
 
         if not self._machine_projection_task_is_current(item, task_record):
+            logger.info(
+                "watcher nonurgent work unit repo=%s pr=%s kind=machine_projection stage=refresh duration_seconds=%.3f result=superseded",
+                repo, pr_number, max(0.0, self._monotonic() - unit_started),
+            )
             return True
         if result == "refreshed":
             self._log_machine_projection_refresh_result(
                 repo, pr_number, result, complete=True,
                 expected_record=task_record,
+            )
+            logger.info(
+                "watcher nonurgent work unit repo=%s pr=%s kind=machine_projection stage=refresh duration_seconds=%.3f result=refreshed",
+                repo, pr_number, max(0.0, self._monotonic() - unit_started),
             )
             return True
         if result == "stale":
@@ -4330,6 +4697,10 @@ class GitHubCommandWatcher:
             )
             self._forget_machine_projection_refresh(
                 repo, pr_number, expected_record=task_record,
+            )
+            logger.info(
+                "watcher nonurgent work unit repo=%s pr=%s kind=machine_projection stage=refresh duration_seconds=%.3f result=stale",
+                repo, pr_number, max(0.0, self._monotonic() - unit_started),
             )
             return True
 
@@ -4343,6 +4714,10 @@ class GitHubCommandWatcher:
         )
         self._scan_failure_reasons.append(
             f"machine_projection:{repo}#{pr_number}:incomplete",
+        )
+        logger.info(
+            "watcher nonurgent work unit repo=%s pr=%s kind=machine_projection stage=refresh duration_seconds=%.3f result=retry_incomplete",
+            repo, pr_number, max(0.0, self._monotonic() - unit_started),
         )
         return False
 
@@ -4403,6 +4778,9 @@ class GitHubCommandWatcher:
             return False
         cached = self._pr_reconcile_cache.get((repo, pr_number))
         if not isinstance(cached, dict) or cached.get("requires_reconcile") is True:
+            return False
+        if (cached.get("authorization_generation")
+                != self._repo_baseline_cutoff_utc.get(repo)):
             return False
         if cached.get("updated_at") != updated_at or cached.get("head_sha") != head_sha:
             return False
@@ -4524,6 +4902,7 @@ class GitHubCommandWatcher:
             "has_deployed_components": has_deployed_components,
             "projected_label": projected_label,
             "requires_reconcile": requires_reconcile,
+            "authorization_generation": self._repo_baseline_cutoff_utc.get(repo),
             "processed_at": self._monotonic(),
         }
         while len(self._pr_reconcile_cache) > 4096:
@@ -4586,21 +4965,48 @@ class GitHubCommandWatcher:
 
     async def _process_scheduled_pr(
         self, repo: str, pr_number: int, *, priority_path: bool = False,
+        priority_command: bool = False,
+        allow_reserved_progress: bool = False,
     ) -> bool | str:
-        """Run one PR through the existing serial writer and evidence path."""
+        """Run command/baseline work, then schedule optional evidence duties."""
         baseline_done = self._baseline_progress.setdefault(repo, set())
         baseline_required = self._authorization_baseline_required(repo, pr_number)
         baseline_ran = False
         baseline_succeeded = True
+        process_yielded = False
         if baseline_required:
             baseline_ran = True
             self._current_scan_stage = "comment_baseline"
-            if await self._baseline_pr(repo, pr_number):
+            baseline_started = self._monotonic()
+            baseline_result = await self._baseline_pr(
+                repo, pr_number,
+                yield_to_other_commands=not (
+                    priority_command or allow_reserved_progress
+                ),
+            )
+            logger.info(
+                "watcher nonurgent work unit repo=%s pr=%s kind=authorization_baseline duration_seconds=%.3f result=%s",
+                repo, pr_number, max(0.0, self._monotonic() - baseline_started),
+                baseline_result if isinstance(baseline_result, str)
+                else "complete" if baseline_result else "retry",
+            )
+            if baseline_result == "yielded":
+                process_yielded = True
+            elif baseline_result:
                 baseline_done.add(pr_number)
                 # The fixed authorization cutoff now applies to a completed
                 # baseline. Deliver the one-time rejection notices for commands
                 # that were sent before that boundary; they never execute.
-                await self._flush_pending_baseline_notices(repo, pr_number)
+                notice_result = await self._flush_pending_baseline_notices(
+                    repo, pr_number,
+                    yield_for_priority=not (
+                        priority_command or allow_reserved_progress
+                    ),
+                )
+                if notice_result == "yielded":
+                    process_yielded = True
+                elif notice_result is not True:
+                    baseline_succeeded = False
             else:
                 baseline_succeeded = False
         else:
@@ -4609,9 +5015,20 @@ class GitHubCommandWatcher:
             # cycle may dispatch, so deliver them first. That keeps the visible
             # conversation ordered: a later command never appears to overtake an
             # earlier command that still owes a rejection.
-            await self._flush_pending_baseline_notices(repo, pr_number)
+            notice_result = await self._flush_pending_baseline_notices(
+                repo, pr_number,
+                yield_for_priority=not (
+                    priority_command or allow_reserved_progress
+                ),
+            )
+            if notice_result is not True:
+                return "yielded" if notice_result == "yielded" else False
             process_result = await self._process_pr(
-                repo, pr_number, yield_for_priority=not priority_path,
+                repo, pr_number,
+                yield_for_priority=not (
+                    priority_path or priority_command or allow_reserved_progress
+                ),
+                priority_command=(priority_command or allow_reserved_progress),
             )
             if process_result == "yielded":
                 if (self.config.auth_valid is not True
@@ -4619,149 +5036,107 @@ class GitHubCommandWatcher:
                         or repo not in self.config.github_repos
                         or self._authorization_baseline_required(repo, pr_number)):
                     return False
-                return "yielded"
-            if process_result is False:
+                process_yielded = True
+            elif process_result is False:
                 return False
-            # A comment may have been registered during _process_pr itself;
-            # flush again so it is not delayed until the next cycle.
-            await self._flush_pending_baseline_notices(repo, pr_number)
+            else:
+                # A comment may have been registered during _process_pr itself;
+                # flush again so it is not delayed until the next cycle.
+                notice_result = await self._flush_pending_baseline_notices(
+                    repo, pr_number,
+                    yield_for_priority=not (
+                        priority_command or allow_reserved_progress
+                    ),
+                )
+                if notice_result == "yielded":
+                    process_yielded = True
         if (self.config.auth_valid is not True or repo not in self.config.active_repos
                 or repo not in self.config.github_repos):
             return False
+        if process_yielded and baseline_ran:
+            return "yielded"
+        item = (repo, pr_number)
         if self._defer_evidence_projection_for_priority(repo, pr_number):
-            return baseline_succeeded
+            return "yielded" if process_yielded else baseline_succeeded
         self._current_scan_stage = "post_command_pr_validation"
         current_pr = await self.proxy.get_pr(repo, pr_number)
         if self._defer_evidence_projection_for_priority(repo, pr_number):
-            return baseline_succeeded
-        if (isinstance(current_pr, dict) and current_pr.get("state") == "open"
-                and not current_pr.get("merged") and not current_pr.get("draft")):
-            updated_at = current_pr.get("updated_at")
-            head_sha = current_pr.get("head", {}).get("sha")
-            projection_version = (
-                f"{head_sha}:{updated_at}"
-                if isinstance(head_sha, str) and isinstance(updated_at, str) else ""
-            )
-            key = (repo, pr_number)
-            previous = self._last_evidence_projection.get(key)
-            now = self._monotonic()
-            refresh_due = previous is None or now - previous[1] >= 6 * 24 * 60 * 60
-            changed = not projection_version or previous is None or previous[0] != projection_version
-
-            item = (repo, pr_number)
-            # Reconcile ready attachments when scheduled, when the PR changed,
-            # or when a previous reconcile is due for retry. Never re-enqueue
-            # unconditionally on every routine scan pass.
-            if item in self._evidence_sync_set or changed:
-                if self._monotonic() >= self._evidence_sync_retry_after.get(item, 0.0):
-                    reconcile_retry_after = 0.0
-                    try:
-                        succeeded = await self._reconcile_ready_evidence(
-                            repo, pr_number,
-                        )
-                    except Exception as exc:
-                        reconcile_retry_after = getattr(
-                            exc, "retry_after_seconds", 0.0,
-                        )
-                        logger.warning(
-                            "watcher scheduled evidence reconcile failed %s#%s: %s",
-                            repo, pr_number, type(exc).__name__,
-                        )
-                        self._scan_failure_reasons.append(
-                            f"evidence_sync:{repo}#{pr_number}:{type(exc).__name__}",
-                        )
-                        succeeded = False
-                    if succeeded == "deferred":
-                        self.schedule_evidence_sync(repo, pr_number)
-                        return baseline_succeeded
-                    if succeeded:
-                        self._clear_evidence_sync_retry(item)
-                        if item in self._evidence_sync_set:
-                            self._evidence_sync_set.discard(item)
-                            try:
-                                self._evidence_sync_queue.remove(item)
-                            except ValueError:
-                                pass
-                    else:
-                        self._retry_evidence_sync(
-                            item, retry_after=reconcile_retry_after,
-                        )
-                    previous = self._last_evidence_projection.get(key)
-                    changed = not projection_version or previous is None or previous[0] != projection_version
-
-            if changed or refresh_due:
-                self._current_scan_stage = "evidence_projection"
-                projection_succeeded = True
-                try:
-                    await self.controller.project_evidence(repo, pr_number)
-                except Exception as exc:
-                    logger.warning(
-                        "evidence projection failed %s#%s: %s; retry scheduled",
-                        repo, pr_number, type(exc).__name__,
-                    )
-                    self._scan_failure_reasons.append(
-                        f"evidence_projection:{repo}#{pr_number}:{type(exc).__name__}",
-                    )
-                    self._retry_evidence_sync(
-                        item,
-                        retry_after=getattr(exc, "retry_after_seconds", 0.0),
-                    )
-                    projection_succeeded = False
-                if self._defer_evidence_projection_for_priority(repo, pr_number):
-                    return baseline_succeeded
-                self._current_scan_stage = "visible_archive_migration"
-                try:
-                    await self.proxy.ensure_visible_evidence_archive_comments(
-                        repo, pr_number, limit=2,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "visible archive migration failed %s#%s: %s; retry scheduled",
-                        repo, pr_number, type(exc).__name__,
-                    )
-                    self._scan_failure_reasons.append(
-                        f"evidence_archive:{repo}#{pr_number}:{type(exc).__name__}",
-                    )
-                    self._retry_evidence_sync(
-                        item,
-                        retry_after=getattr(exc, "retry_after_seconds", 0.0),
-                    )
-                    projection_succeeded = False
-                if self._defer_evidence_projection_for_priority(repo, pr_number):
-                    return baseline_succeeded
-                self._current_scan_stage = "legacy_reply_retirement"
-                try:
-                    valid_cos_links = await self._validated_current_summary_cos_links(repo, pr_number)
-                    if self._defer_evidence_projection_for_priority(repo, pr_number):
-                        return baseline_succeeded
-                    await self.proxy.retire_legacy_evidence_link_replies(
-                        repo, pr_number, valid_cos_links, limit=2,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "legacy evidence reply retirement failed %s#%s: %s; retry scheduled",
-                        repo, pr_number, type(exc).__name__,
-                    )
-                    self._scan_failure_reasons.append(
-                        f"evidence_retirement:{repo}#{pr_number}:{type(exc).__name__}",
-                    )
-                    self._retry_evidence_sync(
-                        item,
-                        retry_after=getattr(exc, "retry_after_seconds", 0.0),
-                    )
-                    projection_succeeded = False
-                if projection_version and projection_succeeded:
-                    self._last_evidence_projection.pop(key, None)
-                    self._last_evidence_projection[key] = (projection_version, now)
-                    if len(self._last_evidence_projection) > 4096:
-                        self._last_evidence_projection.pop(next(iter(self._last_evidence_projection)))
-            if baseline_succeeded and not baseline_ran:
-                await self._remember_pr_schedule(repo, pr_number, current_pr)
-            else:
-                self._pr_reconcile_cache.pop((repo, pr_number), None)
-        else:
+            return "yielded" if process_yielded else baseline_succeeded
+        if (not isinstance(current_pr, dict) or current_pr.get("state") != "open"
+                or current_pr.get("merged") or current_pr.get("draft")):
             self._pr_reconcile_cache.pop((repo, pr_number), None)
-        return baseline_succeeded
+            return baseline_succeeded
+
+        head = current_pr.get("head")
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        previous = self._last_evidence_projection.get(item)
+        now = self._monotonic()
+        maintenance_due = (
+            item in self._evidence_sync_set
+            or not isinstance(head_sha, str) or not head_sha
+            or previous is None or previous[0] != head_sha
+            or now - previous[1] >= 6 * 24 * 60 * 60
+        )
+        if maintenance_due:
+            cached_hint = self._pr_reconcile_cache.get(item)
+            reconcile_hint = bool(
+                isinstance(cached_hint, dict)
+                and cached_hint.get("evidence_reconcile_pending") is True
+            ) or previous is None or previous[0] != head_sha
+            scheduled = self.schedule_evidence_sync(
+                repo, pr_number, force_projection=False,
+                reconcile_ready=reconcile_hint, clear_retry=False,
+            )
+            if scheduled and reconcile_hint:
+                current_hint = self._pr_reconcile_cache.get(item)
+                if isinstance(current_hint, dict):
+                    current_hint.pop("evidence_reconcile_pending", None)
+            if not scheduled:
+                # The retry source remains the ordinary PR scheduler; preserve
+                # an explicit ready-attachment bit when the queue is full.
+                self._last_evidence_projection.pop(item, None)
+                if reconcile_hint:
+                    pending_cache = self._pr_reconcile_cache.setdefault(item, {})
+                    pending_cache["requires_reconcile"] = True
+                    pending_cache["evidence_reconcile_pending"] = True
+                else:
+                    self._pr_reconcile_cache.pop(item, None)
+                logger.info(
+                    "watcher evidence maintenance deferred repo=%s pr=%s reason=evidence_queue_full",
+                    repo, pr_number,
+                )
+        elif not baseline_ran:
+            if self._has_ready_developer_command():
+                command_item = next((queued for queued in self._priority_pr_queue
+                                     if self._priority_pr_sources.get(queued) == "command"
+                                     and self._monotonic() >= self._priority_pr_retry_deadline(queued)), None)
+                comment_id, command_wait = self._pending_command_wait(*command_item) \
+                    if command_item is not None else (None, None)
+                logger.info(
+                    "watcher yielded nonurgent work repo=%s pr=%s kind=reconcile_cache_refresh reason=new_developer_command command_repo=%s command_pr=%s comment_id=%s command_wait_seconds=%s",
+                    repo, pr_number,
+                    command_item[0] if command_item else None,
+                    command_item[1] if command_item else None,
+                    comment_id, command_wait,
+                )
+                return "yielded" if process_yielded else baseline_succeeded
+            # Cache refresh is a single read-only state snapshot, separate from
+            # optional evidence projection/archive work.
+            cache_started = self._monotonic()
+            try:
+                await self._remember_pr_schedule(repo, pr_number, current_pr)
+            except Exception as exc:
+                logger.warning(
+                    "watcher reconcile cache refresh failed repo=%s pr=%s reason=%s",
+                    repo, pr_number, type(exc).__name__,
+                )
+            logger.info(
+                "watcher nonurgent work unit repo=%s pr=%s kind=reconcile_cache_refresh duration_seconds=%.3f result=complete",
+                repo, pr_number, max(0.0, self._monotonic() - cache_started),
+            )
+        else:
+            self._pr_reconcile_cache.pop(item, None)
+        return "yielded" if process_yielded else baseline_succeeded
 
     async def _drain_priority_prs(
         self, priority_done, priority_attempted, recent_attempted,
@@ -4771,6 +5146,7 @@ class GitHubCommandWatcher:
         max_items = min(4, max(0, max_items))
         cycle_ok = True
         processed_items = 0
+        extra_command_items = 0
         # Clear entries left by pre-isolation versions. Their projection intent
         # remains in _machine_refresh_pending and is selected independently.
         for legacy_machine in [
@@ -4814,7 +5190,13 @@ class GitHubCommandWatcher:
         machine_items = 0
         review_items = 0
         attempted_prs_cycle: set[tuple[str, int]] = set()
-        while processed_items < max_items:
+        priority_generation_at_start = self._priority_generation
+        generation_command_granted = False
+        while (processed_items < max_items
+               or (extra_command_items < max_items
+                   and self._has_ready_developer_command())):
+            if self._task is not None and not self._running:
+                break
             if self._github_backing_off():
                 return False
             now = self._monotonic()
@@ -4845,13 +5227,26 @@ class GitHubCommandWatcher:
                 for queued in self._priority_pr_queue
             )
             forced_source = None
+            extra_command_only = processed_items >= max_items
+            # Keep the existing bounded Review and machine-projection slots
+            # even when commands are queued. Each slot is one safe PR unit;
+            # command work takes the next slot immediately afterward.
             if (review_ready and "review" in allowed_sources
-                    and review_items == 0 and processed_items == 2):
+                    and review_items == 0 and processed_items >= 2):
                 forced_source = "review"
             elif (machine_ready and "machine" in allowed_sources
                   and machine_items < 2 and max_items > 1
                   and processed_items >= max_items - 1):
                 forced_source = "machine"
+            elif (self._has_ready_developer_command()
+                    and self._priority_generation != priority_generation_at_start
+                    and not generation_command_granted
+                    and not extra_command_only
+                    and "command" in allowed_sources):
+                forced_source = "command"
+                generation_command_granted = True
+            elif self._has_ready_developer_command() and "command" in allowed_sources:
+                forced_source = "command"
             # A quota-selected task is only a preference. If its current
             # candidate became unavailable, continue through the ordinary
             # source order so the remaining worker slots are still useful.
@@ -4860,6 +5255,18 @@ class GitHubCommandWatcher:
                     source for source in sources if source != forced_source
                 ) if forced_source else sources
             )
+            if forced_source in {"review", "machine"}:
+                fairness_sources = tuple(
+                    source for source in ("review", "machine")
+                    if source != forced_source
+                )
+                source_order = (
+                    forced_source, *fairness_sources, "command",
+                    *(source for source in sources
+                      if source not in {forced_source, *fairness_sources, "command"}),
+                )
+            if extra_command_only:
+                source_order = ("command",)
             for source in source_order:
                 if source not in allowed_sources or (source == "machine" and machine_items >= 2):
                     continue
@@ -4957,6 +5364,9 @@ class GitHubCommandWatcher:
                 if self._monotonic() < self._priority_pr_retry_deadline(item):
                     continue
                 self._priority_pr_queue.remove(item)
+            over_budget_command = (
+                processed_items >= max_items and chosen_source == "command"
+            )
             processed_items += 1
             queued_repo, pr_number = item
             source = (
@@ -4974,9 +5384,17 @@ class GitHubCommandWatcher:
             pending_comment_id, command_wait = self._pending_command_wait(
                 queued_repo, pr_number,
             )
+            enqueued_mono = self._priority_pr_enqueued_at.get(item)
+            command_schedule_wait = (
+                max(0.0, self._monotonic() - enqueued_mono)
+                if isinstance(enqueued_mono, (int, float)) else None
+            )
+            if over_budget_command:
+                extra_command_items += 1
             logger.info(
-                "watcher priority work started repo=%s pr=%s trigger=%s comment_id=%s command_wait_seconds=%s",
+                "watcher priority work started repo=%s pr=%s trigger=%s comment_id=%s command_wait_seconds=%s command_schedule_wait_seconds=%s",
                 queued_repo, pr_number, trigger, pending_comment_id, command_wait,
+                command_schedule_wait,
             )
             if self.config.auth_valid is not True:
                 self._queue_priority_pr(item, source)
@@ -5183,7 +5601,28 @@ class GitHubCommandWatcher:
             try:
                 succeeded = await self._process_scheduled_pr(
                     queued_repo, pr_number, priority_path=True,
+                    priority_command=(
+                        source == "command" or pending_comment_id is not None
+                    ),
+                    allow_reserved_progress=(source == "review"),
                 )
+                if succeeded == "yielded":
+                    if source == "review":
+                        self._queue_review_pr(item)
+                    else:
+                        self._queue_priority_pr(item, source)
+                        if isinstance(enqueued_mono, (int, float)):
+                            current_enqueued = self._priority_pr_enqueued_at.get(item)
+                            self._priority_pr_enqueued_at[item] = min(
+                                enqueued_mono,
+                                current_enqueued if isinstance(current_enqueued, (int, float))
+                                else enqueued_mono,
+                            )
+                    logger.info(
+                        "watcher yielded priority work repo=%s pr=%s trigger=%s reason=new_developer_command command_wait_seconds=%s",
+                        queued_repo, pr_number, trigger, command_wait,
+                    )
+                    continue
                 if not succeeded:
                     if source == "review":
                         self._retry_review_pr(item, "baseline_incomplete")
@@ -5224,10 +5663,11 @@ class GitHubCommandWatcher:
                     self._monotonic() - attempt_started,
                 )
                 logger.info(
-                    "watcher priority work finished repo=%s pr=%s trigger=%s result=%s command_wait_seconds=%s",
+                    "watcher priority work finished repo=%s pr=%s trigger=%s result=%s command_wait_seconds=%s unit_duration_seconds=%.3f",
                     queued_repo, pr_number, trigger,
                     "processed",
                     command_wait,
+                    max(0.0, self._monotonic() - attempt_started),
                 )
             except GitHubRateLimitError as exc:
                 self._remember_priority_github_retry(item, exc.retry_after_seconds)
@@ -5280,6 +5720,9 @@ class GitHubCommandWatcher:
 
     async def _poll_once(self) -> None:
         """Drain queued work, then run a bounded fair scan through the single writer."""
+        def shutdown_requested() -> bool:
+            return self._task is not None and not self._running
+
         self._prune_expired_priority_github_retries()
         if self.config.auth_valid is not True:
             self._invalidate_all_open_pr_listing_snapshots()
@@ -5295,6 +5738,8 @@ class GitHubCommandWatcher:
             )
             return
         self._sync_open_pr_listing_repos(authorized_repos)
+        if shutdown_requested():
+            return
         if not authorized_repos:
             return
         cycle_started = self._monotonic()
@@ -5318,6 +5763,7 @@ class GitHubCommandWatcher:
         for repo in repos:
             self._queue_machine_projection_refreshes(repo, max_items=2)
 
+        priority_generation_before_drain = self._priority_generation
         # Discovery is read-only and runs independently; this remains the
         # single serial worker for every Lifecycle or evidence write.
         self._current_scan_stage = "priority_queue"
@@ -5329,6 +5775,8 @@ class GitHubCommandWatcher:
             },
             max_items=4,
         ) and cycle_ok
+        if shutdown_requested():
+            return
         # Ready-evidence hints are bounded and yield to priority work: they
         # only read persisted records and re-project when a link is missing.
         # At least one item is still attempted under a continuous priority
@@ -5338,17 +5786,41 @@ class GitHubCommandWatcher:
         self._current_scan_stage = "evidence_sync"
         evidence_budget = 1 if self._priority_pr_queue else 2
         await self._drain_evidence_sync(max_items=evidence_budget)
-        priority_generation_after_drain = self._priority_generation
+        if shutdown_requested():
+            return
+        # An evidence unit may have yielded after a command arrived while it
+        # was in flight. Give that command the writer before starting any
+        # ordinary scan work in this cycle.
+        if self._has_ready_developer_command():
+            cycle_ok = await self._drain_priority_prs(
+                priority_done, priority_attempted, recent_attempted,
+                allowed_sources={"command", "webhook", "recent", "initialization"},
+                max_items=1,
+            ) and cycle_ok
+        if shutdown_requested():
+            return
         interrupted_for_new_priority = False
+        ordinary_reserved_attempted = False
 
         def interrupt_ordinary_scan_for_new_priority() -> bool:
             nonlocal interrupted_for_new_priority
-            if (self._priority_generation != priority_generation_after_drain
+            if (self._priority_generation != priority_generation_before_drain
                     and (self._priority_pr_queue
                          or self._has_ready_review_pr()
                          or self._has_ready_machine_projection_refresh())):
+                if not ordinary_reserved_attempted:
+                    return False
                 interrupted_for_new_priority = True
                 self._signal_wakeup()
+                command_item = next((item for item in self._priority_pr_queue
+                                     if self._priority_pr_sources.get(item) == "command"
+                                     and self._monotonic() >= self._priority_pr_retry_deadline(item)), None)
+                if command_item is not None:
+                    comment_id, wait_seconds = self._pending_command_wait(*command_item)
+                    logger.info(
+                        "watcher yielded ordinary scan reason=new_developer_command repo=%s pr=%s comment_id=%s command_wait_seconds=%s",
+                        command_item[0], command_item[1], comment_id, wait_seconds,
+                    )
                 return True
             return False
 
@@ -5378,6 +5850,8 @@ class GitHubCommandWatcher:
             self._scan_failure_reasons.append("authenticated_github_backoff")
         else:
             for repo in repos:
+                if shutdown_requested():
+                    return
                 if interrupt_ordinary_scan_for_new_priority():
                     break
                 if not self._open_pr_listing_repo_is_authorized(repo):
@@ -5666,6 +6140,8 @@ class GitHubCommandWatcher:
 
                 processed = []
                 for number in selected[:pr_work_budget]:
+                    if shutdown_requested():
+                        break
                     snapshot_completed = snapshot.get("completed_monotonic")
                     snapshot_age = (
                         self._monotonic() - snapshot_completed
@@ -5769,6 +6245,11 @@ class GitHubCommandWatcher:
                         if self._github_backing_off():
                             break
                         continue
+                    if interrupt_ordinary_scan_for_new_priority():
+                        # No command/lifecycle work for this PR has started;
+                        # leave its scan cursor untouched and resume after the
+                        # queued developer command is serviced.
+                        break
                     if (not self._open_pr_listing_repo_is_authorized(repo)
                             or self._repo_baseline_cutoff_utc.get(repo)
                             != authorization_generation):
@@ -5834,6 +6315,7 @@ class GitHubCommandWatcher:
                             self._record_draft_label_attempt(repo, number)
                             await self.controller.reconcile_pr(repo, number)
                             self._log_draft_label_retry_state(repo, number)
+                            ordinary_reserved_attempted = True
                             self._fail_recent_commands_for_pr(
                                 repo, number, "pr_is_draft", retryable=False,
                             )
@@ -5866,7 +6348,14 @@ class GitHubCommandWatcher:
                                 f"authorization:{repo}:changed_before_pr_processing",
                             )
                             break
-                        succeeded = await self._process_scheduled_pr(repo, number)
+                        allow_reserved_progress = (
+                            not ordinary_reserved_attempted
+                        )
+                        ordinary_reserved_attempted = True
+                        succeeded = await self._process_scheduled_pr(
+                            repo, number,
+                            allow_reserved_progress=allow_reserved_progress,
+                        )
                         if succeeded == "yielded":
                             self._record_pr_attempt(
                                 repo, number, "ordinary_comment_yield",
@@ -5877,9 +6366,6 @@ class GitHubCommandWatcher:
                             )
                             cycle_ok = False
                             ordinary_partial_yielded = True
-                            processed.append(number)
-                            self._clear_ordinary_pr_scan_retry(repo, number)
-                            advance_pr_cursors(number)
                             logger.info(
                                 "watcher ordinary PR partially processed repo=%s pr=%s trigger=%s result=yielded_after_comment comment_id=%s command_wait_seconds=%s",
                                 repo, number, processing_trigger,
@@ -6025,6 +6511,8 @@ class GitHubCommandWatcher:
                 )
                 if interrupted_for_new_priority or ordinary_partial_yielded:
                     break
+                if shutdown_requested():
+                    return
         for repo in repos:
             if self._usable_open_pr_snapshot(repo) is None:
                 cycle_ok = False
@@ -6096,7 +6584,10 @@ class GitHubCommandWatcher:
             metrics["github_api"], metrics["webhook_enabled"],
         )
 
-    async def _baseline_pr(self, repo: str, pr_number: int) -> bool:
+    async def _baseline_pr(
+        self, repo: str, pr_number: int, *,
+        yield_to_other_commands: bool = True,
+    ) -> bool | str:
         """Baseline old commands without replaying historical business commands.
 
         Used on first observation AND when a repo is newly (re)activated by an
@@ -6111,6 +6602,10 @@ class GitHubCommandWatcher:
         from .evidence_models import EvidenceError, round_id_for_state
 
         key = (repo, pr_number)
+        def other_command_waiting() -> bool:
+            return (yield_to_other_commands
+                    and self._developer_command_waiting_for_other_pr(repo, pr_number))
+
         authorization_cutoff = self._repo_baseline_cutoff_utc.get(repo)
         ready_cutoff = self._ready_for_review_at.get(key)
         if (authorization_cutoff is not None
@@ -6155,6 +6650,8 @@ class GitHubCommandWatcher:
                 repo, pr_number, type(exc).__name__,
             )
             return False
+        if other_command_waiting():
+            return "yielded"
         expected_state = initial_state
 
         baseline_id = 0
@@ -6169,6 +6666,8 @@ class GitHubCommandWatcher:
                     repo, pr_number, type(exc).__name__,
                 )
                 return False
+            if other_command_waiting():
+                return "yielded"
             if (not pr_info or pr_info.get("state") != "open"
                     or pr_info.get("merged") or pr_info.get("draft")):
                 if initial_state is None:
@@ -6186,6 +6685,8 @@ class GitHubCommandWatcher:
                     repo, pr_number, e,
                 )
                 return False
+            if other_command_waiting():
+                return "yielded"
             if (not isinstance(comments_before, list)
                     or any(not isinstance(comment, dict) for comment in comments_before)):
                 return False
@@ -6266,6 +6767,8 @@ class GitHubCommandWatcher:
                     repo, pr_number, type(exc).__name__,
                 )
                 return False
+            if other_command_waiting():
+                return "yielded"
             if (not pr_info or pr_info.get("state") != "open"
                     or pr_info.get("merged") or pr_info.get("draft")):
                 if initial_state is None:
@@ -6363,6 +6866,8 @@ class GitHubCommandWatcher:
                     repo, pr_number, e,
                 )
                 return False
+            if other_command_waiting():
+                return "yielded"
             if (not isinstance(comments, list)
                     or any(not isinstance(comment, dict) for comment in comments)):
                 return False
@@ -6509,6 +7014,8 @@ class GitHubCommandWatcher:
                                 "watcher evidence recovery skipped %s#%s comment=%s reason=%s",
                                 repo, pr_number, comment_id, e.code,
                             )
+                            if other_command_waiting():
+                                return "yielded"
                             continue
                         logger.warning(
                             "watcher evidence recovery retry %s#%s comment=%s reason=%s",
@@ -6521,6 +7028,8 @@ class GitHubCommandWatcher:
                             repo, pr_number, comment_id, type(e).__name__,
                         )
                         return False
+                    if other_command_waiting():
+                        return "yielded"
             # Reconcile a second time only when the baseline is about to consume
             # a trusted Review Completion the lifecycle has not reflected yet.
             # Cursor reference is the lifecycle cursor after the reconcile that
@@ -6545,6 +7054,8 @@ class GitHubCommandWatcher:
         except Exception as e:
             logger.warning("watcher baseline recheck %s#%s: %s — fail closed", repo, pr_number, type(e).__name__)
             return False
+        if other_command_waiting():
+            return "yielded"
         expected_head = expected_state.get("head_sha") if isinstance(expected_state, dict) else None
         expected_status = expected_state.get("status") if isinstance(expected_state, dict) else None
         if (not isinstance(latest_pr, dict) or latest_pr.get("state") != "open"
@@ -6633,6 +7144,7 @@ class GitHubCommandWatcher:
 
     async def _process_pr(
         self, repo: str, pr_number: int, *, yield_for_priority: bool = False,
+        priority_command: bool = False,
     ) -> bool | str | None:
         """Process commands for one PR.
 
@@ -6660,18 +7172,52 @@ class GitHubCommandWatcher:
             _needs_initial_comment_baseline(initial_state)
             and pr_number not in self._baseline_progress.get(repo, set())
         ):
-            if await self._baseline_pr(repo, pr_number):
+            baseline_result = await self._baseline_pr(
+                repo, pr_number,
+                yield_to_other_commands=not priority_command,
+            )
+            if baseline_result == "yielded":
+                return "yielded"
+            if baseline_result:
                 self._baseline_progress.setdefault(repo, set()).add(pr_number)
-                await self._flush_pending_baseline_notices(repo, pr_number)
+                notice_result = await self._flush_pending_baseline_notices(
+                    repo, pr_number,
+                    yield_for_priority=yield_for_priority and not priority_command,
+                )
+                if notice_result == "yielded":
+                    return "yielded"
             return
 
-        # Existing state PR — normal processing path.
+        if (yield_for_priority
+                and self._developer_command_waiting_for_other_pr(repo, pr_number)):
+            logger.info(
+                "watcher yielded ordinary PR before reconcile repo=%s pr=%s reason=new_developer_command",
+                repo, pr_number,
+            )
+            return "yielded"
+
+        # Reconcile every selected PR so review evidence, HEAD transitions,
+        # and deployment recovery are always checked against current state.
         await self.controller.reconcile_pr(
             repo, pr_number, defer_machine_projection=True,
         )
+        if (yield_for_priority
+                and self._developer_command_waiting_for_other_pr(repo, pr_number)):
+            logger.info(
+                "watcher yielded ordinary PR after completed reconcile repo=%s pr=%s reason=new_developer_command",
+                repo, pr_number,
+            )
+            return "yielded"
         state = await self.proxy.read_hidden_state(repo, pr_number)
         if state is None:
             return
+        if (yield_for_priority
+                and self._developer_command_waiting_for_other_pr(repo, pr_number)):
+            logger.info(
+                "watcher yielded ordinary PR after lifecycle read repo=%s pr=%s reason=new_developer_command",
+                repo, pr_number,
+            )
+            return "yielded"
         cursor = state.get("last_processed_comment_id", 0)
         for (observed_repo, observed_pr, observed_comment_id), observed in list(
                 self._recent_command_records.items()):
@@ -6682,13 +7228,19 @@ class GitHubCommandWatcher:
                     repo, pr_number, observed_comment_id,
                 )
 
-        # Fetch comments
         try:
             comments = await self.proxy.get_issue_comments(repo, pr_number)
         except GitHubStateProxyError as e:
             logger.warning("watcher get comments %s#%s: %s", repo, pr_number, e)
             self._fail_recent_commands_for_pr(repo, pr_number, type(e).__name__)
             return False
+        if (yield_for_priority
+                and self._developer_command_waiting_for_other_pr(repo, pr_number)):
+            logger.info(
+                "watcher yielded ordinary PR after comment snapshot repo=%s pr=%s reason=new_developer_command",
+                repo, pr_number,
+            )
+            return "yielded"
 
         # Filter new comments, sort ascending
         new_comments = [
